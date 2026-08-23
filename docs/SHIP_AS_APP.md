@@ -3375,6 +3375,141 @@ cap gate positive + three refusal branches, malformed / edge args.
 **References**: ADR-0201 (small-LLM sidecar contract), ADR-0211
 (LLM-free NLP as primary path; fallback rate drives investment).
 
+### 7.47 Grammar expansion 12 -> N patterns (R97 — Phase C part 2)
+
+Phase C part 1 (R96) landed the `nl.metrics` verb, but a metric only
+matters if you have a knob to turn. R97 turns the first knob: it
+extends the deterministic LLM-free grammar parser
+(`src/nl/grammar_parser.nova`) from its R48p2 core of ~12 canonical
+patterns to **~85 natural phrasings**, without introducing any new
+`StructuredQuery` kinds. Every added pattern maps to one of the same
+11 `NLK_*` kinds the executor already knows how to dispatch. This is
+the FIRST metric-driven grammar expansion — the direct effect on
+`_total_all_holders`'s `fallback_rate` (basis points, see §7.46) is
+the tuning signal for future work.
+
+**What "12 -> N" means concretely.** Existing behavior on every R48p2
+test input is preserved byte-for-byte (regression suite: 103 checks
+still green). R97 layers new matchers around it so the parser now
+also recognizes the polite / synonymous / suffix / infix / declarative
+forms real users type. `sq_unparsed` (which sends the query out to
+the small-LLM sidecar) fires on strictly fewer inputs than before.
+
+**Per-category coverage added** (all map to existing `NLK_*` kinds;
+counts refer to distinct new phrasings, not test cases):
+
+- **NLK_RESEARCH (+24)** — `explain X` / `describe X` / `define X` /
+  `what does X mean` / `what is the meaning of X` /
+  `give me info on|about X` / `information on|about X` /
+  `what can you say about X` / `elaborate on X` / `expand on X` /
+  `overview of X` / `summary of X` / `background on X` /
+  `history of X` / `origin of X` / `facts about X` /
+  `key points about X` / `details on|about X` /
+  `how does X work` / `why is X important` /
+  suffix forms `X definition` / `X meaning` / `X explained` /
+  `know about X` (picks up after `i want to` preamble strip).
+- **NLK_RELATE (+11)** — `how does X relate to Y` /
+  `what is the relationship between X and Y` /
+  `connection between X and Y` / `link between X and Y` /
+  `association between X and Y` / `similarities between X and Y` /
+  `difference[s] between X and Y` / `how are X and Y related` /
+  `compare X and Y` / `comparison of X and Y` /
+  `X vs Y` / `X versus Y` (infix).
+- **NLK_CONTRADICT_SCAN (+6)** — 1-topic scan forms mapped by
+  putting the topic in both slots: `contradictions in X` /
+  `inconsistencies in X` / `conflicts about X` /
+  `disagreements about X` / `find contradictions in X` /
+  `scan for contradictions about X` / `where does X conflict`.
+- **NLK_IS_A (+7)** — `is X a kind of Y` / `is X a type of Y`
+  (strip leading `kind of` / `type of` from Y) /
+  `is X kind of Y` / `is X type of Y` (article-less) /
+  `does X count as [a] Y` / `is X considered [a] Y` /
+  declarative `X is a[n] Y`.
+- **NLK_RETRACT (+6)** — `forget X` / `forget about X` /
+  `remove X` / `delete X` / `unlearn X` / `withdraw X` /
+  `retract fact X`.
+- **NLK_CAPSULE_INSTALL (+5)** — `add capsule X` / `load capsule X` /
+  `import capsule X` / `enable capsule X` / `install pack X`
+  (`pack` is a `capsule` synonym).
+- **NLK_SKILL_INSTALL (+4)** — `add skill X` / `load skill X` /
+  `enable skill X` / `activate skill X`.
+- **NLK_CAPSULE_LIST (+7)** — `show capsules` / `show all capsules` /
+  `list all capsules` / `what capsules are installed` /
+  `which capsules do i have` / `installed capsules` /
+  `available capsules`.
+- **NLK_SKILL_LIST (+7)** — same shapes as CAPSULE_LIST with
+  `skills`: `show skills` / `show all skills` / `list all skills` /
+  `what skills are available` / `which skills do i have` /
+  `installed skills` / `available skills`.
+- **NLK_SKILL_RUN (+6)** — `execute X on Y` / `use [skill] X on Y` /
+  `invoke X on Y` / `apply X to Y` / `run X with Y`.
+- **NLK_NONE (+6)** — filler / greeting-only utterances now return
+  NONE (a greeting isn't a query): `hi` / `hey` / `hello` / `um` /
+  `uh` / `hmm`, including multi-token combinations like `hi there`.
+  Pure-punctuation inputs (`?`, `!`, `.`, `...`) already returned
+  NONE via the empty-token path.
+
+**Preamble stripping.** Before pattern matching, common polite /
+filler leading tokens are removed in a fixed-point loop so
+`please tell me about X` and `could you please tell me about X` both
+parse identically to `tell me about X`. Leading strips: `please`,
+`hey`, `hi`, `hello`, `um`, `uh`, `hmm`, `hi there`, `hello there`,
+`hey there`, `can|could|would|will you`, `may i ask`, `i want to`,
+`i would like to`, `i d like to` (post-apostrophe-stripping tokens
+for `i'd like to`). Trailing strips: `please`, `thanks`, `thank you`.
+`not` is NEVER stripped — that would change meaning. This preamble
+layer multiplies coverage: every base pattern gets its polite
+variants for free.
+
+**Priority discipline.** Longer / more-specific patterns run first;
+looser ones (single-word verb prefixes, suffix forms, declarative
+`X is a Y`, and the terminal `why X` catch-all) run last. Regression
+guards ensure `install capsule X` still routes to CAPSULE_INSTALL
+(not RESEARCH about "capsule X"), `add capsule X` beats RESEARCH,
+`forget X` beats RESEARCH, and 2-token bare list forms
+(`installed capsules`) beat the late-firing declarative IS_A.
+
+**Tests (409 new checks in `test_nl_grammar_parser`, 103 -> 512
+total).** Every new phrasing has at least one direct assertion of
+(kind, args); the `test_r97_every_new_pattern_validates` sweep
+additionally re-checks that every added phrasing produces an
+`sq_validate == SQ_OK` structured query, so no pattern silently
+constructs an ill-formed SQ. Preamble tests cover single strips,
+nested strips (`could you please tell me about X`), 4-token
+whole-phrase strips (`i would like to know about X`), the
+apostrophe-tokenized `i'd like to` form, and trailing strips
+(`please`, `thanks`, `thank you`). Filler-only inputs (`hi`,
+`hello`, `hmm`, `um uh hmm`, `hi there hello`) are asserted to
+return `NLK_NONE`, not `NLK_UNPARSED` — a greeting should not fire
+the LLM sidecar.
+
+**Effect on the R96 metric.** `nl.metrics` snapshots
+`fallback_rate = llm_attempts * 10000 / total` in basis points
+(§7.46). Before R97, every one of the newly-recognized phrasings
+produced an `NLK_UNPARSED` and either fired the sidecar (raising
+`llm_attempts`) or refused (still counted as `unparsed`). After
+R97, the same inputs return an `sq_*` from the grammar path,
+skipping both counters and thus lowering `fallback_rate` for any
+holder whose traffic contains these forms. No absolute-baseline
+number is quoted here — the metric is per-holder and per-workload,
+so operators observe their own reduction against their own baseline
+via `scripts/rpc.sh nl.metrics` before/after upgrading. The point
+of R97 is that a reduction is now **possible without touching the
+sidecar** — the ADR-0211 objective (LLM-free NLP as the primary
+path) advances by a full step.
+
+**Not touched.** The `StructuredQuery` shape (`query_shape.nova`),
+executor kind dispatch (`executor.nova`), templater, RPC verbs,
+LLM parser, and R96 metrics wire are all unchanged. This is a pure
+front-end recognizer expansion. The next Phase C candidate (R98)
+adds a hyperdimensional-computing prototype-vector intent classifier
+that handles freeform inputs the grammar STILL misses (before the
+sidecar), and is also measurable via `nl.metrics`.
+
+**References**: ADR-0104 (NL Surface Layer), ADR-0211 (LLM-free NLP
+as primary path; fallback rate as tuning signal), §7.46 (the metric
+that R97 moves).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -3471,18 +3606,21 @@ stood up the per-holder metrics registry (see §7.45). **Phase C
 part 1 (R96)** landed the `nl.metrics` wire verb (see §7.46) so
 operators can snapshot the per-holder fallback rate live in basis
 points — the ADR-0211 metric that drives the rest of Phase C is
-now visible. **Front-of-queue for Phase C** (either can go next):
-- **R97 (candidate)** — extend `grammar_parser.nova` from its
-  current 12-pattern core toward 50–100 patterns so the LLM path
-  fires on fewer inputs. Direct effect on `_total_all_holders`'s
-  `fallback_rate` field.
+now visible. **Phase C part 2 (R97)** expanded the LLM-free grammar
+parser from ~12 canonical patterns to ~85 natural phrasings across
+the same 11 SQ kinds (see §7.47) — the first metric-driven grammar
+expansion. Regression suite grew 103 -> 512 checks; every added
+phrasing has a direct kind+args assertion plus a validator sweep.
+Sidecar fallback rate for any holder whose traffic contains the
+newly-recognized forms drops without any sidecar-side change.
+**Front-of-queue for Phase C:**
 - **R98 (candidate)** — ship the HDC prototype-vector intent
-  classifier so freeform inputs the grammar misses are still
-  handled by a zero-shot symbolic path before the sidecar. Also
-  measurable via the same metric.
+  classifier so freeform inputs the grammar STILL misses are handled
+  by a zero-shot symbolic path before the sidecar. Also measurable
+  via the same `nl.metrics` verb.
 Each Phase C improvement is directly measurable via the R96 verb;
 the fallback-rate basis-points number is the single scalar tuning
-target.
+target, and R97 is the first knob turned against it.
 
 **Front-of-queue (non-TLS, post-Phase-B; the top three are the
 immediate targets):**
