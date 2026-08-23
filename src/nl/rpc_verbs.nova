@@ -2264,6 +2264,141 @@ fn _rpc_verb_admin_set_holder(args, ctx) {
     return _rpc_ok(_rpc_obj(kv))
 }
 
+// ---- R96 nl.metrics wire verb -------------------------------------------
+//
+// Expose the R95 per-holder counter registry (src/nl/nl_metrics.nova)
+// over the wire so operators can snapshot the LLM-fallback rate live.
+// ADR-0211 mandates the metric as the primary driver of Phase C's
+// grammar / classifier investment: if you can't see the rate, you
+// can't drive it down.
+//
+//   args:
+//     holder (optional string) -- when present, report just that
+//                                 holder's counters (the "" empty
+//                                 string is the anonymous bucket, a
+//                                 first-class row). When absent, the
+//                                 response carries a "holders" object
+//                                 keyed by holder id with an added
+//                                 "_total_all_holders" aggregate row.
+//   returns:
+//     with holder arg:
+//       {total, unparsed, llm_attempts, llm_successes, llm_failures,
+//        fallback_rate}
+//     without:
+//       {holders: {"<id>": {...}, ..., "_total_all_holders": {...}}}
+//   cap: nl:metrics:read  (bundled with the READER role -- observability,
+//                          not admin).
+//
+// fallback_rate encoding
+// ----------------------
+// NOVA has no float type. We report the rate as INTEGER BASIS POINTS
+// (parts per ten thousand): `basis_points = llm_attempts * 10000 / total`
+// with total==0 mapped to 0. 8.47% renders as 847; 1.19% as 119. Four
+// digits of precision are enough for the dashboard, and the encoding
+// avoids "num/denom" string parsing on the client. When total==0 the
+// field is 0, not "n/a" -- the counter is already all-zero and the
+// client can distinguish "we have no traffic" from "the LLM never
+// fired" via total==0 in the same row.
+//
+// The verb NEVER mutates the registry (snapshot semantics). Absent a
+// registry on the context the verb returns an empty per-holder map
+// with a zero "_total_all_holders" so a client can distinguish
+// "metrics not wired" from "no traffic yet" via the empty holders
+// map. Callers that want a hard refusal can inspect the shape.
+//
+// Refusals: malformed holder arg (a caller passing an empty holder
+// STRING is valid -- that's the anonymous bucket; there is no invalid
+// holder-arg shape to detect at this layer).
+
+fn _nlm_basis_points(attempts, total) {
+    // Basis points: attempts * 10000 / total, integer division.
+    // total == 0 -> 0 (no traffic -> no rate).
+    if total <= 0 { return 0 }
+    return (attempts * 10000) / total
+}
+
+// Emit one holder's row as {total, unparsed, llm_attempts, ...} inner
+// object. Used for both the per-holder branch and each entry in the
+// holders map.
+fn _nlm_row_obj(total, unparsed, attempts, successes, failures) {
+    let kv = list_new()
+    let a = list_new() push(a, "total")           push(a, _rpc_int(total))     push(kv, a)
+    let b = list_new() push(b, "unparsed")        push(b, _rpc_int(unparsed))  push(kv, b)
+    let c = list_new() push(c, "llm_attempts")    push(c, _rpc_int(attempts))  push(kv, c)
+    let d = list_new() push(d, "llm_successes")   push(d, _rpc_int(successes)) push(kv, d)
+    let e = list_new() push(e, "llm_failures")    push(e, _rpc_int(failures))  push(kv, e)
+    let f = list_new() push(f, "fallback_rate")
+        push(f, _rpc_int(_nlm_basis_points(attempts, total)))
+        push(kv, f)
+    return _rpc_obj(kv)
+}
+
+// Encode one snapshot row (NLMS_* layout).
+fn _nlm_encode_row(row) {
+    return _nlm_row_obj(nlms_total(row),
+                        nlms_unparsed(row),
+                        nlms_attempts(row),
+                        nlms_successes(row),
+                        nlms_failures(row))
+}
+
+fn _rpc_verb_nl_metrics(args, ctx) {
+    let reg = rpc_ctx_nl_metrics(ctx)
+    // Per-holder branch: return just that row.
+    if _rpc_has_arg(args, "holder") == 1 {
+        let h = _rpc_arg(args, "holder")
+        // Direct reads are 0 for unseen holders (see _nlm_read_slot).
+        // No side effect: we do NOT allocate a row here.
+        let t = nl_metrics_total(reg, h)
+        let u = nl_metrics_unparsed(reg, h)
+        let at = nl_metrics_llm_fallback_attempts(reg, h)
+        let s = nl_metrics_llm_fallback_successes(reg, h)
+        let f = nl_metrics_llm_fallback_failures(reg, h)
+        return _rpc_ok(_nlm_row_obj(t, u, at, s, f))
+    }
+    // Full-registry branch: snapshot every row + aggregate.
+    let rows = nl_metrics_snapshot(reg)
+    let holders_kv = list_new()
+    let tot_total = 0
+    let tot_unparsed = 0
+    let tot_attempts = 0
+    let tot_successes = 0
+    let tot_failures = 0
+    let i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        tot_total     = tot_total     + nlms_total(r)
+        tot_unparsed  = tot_unparsed  + nlms_unparsed(r)
+        tot_attempts  = tot_attempts  + nlms_attempts(r)
+        tot_successes = tot_successes + nlms_successes(r)
+        tot_failures  = tot_failures  + nlms_failures(r)
+        let pair = list_new()
+        push(pair, nlms_holder(r))
+        push(pair, _nlm_encode_row(r))
+        push(holders_kv, pair)
+        i = i + 1
+    }
+    // Aggregate row -- always present so a client can read a single
+    // number for the "how bad is fallback right now?" dashboard tile
+    // without summing per-holder rows itself. Key intentionally starts
+    // with an underscore so it can't clash with a real holder id
+    // (holders are user_ids / service names; leading underscores are
+    // conventionally reserved for internal keys everywhere else in
+    // this codebase).
+    let agg_pair = list_new()
+    push(agg_pair, "_total_all_holders")
+    push(agg_pair, _nlm_row_obj(tot_total, tot_unparsed,
+                                 tot_attempts, tot_successes,
+                                 tot_failures))
+    push(holders_kv, agg_pair)
+    let outer_kv = list_new()
+    let holders_field = list_new()
+    push(holders_field, "holders")
+    push(holders_field, _rpc_obj(holders_kv))
+    push(outer_kv, holders_field)
+    return _rpc_ok(_rpc_obj(outer_kv))
+}
+
 // capability.list -- audit surface. Requires admin.
 //   args: {}
 //   returns: list of {holder, caps[], issued_at, expires_at,
@@ -2857,6 +2992,7 @@ fn rpc_dispatch(verb, args, ctx) {
     if str_eq_bytes(verb, "admin.remove_cap")   == 1 { return _rpc_verb_admin_remove_cap(args, ctx) }
     if str_eq_bytes(verb, "admin.set_revoked")  == 1 { return _rpc_verb_admin_set_revoked(args, ctx) }
     if str_eq_bytes(verb, "admin.set_holder")   == 1 { return _rpc_verb_admin_set_holder(args, ctx) }
+    if str_eq_bytes(verb, "nl.metrics")         == 1 { return _rpc_verb_nl_metrics(args, ctx) }
     if str_eq_bytes(verb, "session.save")      == 1 { return _rpc_verb_session_save(args, ctx) }
     if str_eq_bytes(verb, "session.load")      == 1 { return _rpc_verb_session_load(args, ctx) }
     if str_eq_bytes(verb, "session.list")      == 1 { return _rpc_verb_session_list(args, ctx) }
@@ -2901,6 +3037,7 @@ fn rpc_verb_names() {
     push(v, "admin.remove_cap")
     push(v, "admin.set_revoked")
     push(v, "admin.set_holder")
+    push(v, "nl.metrics")
     push(v, "session.save")
     push(v, "session.load")
     push(v, "session.list")

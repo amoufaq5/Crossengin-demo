@@ -1,0 +1,444 @@
+// Unit tests for the R96 nl.metrics wire verb (Phase C part 1).
+//
+// Covers:
+//   * verb registered + verb-count bump handled by test_nl_rpc_verbs.
+//   * fresh-daemon empty snapshot -> holders map contains only
+//     _total_all_holders (all zeros).
+//   * 3 nl.ask calls (2 grammar-parsable + 1 unparsed-with-sidecar-off)
+//     reflect total=3, unparsed=1, attempts=0.
+//   * test-mode wire that parses OK -> attempts=N, successes=N.
+//   * test-mode wire that fails to parse -> attempts=N, failures=N.
+//   * holder arg filters to a single holder's row.
+//   * _total_all_holders aggregate is correct across 2+ holders.
+//   * fallback_rate basis-points math: 0/0 -> 0; 1/10 -> 1000;
+//     3/17 -> 1764.
+//   * capability gate: reader-role holder allowed; anonymous refused;
+//     token missing the cap refused.
+//   * malformed args refused cleanly.
+
+import "../ce_test.nova"
+import "../../src/nl/rpc_verbs.nova"
+import "../../src/nl/nl_llm_sidecar.nova"
+import "../../src/nl/nl_metrics.nova"
+import "../../src/nl/query_shape.nova"
+import "../../src/sandbox/capability.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/capsules/capsule.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/persona/persona.nova"
+import "../../src/persona/persona_registry.nova"
+import "../../src/skills/skill_registry.nova"
+import "../../src/skills/skill_dispatch.nova"
+import "../../src/skills/skill_supervisor.nova"
+import "../../src/skills/skills/echo_skill.nova"
+import "../../src/skills/skills/research_skill.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/util/str_safe.nova"
+
+// ---- test helpers ---------------------------------------------------------
+
+fn _mk_kgreg() {
+    let reg = kg_registry_new()
+    let kg1 = kg_spawn(reg, "solar_system")
+    let a1 = kg_add_atom(kg1, ATOM_FACT, "mars", 0)
+    list_set(a1[A_BELIEF], 0, 8000) list_set(a1[A_BELIEF], 1, 2000)
+    return reg
+}
+
+fn _mk_ctx() {
+    let kgreg = _mk_kgreg()
+    let capreg = capreg_new()
+    let mo = mo_new()
+    let sr = skill_registry_new()
+    skill_registry_register(sr, echo_skill_manifest())
+    skill_registry_register(sr, research_skill_manifest())
+    let preg = persona_registry_new()
+    persona_registry_ensure(preg, "owner", 100)
+    let ctx = rpc_ctx_new(kgreg, capreg, preg, sr, mo, 0, 0, 100)
+    rpc_ctx_set_nl_metrics(ctx, nl_metrics_new())
+    return ctx
+}
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+fn _args1(k, v) {
+    let a = list_new()
+    push(a, rpc_arg_kv(k, v))
+    return a
+}
+
+fn _args2(k1, v1, k2, v2) {
+    let a = list_new()
+    push(a, rpc_arg_kv(k1, v1))
+    push(a, rpc_arg_kv(k2, v2))
+    return a
+}
+
+// ---- verb registration + cap declaration ---------------------------------
+
+fn test_verb_registered() {
+    let names = rpc_verb_names()
+    let saw = 0
+    let i = 0
+    while i < len(names) {
+        if str_eq_bytes(names[i], "nl.metrics") == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("nl.metrics in verb names", saw, 1)
+}
+
+fn test_verb_requires_metrics_read_cap() {
+    ce_eq("nl.metrics -> nl:metrics:read",
+          str_eq_bytes(capability_verb_required("nl.metrics"),
+                       CAP_NL_METRICS_READ), 1)
+}
+
+fn test_reader_role_carries_metrics_read() {
+    let caps = capability_role_expand("reader")
+    let i = 0
+    let saw = 0
+    while i < len(caps) {
+        if str_eq_bytes(caps[i], CAP_NL_METRICS_READ) == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("reader has nl:metrics:read", saw, 1)
+}
+
+fn test_admin_role_carries_metrics_read() {
+    let caps = capability_role_expand("admin")
+    let i = 0
+    let saw = 0
+    while i < len(caps) {
+        if str_eq_bytes(caps[i], CAP_NL_METRICS_READ) == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("admin has nl:metrics:read", saw, 1)
+}
+
+fn test_service_role_no_metrics_read() {
+    // Service is a minimal role for headless call-serve accounts;
+    // it does NOT carry the observability cap.
+    let caps = capability_role_expand("service")
+    let i = 0
+    let saw = 0
+    while i < len(caps) {
+        if str_eq_bytes(caps[i], CAP_NL_METRICS_READ) == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("service lacks nl:metrics:read", saw, 0)
+}
+
+fn test_known_cap_registered() {
+    ce_eq("cap string is known",
+          capability_is_known_cap(CAP_NL_METRICS_READ), 1)
+}
+
+// ---- fresh registry snapshot ----------------------------------------------
+
+fn test_fresh_daemon_empty_snapshot() {
+    let ctx = _mk_ctx()
+    let out = rpc_dispatch("nl.metrics", list_new(), ctx)
+    ce_check("ok true",             _has(out, "\"ok\":true"))
+    ce_check("carries holders map", _has(out, "\"holders\":"))
+    ce_check("has aggregate row",   _has(out, "\"_total_all_holders\":"))
+    ce_check("aggregate total=0",   _has(out, "\"total\":0"))
+    ce_check("aggregate rate=0",    _has(out, "\"fallback_rate\":0"))
+}
+
+fn test_no_metrics_registry_still_ok() {
+    // A daemon that never wired a metrics registry gets an empty
+    // holders map with the aggregate row at zero -- no refusal.
+    let kgreg = _mk_kgreg()
+    let ctx = rpc_ctx_new(kgreg, 0, 0, 0, 0, 0, 0, 100)
+    let out = rpc_dispatch("nl.metrics", list_new(), ctx)
+    ce_check("ok true",             _has(out, "\"ok\":true"))
+    ce_check("holders map present", _has(out, "\"holders\":"))
+    ce_check("aggregate present",   _has(out, "\"_total_all_holders\":"))
+    ce_check("aggregate zero",      _has(out, "\"total\":0"))
+}
+
+// ---- integration through nl.ask ------------------------------------------
+
+fn test_three_asks_shape_snapshot() {
+    // 2 grammar-parseable + 1 unparsed with sidecar off ->
+    // total=3, unparsed=1, attempts=0.
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_off()
+    let ctx = _mk_ctx()
+    rpc_dispatch("nl.ask", _args2("text", "what is mars",     "user_id", "owner"), ctx)
+    rpc_dispatch("nl.ask", _args2("text", "is earth a planet", "user_id", "owner"), ctx)
+    rpc_dispatch("nl.ask", _args2("text", "floof floof glorp", "user_id", "owner"), ctx)
+    // Read via the wire verb.
+    let out = rpc_dispatch("nl.metrics", list_new(), ctx)
+    ce_check("ok true",       _has(out, "\"ok\":true"))
+    ce_check("total=3 total", _has(out, "\"total\":3"))
+    ce_check("unparsed=1",    _has(out, "\"unparsed\":1"))
+    ce_check("attempts=0",    _has(out, "\"llm_attempts\":0"))
+    ce_check("successes=0",   _has(out, "\"llm_successes\":0"))
+    ce_check("failures=0",    _has(out, "\"llm_failures\":0"))
+    // Also readable via holder arg (anonymous bucket "").
+    let out2 = rpc_dispatch("nl.metrics", _args1("holder", ""), ctx)
+    ce_check("per-holder ok",         _has(out2, "\"ok\":true"))
+    ce_check("per-holder total=3",    _has(out2, "\"total\":3"))
+    ce_check("per-holder unparsed=1", _has(out2, "\"unparsed\":1"))
+}
+
+fn test_testmode_success_reflects_attempts() {
+    // Sidecar test-mode returns a well-formed wire; every unparsed
+    // input becomes an attempt + a success.
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("KIND research\nARG cats\n")
+    let ctx = _mk_ctx()
+    rpc_dispatch("nl.ask", _args2("text", "wobble wobble frotzle", "user_id", "owner"), ctx)
+    rpc_dispatch("nl.ask", _args2("text", "gribble grabble glorp",  "user_id", "owner"), ctx)
+    let out = rpc_dispatch("nl.metrics", _args1("holder", ""), ctx)
+    ce_check("total=2",     _has(out, "\"total\":2"))
+    ce_check("unparsed=2",  _has(out, "\"unparsed\":2"))
+    ce_check("attempts=2",  _has(out, "\"llm_attempts\":2"))
+    ce_check("successes=2", _has(out, "\"llm_successes\":2"))
+    ce_check("failures=0",  _has(out, "\"llm_failures\":0"))
+}
+
+fn test_testmode_malformed_reflects_failures() {
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("not wire format at all")
+    let ctx = _mk_ctx()
+    rpc_dispatch("nl.ask", _args2("text", "wobble wobble frotzle", "user_id", "owner"), ctx)
+    rpc_dispatch("nl.ask", _args2("text", "gribble grabble glorp",  "user_id", "owner"), ctx)
+    let out = rpc_dispatch("nl.metrics", _args1("holder", ""), ctx)
+    ce_check("total=2",     _has(out, "\"total\":2"))
+    ce_check("unparsed=2",  _has(out, "\"unparsed\":2"))
+    ce_check("attempts=2",  _has(out, "\"llm_attempts\":2"))
+    ce_check("failures=2",  _has(out, "\"llm_failures\":2"))
+    ce_check("successes=0", _has(out, "\"llm_successes\":0"))
+}
+
+// ---- holder arg branch ----------------------------------------------------
+
+fn test_holder_arg_filters_row() {
+    // Pre-populate the registry with two holders + differing counts,
+    // then query per-holder via the arg.
+    let ctx = _mk_ctx()
+    let reg = rpc_ctx_nl_metrics(ctx)
+    nl_metrics_inc_total(reg, "alice")
+    nl_metrics_inc_total(reg, "alice")
+    nl_metrics_inc_unparsed(reg, "alice")
+    nl_metrics_inc_total(reg, "bob")
+    // Only alice's row for holder=alice.
+    let out_a = rpc_dispatch("nl.metrics", _args1("holder", "alice"), ctx)
+    ce_check("alice ok",         _has(out_a, "\"ok\":true"))
+    ce_check("alice total=2",    _has(out_a, "\"total\":2"))
+    ce_check("alice unparsed=1", _has(out_a, "\"unparsed\":1"))
+    // No holders map -- this is a single-row response.
+    ce_eq("alice no holders map", _has(out_a, "\"holders\":"), 0)
+    ce_eq("alice no aggregate",   _has(out_a, "\"_total_all_holders\""), 0)
+    // Bob's row is only 1 total.
+    let out_b = rpc_dispatch("nl.metrics", _args1("holder", "bob"), ctx)
+    ce_check("bob total=1",    _has(out_b, "\"total\":1"))
+    ce_check("bob unparsed=0", _has(out_b, "\"unparsed\":0"))
+    // Unseen holder returns all-zero row (no side effect -- see
+    // nl_metrics_holder_count assertion below).
+    let before = nl_metrics_holder_count(reg)
+    let out_ghost = rpc_dispatch("nl.metrics", _args1("holder", "ghost"), ctx)
+    ce_check("ghost ok",       _has(out_ghost, "\"ok\":true"))
+    ce_check("ghost total=0",  _has(out_ghost, "\"total\":0"))
+    ce_eq("read did not allocate a row",
+          nl_metrics_holder_count(reg), before)
+}
+
+// ---- aggregate math -------------------------------------------------------
+
+fn test_aggregate_sums_across_holders() {
+    let ctx = _mk_ctx()
+    let reg = rpc_ctx_nl_metrics(ctx)
+    // alice: 10 total, 4 unparsed, 4 attempts, 3 successes, 1 failure.
+    let i = 0
+    while i < 10 { nl_metrics_inc_total(reg, "alice") i = i + 1 }
+    i = 0
+    while i < 4 { nl_metrics_inc_unparsed(reg, "alice") i = i + 1 }
+    i = 0
+    while i < 4 { nl_metrics_inc_llm_fallback_attempt(reg, "alice") i = i + 1 }
+    i = 0
+    while i < 3 { nl_metrics_inc_llm_fallback_success(reg, "alice") i = i + 1 }
+    nl_metrics_inc_llm_fallback_failure(reg, "alice")
+    // bob: 7 total, 0 unparsed, 0 attempts.
+    i = 0
+    while i < 7 { nl_metrics_inc_total(reg, "bob") i = i + 1 }
+    // carol: 0 total (never touched -- shouldn't appear).
+    let out = rpc_dispatch("nl.metrics", list_new(), ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("alice in map",    _has(out, "\"alice\":"))
+    ce_check("bob in map",      _has(out, "\"bob\":"))
+    ce_eq("carol absent",       _has(out, "\"carol\":"), 0)
+    ce_check("aggregate row",   _has(out, "\"_total_all_holders\":"))
+    // Aggregate: total=17, unparsed=4, attempts=4, successes=3, failures=1.
+    // The aggregate row is the LAST element of the holders object, so
+    // the trailing "total":17 is unique to it (alice=10, bob=7, agg=17).
+    ce_check("aggregate total=17",   _has(out, "\"total\":17"))
+    ce_check("aggregate unparsed=4", _has(out, "\"unparsed\":4"))
+    ce_check("aggregate attempts=4", _has(out, "\"llm_attempts\":4"))
+    ce_check("aggregate successes=3", _has(out, "\"llm_successes\":3"))
+    ce_check("aggregate failures=1",  _has(out, "\"llm_failures\":1"))
+}
+
+// ---- fallback_rate basis-points math -------------------------------------
+
+fn test_rate_math_zero_over_zero() {
+    let ctx = _mk_ctx()
+    let out = rpc_dispatch("nl.metrics", _args1("holder", "nobody"), ctx)
+    ce_check("total=0",         _has(out, "\"total\":0"))
+    ce_check("rate=0",          _has(out, "\"fallback_rate\":0"))
+}
+
+fn test_rate_math_one_over_ten() {
+    // 1 attempt out of 10 -> 1 * 10000 / 10 = 1000 basis points (10%).
+    let ctx = _mk_ctx()
+    let reg = rpc_ctx_nl_metrics(ctx)
+    let i = 0
+    while i < 10 { nl_metrics_inc_total(reg, "dana") i = i + 1 }
+    nl_metrics_inc_llm_fallback_attempt(reg, "dana")
+    let out = rpc_dispatch("nl.metrics", _args1("holder", "dana"), ctx)
+    ce_check("total=10",         _has(out, "\"total\":10"))
+    ce_check("attempts=1",       _has(out, "\"llm_attempts\":1"))
+    ce_check("rate=1000 bps",    _has(out, "\"fallback_rate\":1000"))
+}
+
+fn test_rate_math_three_over_seventeen() {
+    // 3 attempts out of 17 -> 3 * 10000 / 17 = 1764 basis points
+    // (17.64%). Integer division truncates the trailing digit.
+    let ctx = _mk_ctx()
+    let reg = rpc_ctx_nl_metrics(ctx)
+    let i = 0
+    while i < 17 { nl_metrics_inc_total(reg, "eli") i = i + 1 }
+    i = 0
+    while i < 3 { nl_metrics_inc_llm_fallback_attempt(reg, "eli") i = i + 1 }
+    let out = rpc_dispatch("nl.metrics", _args1("holder", "eli"), ctx)
+    ce_check("total=17",       _has(out, "\"total\":17"))
+    ce_check("attempts=3",     _has(out, "\"llm_attempts\":3"))
+    ce_check("rate=1764 bps",  _has(out, "\"fallback_rate\":1764"))
+}
+
+fn test_rate_math_full_saturation() {
+    // 5/5 -> 10000 basis points (100%). Explicit ceiling check.
+    let ctx = _mk_ctx()
+    let reg = rpc_ctx_nl_metrics(ctx)
+    let i = 0
+    while i < 5 {
+        nl_metrics_inc_total(reg, "fern")
+        nl_metrics_inc_llm_fallback_attempt(reg, "fern")
+        i = i + 1
+    }
+    let out = rpc_dispatch("nl.metrics", _args1("holder", "fern"), ctx)
+    ce_check("total=5",         _has(out, "\"total\":5"))
+    ce_check("attempts=5",      _has(out, "\"llm_attempts\":5"))
+    ce_check("rate=10000 bps",  _has(out, "\"fallback_rate\":10000"))
+}
+
+// ---- capability gate ------------------------------------------------------
+
+fn test_reader_allowed_under_enforcement() {
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-r", "alice", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-r")
+    let out = rpc_dispatch("nl.metrics", list_new(), ctx)
+    ce_check("reader can read metrics", _has(out, "\"ok\":true"))
+    ce_check("gets holders map",        _has(out, "\"holders\":"))
+}
+
+fn test_anonymous_refused_under_enforcement() {
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    // No presented token.
+    let out = rpc_dispatch("nl.metrics", list_new(), ctx)
+    ce_check("refused",         _has(out, "\"ok\":false"))
+    ce_check("names token miss", _has(out, "missing 'token'"))
+}
+
+fn test_capless_token_refused() {
+    // A token minted with no nl:metrics:read cap is refused.
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    let caps = list_new()
+    push(caps, CAP_NL_ASK)     // has nl:ask but NOT nl:metrics:read
+    let t = capability_token_new("tk-no", "eve", caps, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-no")
+    let out = rpc_dispatch("nl.metrics", list_new(), ctx)
+    ce_check("refused",             _has(out, "\"ok\":false"))
+    ce_check("names required cap",  _has(out, "capability required: nl:metrics:read"))
+}
+
+fn test_unknown_token_refused() {
+    let ctx = _mk_ctx()
+    let reg = capability_registry_new()
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-does-not-exist")
+    let out = rpc_dispatch("nl.metrics", list_new(), ctx)
+    ce_check("refused",           _has(out, "\"ok\":false"))
+    ce_check("names unknown tok", _has(out, "unknown token"))
+}
+
+// ---- malformed / edge-case args ------------------------------------------
+
+fn test_ignores_unknown_args() {
+    // Extra keys are ignored (matches every other verb's behavior).
+    let ctx = _mk_ctx()
+    let out = rpc_dispatch("nl.metrics",
+        _args1("nonsense_key", "some value"), ctx)
+    ce_check("still ok",      _has(out, "\"ok\":true"))
+    ce_check("aggregate row", _has(out, "\"_total_all_holders\":"))
+}
+
+fn test_empty_holder_arg_is_anonymous_bucket() {
+    // An explicitly empty holder is a VALID query: the anonymous bucket.
+    let ctx = _mk_ctx()
+    let reg = rpc_ctx_nl_metrics(ctx)
+    nl_metrics_inc_total(reg, "")
+    nl_metrics_inc_total(reg, "")
+    let out = rpc_dispatch("nl.metrics", _args1("holder", ""), ctx)
+    ce_check("ok",           _has(out, "\"ok\":true"))
+    ce_check("total=2",      _has(out, "\"total\":2"))
+    ce_eq("single-row response",
+          _has(out, "\"holders\":"), 0)
+}
+
+// ---- runner ---------------------------------------------------------------
+
+fn main() {
+    test_verb_registered()
+    test_verb_requires_metrics_read_cap()
+    test_reader_role_carries_metrics_read()
+    test_admin_role_carries_metrics_read()
+    test_service_role_no_metrics_read()
+    test_known_cap_registered()
+    test_fresh_daemon_empty_snapshot()
+    test_no_metrics_registry_still_ok()
+    test_three_asks_shape_snapshot()
+    test_testmode_success_reflects_attempts()
+    test_testmode_malformed_reflects_failures()
+    test_holder_arg_filters_row()
+    test_aggregate_sums_across_holders()
+    test_rate_math_zero_over_zero()
+    test_rate_math_one_over_ten()
+    test_rate_math_three_over_seventeen()
+    test_rate_math_full_saturation()
+    test_reader_allowed_under_enforcement()
+    test_anonymous_refused_under_enforcement()
+    test_capless_token_refused()
+    test_unknown_token_refused()
+    test_ignores_unknown_args()
+    test_empty_holder_arg_is_anonymous_bucket()
+    ce_summary("nl_rpc_metrics_verb")
+}
+
+main()

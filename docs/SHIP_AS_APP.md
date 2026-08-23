@@ -3254,6 +3254,127 @@ query, and the daemon dispatches the research skill.
 (LLM-free NLP as primary path; fallback rate drives investment),
 plan file `gentle-toasting-zephyr.md`.
 
+### 7.46 nl.metrics wire verb (R96 — Phase C part 1)
+
+R95 stood up the per-holder counter registry but left it invisible
+on the wire: an operator could see the LLM sidecar fire but not
+snapshot the fallback rate. R96 closes that gap with a single
+read-only verb, `nl.metrics`, that exposes the R95 counters as
+JSON. This is Phase C part 1: ADR-0211 mandates the fallback-rate
+metric as the primary driver of Phase C's grammar / classifier
+investment, and you cannot drive down a rate you cannot see.
+
+**Verb summary:**
+
+- **Verb name:** `nl.metrics`
+- **Cap required:** `nl:metrics:read` (new; bundled with the READER
+  role, not admin — this is observability, not a mutation).
+- **Args (all optional):**
+  - `holder` — when present, return just that holder's row.
+    The empty string `""` is a valid query: the anonymous bucket
+    (calls made with no capability token presented).
+- **Response shape (no `holder` arg):**
+
+  ```
+  {
+    "holders": {
+      "alice": {"total": 42, "unparsed": 5, "llm_attempts": 5,
+                 "llm_successes": 4, "llm_failures": 1,
+                 "fallback_rate": 119},
+      "bob":   {"total": 17, "unparsed": 0, "llm_attempts": 0,
+                 "llm_successes": 0, "llm_failures": 0,
+                 "fallback_rate": 0},
+      "_total_all_holders": {
+        "total": 59, "unparsed": 5, "llm_attempts": 5,
+        "llm_successes": 4, "llm_failures": 1,
+        "fallback_rate": 847
+      }
+    }
+  }
+  ```
+
+- **Response shape (with `holder` arg):** just the inner
+  `{total, unparsed, llm_attempts, llm_successes, llm_failures,
+  fallback_rate}` row, no wrapping `holders` map.
+
+**`fallback_rate` encoding — integer basis points.** NOVA has no
+float type (`docs/NOVA_RUNTIME_GAPS.md`). The rate is emitted as
+BASIS POINTS: `llm_attempts * 10000 / total`, integer division,
+with `total == 0` mapped to 0. Four significant digits — enough
+for a dashboard tile. 8.47% renders as `847`; 1.19% as `119`;
+100% as `10000`; "no traffic yet" as `0` (distinguishable from
+"traffic without fallback" via `total > 0` on the same row).
+Clients can render as a percentage by dividing by 100.
+
+**Snapshot semantics.** The verb NEVER mutates the registry.
+Successive calls without any intervening `nl.ask` return
+identical rows. An unseen holder's per-holder query returns an
+all-zero row and does NOT allocate a registry row (no
+side-effect-in-getter).
+
+**No metrics registry wired** (custom daemons that skipped
+`rpc_ctx_set_nl_metrics`): the verb returns an empty holders
+map with a zero `_total_all_holders` row rather than refusing.
+Callers distinguishing "not wired" from "no traffic yet" can
+inspect the shape: a wired-but-empty registry returns
+`{"holders": {"_total_all_holders": {...zeros...}}}`; a call
+against a non-wired context returns the same shape (the R95
+inc helpers no-op on registry==0 so the two cases converge by
+design). The reference daemon (`crossengin_rpc_daemon.nova`)
+wires a fresh registry at boot, so this branch only surfaces
+when an operator disabled the wiring deliberately.
+
+**Example (loopback, no sandbox):**
+
+```
+scripts/rpc.sh nl.metrics
+# -> {"ok":true,"result":{"holders":{
+#      "_total_all_holders":{"total":0,"unparsed":0,
+#        "llm_attempts":0,"llm_successes":0,"llm_failures":0,
+#        "fallback_rate":0}}}, "error":""}
+
+scripts/rpc.sh nl.ask text='floof glorpity'  user_id=owner
+scripts/rpc.sh nl.metrics holder=''
+# -> {"ok":true,"result":{"total":1,"unparsed":1,
+#      "llm_attempts":0,"llm_successes":0,"llm_failures":0,
+#      "fallback_rate":0}, "error":""}
+```
+
+**Example (sandbox-enforced dashboard reader):**
+
+```
+# admin mints a reader token for the dashboard cron job:
+scripts/rpc.sh capability.issue holder=dashboard roles=reader
+# -> ...token_id=abcd...
+
+TOK=abcd... curl (or scripts/rpc.sh) nl.metrics
+# Reader role carries nl:metrics:read; call is authorized.
+```
+
+**Cap gate.** `nl.metrics` requires `nl:metrics:read`. The reader,
+skill_user, curator, and admin roles all carry it; the service
+role does not (call-serve accounts don't need dashboard reads).
+Under enforcement:
+
+- reader token -> allowed
+- admin token -> allowed
+- token missing the cap -> `"capability required: nl:metrics:read"`
+- unknown token -> `"capability required: unknown token"`
+- anonymous (no token) -> `"capability required: request missing 'token' field"`
+
+**Tests (78 new checks in `test_nl_rpc_metrics_verb`):**
+verb registered + cap declared, reader/admin carry the cap +
+service does not, fresh-registry empty snapshot, unwired-context
+still returns ok, three-`nl.ask` shape check (2 parsable + 1
+unparsable-sidecar-off), test-mode success shape, test-mode
+failure shape, holder-arg single-row filter (with no-side-effect
+verification on unseen holders), aggregate math across two
+holders, basis-points math edge cases (0/0, 1/10, 3/17, 5/5),
+cap gate positive + three refusal branches, malformed / edge args.
+
+**References**: ADR-0201 (small-LLM sidecar contract), ADR-0211
+(LLM-free NLP as primary path; fallback rate drives investment).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -3343,17 +3464,25 @@ wiring, sidecar contract — all in tree. Any further TLS work
 concurrent handshakes / ACME sidecar) is optional hardening layered
 on top; see the R86 ADR's post-scriptum for the full list.
 
-**AI-Factory epic (Phase A + B ✅; Phase C is the front-of-queue).**
-Phase A shipped the vision (ADR-0200..0211 + 5 top-level docs).
-Phase B (R95) wired the small-LLM sidecar as the freeform-NL
-fallback and stood up the per-holder metrics registry (see §7.45).
-**Phase C — LLM-free NLP expansion** is the immediate next
-target: (a) add `nl.metrics` wire verb so operators can snapshot
-the fallback rate live, (b) extend `grammar_parser.nova` to
-50–100 patterns so the LLM path fires on fewer inputs, (c) ship
-the HDC prototype-vector intent classifier so more inputs are
-handled with zero-shot symbolic matching instead of grammar. Every
-Phase C improvement is measurable via the R95 metric slots.
+**AI-Factory epic (Phase A + B ✅; Phase C in progress).** Phase A
+shipped the vision (ADR-0200..0211 + 5 top-level docs). Phase B
+(R95) wired the small-LLM sidecar as the freeform-NL fallback and
+stood up the per-holder metrics registry (see §7.45). **Phase C
+part 1 (R96)** landed the `nl.metrics` wire verb (see §7.46) so
+operators can snapshot the per-holder fallback rate live in basis
+points — the ADR-0211 metric that drives the rest of Phase C is
+now visible. **Front-of-queue for Phase C** (either can go next):
+- **R97 (candidate)** — extend `grammar_parser.nova` from its
+  current 12-pattern core toward 50–100 patterns so the LLM path
+  fires on fewer inputs. Direct effect on `_total_all_holders`'s
+  `fallback_rate` field.
+- **R98 (candidate)** — ship the HDC prototype-vector intent
+  classifier so freeform inputs the grammar misses are still
+  handled by a zero-shot symbolic path before the sidecar. Also
+  measurable via the same metric.
+Each Phase C improvement is directly measurable via the R96 verb;
+the fallback-rate basis-points number is the single scalar tuning
+target.
 
 **Front-of-queue (non-TLS, post-Phase-B; the top three are the
 immediate targets):**
