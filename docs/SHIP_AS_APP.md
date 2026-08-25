@@ -3649,6 +3649,148 @@ without touching the others.
 §7.45 (sidecar), §7.46 (metrics wire verb + basis-points math),
 §7.47 (R97 grammar expansion — the neighbouring rung).
 
+### 7.49 bake_child factory (R99 — Phase D part 1)
+
+R99 delivers the first slice of the mother/child bake factory promised
+in ADR-0203 + ADR-0204. A mother daemon reads a `BakeManifest`, walks
+its live registries under the manifest's allowlists + KG-atom filter,
+and emits a signed line-oriented bundle a child runtime will consume.
+R100 (`--child-mode`) and R101 (signed KG-delta channel) are the
+next Phase D rounds; R99 stops at the produce-and-sign step.
+
+**Wire verb:** `admin.bake_child` (cap `admin:bake`, admin role only).
+
+    args:
+      manifest_text  (inline text)  -- OR --
+      manifest_path  (readable file path)
+      output_path    (optional; defaults to
+                      $CROSSENGIN_BAKE_DIR/<name>-<version>.bundle)
+
+    response (on ok=true):
+      { name, version, domain,
+        bundle_path, bundle_bytes_len, signature_bytes_len,
+        personas, capsules, skills, patterns, policies,
+        kg_atoms, ownership_entries }
+
+Refusals: signer keys missing, malformed manifest, unreadable
+manifest_path, no bake dir configured (when output_path absent),
+write failure.
+
+**Manifest format** (`src/factory/bake_manifest.nova`):
+
+    BAKE-MANIFEST v1
+    NAME solar-child
+    VERSION 0.1.0
+    DOMAIN astronomy
+    ALLOW_CAPSULE solar_system                # repeatable
+    ALLOW_SKILL research                      # repeatable
+    ALLOW_PATTERN debug_common                # repeatable
+    PERSONA_USER alice                        # repeatable
+    ALLOW_POLICY auto_wikidata                # repeatable
+    ALLOW_KG_CAPSULE solar_system             # KG-atom filter (repeatable)
+    ALLOW_SOURCE_PREFIX solar_                # KG-atom filter (repeatable)
+    ALLOW_LICENSE OPEN                        # KG-atom filter (repeatable)
+    STYLE plain                               # optional single style pin
+    # comment lines start with '#'; blank lines ignored
+
+Comment + blank lines are ignored; duplicate `ALLOW_*` directives
+aggregate; unknown directives are refused with a naming error.
+`NAME`, `VERSION`, `DOMAIN` are required (empty allowlists are
+legal — the bundle carries empty-of-that-kind sections). The literal
+`*` in any ALLOW list acts as a wildcard for that predicate.
+
+**KG-atom filter** (`src/factory/kg_filter.nova`). An atom is
+selected iff ANY of:
+
+  1. It belongs to a capsule named in `ALLOW_KG_CAPSULE`.
+  2. Its KG label starts with any prefix in `ALLOW_SOURCE_PREFIX`.
+  3. Its `atom_license` (int) matches any license name in
+     `ALLOW_LICENSE` (`UNKNOWN` / `OWNER` / `OPEN` / `CC_BY_SA` /
+     `PROPRIETARY`, mapping to the R32 license constants).
+
+Empty allowlists = no atoms pass. Cross-KG capsule membership can
+be over-broad due to the base capsule module's per-id (not per-kg)
+membership store; users should scope their `ALLOW_KG_CAPSULE`
+entries to capsules that actually cover atoms they want in the
+child. A future round tightens this by threading kg-label through
+capsule membership.
+
+**Bundle format** (line-oriented ASCII + hex-encoded signature
+footer). Sections emitted in order:
+
+    #CROSSENGIN-CHILD-BUNDLE v1
+    #name <name>
+    #version <ver>
+    #domain <domain>
+    #baked-at <now>
+    #mother-fingerprint <sha256-of-signer-pk-hex>
+
+    #PERSONA v1        ... personas from PERSONA_USER intersect ...
+    #OWNERSHIP v1      ... entries whose (kind, name) is in the
+                            corresponding ALLOW_* list ...
+    #POLICY v1         ... policies from ALLOW_POLICY intersect ...
+    #PATTERN v1        ... pattern capsules from ALLOW_PATTERN ...
+    #SKILL v1          ... skills from ALLOW_SKILL intersect ...
+    #CAPSULE v1        ... capsules from ALLOW_CAPSULE, with
+                            atom-ref labels (not raw atom-ids) so
+                            the child can rehydrate against its
+                            own KG section ...
+    #KG v1             ... ATOM + XREF lines for atoms selected by
+                            the R99 filter ...
+
+    #SIGNATURE <hex-128>
+    #SIGNER-PK  <hex-64>
+
+Note: NO `#CAPS v1` (bearer tokens stay with the mother) and NO
+`#TRUST v1` (trust anchors stay with the mother). The child boots
+without secrets it wasn't explicitly provisioned with.
+
+**Signature** (`src/persistence/bundle_signing.nova`). Signs SHA-256
+of the bundle bytes UP TO but NOT INCLUDING the `#SIGNATURE` line;
+Ed25519 via the existing R16A `merkle_sign` primitive. The child
+recomputes the same digest over the same prefix on verify.
+
+**Signer keys** come from ENV (secure_random is seccomp-blocked in
+this container; keys MUST be provisioned externally):
+
+    CROSSENGIN_MOTHER_SIGNER_SEED_B64   -- base64(32-byte Ed25519 seed)
+    CROSSENGIN_MOTHER_SIGNER_PK_B64     -- base64(32-byte Ed25519 pub key)
+    CROSSENGIN_BAKE_DIR                 -- absolute path; where the
+                                            bundle file lands
+
+The sidecar (see §7.44 recipe) generates the keypair, exports both
+env vars to the mother daemon's environment, and holds the private
+seed for the lifetime of the mother. A child that trusts a mother
+carries the mother's PK as its anchor (R100 wires this).
+
+**Files** (R99):
+
+  * `src/factory/bake_manifest.nova`   -- parser + validator + serializer
+  * `src/factory/kg_filter.nova`       -- atom predicate + selection walker
+  * `src/factory/bake.nova`            -- pipeline + bundle format + verify
+  * `src/persistence/bundle_signing.nova`
+                                        -- Ed25519 sign / verify + env loader
+  * `src/sandbox/session_snapshot.nova` -- 5 `_scoped` section serializers
+  * `src/persistence/snapshot_disk.nova`
+                                        -- `kg_section_build_scoped`
+  * `src/sandbox/capability.nova`      -- `CAP_ADMIN_BAKE` constant +
+                                            verb-required + admin role
+  * `src/nl/rpc_verbs.nova`            -- `_rpc_verb_admin_bake_child`
+                                            handler + dispatch + name
+
+**Tests** (all green): `test_bake_manifest` (81 checks),
+`test_kg_filter` (22 checks), `test_bundle_signing` (25 checks),
+`test_bake` (53 checks), `test_admin_bake_child_verb` (20 checks).
+Verb count 37 → 38 in `test_nl_rpc_verbs`.
+
+**Backwards compat:** `session.save` / `session.load` unchanged.
+Existing whole-daemon serializers preserved; scoped variants sit
+beside them and are invoked ONLY by `bake_child`.
+
+**References:** ADR-0203 (BakeManifest), ADR-0204 (Signed bundle),
+ADR-0104 (NL Surface Layer), ADR-0105 (Sandbox Architecture), R16A
+Merkle signing.
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -3759,19 +3901,34 @@ BEFORE the LLM sidecar; a hit skips the sidecar entirely, dropping
 `classifier_hit_rate`) so both rungs are dashboardable side by
 side.
 
-**Front-of-queue after Phase C ✅:**
-- **R99 (candidate)** — KG-driven paraphrase: consult the live KG
-  for atom aliases at classify time so a training utterance that
-  says "photosynthesis" also matches queries about "photosynthetic
+**Phase D roadmap (bake-factory epic; R99 shipped):**
+- **R99 ✅** — `bake_child` + BakeManifest + filtered snapshot +
+  signed bundle (see §7.49). Mother produces the artifact; child
+  can verify but does not yet CONSUME it.
+- **R100** — `--child-mode` runtime flag + bitmask. Boot loads a
+  signed bundle via `session_snapshot_apply_ex`, verifies signature
+  under `CROSSENGIN_MOTHER_ANCHOR_PK_B64`, marks the KG immutable,
+  disables ingest/bake/admin verbs. First moment a bundle produced
+  by R99 is actually loaded and served.
+- **R101** — Signed KG-delta update channel. Mother emits an
+  incremental delta bundle between two moments (`admin.emit_delta`);
+  child verifies + applies (`update.apply`) under the anchor from
+  R100. Deltas chain via `parent-bundle-fingerprint`.
+
+**Front-of-queue after Phase C ✅ / Phase D part 1 ✅:**
+- **R100** — --child-mode runtime flag (next Phase D round).
+- **R101** — signed KG-delta update channel (Phase D part 3).
+- **Phase E** — selective load (operator preference); can run in
+  parallel with R100/R101 since files don't overlap.
+- **KG-driven paraphrase (candidate)** — consult the live KG for
+  atom aliases at classify time so a training utterance that says
+  "photosynthesis" also matches queries about "photosynthetic
   process" without adding a new corpus line. Slots in as a fourth
   pipeline rung; measurable via the same `nl.metrics` verb.
-- **R99 alt** — fallback-rate driven grammar backfill loop: an
+- **Fallback-rate driven grammar backfill loop (candidate)** — an
   operator tool that reads `nl.metrics` snapshots, harvests the
   top-N high-frequency unparsed inputs from a holder's traffic, and
-  suggests new grammar patterns for R100 to add.
-- **Phase D** — bake-factory work (R95..R100 was originally
-  planned; renumber if we skip R99 KG paraphrase).
-- **Phase E** — selective load (operator preference).
+  suggests new grammar patterns to hand-add.
 
 Each Phase C improvement is directly measurable via the R96 verb;
 the fallback-rate basis-points number is the single scalar tuning

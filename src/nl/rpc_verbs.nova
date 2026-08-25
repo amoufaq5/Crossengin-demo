@@ -94,6 +94,9 @@ import "../sandbox/capability.nova"
 import "../sandbox/skill_signature.nova"
 import "../sandbox/ownership.nova"
 import "../sandbox/session_snapshot.nova"
+import "../factory/bake_manifest.nova"
+import "../factory/bake.nova"
+import "../persistence/bundle_signing.nova"
 import "../util/str_safe.nova"
 
 // ---- RpcContext slot layout ---------------------------------------------
@@ -129,7 +132,10 @@ let RCTX_INGEST_POLICY = 15    // policy_registry (may be 0); when 0,
 // want to track LLM-fallback rate wire a fresh nl_metrics registry
 // via rpc_ctx_set_nl_metrics.
 let RCTX_NL_METRICS   = 16
-let RCTX_SLOTS        = 17
+// R99 bake-child output directory (from CROSSENGIN_BAKE_DIR). When "",
+// admin.bake_child refuses cleanly with "no bake directory configured".
+let RCTX_BAKE_DIR     = 17
+let RCTX_SLOTS        = 18
 
 fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
                ingest_agent, review_queue, now) {
@@ -151,6 +157,7 @@ fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
     push(c, "")         // SNAPSHOT_DIR (empty = session.* refuse)
     push(c, 0)          // INGEST_POLICY (0 = ingest.auto_approve refuses)
     push(c, 0)          // NL_METRICS (0 = counters not recorded; R95)
+    push(c, "")         // BAKE_DIR (R99; empty = admin.bake_child refuses)
     return c
 }
 
@@ -204,6 +211,17 @@ fn rpc_ctx_set_ingest_policy(ctx, pol_reg) {
     list_set(ctx, RCTX_INGEST_POLICY, pol_reg)
     return ctx
 }
+
+// R99 mutator: wire the bake_child output directory. Once set with a
+// non-empty absolute path, admin.bake_child writes the signed child
+// bundle as `<dir>/<name>-<version>.bundle`. Absent this, the verb
+// refuses cleanly with "no bake directory configured".
+fn rpc_ctx_set_bake_dir(ctx, dir) {
+    list_set(ctx, RCTX_BAKE_DIR, dir)
+    return ctx
+}
+
+fn rpc_ctx_bake_dir(c) { return c[RCTX_BAKE_DIR] }
 
 // R95 mutator: wire an nl_metrics registry. Once set, nl.ask
 // increments total / unparsed / llm_fallback_{attempt,success,failure}
@@ -2970,6 +2988,109 @@ fn _rpc_verb_session_delete(args, ctx) {
     return _rpc_ok(_rpc_obj(kv))
 }
 
+// ---- R99 admin.bake_child verb ----------------------------------------
+//
+// Produce a signed child bundle from a BakeManifest + the mother's live
+// registries. Output goes to CROSSENGIN_BAKE_DIR/<name>-<version>.bundle
+// (or an explicit output_path arg).
+//
+//   args:
+//     manifest_text (inline text) OR manifest_path (readable file path)
+//     output_path (optional; overrides the default)
+//   returns:
+//     {name, version, bundle_path, bundle_bytes_len, signature_bytes_len,
+//      personas, capsules, skills, patterns, policies, kg_atoms}
+//   cap: admin:bake (admin role only)
+//
+// Refusals: signer keys not loaded (env), missing args, malformed
+// manifest, bake directory not configured (when output_path absent),
+// write failure.
+
+fn _rpc_verb_admin_bake_child(args, ctx) {
+    // ---- 1. Resolve manifest text ----
+    let manifest_text = ""
+    if _rpc_has_arg(args, "manifest_text") == 1 {
+        manifest_text = _rpc_arg(args, "manifest_text")
+    } else {
+        if _rpc_has_arg(args, "manifest_path") == 1 {
+            let mp = _rpc_arg(args, "manifest_path")
+            let mt = _rpc_snap_read(mp)
+            if len(mt) == 0 {
+                return _rpc_err("manifest_path unreadable or empty: " + mp)
+            }
+            manifest_text = mt
+        } else {
+            return _rpc_err("missing arg: manifest_text or manifest_path")
+        }
+    }
+    // ---- 2. Parse + validate manifest ----
+    let pr = bake_manifest_parse(manifest_text)
+    if pr[0] == 0 {
+        return _rpc_err("manifest parse failed: " + pr[2])
+    }
+    let manifest = pr[1]
+    let vr = bake_manifest_validate(manifest)
+    if vr[0] == 0 {
+        return _rpc_err("manifest invalid: " + vr[1])
+    }
+    // ---- 3. Load signer keys from env ----
+    let sk = bundle_signer_load_from_env()
+    if sk[0] == 0 {
+        return _rpc_err("signer keys not loaded: " + sk[3])
+    }
+    let seed = sk[1]
+    let pk   = sk[2]
+    // ---- 4. Resolve output path ----
+    let out_path = ""
+    if _rpc_has_arg(args, "output_path") == 1 {
+        out_path = _rpc_arg(args, "output_path")
+    } else {
+        let dir = rpc_ctx_bake_dir(ctx)
+        if len(dir) == 0 {
+            return _rpc_err("no bake directory configured (set CROSSENGIN_BAKE_DIR)")
+        }
+        let n = len(dir)
+        let slash = "/"
+        if n > 0 { if char_at(dir, n - 1) == 47 { slash = "" } }
+        out_path = dir + slash + bake_manifest_name(manifest)
+                       + "-" + bake_manifest_version(manifest) + ".bundle"
+    }
+    // ---- 5. Bake ----
+    let br = bake_child(manifest,
+        rpc_ctx_persona_reg(ctx),
+        rpc_ctx_kgreg(ctx),
+        rpc_ctx_capreg(ctx),
+        rpc_ctx_skill_reg(ctx),
+        rpc_ctx_ingest_policy(ctx),
+        rpc_ctx_ownership(ctx),
+        seed, pk, rpc_ctx_now(ctx))
+    if bake_result_ok(br) == 0 {
+        return _rpc_err("bake_child failed: " + bake_result_err(br))
+    }
+    let bundle = bake_result_bundle(br)
+    // ---- 6. Write atomically ----
+    let ok = _rpc_snap_write(out_path, bundle)
+    if ok == 0 {
+        return _rpc_err("write failed to " + out_path)
+    }
+    // ---- 7. Compose response ----
+    let kv = list_new()
+    let a = list_new() push(a, "name")         push(a, _rpc_str(bake_manifest_name(manifest)))    push(kv, a)
+    let b = list_new() push(b, "version")      push(b, _rpc_str(bake_manifest_version(manifest))) push(kv, b)
+    let c = list_new() push(c, "domain")       push(c, _rpc_str(bake_manifest_domain(manifest)))  push(kv, c)
+    let d = list_new() push(d, "bundle_path")  push(d, _rpc_str(out_path))                        push(kv, d)
+    let e = list_new() push(e, "bundle_bytes_len")   push(e, _rpc_int(len(bundle)))               push(kv, e)
+    let f = list_new() push(f, "signature_bytes_len") push(f, _rpc_int(bake_result_sig_len(br))) push(kv, f)
+    let g = list_new() push(g, "personas")     push(g, _rpc_int(bake_result_personas(br)))        push(kv, g)
+    let h = list_new() push(h, "capsules")     push(h, _rpc_int(bake_result_capsules(br)))        push(kv, h)
+    let i = list_new() push(i, "skills")       push(i, _rpc_int(bake_result_skills(br)))          push(kv, i)
+    let j = list_new() push(j, "patterns")     push(j, _rpc_int(bake_result_patterns(br)))        push(kv, j)
+    let k = list_new() push(k, "policies")     push(k, _rpc_int(bake_result_policies(br)))        push(kv, k)
+    let l = list_new() push(l, "kg_atoms")     push(l, _rpc_int(bake_result_kg_atoms(br)))        push(kv, l)
+    let mm = list_new() push(mm, "ownership_entries") push(mm, _rpc_int(bake_result_ownership(br))) push(kv, mm)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
 // ---- top-level dispatch --------------------------------------------------
 
 // The one entry point a daemon calls. `verb` is the verb name string;
@@ -3030,6 +3151,7 @@ fn rpc_dispatch(verb, args, ctx) {
     if str_eq_bytes(verb, "session.load")      == 1 { return _rpc_verb_session_load(args, ctx) }
     if str_eq_bytes(verb, "session.list")      == 1 { return _rpc_verb_session_list(args, ctx) }
     if str_eq_bytes(verb, "session.delete")    == 1 { return _rpc_verb_session_delete(args, ctx) }
+    if str_eq_bytes(verb, "admin.bake_child")  == 1 { return _rpc_verb_admin_bake_child(args, ctx) }
     return _rpc_err("unknown verb: " + verb)
 }
 
@@ -3075,5 +3197,6 @@ fn rpc_verb_names() {
     push(v, "session.load")
     push(v, "session.list")
     push(v, "session.delete")
+    push(v, "admin.bake_child")
     return v
 }

@@ -1,0 +1,571 @@
+// CrossEngin factory: bake_child pipeline (R99, ADR-0203/0204).
+//
+// Take a live mother-daemon's registry set + a BakeManifest, and emit a
+// filtered, signed child bundle. The bundle is what a --child-mode
+// runtime (R100) will load; R101 adds a signed KG-delta update channel
+// so the mother can push incremental changes to a running child.
+//
+// Bundle format (line-oriented ASCII with a base64-hex footer):
+//
+//   #CROSSENGIN-CHILD-BUNDLE v1
+//   #name <name>
+//   #version <ver>
+//   #domain <domain>
+//   #baked-at <now>
+//   #mother-fingerprint <sha256-of-signer-pk-hex>
+//
+//   #PERSONA v1
+//   ...personas...
+//
+//   #OWNERSHIP v1
+//   ...ownership entries...
+//
+//   #POLICY v1
+//   ...policies...
+//
+//   #PATTERN v1
+//   ...pattern capsules...
+//
+//   #SKILL v1
+//   ...skills...
+//
+//   #KG v1
+//   ATOM <kg_label> <atom_id> <kind> <license> <source_tier> <label>
+//   XREF <kg_label> <atom_id> <dst_kg_label> <dst_atom_label> <kind> <weight>
+//   ...
+//
+//   #SIGNATURE <hex-sig-128-chars>
+//   #SIGNER-PK <hex-pk-64-chars>
+//
+// Note: NO #CAPS v1 (bearer tokens are per-mother secrets), NO #TRUST v1
+// (trust anchors are per-mother). The child boots WITHOUT its own tokens
+// or trust anchors; the mother provisions those out of band.
+//
+// The signature is Ed25519 over SHA-256 of the bundle bytes UP TO but
+// NOT INCLUDING the "#SIGNATURE ..." line. On verify the child recomputes
+// the digest over the same prefix.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/factory/bake_manifest.nova
+//   src/factory/kg_filter.nova
+//   src/persistence/bundle_signing.nova
+//   src/sandbox/session_snapshot.nova (_scoped section serializers)
+//   src/kg/multi_kg_manager.nova + atom_store.nova
+//   src/persona/persona_registry.nova
+//   src/capsules/capsule_registry.nova
+//   src/skills/skill_registry.nova + skill_manifest.nova
+//   src/ingest/policy.nova
+//   src/sandbox/ownership.nova
+//   src/util/str_safe.nova.
+
+import "./bake_manifest.nova"
+import "./kg_filter.nova"
+import "../persistence/bundle_signing.nova"
+import "../sandbox/session_snapshot.nova"
+import "../sandbox/ownership.nova"
+import "../kg/multi_kg_manager.nova"
+import "../kg/atom_store.nova"
+import "../persona/persona.nova"
+import "../persona/persona_registry.nova"
+import "../capsules/capsule.nova"
+import "../capsules/capsule_registry.nova"
+import "../skills/skill_registry.nova"
+import "../skills/skill_manifest.nova"
+import "../ingest/policy.nova"
+import "../capsules/pattern_capsule.nova"
+import "../util/str_safe.nova"
+
+// ---- header + footer helpers -------------------------------------------
+
+let BAKE_BUNDLE_HEADER = "#CROSSENGIN-CHILD-BUNDLE v1"
+
+fn _bake_header(name, version, domain, now, mother_pk_hex_fingerprint) {
+    let s = BAKE_BUNDLE_HEADER + "\n"
+    s = s + "#name " + name + "\n"
+    s = s + "#version " + version + "\n"
+    s = s + "#domain " + domain + "\n"
+    s = s + "#baked-at " + int_to_str(now) + "\n"
+    s = s + "#mother-fingerprint " + mother_pk_hex_fingerprint + "\n"
+    return s
+}
+
+// ---- KG section serializer for the bundle ------------------------------
+//
+// The bundle carries a compact per-atom line format. Not the same shape
+// as snapshot_disk.nova (that emits kgs.atoms[i].* key-value pairs)
+// because a bundle is line-oriented + hand-inspectable; the R100 child
+// runtime parses it directly.
+//
+// Format:
+//   #KG v1
+//   ATOM <kg_label> <atom_id> <kind> <license> <source_tier> <label>
+//   XREF <kg_label> <src_atom_id> <dst_kg_label> <dst_atom_label> <kind> <weight>
+//
+// Labels are kept as one-line strings (no embedded newlines by construction).
+// XREFs are emitted only for edges whose src atom was selected AND whose
+// dst atom was selected (edges dangling off the selected set are dropped).
+
+fn _bake_kg_section(selected_triples) {
+    if len(selected_triples) == 0 { return "\n#KG v1\n" }
+    let out = "\n#KG v1\n"
+    // Emit ATOM lines first.
+    let i = 0
+    while i < len(selected_triples) {
+        let t = selected_triples[i]
+        let lbl = t[0]
+        let aid = t[1]
+        let a = t[2]
+        out = out + "ATOM " + lbl
+                  + " " + int_to_str(aid)
+                  + " " + int_to_str(atom_kind(a))
+                  + " " + int_to_str(atom_license(a))
+                  + " " + int_to_str(atom_source_tier(a))
+                  + " " + atom_label(a)
+                  + "\n"
+        i = i + 1
+    }
+    // Emit XREF lines (only where both endpoints are selected).
+    i = 0
+    while i < len(selected_triples) {
+        let t = selected_triples[i]
+        let lbl = t[0]
+        let aid = t[1]
+        let a = t[2]
+        let xs = atom_xrefs(a)
+        let xi = 0
+        while xi < len(xs) {
+            let x = xs[xi]
+            let dst_kg = xref_dst_kg(x)
+            let dst_id = xref_dst_atom(x)
+            // Is the (dst_kg, dst_id) endpoint selected?
+            if kg_filter_selected_has(selected_triples, dst_kg, dst_id) == 1 {
+                // Resolve dst label via a search through the triple list.
+                let dst_lbl = ""
+                let j = 0
+                while j < len(selected_triples) {
+                    let tj = selected_triples[j]
+                    if tj[1] == dst_id {
+                        if str_eq_bytes(tj[0], dst_kg) == 1 {
+                            dst_lbl = atom_label(tj[2])
+                            j = len(selected_triples)
+                        }
+                    }
+                    j = j + 1
+                }
+                out = out + "XREF " + lbl
+                          + " " + int_to_str(aid)
+                          + " " + dst_kg
+                          + " " + dst_lbl
+                          + " " + int_to_str(xref_kind(x))
+                          + " " + int_to_str(xref_weight(x))
+                          + "\n"
+            }
+            xi = xi + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- CAPSULE section serializer ----------------------------------------
+//
+// Bundles carry capsule metadata + label references (not raw atom-ids
+// which are not stable across load). The child rehydrates atom refs by
+// looking up labels against the bundle's KG section on load (R100).
+//
+// Format:
+//   #CAPSULE v1
+//   CAPSULE <name> <version> <license> <installed_flag>
+//   DESC <description>
+//   ATOM_LABEL <label>              (0+)
+//   DEP <dep_name>:<dep_version>    (0+)
+
+fn _bake_capsule_section(capreg, allowed_names, kgreg) {
+    if capreg == 0 { return "" }
+    let caps = capreg_capsules(capreg)
+    if len(caps) == 0 { return "" }
+    let out = "\n#CAPSULE v1\n"
+    let i = 0
+    while i < len(caps) {
+        let c = caps[i]
+        let nm = capsule_name(c)
+        // Filter by manifest allowlist.
+        let allow = 0
+        let ai = 0
+        while ai < len(allowed_names) {
+            if str_eq_bytes(allowed_names[ai], nm) == 1 { allow = 1 }
+            ai = ai + 1
+        }
+        if allow == 1 {
+            let installed = capsule_installed(c)
+            out = out + "CAPSULE " + nm
+                      + " " + capsule_version(c)
+                      + " " + capsule_license(c)
+                      + " " + int_to_str(installed)
+                      + "\n"
+            let desc = capsule_description(c)
+            if len(desc) > 0 { out = out + "DESC " + desc + "\n" }
+            // Resolve atom_refs to labels via the KG registry.
+            if kgreg != 0 {
+                let refs = capsule_atom_refs(c)
+                let ri = 0
+                while ri < len(refs) {
+                    let aid = refs[ri]
+                    // Walk every KG to find the atom (atom-ids are kg-local
+                    // but the capsule doesn't record which kg -- we scan).
+                    let kn = kg_count(kgreg)
+                    let ki = 0
+                    let found = 0
+                    while ki < kn {
+                        if found == 0 {
+                            let kg = kgreg[1][ki]
+                            let a = kg_atom(kg, aid)
+                            if a != 0 {
+                                out = out + "ATOM_LABEL " + atom_label(a) + "\n"
+                                found = 1
+                            }
+                        }
+                        ki = ki + 1
+                    }
+                    ri = ri + 1
+                }
+            }
+            let deps = capsule_deps(c)
+            let di = 0
+            while di < len(deps) {
+                out = out + "DEP " + deps[di][0] + ":" + deps[di][1] + "\n"
+                di = di + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- Signature footer --------------------------------------------------
+//
+// Append "#SIGNATURE <hex>\n#SIGNER-PK <hex>\n" to a bundle prefix.
+// The digest signed is SHA-256 over the prefix bytes (i.e. everything
+// EXCEPT the signature footer itself). The child recomputes the same
+// digest by SHA-256'ing everything up through and including the last
+// non-signature line.
+fn _bake_bytes_from_string(s) {
+    let n = len(s)
+    let out = list_new()
+    let i = 0
+    while i < n {
+        push(out, char_at(s, i))
+        i = i + 1
+    }
+    return out
+}
+
+fn _bake_string_from_bytes(bytes) {
+    // Note: byte 0 breaks NOVA strings. Bundle prefix bytes are ASCII by
+    // construction so this is safe pre-signature; caller must NOT call
+    // this on post-signature bytes.
+    let s = ""
+    let i = 0
+    while i < len(bytes) {
+        s = s + chr(bytes[i])
+        i = i + 1
+    }
+    return s
+}
+
+// Sign the bundle prefix and return the full bundle (prefix +
+// #SIGNATURE + #SIGNER-PK). Returns [ok, bundle_text, err].
+fn _bake_sign_and_wrap(prefix, seed, pk) {
+    let ret = list_new()
+    let prefix_bytes = _bake_bytes_from_string(prefix)
+    let sig_r = bundle_pkg_sign(prefix_bytes, seed, pk)
+    if sig_r[0] == 0 {
+        push(ret, 0) push(ret, "") push(ret, "sign failed") return ret
+    }
+    let sig = sig_r[1]
+    let sig_hex = bundle_hex_encode(sig)
+    let pk_hex  = bundle_hex_encode(pk)
+    let bundle = prefix + "#SIGNATURE " + sig_hex + "\n"
+                        + "#SIGNER-PK "  + pk_hex  + "\n"
+    push(ret, 1) push(ret, bundle) push(ret, "")
+    return ret
+}
+
+// ---- BakeResult accessors ----------------------------------------------
+//
+// bake_child returns a structured record so callers can extract both
+// the raw bundle text AND the per-section counts (the wire verb
+// echoes those to the client so an operator sees "45 atoms, 3 capsules
+// baked" without re-parsing the bundle).
+
+let BR_OK             = 0
+let BR_BUNDLE         = 1
+let BR_ERR            = 2
+let BR_PERSONAS       = 3
+let BR_OWNERSHIP      = 4
+let BR_POLICIES       = 5
+let BR_PATTERNS       = 6
+let BR_SKILLS         = 7
+let BR_KG_ATOMS       = 8
+let BR_CAPSULES       = 9
+let BR_SIG_LEN        = 10
+let BR_SLOTS          = 11
+
+fn bake_result_ok(r)         { return r[BR_OK] }
+fn bake_result_bundle(r)     { return r[BR_BUNDLE] }
+fn bake_result_err(r)        { return r[BR_ERR] }
+fn bake_result_personas(r)   { return r[BR_PERSONAS] }
+fn bake_result_ownership(r)  { return r[BR_OWNERSHIP] }
+fn bake_result_policies(r)   { return r[BR_POLICIES] }
+fn bake_result_patterns(r)   { return r[BR_PATTERNS] }
+fn bake_result_skills(r)     { return r[BR_SKILLS] }
+fn bake_result_kg_atoms(r)   { return r[BR_KG_ATOMS] }
+fn bake_result_capsules(r)   { return r[BR_CAPSULES] }
+fn bake_result_sig_len(r)    { return r[BR_SIG_LEN] }
+
+fn _bake_result_err(msg) {
+    let r = list_new()
+    push(r, 0) push(r, "") push(r, msg)
+    push(r, 0) push(r, 0) push(r, 0) push(r, 0) push(r, 0) push(r, 0)
+    push(r, 0) push(r, 0)
+    return r
+}
+
+// ---- intersection utilities -------------------------------------------
+
+fn _bake_intersect(names, allowlist) {
+    let out = list_new()
+    let i = 0
+    while i < len(names) {
+        let j = 0
+        while j < len(allowlist) {
+            if str_eq_bytes(names[i], allowlist[j]) == 1 {
+                push(out, names[i])
+                j = len(allowlist)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- main entry point --------------------------------------------------
+//
+// bake_child(manifest, persona_reg, kgreg, capreg, skill_reg,
+//            policy_reg, overlay, signer_seed, signer_pk, now)
+//
+//   - manifest      : parsed BakeManifest
+//   - persona_reg   : registry to draw personas from (may be 0)
+//   - kgreg         : KG registry to filter atoms from (may be 0)
+//   - capreg        : capsule registry (may be 0)
+//   - skill_reg     : skill registry (may be 0)
+//   - policy_reg    : ingest policy registry (may be 0)
+//   - overlay       : ownership overlay (may be 0)
+//   - signer_seed   : 32-byte Ed25519 seed
+//   - signer_pk     : 32-byte Ed25519 public key
+//   - now           : logical clock reading
+//
+// Returns a BakeResult record. On ok=0 the bundle string is empty; err
+// carries a human-readable reason.
+fn bake_child(manifest, persona_reg, kgreg, capreg, skill_reg,
+              policy_reg, overlay, signer_seed, signer_pk, now) {
+    if manifest == 0 {
+        return _bake_result_err("manifest is null")
+    }
+    let v = bake_manifest_validate(manifest)
+    if v[0] == 0 { return _bake_result_err(v[1]) }
+    if signer_seed == 0 { return _bake_result_err("signer seed is null") }
+    if signer_pk == 0   { return _bake_result_err("signer public key is null") }
+    if len(signer_seed) != 32 { return _bake_result_err("signer seed must be 32 bytes") }
+    if len(signer_pk)   != 32 { return _bake_result_err("signer pk must be 32 bytes") }
+
+    let fp = bundle_signer_fingerprint(signer_pk)
+    let prefix = _bake_header(bake_manifest_name(manifest),
+                              bake_manifest_version(manifest),
+                              bake_manifest_domain(manifest),
+                              now, fp)
+
+    // ---- Persona section (filtered) ----
+    let persona_uids = bake_manifest_persona_users(manifest)
+    let persona_body = _snap_persona_section_scoped(persona_reg, persona_uids)
+    prefix = prefix + persona_body
+    let n_personas = 0
+    if persona_reg != 0 {
+        let ps = persona_registry_personas(persona_reg)
+        let pi = 0
+        while pi < len(ps) {
+            let p = ps[pi]
+            let pk = 0
+            let pj = 0
+            while pj < len(persona_uids) {
+                if str_eq_bytes(persona_uids[pj], persona_user_id(p)) == 1 { pk = 1 }
+                pj = pj + 1
+            }
+            if pk == 1 { n_personas = n_personas + 1 }
+            pi = pi + 1
+        }
+    }
+
+    // ---- Ownership section (per-kind filtered) ----
+    let kg_allow = list_new()               // no KG-name allowlist directive in manifest
+    let ka = _snap_kind_allowlists_new(
+        bake_manifest_allowed_capsules(manifest),
+        bake_manifest_allowed_skills(manifest),
+        bake_manifest_allowed_patterns(manifest),
+        kg_allow)
+    let own_body = _snap_ownership_section_scoped(overlay, ka)
+    prefix = prefix + own_body
+    let n_own = 0
+    if overlay != 0 {
+        let es = ownership_entries(overlay)
+        let ei = 0
+        while ei < len(es) {
+            let e = es[ei]
+            let k = e[OWN_ENTRY_KIND]
+            let nm = e[OWN_ENTRY_NAME]
+            let allow = 0
+            if str_eq_bytes(k, OWN_KIND_CAPSULE) == 1 {
+                if bake_manifest_list_has(bake_manifest_allowed_capsules(manifest), nm) == 1 { allow = 1 }
+            }
+            if str_eq_bytes(k, OWN_KIND_SKILL) == 1 {
+                if bake_manifest_list_has(bake_manifest_allowed_skills(manifest), nm) == 1 { allow = 1 }
+            }
+            if str_eq_bytes(k, OWN_KIND_PATTERN) == 1 {
+                if bake_manifest_list_has(bake_manifest_allowed_patterns(manifest), nm) == 1 { allow = 1 }
+            }
+            if allow == 1 { n_own = n_own + 1 }
+            ei = ei + 1
+        }
+    }
+
+    // ---- Policy section (filtered by name) ----
+    let pol_allow = bake_manifest_policy_allowlist(manifest)
+    let pol_body = _snap_policy_section_scoped(policy_reg, pol_allow)
+    prefix = prefix + pol_body
+    let n_pol = 0
+    if policy_reg != 0 {
+        let all_pol_names = policy_registry_names(policy_reg)
+        n_pol = len(_bake_intersect(all_pol_names, pol_allow))
+    }
+
+    // ---- Pattern section (filtered) ----
+    let pat_allow = bake_manifest_allowed_patterns(manifest)
+    let pat_body = _snap_pattern_section_scoped(pat_allow)
+    prefix = prefix + pat_body
+    let n_pat = len(_bake_intersect(pattern_registry_names(), pat_allow))
+
+    // ---- Skill section (filtered) ----
+    let sk_allow = bake_manifest_allowed_skills(manifest)
+    let sk_body = _snap_skill_section_scoped(skill_reg, sk_allow)
+    prefix = prefix + sk_body
+    let n_sk = 0
+    if skill_reg != 0 {
+        n_sk = len(_bake_intersect(skill_registry_names(skill_reg), sk_allow))
+    }
+
+    // ---- Capsule metadata section ----
+    let cap_allow = bake_manifest_allowed_capsules(manifest)
+    let cap_body = _bake_capsule_section(capreg, cap_allow, kgreg)
+    prefix = prefix + cap_body
+    let n_cap = 0
+    if capreg != 0 {
+        let caps = capreg_capsules(capreg)
+        let ci = 0
+        while ci < len(caps) {
+            if bake_manifest_list_has(cap_allow, capsule_name(caps[ci])) == 1 {
+                n_cap = n_cap + 1
+            }
+            ci = ci + 1
+        }
+    }
+
+    // ---- KG section (predicate-filtered atoms) ----
+    let selected = kg_filter_selected_atoms(kgreg, manifest, capreg)
+    let kg_body = _bake_kg_section(selected)
+    prefix = prefix + kg_body
+
+    // ---- Sign + wrap ----
+    let sw = _bake_sign_and_wrap(prefix, signer_seed, signer_pk)
+    if sw[0] == 0 { return _bake_result_err(sw[2]) }
+
+    let r = list_new()
+    push(r, 1)              // OK
+    push(r, sw[1])          // BUNDLE
+    push(r, "")             // ERR
+    push(r, n_personas)     // PERSONAS
+    push(r, n_own)          // OWNERSHIP
+    push(r, n_pol)          // POLICIES
+    push(r, n_pat)          // PATTERNS
+    push(r, n_sk)           // SKILLS
+    push(r, len(selected))  // KG_ATOMS
+    push(r, n_cap)          // CAPSULES
+    push(r, 64)             // SIG_LEN (constant for Ed25519)
+    return r
+}
+
+// ---- Bundle-level verify (helper for tests + child load) --------------
+//
+// Verify that a bundle's #SIGNATURE line covers the prefix under the
+// supplied signer public key. Returns [ok, err]. On success ok=1 +
+// err="". On failure err carries a human-readable reason.
+//
+// The parse strategy: find the "#SIGNATURE " marker (must be the FIRST
+// line whose prefix matches); slice the prefix; extract the hex sig +
+// signer pk; verify.
+
+fn _bake_find_sig_line_start(bundle) {
+    // Walk lines looking for one that starts with "#SIGNATURE ". Return
+    // its starting byte position, or -1 if none.
+    let n = len(bundle)
+    let line_start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(bundle, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(bundle, line_start, i - line_start)
+            if len(line) >= 11 {
+                let head = substr(line, 0, 11)
+                if str_eq_bytes(head, "#SIGNATURE ") == 1 {
+                    return line_start
+                }
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn bake_verify_bundle(bundle_text, signer_pk_bytes) {
+    let ret = list_new()
+    if len(bundle_text) == 0 {
+        push(ret, 0) push(ret, "empty bundle") return ret
+    }
+    let sig_pos = _bake_find_sig_line_start(bundle_text)
+    if sig_pos < 0 {
+        push(ret, 0) push(ret, "no #SIGNATURE line in bundle") return ret
+    }
+    let prefix = substr(bundle_text, 0, sig_pos)
+    // Extract sig hex from the #SIGNATURE line (everything after
+    // "#SIGNATURE " up to newline).
+    let rest = substr(bundle_text, sig_pos, len(bundle_text) - sig_pos)
+    let nl = find_char(rest, 10)
+    if nl <= 11 {
+        push(ret, 0) push(ret, "malformed #SIGNATURE line") return ret
+    }
+    let sig_hex = substr(rest, 11, nl - 11)
+    let sig_bytes = bundle_hex_decode(sig_hex)
+    if sig_bytes == 0 {
+        push(ret, 0) push(ret, "signature hex malformed") return ret
+    }
+    let prefix_bytes = _bake_bytes_from_string(prefix)
+    let v = bundle_pkg_verify(prefix_bytes, sig_bytes, signer_pk_bytes)
+    if v[0] == 1 {
+        push(ret, 1) push(ret, "") return ret
+    }
+    push(ret, 0) push(ret, v[1]) return ret
+}
