@@ -48,6 +48,7 @@ import "../ingest/policy.nova"
 import "../capsules/pattern_capsule.nova"
 import "../skills/skill_manifest.nova"
 import "../skills/skill_registry.nova"
+import "../preference/user_preference.nova"
 import "../util/str_safe.nova"
 
 // ---- version constant --------------------------------------------------
@@ -379,6 +380,45 @@ fn _snap_skill_section(skill_reg) {
     return out
 }
 
+// ---- R101: preference section builder ----------------------------------
+//
+// Serialize the R101 user-preference registry as a #PREFERENCE v1 block.
+// Each entry emits one directive:
+//
+//   PREF <holder> <kind> <name> <enabled>
+//
+// where `enabled` is 0 or 1. Wildcard "*" names round-trip unchanged
+// (parser treats them as literals; the visibility check in
+// user_preference.nova does the wildcard interpretation). Holders are
+// treated as opaque single-word tokens; a holder with spaces would
+// confuse the split-on-32 parser, so we forbid space-bearing holders
+// at PREFERENCE_SET time (an empty/whitespace holder never reaches
+// here because the wire verb refuses it earlier).
+//
+// Section is OMITTED entirely when pref_reg == 0 (backward compat with
+// R55.3-R100 snapshots; the loader treats missing #PREFERENCE as "no
+// preferences to restore"). Section header is always present when at
+// least one entry exists (a preference registry with zero entries emits
+// no header, again for round-trip parity with a fresh boot).
+fn _snap_preference_section(pref_reg) {
+    if pref_reg == 0 { return "" }
+    let entries = preference_entries(pref_reg)
+    if len(entries) == 0 { return "" }
+    let out = "\n#PREFERENCE v1\n"
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let enabled_str = "0"
+        if e[PREF_ENTRY_ENABLED] == 1 { enabled_str = "1" }
+        out = out + "PREF " + e[PREF_ENTRY_HOLDER]
+                  + " " + e[PREF_ENTRY_KIND]
+                  + " " + e[PREF_ENTRY_NAME]
+                  + " " + enabled_str + "\n"
+        i = i + 1
+    }
+    return out
+}
+
 // ---- R99: scoped section serializers (bake_child filter) ---------------
 //
 // The whole-daemon serializers above emit EVERY entry in the registry;
@@ -621,15 +661,21 @@ fn _snap_skill_section_scoped(skill_reg, name_allowlist) {
 fn session_snapshot_serialize(persona_reg, cap_reg, trust_reg,
                               overlay, include_secrets, now) {
     return session_snapshot_serialize_ex(persona_reg, cap_reg, trust_reg,
-                                          overlay, 0, 0,
+                                          overlay, 0, 0, 0,
                                           include_secrets, now)
 }
 
 // R73 extended serializer: policy_reg (may be 0) round-trips as
 // a #POLICY v1 section. R75 added skill_reg (may be 0) -> #SKILL v1.
 // R74: also emits #PATTERN v1 (unconditional; no reg param).
+// R101: preference_reg (may be 0) round-trips as #PREFERENCE v1.
+// It is inserted BEFORE include_secrets (positional convention: every
+// new "may be 0" registry appended to the registry list before the
+// trailing knob args). Callers that don't have a preference registry
+// pass 0 for byte-identical R100 behavior.
 fn session_snapshot_serialize_ex(persona_reg, cap_reg, trust_reg,
                                   overlay, policy_reg, skill_reg,
+                                  preference_reg,
                                   include_secrets, now) {
     let out = SNAP_VERSION_LINE + "\n"
     out = out + "#saved-at " + int_to_str(now) + "\n"
@@ -645,6 +691,7 @@ fn session_snapshot_serialize_ex(persona_reg, cap_reg, trust_reg,
     out = out + _snap_policy_section(policy_reg)
     out = out + _snap_pattern_section()
     out = out + _snap_skill_section(skill_reg)
+    out = out + _snap_preference_section(preference_reg)
     return out
 }
 
@@ -678,7 +725,8 @@ let SNAPRES_SKILLS      = 9    // R75 (manifests registered)
 let SNAPRES_SKILL_INSTALL_NAMES = 10  // R75 (installed-flag names, for
                                        //       the caller's supervisor
                                        //       rebuild loop)
-let SNAPRES_SLOTS       = 11
+let SNAPRES_PREFERENCES = 11   // R101 (per-user preference entries loaded)
+let SNAPRES_SLOTS       = 12
 
 fn _snap_result_new() {
     let r = list_new()
@@ -693,6 +741,7 @@ fn _snap_result_new() {
     push(r, 0)                  // PATTERNS (R74)
     push(r, 0)                  // SKILLS (R75)
     push(r, list_new())         // SKILL_INSTALL_NAMES (R75)
+    push(r, 0)                  // PREFERENCES (R101)
     return r
 }
 
@@ -709,6 +758,7 @@ fn snap_result_skills(r)             { return r[SNAPRES_SKILLS] }
 fn snap_result_skill_install_names(r) {
     return r[SNAPRES_SKILL_INSTALL_NAMES]
 }
+fn snap_result_preferences(r)        { return r[SNAPRES_PREFERENCES] }
 
 // Split the whole dump into individual sections keyed by their header
 // marker (#PERSONA v1 / #OWNERSHIP v1 / #TRUST v1 / #CAPS v1). Returns
@@ -738,6 +788,7 @@ fn _snap_split_sections(text) {
                     if str_eq_bytes(line, "#POLICY v1")    == 1 { is_marker = 1 }
                     if str_eq_bytes(line, "#PATTERN v1")   == 1 { is_marker = 1 }
                     if str_eq_bytes(line, "#SKILL v1")     == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#PREFERENCE v1") == 1 { is_marker = 1 }
                 }
             }
             if is_marker == 1 {
@@ -1274,20 +1325,74 @@ fn _snap_apply_skill(body, skill_reg, result) {
     return applied
 }
 
+// R101 preference loader. Walks a #PREFERENCE v1 body line by line:
+//
+//   PREF <holder> <kind> <name> <enabled>
+//
+// Applies each row via preference_set. Malformed lines (short of 5
+// fields, unknown kind, non-numeric enabled) are dropped silently
+// (lenient parse -- matches the R73/R74/R75 shape). Wildcard "*"
+// names pass through unchanged; the wildcard interpretation happens
+// at read time in preference_visible.
+//
+// Returns the count of PREFERENCES successfully registered.
+fn _snap_apply_preference(body, pref_reg) {
+    if pref_reg == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 { if char_at(line, 0) != 35 {
+                let parts = split_char(line, 32)
+                if len(parts) >= 5 {
+                    if str_eq_bytes(parts[0], "PREF") == 1 {
+                        let holder  = parts[1]
+                        let kind    = parts[2]
+                        let name    = parts[3]
+                        let en_str  = parts[4]
+                        let enabled = 0
+                        if str_eq_bytes(en_str, "1") == 1 { enabled = 1 }
+                        else { if str_eq_bytes(en_str, "0") == 1 { enabled = 0 }
+                               else { enabled = 0 - 1 } }
+                        if enabled >= 0 {
+                            if preference_set(pref_reg, holder, kind,
+                                               name, enabled) == 1 {
+                                applied = applied + 1
+                            }
+                        }
+                    }
+                }
+            } }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return applied
+}
+
 // The public deserialize entry point. Consumes `text`, applies each
 // section to its matching (non-null) registry. `now` is used for
 // freshly-minted token ids on shape-only snapshots.
 //
 // R73: preserved as a thin wrapper. Use session_snapshot_apply_ex
 // when the policy or skill registry needs to be populated.
+// R101: adds `preference_reg` (may be 0) so per-user preferences
+// round-trip through the snapshot alongside the other registries.
 fn session_snapshot_apply(text, persona_reg, cap_reg, trust_reg,
                           overlay, now) {
     return session_snapshot_apply_ex(text, persona_reg, cap_reg, trust_reg,
-                                      overlay, 0, 0, now)
+                                      overlay, 0, 0, 0, now)
 }
 
 fn session_snapshot_apply_ex(text, persona_reg, cap_reg, trust_reg,
-                              overlay, policy_reg, skill_reg, now) {
+                              overlay, policy_reg, skill_reg,
+                              preference_reg, now) {
     let r = _snap_result_new()
     if len(text) == 0 {
         list_set(r, SNAPRES_ERR, "empty snapshot text")
@@ -1338,6 +1443,10 @@ fn session_snapshot_apply_ex(text, persona_reg, cap_reg, trust_reg,
         if str_eq_bytes(marker, "#SKILL v1") == 1 {
             let a = _snap_apply_skill(body, skill_reg, r)
             list_set(r, SNAPRES_SKILLS, r[SNAPRES_SKILLS] + a)
+        }
+        if str_eq_bytes(marker, "#PREFERENCE v1") == 1 {
+            let a = _snap_apply_preference(body, preference_reg)
+            list_set(r, SNAPRES_PREFERENCES, r[SNAPRES_PREFERENCES] + a)
         }
         i = i + 1
     }

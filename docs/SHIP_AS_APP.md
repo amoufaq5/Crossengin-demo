@@ -3968,6 +3968,114 @@ surface area shrinks (disable table) rather than expanding.
 ADR-0104 (NL Surface Layer), ADR-0105 (Sandbox Architecture), §7.49
 (R99 bake pipeline).
 
+### 7.51 Per-user selective load (R101 — Phase E)
+
+ADR-0205 (Mode 2) says one mother should be able to serve many
+effective views: the same daemon, but each user sees only the parts
+they opted in to. R101 wires that as a soft-filter layer on TOP of the
+R55.2 ownership overlay — ownership stays the hard boundary (operator
+authority; admin-only mutation), preferences become the user's own
+opt-in list within what ownership already allows.
+
+**Composed visibility:**
+
+```
+composed_visible(H, kind, name) =
+    ownership_visible(overlay, kind, name, H)
+AND preference_visible(pref_reg, H, kind, name)
+```
+
+* ownership decides whether H is ALLOWED to see this at all.
+* preference decides whether H CURRENTLY wants to see it.
+
+Default is opt-in: absence of a preference row means visible (fall
+through to ownership). Only an explicit `enabled=0` entry (or a
+matching wildcard) hides an item; ownership-blocks always win.
+
+**Three wire verbs (verb count 38 -> 41):**
+
+| Verb                     | Cap                     | Purpose                                                       |
+|--------------------------|-------------------------|---------------------------------------------------------------|
+| `user.preference.set`    | `nl:preference:write`   | Set a per-user (kind, name) -> enabled bit; `holder` optional |
+| `user.preference.list`   | `nl:preference:read`    | Enumerate the caller's preferences (or another's, with admin) |
+| `user.preference.clear`  | `nl:preference:write`   | Clear one entry or all entries for the caller                 |
+
+Three new caps:
+
+- `nl:preference:read`  — bundled with the READER role.
+- `nl:preference:write` — bundled with the READER role.
+- `admin:preference`    — admin-only; required to pass a `holder` arg
+  targeting another user's preferences.
+
+**Kinds** match the R55.2 ownership vocabulary: `capsule`, `skill`,
+`pattern`, `kg`.
+
+**Wildcards.** A name of literal `"*"` applies the entry to EVERY
+name of that kind for that holder. Only kind-wide disable makes
+practical sense; a matching per-name enable STILL WINS the visibility
+check.
+
+**Example — user hides all pattern packs from themselves:**
+
+```bash
+# Alice decides she wants a quieter menu.
+CE_RPC_TOKEN=$(cat ~/tok-alice) scripts/rpc.sh \
+    user.preference.set kind=pattern name='*' enabled=0
+
+# pattern.list now returns [] for alice (her wildcard),
+# still returns everything for bob (his registry is empty).
+scripts/rpc.sh user.preference.list
+# {"holder":"alice","preferences":[{"kind":"pattern","name":"*","enabled":0}],"count":1}
+
+# Alice changes her mind about one specific pack:
+scripts/rpc.sh user.preference.set \
+    kind=pattern name=debug_common enabled=1
+# debug_common now visible again, everything else still hidden.
+
+# Reset everything:
+scripts/rpc.sh user.preference.clear all=1
+```
+
+**Wired into list verbs:** `kg.list`, `capsule.list`, `skill.list`,
+`pattern.list` all now consult `visibility_visible(overlay, pref_reg,
+kind, name, holder)` in place of the old `ownership_*_visible`
+helpers. Absent a preference registry (default before daemon boot
+wires one), the composed check collapses to pure ownership — every
+pre-R101 caller sees byte-identical behavior.
+
+**Dispatch gating:** the R57/R60 skill dispatch check
+(`skill.run` + `nl_execute_scoped_ex`'s "research" gate) also
+consults the composed helper — a user who wildcard-hides skills from
+their menu also cannot dispatch them until they clear the preference.
+
+**Snapshot round-trip:** `session.save`/`session.load` carry a new
+`#PREFERENCE v1` section:
+
+```
+#PREFERENCE v1
+PREF alice skill research 0
+PREF alice pattern * 0
+PREF bob capsule solar_system 0
+```
+
+Section is omitted when no preference registry is wired OR the
+registry is empty; lenient parser drops malformed rows.
+`session_snapshot_serialize_ex` gains a `preference_reg` parameter
+between `skill_reg` and `include_secrets`; `session_snapshot_apply_ex`
+takes the mirror slot before `now`. Bake bundles (R99) always pass
+`0` for that slot — per-user state is mother-side, not baked.
+
+**Interaction with child-mode (R100):** a child-mode daemon still
+serves `user.preference.*` since preferences are per-user soft
+choice, not a factory operator boundary. A child's bundle allowlist
+becomes the outer envelope; user preferences carve the personal
+subset.
+
+**References:** ADR-0205 (Per-User Selective Load; Mode 2),
+ADR-0105 (Sandbox Architecture; the R55.2 overlay this composes with),
+`src/preference/user_preference.nova`, §7.9 (R55.2 ownership overlay
+this composes with), §7.10 (R55.3 snapshot round-trip this extends).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -4087,15 +4195,23 @@ side.
   verifies signature under `CROSSENGIN_MOTHER_ANCHOR_PK_B64`, marks
   the KG immutable, disables ingest/bake/admin/install verbs.
   Bundles produced by R99 are now actually loaded and served.
-- **R101** — Signed KG-delta update channel. Mother emits an
-  incremental delta bundle between two moments (`admin.emit_delta`);
-  child verifies + applies (`update.apply`) under the anchor from
-  R100. Deltas chain via `parent-bundle-fingerprint`.
+- **R102** — Signed KG-delta update channel (remaining Phase D
+  round; was originally R101). Mother emits an incremental delta
+  bundle between two moments (`admin.emit_delta`); child verifies +
+  applies (`update.apply`) under the anchor from R100. Deltas chain
+  via `parent-bundle-fingerprint`.
 
-**Front-of-queue after Phase C ✅ / Phase D parts 1 + 2 ✅:**
-- **R101** — signed KG-delta update channel (Phase D part 3).
-- **Phase E** — selective load (operator preference); can run in
-  parallel with R100/R101 since files don't overlap.
+**Phase E ✅ (R101).** Per-user selective load — the third
+consumption mode from ADR-0200. Same mother, per-user overlay that
+projects only opted-in items via the new `user.preference.*` verb
+family. Composes on top of R55.2 ownership; snapshot round-trips a
+new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
+
+**Front-of-queue after Phase C ✅ / Phase D parts 1 + 2 ✅ /
+Phase E ✅:**
+- **R102** — signed KG-delta update channel (remaining Phase D
+  round). Mother emits an incremental delta bundle; child verifies +
+  applies. Deltas chain via `parent-bundle-fingerprint`.
 - **KG-driven paraphrase (candidate)** — consult the live KG for
   atom aliases at classify time so a training utterance that says
   "photosynthesis" also matches queries about "photosynthetic
