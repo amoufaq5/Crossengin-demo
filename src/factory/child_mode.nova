@@ -1,0 +1,285 @@
+// CrossEngin factory: --child-mode runtime (R100, ADR-0203/0204).
+//
+// R99 shipped `bake_child`, which produces a signed child bundle from a
+// filtered snapshot of a mother daemon's registries. R100 delivers the
+// *other* half of the mother/child arc: the slim runtime that LOADS one
+// of those bundles at boot and serves it -- read-mostly, no ingest, no
+// bake, no admin.
+//
+// Boot contract (env vars, all optional):
+//
+//   CROSSENGIN_CHILD_MODE=1
+//     Turn child mode on. Any other value (unset / "0" / other) leaves
+//     the daemon in mother mode, byte-identical to pre-R100 boot.
+//
+//   CROSSENGIN_CHILD_BUNDLE_PATH=<abs-path>
+//     Absolute path to a signed bundle produced by `admin.bake_child`.
+//     Required when CROSSENGIN_CHILD_MODE=1.
+//
+//   CROSSENGIN_MOTHER_ANCHOR_PK_B64=<base64(32-byte-pk)>
+//     The mother's Ed25519 public key. Trust anchor for verifying the
+//     bundle signature. Required when CROSSENGIN_CHILD_MODE=1. Distinct
+//     from CROSSENGIN_MOTHER_SIGNER_PK_B64 (which is only used by the
+//     mother's *baker* side): the child never signs, only verifies, so
+//     it carries just the anchor pk -- never the signer seed.
+//
+// Public API:
+//
+//   child_mode_bootstrap_from_env() -> [ok, payload, err]
+//     - ok = 0 with err = "" -> child mode NOT requested. No-op; the
+//       daemon boots normally in mother mode.
+//     - ok = 0 with err != "" -> child mode was requested but the
+//       bootstrap failed (missing env var, unreadable bundle, bad
+//       signature, ...). Caller MUST refuse to start; a partial /
+//       silent boot would demote trust without operator visibility.
+//     - ok = 1 -> child mode successfully bootstrapped. payload is
+//       [bits, bundle_text]. bits is the CHILD_MODE_* bitmask to
+//       stash in every rpc_ctx via rpc_ctx_set_child_mode_bits(...);
+//       bundle_text is the raw bundle text ready to feed to
+//       session_snapshot_apply_ex.
+//
+//   child_mode_verb_disabled(verb) -> 0 | 1
+//     - Returns 1 if `verb` is on the child-mode disable table (see
+//       below), else 0. Unknown verb names return 0 (default-allow) --
+//       the rpc_dispatch layer refuses unknown verbs on its own.
+//
+//   child_mode_env_active() -> 0 | 1
+//     - Cheap pre-check the daemon can use to decide whether to run
+//       bootstrap AT ALL. Returns 1 iff CROSSENGIN_CHILD_MODE=1.
+//
+// Bitmask (only bit 0 defined in R100; future rounds may add sub-bits
+// that selectively re-enable a subset of the disable table):
+//
+//   CHILD_MODE_INACTIVE     = 0     -- mother mode, no restrictions
+//   CHILD_MODE_ACTIVE       = 1     -- bit 0: KG immutable, ingest /
+//                                     bake / admin / install verbs
+//                                     refused at the wire
+//   CHILD_MODE_KG_IMMUTABLE = 1     -- alias for CHILD_MODE_ACTIVE;
+//                                     the property callers reason
+//                                     about when they read the bit
+//
+// Verb disable table (see child_mode_verb_disabled below for the
+// authoritative source). Every mutator that changes what the child
+// "knows" is refused when CHILD_MODE_ACTIVE is set:
+//
+//   ingest.file, ingest.policy.add, ingest.policy.list,
+//   ingest.policy.remove, capsule.install, skill.install,
+//   pattern.install, session.save, admin.rotate_token,
+//   admin.set_qps, admin.set_expires, admin.grant_cap,
+//   admin.remove_cap, admin.set_revoked, admin.set_holder,
+//   admin.bake_child, capability.issue, capability.revoke,
+//   ownership.transfer.
+//
+// Verbs that STAY ENABLED under child mode (read + query side):
+//
+//   nl.ask, nl.metrics, kg.list, capsule.list, skill.list,
+//   skill.run, pattern.list, capability.list, session.load,
+//   session.list, ownership.list.
+//
+// Design notes (belt, not suspenders):
+//
+//   R100's KG immutability is enforced at the WIRE, not deep in
+//   `kg_insert`. Every atom-mutating surface the child exposes runs
+//   through one of the verbs on the disable table (ingest.file for
+//   pipeline ingest, capsule.install / skill.install / pattern.install
+//   for registry additions, admin.* for token / cap mutation). An
+//   internal reasoning path that writes to KG mid-nl.ask would still
+//   see mutable atoms -- that is a hypothetical latent bug in
+//   `nl_execute_scoped`, NOT an R100 gap. If R101 or later grows an
+//   nl.ask path that mutates, the correct fix is to make that path
+//   consult the ctx bit; deep-gating every atom-store call would be
+//   suspenders without a belt-side threat.
+//
+// NOVA dependencies: builtins (getenv, len, sys_open, sys_read,
+//   sys_close, alloc, load8, chr, char_at).
+// CrossEngin dependencies:
+//   src/factory/bake.nova              (bake_verify_bundle)
+//   src/net/tls/base64.nova            (anchor pk decode)
+//   src/util/str_safe.nova             (str_eq_bytes).
+
+import "./bake.nova"
+import "../net/tls/base64.nova"
+import "../util/str_safe.nova"
+
+// ---- bitmask constants -------------------------------------------------
+
+let CHILD_MODE_INACTIVE     = 0
+let CHILD_MODE_ACTIVE       = 1
+let CHILD_MODE_KG_IMMUTABLE = 1
+
+// ---- env-var guard -----------------------------------------------------
+//
+// Mirrors the same pattern _bps_env / _rpcd_*_from_env use: an unset
+// var yields address 0, whose len() would segfault -- so we check both
+// the pointer and the length. Returns "" for missing / empty.
+
+fn _cm_env(name) {
+    let v = getenv(name)
+    if v == 0 { return "" }
+    if len(v) == 0 { return "" }
+    return v
+}
+
+// Is CROSSENGIN_CHILD_MODE=1 (exactly the string "1")? Any other value
+// -- including "0", "true", "on", "yes", accidentally-lowercased env
+// -- leaves child mode OFF. Strict match keeps the boot decision
+// visible and grep-able.
+fn child_mode_env_active() {
+    let v = _cm_env("CROSSENGIN_CHILD_MODE")
+    if len(v) == 0 { return 0 }
+    if str_eq_bytes(v, "1") == 1 { return 1 }
+    return 0
+}
+
+// ---- file read helper --------------------------------------------------
+//
+// Bundle content is ASCII by construction (BAKE header + section text
+// + a hex-encoded signature footer), so reading it into a NOVA string
+// is safe -- no interior NULs. 4 MiB cap mirrors _rpc_snap_read; a
+// filtered child bundle is typically << 1 MiB.
+
+fn _cm_read_file(path) {
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return "" }
+    let cap = 4194304
+    let acc = ""
+    let done = 0
+    while done == 0 {
+        if len(acc) >= cap { done = 1 }
+        else {
+            let buf = alloc(4097)
+            let m = sys_read(fd, buf, 4096)
+            if m <= 0 { done = 1 }
+            else {
+                let piece = ""
+                let i = 0
+                while i < m {
+                    piece = piece + chr(load8(buf + i))
+                    i = i + 1
+                }
+                acc = acc + piece
+            }
+        }
+    }
+    sys_close(fd)
+    return acc
+}
+
+// ---- result helpers ----------------------------------------------------
+
+fn _cm_noop() {
+    // Not in child mode; nothing to do, no error.
+    let r = list_new()
+    push(r, 0) push(r, 0) push(r, "")
+    return r
+}
+
+fn _cm_err(msg) {
+    // Child mode was requested but bootstrap failed. Caller MUST refuse
+    // to start.
+    let r = list_new()
+    push(r, 0) push(r, 0) push(r, msg)
+    return r
+}
+
+fn _cm_ok(bundle_text) {
+    // Child mode bootstrapped. Payload = [bits, bundle_text].
+    let payload = list_new()
+    push(payload, CHILD_MODE_ACTIVE)
+    push(payload, bundle_text)
+    let r = list_new()
+    push(r, 1) push(r, payload) push(r, "")
+    return r
+}
+
+// ---- main entry point --------------------------------------------------
+
+fn child_mode_bootstrap_from_env() {
+    // Cheap gate: unset / anything-but-"1" -> no-op, mother mode.
+    if child_mode_env_active() == 0 {
+        return _cm_noop()
+    }
+    // Bundle path is required from here on.
+    let path = _cm_env("CROSSENGIN_CHILD_BUNDLE_PATH")
+    if len(path) == 0 {
+        return _cm_err("CROSSENGIN_CHILD_MODE=1 but CROSSENGIN_CHILD_BUNDLE_PATH not set")
+    }
+    // Anchor pk is required too -- unsigned bundles are refused.
+    let anchor_b64 = _cm_env("CROSSENGIN_MOTHER_ANCHOR_PK_B64")
+    if len(anchor_b64) == 0 {
+        return _cm_err("CROSSENGIN_CHILD_MODE=1 but CROSSENGIN_MOTHER_ANCHOR_PK_B64 not set")
+    }
+    let dec = base64_decode(anchor_b64)
+    if dec[0] == 0 {
+        return _cm_err("CROSSENGIN_MOTHER_ANCHOR_PK_B64 base64 malformed")
+    }
+    let anchor_pk = dec[1]
+    if len(anchor_pk) != 32 {
+        return _cm_err("CROSSENGIN_MOTHER_ANCHOR_PK_B64 must decode to 32 bytes")
+    }
+    // Read the bundle. sys_open on /tmp is broken in this container;
+    // other absolute paths work. Operators should provision bundles
+    // under a dedicated /var/lib/crossengin/child/ or equivalent.
+    let bundle_text = _cm_read_file(path)
+    if len(bundle_text) == 0 {
+        return _cm_err("child bundle unreadable or empty: " + path)
+    }
+    // Verify the signature under the anchor.
+    let vr = bake_verify_bundle(bundle_text, anchor_pk)
+    if vr[0] == 0 {
+        return _cm_err("child bundle signature refused: " + vr[1])
+    }
+    return _cm_ok(bundle_text)
+}
+
+// ---- verb-disable table ------------------------------------------------
+//
+// Authoritative list of verbs refused when CHILD_MODE_ACTIVE is set on
+// an rpc_ctx. Kept as a linear scan (not a hash set): NOVA doesn't
+// have a native set builtin, and the disable list is short + queried
+// once per request -- the cost is negligible against JSON encode
+// alone.
+
+fn child_mode_verb_disabled(verb) {
+    // Ingest -- child cannot grow its KG.
+    if str_eq_bytes(verb, "ingest.file")            == 1 { return 1 }
+    if str_eq_bytes(verb, "ingest.policy.add")      == 1 { return 1 }
+    if str_eq_bytes(verb, "ingest.policy.list")     == 1 { return 1 }
+    if str_eq_bytes(verb, "ingest.policy.remove")   == 1 { return 1 }
+    // Installers -- registries are frozen at bake time.
+    if str_eq_bytes(verb, "capsule.install")        == 1 { return 1 }
+    if str_eq_bytes(verb, "skill.install")          == 1 { return 1 }
+    if str_eq_bytes(verb, "pattern.install")        == 1 { return 1 }
+    // Session -- child loads at boot only; new snapshots would fork
+    // its identity away from the mother.
+    if str_eq_bytes(verb, "session.save")           == 1 { return 1 }
+    // Admin knobs -- token / cap / holder mutation belongs on the
+    // mother. Child inherits whatever cap set the operator provisions
+    // out of band at boot.
+    if str_eq_bytes(verb, "admin.rotate_token")     == 1 { return 1 }
+    if str_eq_bytes(verb, "admin.set_qps")          == 1 { return 1 }
+    if str_eq_bytes(verb, "admin.set_expires")      == 1 { return 1 }
+    if str_eq_bytes(verb, "admin.grant_cap")        == 1 { return 1 }
+    if str_eq_bytes(verb, "admin.remove_cap")       == 1 { return 1 }
+    if str_eq_bytes(verb, "admin.set_revoked")      == 1 { return 1 }
+    if str_eq_bytes(verb, "admin.set_holder")       == 1 { return 1 }
+    // Bake -- only the mother bakes children.
+    if str_eq_bytes(verb, "admin.bake_child")       == 1 { return 1 }
+    // Capability lifecycle -- read (capability.list) stays open;
+    // mutation is refused.
+    if str_eq_bytes(verb, "capability.issue")       == 1 { return 1 }
+    if str_eq_bytes(verb, "capability.revoke")      == 1 { return 1 }
+    // Ownership mutation -- overlay is frozen at bake.
+    if str_eq_bytes(verb, "ownership.transfer")     == 1 { return 1 }
+    return 0
+}
+
+// ---- refusal message helper --------------------------------------------
+//
+// Callers (rpc_dispatch + capability_authorize) share one refusal
+// message shape so operators + tests can grep for it uniformly.
+// Format: "verb disabled in child-mode runtime: <verb>"
+
+fn child_mode_refusal(verb) {
+    return "verb disabled in child-mode runtime: " + verb
+}

@@ -3791,6 +3791,183 @@ beside them and are invoked ONLY by `bake_child`.
 ADR-0104 (NL Surface Layer), ADR-0105 (Sandbox Architecture), R16A
 Merkle signing.
 
+### 7.50 `--child-mode` runtime flag (R100 — Phase D part 2)
+
+R99 shipped `admin.bake_child`, which produces a signed child bundle
+from a filtered snapshot of a mother daemon's registries. R100
+delivers the **other** half of the mother/child arc: the slim runtime
+that LOADS one of those bundles at boot and serves it read-mostly.
+
+**Boot contract (env vars, all optional):**
+
+```
+CROSSENGIN_CHILD_MODE=1
+    Turn child mode on. Any other value (unset / "0" / other) leaves
+    the daemon in mother mode, byte-identical to pre-R100 boot.
+
+CROSSENGIN_CHILD_BUNDLE_PATH=<abs-path>
+    Absolute path to a signed bundle produced by admin.bake_child.
+    Required when CROSSENGIN_CHILD_MODE=1.
+
+CROSSENGIN_MOTHER_ANCHOR_PK_B64=<base64(32-byte-pk)>
+    The mother's Ed25519 public key. Trust anchor for verifying the
+    bundle signature. Required when CROSSENGIN_CHILD_MODE=1.
+    Distinct from CROSSENGIN_MOTHER_SIGNER_PK_B64 (which the mother's
+    baker side uses): the child never signs, only verifies, so it
+    carries just the anchor -- never the signer seed.
+```
+
+**Boot sequence:**
+
+```
+1. main()
+2. call child_mode_bootstrap_from_env():
+     - env unset -> ok=0, err="" -> proceed as mother-mode daemon.
+     - env=1 but bundle missing / anchor missing / bundle unreadable
+       / bad base64 / wrong-length pk / signature mismatch
+                 -> ok=0, err="<reason>" -> daemon PRINTS the reason
+                    and REFUSES TO START (a silent fallback would
+                    demote trust without the operator noticing).
+     - happy path -> ok=1, payload = [bits, bundle_text].
+3. apply the bundle via
+     session_snapshot_apply_ex(bundle_text, persona_reg, cap_reg,
+                                trust_reg, overlay, policy_reg,
+                                skill_reg, now)
+   (bundle carries #PERSONA + #OWNERSHIP + #POLICY + #PATTERN +
+   #SKILL + #KG sections; NO #CAPS / #TRUST -- bearer tokens are
+   per-mother secrets, provisioned out of band).
+4. call rpc_ctx_set_child_mode_bits(ctx, CHILD_MODE_ACTIVE) so every
+   subsequent request runs through the disable-table gate below.
+```
+
+**Verb disable table (refused when the CHILD_MODE_ACTIVE bit is
+set on a ctx):**
+
+```
+ingest.file              admin.rotate_token   capability.issue
+ingest.policy.add        admin.set_qps        capability.revoke
+ingest.policy.list       admin.set_expires    ownership.transfer
+ingest.policy.remove     admin.grant_cap
+capsule.install          admin.remove_cap
+skill.install            admin.set_revoked
+pattern.install          admin.set_holder
+session.save             admin.bake_child
+```
+
+**Verbs still enabled in child mode:**
+
+```
+nl.ask     nl.metrics       kg.list          capsule.list
+skill.list skill.run        pattern.list     capability.list
+session.load session.list   ownership.list
+persona.show  persona.project   nl.parse_only
+```
+
+**Refusal message shape:** `verb disabled in child-mode runtime:
+<verb>` -- fixed, grep-able, distinct from the `capability
+required: ...` shape the sandbox layer emits.
+
+**KG immutability:** enforced at the WIRE, not deep in `kg_insert`.
+Every atom-mutating surface a child daemon exposes runs through one
+of the disable-table verbs (ingest.file for pipeline ingest;
+capsule.install / skill.install / pattern.install for registry
+additions; admin.* for token / cap / holder mutation). An internal
+reasoning path that mutated KG mid-`nl.ask` would still see mutable
+atoms -- that is a hypothetical latent bug in `nl_execute_scoped`,
+NOT an R100 gap; belt not suspenders. If R101 or later grows an
+`nl.ask` path that mutates, the correct fix is to make that path
+consult the ctx bit; deep-gating every atom-store call would be
+suspenders without a belt-side threat.
+
+**Gate ordering:** `rpc_dispatch` calls `capability_authorize_ex`
+which folds the child-mode check IN FRONT OF the pre-R100 cap check.
+When both would refuse, the child-mode message wins so an operator
+sees the actual reason (the caller's token may legitimately hold the
+required cap; child mode is what's forbidding it). Enabled verbs
+fall through to the pre-R100 cap path unchanged.
+
+**Child bundle provisioning recipe** (illustrative shell):
+
+```
+# On the mother host:
+#   sidecar sets CROSSENGIN_MOTHER_SIGNER_SEED_B64 + _PK_B64.
+#   Operator calls admin.bake_child with a manifest naming the
+#   capsules / skills / patterns / personas / policies / KG atoms
+#   that the child should be allowed to see.
+$ echo '{"verb":"admin.bake_child","token":"<admin>",
+         "args":{"manifest_path":"child-astro.manifest"}}' \
+  | nc -q1 127.0.0.1 9876
+# -> {"ok":true,"result":{"bundle_path":"/var/lib/crossengin/bake/
+#     astro-child-0.1.0.bundle", ...}}
+
+# Ship both the bundle AND the mother's public key (NOT the seed)
+# out of band to the child host:
+$ scp /var/lib/crossengin/bake/astro-child-0.1.0.bundle \
+      child.host:/var/lib/crossengin/child/
+$ echo "$CROSSENGIN_MOTHER_SIGNER_PK_B64" \
+      | ssh child.host 'cat > /var/lib/crossengin/child/anchor.pk.b64'
+
+# On the child host, boot the daemon in child mode:
+$ export CROSSENGIN_CHILD_MODE=1
+$ export CROSSENGIN_CHILD_BUNDLE_PATH=/var/lib/crossengin/child/astro-child-0.1.0.bundle
+$ export CROSSENGIN_MOTHER_ANCHOR_PK_B64="$(cat /var/lib/crossengin/child/anchor.pk.b64)"
+$ export CE_RPC_PORT=9877
+$ ./bin/crossengin-rpc-daemon
+=== CrossEngin JSON-RPC daemon ===
+listening on 127.0.0.1:9877  (max_request=65536 bytes)
+child-mode: ON -- bundle loaded from /var/lib/crossengin/child/astro-child-0.1.0.bundle
+           bundle signature verified under anchor pk;
+           KG immutable + ingest/bake/admin verbs refused.
+
+# Verify from a client -- read verbs work:
+$ echo '{"verb":"kg.list"}' | nc -q1 127.0.0.1 9877
+{"ok":true,"result":["world"], ...}
+# ingest is refused:
+$ echo '{"verb":"ingest.file","args":{}}' | nc -q1 127.0.0.1 9877
+{"ok":false,"error":"verb disabled in child-mode runtime: ingest.file"}
+```
+
+**Files** (R100):
+
+  * `src/factory/child_mode.nova`      -- bootstrap + disable table +
+                                          bit constants (~280 lines)
+  * `src/nl/rpc_verbs.nova`            -- `RCTX_CHILD_MODE_BITS`
+                                          slot + `rpc_ctx_is_child_mode`
+                                          + dispatch calls
+                                          `capability_authorize_ex`
+  * `src/sandbox/capability.nova`      -- `capability_authorize_ex`
+                                          (child-mode gate composed
+                                          with pre-R100 cap check)
+  * `examples/crossengin_rpc_daemon.nova`
+                                        -- boot-time bootstrap +
+                                           `session_snapshot_apply_ex`
+                                           + set-bits call; refuses to
+                                           start on bootstrap failure
+
+**Tests** (all green): `test_child_mode` (59 checks -- bit constants,
+env-off no-op, disable table, refusal shape, verify tamper/wrong-pk
+paths); `test_child_mode_wire` (46 checks -- ctx slot round-trip,
+higher-bit semantics, every disabled verb refused at wire, every
+enabled verb NOT child-refused, `capability_authorize_ex` ordering,
+verb count still 38); `test_capability_wire` gains 4 R100 ordering
+checks (253 total). Regression sweep clean on `test_capability_wire`,
+`test_nl_rpc_verbs`, `test_nl_rpc_server`, `test_session_snapshot`,
+`test_ownership`, `test_bake_manifest`, `test_bake`,
+`test_admin_bake_child_verb`, `test_bundle_signing`, `test_kg_filter`,
+`test_capability`.
+
+**Backwards compat:** With `CROSSENGIN_CHILD_MODE` unset, the daemon
+boots byte-identically to R99. `capability_authorize` is unchanged;
+`capability_authorize_ex` wraps it and reduces to the same function
+when `child_mode_bits=0`.
+
+**Verb count unchanged at 38** — R100 adds no new verbs; the wire's
+surface area shrinks (disable table) rather than expanding.
+
+**References:** ADR-0203 (BakeManifest), ADR-0204 (Signed bundle),
+ADR-0104 (NL Surface Layer), ADR-0105 (Sandbox Architecture), §7.49
+(R99 bake pipeline).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -3901,22 +4078,21 @@ BEFORE the LLM sidecar; a hit skips the sidecar entirely, dropping
 `classifier_hit_rate`) so both rungs are dashboardable side by
 side.
 
-**Phase D roadmap (bake-factory epic; R99 shipped):**
+**Phase D roadmap (bake-factory epic; R99 + R100 shipped):**
 - **R99 ✅** — `bake_child` + BakeManifest + filtered snapshot +
   signed bundle (see §7.49). Mother produces the artifact; child
   can verify but does not yet CONSUME it.
-- **R100** — `--child-mode` runtime flag + bitmask. Boot loads a
-  signed bundle via `session_snapshot_apply_ex`, verifies signature
-  under `CROSSENGIN_MOTHER_ANCHOR_PK_B64`, marks the KG immutable,
-  disables ingest/bake/admin verbs. First moment a bundle produced
-  by R99 is actually loaded and served.
+- **R100 ✅** — `--child-mode` runtime flag + bitmask (see §7.50).
+  Boot loads a signed bundle via `session_snapshot_apply_ex`,
+  verifies signature under `CROSSENGIN_MOTHER_ANCHOR_PK_B64`, marks
+  the KG immutable, disables ingest/bake/admin/install verbs.
+  Bundles produced by R99 are now actually loaded and served.
 - **R101** — Signed KG-delta update channel. Mother emits an
   incremental delta bundle between two moments (`admin.emit_delta`);
   child verifies + applies (`update.apply`) under the anchor from
   R100. Deltas chain via `parent-bundle-fingerprint`.
 
-**Front-of-queue after Phase C ✅ / Phase D part 1 ✅:**
-- **R100** — --child-mode runtime flag (next Phase D round).
+**Front-of-queue after Phase C ✅ / Phase D parts 1 + 2 ✅:**
 - **R101** — signed KG-delta update channel (Phase D part 3).
 - **Phase E** — selective load (operator preference); can run in
   parallel with R100/R101 since files don't overlap.
