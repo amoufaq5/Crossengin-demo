@@ -4076,6 +4076,192 @@ ADR-0105 (Sandbox Architecture; the R55.2 overlay this composes with),
 `src/preference/user_preference.nova`, §7.9 (R55.2 ownership overlay
 this composes with), §7.10 (R55.3 snapshot round-trip this extends).
 
+### 7.52 Signed KG-delta update channel (R102 — Phase D part 3)
+
+R99 shipped `bake_child` (mother -> initial signed bundle) and R100
+shipped `--child-mode` (child loads and enforces the bundle). R102
+closes Phase D with the incremental mother -> child update channel:
+
+- Mother emits a signed **KG-delta bundle** expressing the state
+  change between two watermarks (`admin.emit_delta` wire verb).
+- Child verifies the delta signature + parent-fingerprint chain,
+  then applies via existing merge machinery (`update.apply`).
+- Deltas chain: each delta carries a `#parent-bundle-fingerprint`
+  header referencing the SHA-256 of the bundle-or-delta it was
+  computed from; the child persists the current fingerprint under
+  `<CROSSENGIN_STATE_DIR>/current_bundle_fingerprint` so the chain
+  survives daemon restarts.
+
+**Delta bundle format:**
+
+```
+#CROSSENGIN-KG-DELTA v1
+#parent-bundle-fingerprint <hex-sha256-of-source-bundle>
+#since-watermark <int>
+#until-watermark <int>
+#manifest-name <name>
+#emitted-at <unix-timestamp>
+
+#DELTA-KG v1
++ATOM <kg_label> <atom_id> <kind> <license> <source_tier> <label>
+-ATOM <kg_label> <atom_label>
+
+#DELTA-CAPSULE v1
++CAPSULE <name> <version> <license> <installed_flag>
+DESC <text>
+-CAPSULE <name>
+
+#DELTA-SKILL v1
++SKILL <name> <version> <policy_id> <tier> <installed_flag>
+DESC <text>
+-SKILL <name>
+
+#DELTA-PATTERN v1
++PATTERN_CAPSULE <name> <version>
+PATTERN <confidence> <source_tag>
+TRIGGER <t1> <t2> ...
+GUIDANCE <text>
+-PATTERN_CAPSULE <name>
+
+#DELTA-POLICY v1
++POLICY <name> <action>
+PRED <op_name> <arg>
+-POLICY <name>
+
+#SIGNATURE <hex-sig>
+#SIGNER-PK <hex-pk>
+```
+
+**Watermark semantics.** The delta window is `(since, until]` —
+strictly greater than `since`, less than or equal to `until`.
+`src/kg/atom_store.nova` grows two module-level singletons:
+`_kg_mutation_watermark` (monotonic int; `kg_mutation_watermark_tick`
+/ `_current`) and `_kg_retraction_log` (append-only list;
+`kg_log_retraction` / `kg_retractions_since`). Additions use each
+atom's existing `atom_created(a)` moment (no new per-atom storage);
+retractions use the log (a retracted atom leaves the KG, its slot
+may be reused, so the log is the only truthful record of removals
+across a delta window). Callers seed `since` from the fingerprint
+they last applied and pass a fresh `until` (or omit — defaults to
+`kg_mutation_watermark_current()`).
+
+**Chain-fingerprint state.**
+
+```
+CROSSENGIN_STATE_DIR
+    Directory for daemon state files. Defaults to "./state/" if
+    unset; operators should point at a persistent path in production
+    (e.g. /var/lib/crossengin/state/).
+
+CROSSENGIN_CURRENT_BUNDLE_FINGERPRINT_HEX
+    Optional operator seed at first boot. Overrides whatever the
+    state file holds. Used to seed the chain from a known bundle
+    fingerprint without hand-writing the state file.
+```
+
+At boot in child mode, `crossengin_rpc_daemon.nova` calls
+`child_mode_current_fingerprint_load()` and stashes the value on
+`rpc_ctx` via `rpc_ctx_set_current_bundle_fingerprint`. Each
+successful `update.apply` overwrites the slot (in memory) and
+saves the new fingerprint to disk via
+`child_mode_current_fingerprint_save`.
+
+**Two new wire verbs (verb count 41 -> 43):**
+
+| Verb                  | Cap                       | Side   |
+|-----------------------|---------------------------|--------|
+| `admin.emit_delta`    | `admin:emit-delta`        | mother |
+| `update.apply`        | `admin:update-apply`      | child  |
+
+Both caps are **admin-only** (never bundled with reader / curator /
+skill_user / service). `admin.emit_delta` is DISABLED under
+`CROSSENGIN_CHILD_MODE=1` (the disable table gains it alongside
+`admin.bake_child`). `update.apply` STAYS ENABLED under child mode
+— it is the ONE admin verb the disable table exempts, because it
+IS the intended mother -> child mutation channel.
+
+**Operator workflow** (illustrative shell):
+
+```
+# On the mother (has CROSSENGIN_MOTHER_SIGNER_SEED_B64 + _PK_B64):
+$ echo '{"verb":"admin.emit_delta","token":"<admin>",
+         "args":{"source_bundle_path":"astro-0.1.0.bundle",
+                 "manifest_path":"child-astro.manifest",
+                 "since":"1250"}}' \
+    | nc -q1 127.0.0.1 9876
+# -> {"ok":true,"result":{"delta_path":"...",
+#      "delta_fingerprint":"<hex>","atoms_added":5, ...}}
+
+# Deliver the delta out of band to the child host.
+$ scp /var/lib/crossengin/bake/astro-1250-1300.delta \
+      child.host:/var/lib/crossengin/child/
+
+# On the child (CROSSENGIN_CHILD_MODE=1 + anchor pk already set):
+$ echo '{"verb":"update.apply","token":"<admin>",
+         "args":{"delta_path":"/var/lib/crossengin/child/astro-1250-1300.delta"}}' \
+    | nc -q1 127.0.0.1 9877
+# -> {"ok":true,"result":{"new_bundle_fingerprint":"<hex>",
+#      "atoms_added":5,"atoms_retracted":0, ...}}
+```
+
+**Refusal shapes:** every failure fails closed — a bad signature
+or a broken chain never mutates the child's registries. Wire
+errors surface via the standard `{ok:false,error:"..."}` envelope
+with specific messages for each pre-condition (missing anchor,
+mismatched parent fingerprint, tampered signature, malformed
+delta, missing signer keys on the emit side).
+
+**Files** (R102):
+
+  * `src/factory/update_delta.nova`   -- delta_compute / _verify /
+                                          _apply pipeline; SHA-256
+                                          chain math; delta result
+                                          record (~1350 lines)
+  * `src/kg/atom_store.nova`          -- mutation watermark counter
+                                          + retraction log (~90
+                                          lines added)
+  * `src/factory/child_mode.nova`     -- update.apply exempted from
+                                          disable table;
+                                          current_bundle_fingerprint
+                                          state file helpers (~110
+                                          lines added)
+  * `src/sandbox/capability.nova`     -- CAP_ADMIN_EMIT_DELTA +
+                                          CAP_ADMIN_UPDATE_APPLY;
+                                          verb-required table +
+                                          admin role +
+                                          capability_is_known_cap
+  * `src/nl/rpc_verbs.nova`           -- 2 new wire verbs +
+                                          dispatch + names list +
+                                          RCTX_CURRENT_BUNDLE_FINGERPRINT
+                                          slot + accessor / mutator
+  * `examples/crossengin_rpc_daemon.nova`
+                                        -- boot loads
+                                           current-fingerprint via
+                                           child_mode_current_fingerprint_load
+                                           when in child mode
+
+**Tests:** `test_update_delta` (67 checks — compute / verify /
+apply / chain / watermark / retraction log / refusal paths),
+`test_admin_emit_delta_verb` (16 checks — registration, caps,
+child-mode gate, arg validation, refusal), `test_update_apply_verb`
+(14 checks — registration, caps, child-mode ALLOWANCE, arg + env
+validation, fingerprint round-trip). `test_child_mode_wire` gains
+2 R102 assertions (admin.emit_delta refused in child mode +
+update.apply allowed in child mode); `test_nl_rpc_verbs` +
+`test_admin_bake_child_verb` verb count bumped 41 -> 43.
+
+**Interaction with child-mode (R100):** update.apply is the ONE
+admin verb child mode allows. `admin.emit_delta` remains
+mother-only; a child that receives a delta and calls
+`update.apply` runs the merge machinery *inside* the child-mode
+allowance so KG mutation is now legitimately possible under child
+mode — but ONLY through the signed-delta channel. Direct ingest
+verbs and ad-hoc admin mutation stay refused.
+
+**References:** ADR-0203 (BakeManifest), ADR-0204 (Signed bundle),
+ADR-0105 (Sandbox Architecture), §7.49 (R99 bake pipeline), §7.50
+(R100 child-mode runtime).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -4186,7 +4372,7 @@ BEFORE the LLM sidecar; a hit skips the sidecar entirely, dropping
 `classifier_hit_rate`) so both rungs are dashboardable side by
 side.
 
-**Phase D roadmap (bake-factory epic; R99 + R100 shipped):**
+**Phase D COMPLETE (R99 + R100 + R102 shipped).**
 - **R99 ✅** — `bake_child` + BakeManifest + filtered snapshot +
   signed bundle (see §7.49). Mother produces the artifact; child
   can verify but does not yet CONSUME it.
@@ -4195,11 +4381,15 @@ side.
   verifies signature under `CROSSENGIN_MOTHER_ANCHOR_PK_B64`, marks
   the KG immutable, disables ingest/bake/admin/install verbs.
   Bundles produced by R99 are now actually loaded and served.
-- **R102** — Signed KG-delta update channel (remaining Phase D
-  round; was originally R101). Mother emits an incremental delta
-  bundle between two moments (`admin.emit_delta`); child verifies +
-  applies (`update.apply`) under the anchor from R100. Deltas chain
-  via `parent-bundle-fingerprint`.
+- **R102 ✅** — Signed KG-delta update channel (see §7.52). Mother
+  emits an incremental delta bundle between two watermarks via
+  `admin.emit_delta`; child verifies + applies via `update.apply`
+  under the mother anchor pk. Deltas chain via
+  `parent-bundle-fingerprint`; a state file at
+  `<CROSSENGIN_STATE_DIR>/current_bundle_fingerprint` persists the
+  chain across daemon restarts. `update.apply` is the ONE admin
+  verb that stays enabled under child mode — it IS the intended
+  mutation channel.
 
 **Phase E ✅ (R101).** Per-user selective load — the third
 consumption mode from ADR-0200. Same mother, per-user overlay that
@@ -4207,11 +4397,12 @@ projects only opted-in items via the new `user.preference.*` verb
 family. Composes on top of R55.2 ownership; snapshot round-trips a
 new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
 
-**Front-of-queue after Phase C ✅ / Phase D parts 1 + 2 ✅ /
-Phase E ✅:**
-- **R102** — signed KG-delta update channel (remaining Phase D
-  round). Mother emits an incremental delta bundle; child verifies +
-  applies. Deltas chain via `parent-bundle-fingerprint`.
+**Front-of-queue after Phase C ✅ / Phase D ✅ / Phase E ✅:**
+- **Phase F** — cognitive layer as first-class per ADR-0206.
+- **Phase G** — multimodal ingest bridge per ADR-0202.
+- **Phase H** — perf/benchmark harness per ADR-0208.
+- **Backlog** — admin bulk-ops, DTLS-12 red-fix (72/450 checks
+  since R86), bignum_256 / field25519 consolidation.
 - **KG-driven paraphrase (candidate)** — consult the live KG for
   atom aliases at classify time so a training utterance that says
   "photosynthesis" also matches queries about "photosynthetic

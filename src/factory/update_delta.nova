@@ -1,0 +1,1337 @@
+// CrossEngin factory: signed KG-delta update channel (R102, Phase D
+// part 3, ADR-0203/0204).
+//
+// R99 shipped bake_child (mother -> initial signed child bundle) and R100
+// shipped --child-mode (child loads and enforces the bundle). R102 closes
+// Phase D with the incremental mother -> child update channel:
+//
+//   * `delta_compute(source_bundle_bytes, ..., since, until)`
+//        On the mother: build a signed delta bundle expressing the state
+//        change between watermark `since` and watermark `until`. Signed
+//        by the mother's bake signer key.
+//
+//   * `delta_verify(delta_bytes, expected_parent_fingerprint, anchor_pk)`
+//        On the child: check the delta's parent-bundle-fingerprint chains
+//        to what the child last applied, and check the signature verifies
+//        under the anchor pk (the mother's).
+//
+//   * `delta_apply(delta_bytes, registries..., now)`
+//        On the child: parse the delta and apply each add/remove
+//        directive against the live registries. Returns a result struct
+//        with per-section counts and the delta's own fingerprint (which
+//        becomes the new baseline for the next delta in the chain).
+//
+// Delta bundle format (line-oriented ASCII, signed like the R99 child
+// bundle):
+//
+//   #CROSSENGIN-KG-DELTA v1
+//   #parent-bundle-fingerprint <hex-sha256-of-source-bundle>
+//   #delta-fingerprint <hex-sha256-of-this-delta-content>
+//   #since-watermark <int>
+//   #until-watermark <int>
+//   #manifest-name <name>
+//   #emitted-at <unix-timestamp>
+//
+//   #DELTA-KG v1
+//   +ATOM <kg_label> <atom_id> <kind> <license> <source_tier> <label>
+//   -ATOM <kg_label> <atom_label>
+//
+//   #DELTA-CAPSULE v1
+//   +CAPSULE <name> <version> <license> <installed_flag>
+//   DESC <text>
+//   -CAPSULE <name>
+//
+//   #DELTA-SKILL v1
+//   +SKILL <name> <version> <policy_id> <tier> <installed_flag>
+//   DESC <text>
+//   -SKILL <name>
+//
+//   #DELTA-PATTERN v1
+//   +PATTERN_CAPSULE <name> <version>
+//   PATTERN <confidence> <source_tag>
+//   TRIGGER <t1> <t2> ...
+//   GUIDANCE <text>
+//   -PATTERN_CAPSULE <name>
+//
+//   #DELTA-POLICY v1
+//   +POLICY <name> <action>
+//   PRED <op_name> <arg>
+//   -POLICY <name>
+//
+//   #SIGNATURE <hex-sig-128-chars>
+//   #SIGNER-PK <hex-pk-64-chars>
+//
+// Watermark semantics (documented per R102 plan): the delta window is
+// `(since, until]` -- strictly greater than `since`, less than or
+// equal to `until`. The watermark itself is the module-level counter
+// defined in `src/kg/atom_store.nova` (`kg_mutation_watermark_current`
+// / `kg_mutation_watermark_tick`); atom ADDITIONS use each atom's
+// `atom_created(a)` moment as its effective watermark (existing per-atom
+// stamp, no new storage needed), atom RETRACTIONS use the retraction
+// log (`kg_log_retraction` / `kg_retractions_since`, ticked on every
+// entry).
+//
+// Chaining: every delta stamps `parent-bundle-fingerprint` = SHA-256 of
+// the bundle-or-delta it was computed from. On apply the child compares
+// this against its stored current-bundle-fingerprint (see
+// `child_mode_current_fingerprint_load` in child_mode.nova). Match ->
+// apply; mismatch -> refuse (delta from a fork; operator must
+// investigate).
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/factory/bake.nova              (bundle SHA-256 / signer helpers)
+//   src/factory/bake_manifest.nova     (allowlist + filter accessors)
+//   src/factory/kg_filter.nova         (same predicate the delta filter uses)
+//   src/persistence/bundle_signing.nova
+//   src/persistence/merkle_signing.nova
+//   src/kg/atom_store.nova              (mutation watermark + retraction log)
+//   src/kg/multi_kg_manager.nova
+//   src/capsules/capsule.nova + capsule_registry.nova
+//   src/skills/skill_registry.nova + skill_manifest.nova
+//   src/capsules/pattern_capsule.nova
+//   src/ingest/policy.nova
+//   src/safety/sha256.nova
+//   src/util/str_safe.nova.
+
+import "./bake.nova"
+import "./bake_manifest.nova"
+import "./kg_filter.nova"
+import "../persistence/bundle_signing.nova"
+import "../persistence/merkle_signing.nova"
+import "../kg/atom_store.nova"
+import "../kg/multi_kg_manager.nova"
+import "../capsules/capsule.nova"
+import "../capsules/capsule_registry.nova"
+import "../skills/skill_registry.nova"
+import "../skills/skill_manifest.nova"
+import "../capsules/pattern_capsule.nova"
+import "../ingest/policy.nova"
+import "../safety/sha256.nova"
+import "../util/str_safe.nova"
+
+// ---- byte-list helpers (mirror bake._bake_bytes_from_string) ------------
+//
+// SHA-256 wants a byte list; the delta prefix is ASCII by construction
+// (bytes < 128) so string -> byte-list is safe. The reverse conversion
+// stays unused for the prefix — the child only ever needs to hash it.
+
+fn _dlt_bytes_from_string(s) {
+    let n = len(s)
+    let out = list_new()
+    let i = 0
+    while i < n {
+        push(out, char_at(s, i))
+        i = i + 1
+    }
+    return out
+}
+
+// SHA-256 the string; return hex-encoded 64-char string. Used for the
+// parent-bundle-fingerprint AND the delta-fingerprint (self-hash of the
+// delta content up to but not including the signature footer).
+fn _dlt_hex_sha256(s) {
+    let bytes = _dlt_bytes_from_string(s)
+    let d = sha256_oneshot_bytes(bytes)
+    return bundle_hex_encode(d)
+}
+
+// ---- delta result record ------------------------------------------------
+//
+// Structured record so callers can extract each field without re-parsing
+// the delta text.
+
+let DR_OK                    = 0
+let DR_DELTA                 = 1
+let DR_ERR                   = 2
+let DR_PARENT_FP             = 3
+let DR_DELTA_FP              = 4
+let DR_SINCE                 = 5
+let DR_UNTIL                 = 6
+let DR_ATOMS_ADDED           = 7
+let DR_ATOMS_RETRACTED       = 8
+let DR_CAPSULES_ADDED        = 9
+let DR_CAPSULES_REMOVED      = 10
+let DR_SKILLS_ADDED          = 11
+let DR_SKILLS_REMOVED        = 12
+let DR_PATTERNS_ADDED        = 13
+let DR_PATTERNS_REMOVED      = 14
+let DR_POLICIES_ADDED        = 15
+let DR_POLICIES_REMOVED      = 16
+let DR_SIG_LEN               = 17
+let DR_SLOTS                 = 18
+
+fn _dlt_result_err(msg) {
+    let r = list_new()
+    push(r, 0) push(r, "") push(r, msg)
+    push(r, "") push(r, "")           // parent_fp, delta_fp
+    push(r, 0)  push(r, 0)            // since, until
+    push(r, 0)  push(r, 0)            // atoms added / retracted
+    push(r, 0)  push(r, 0)            // capsules added / removed
+    push(r, 0)  push(r, 0)            // skills added / removed
+    push(r, 0)  push(r, 0)            // patterns added / removed
+    push(r, 0)  push(r, 0)            // policies added / removed
+    push(r, 0)                        // sig_len
+    return r
+}
+
+fn delta_result_ok(r)               { return r[DR_OK] }
+fn delta_result_delta(r)            { return r[DR_DELTA] }
+fn delta_result_err(r)              { return r[DR_ERR] }
+fn delta_result_parent_fp(r)        { return r[DR_PARENT_FP] }
+fn delta_result_delta_fp(r)         { return r[DR_DELTA_FP] }
+fn delta_result_since(r)            { return r[DR_SINCE] }
+fn delta_result_until(r)            { return r[DR_UNTIL] }
+fn delta_result_atoms_added(r)      { return r[DR_ATOMS_ADDED] }
+fn delta_result_atoms_retracted(r)  { return r[DR_ATOMS_RETRACTED] }
+fn delta_result_capsules_added(r)   { return r[DR_CAPSULES_ADDED] }
+fn delta_result_capsules_removed(r) { return r[DR_CAPSULES_REMOVED] }
+fn delta_result_skills_added(r)     { return r[DR_SKILLS_ADDED] }
+fn delta_result_skills_removed(r)   { return r[DR_SKILLS_REMOVED] }
+fn delta_result_patterns_added(r)   { return r[DR_PATTERNS_ADDED] }
+fn delta_result_patterns_removed(r) { return r[DR_PATTERNS_REMOVED] }
+fn delta_result_policies_added(r)   { return r[DR_POLICIES_ADDED] }
+fn delta_result_policies_removed(r) { return r[DR_POLICIES_REMOVED] }
+fn delta_result_sig_len(r)          { return r[DR_SIG_LEN] }
+
+// ---- source-bundle inspection (for capsule/skill/... baselines) ---------
+//
+// delta_compute needs to know what the SOURCE bundle claimed so it can
+// diff live state against it. Rather than re-run the R99 bake pipeline
+// (which is heavy + racy), we read the bundle text and extract minimal
+// baselines from the section bodies.
+//
+// The parsers are lenient (matching the R99 loaders' shape): unknown /
+// short lines are dropped silently.
+
+// Return the section body for `marker` from `bundle_text`, or "" if the
+// section is absent. Markers are the exact bundle header strings, e.g.
+// "#CAPSULE v1" or "#SKILL v1".
+fn _dlt_bundle_section(bundle_text, marker) {
+    let n = len(bundle_text)
+    let mlen = len(marker)
+    let idx = find_bytes(bundle_text, marker)
+    if idx < 0 { return "" }
+    // The marker must be at line start (preceded by '\n' or be at offset 0).
+    if idx > 0 { if char_at(bundle_text, idx - 1) != 10 { return "" } }
+    let body_start = idx + mlen
+    // Skip the trailing newline of the marker line, if any.
+    if body_start < n { if char_at(bundle_text, body_start) == 10 { body_start = body_start + 1 } }
+    // Body ends at the NEXT '#' line boundary or EOF.
+    let i = body_start
+    while i < n {
+        // A section boundary is a '#' at column 0.
+        if char_at(bundle_text, i) == 35 {
+            if i == body_start { return "" }
+            if char_at(bundle_text, i - 1) == 10 {
+                return substr(bundle_text, body_start, i - body_start)
+            }
+        }
+        i = i + 1
+    }
+    return substr(bundle_text, body_start, n - body_start)
+}
+
+// Extract capsule names from a #CAPSULE v1 body. Each capsule line has
+// shape "CAPSULE <name> <version> <license> <installed_flag>". We only
+// need the name for diff purposes.
+fn _dlt_bundle_capsule_names(bundle_text) {
+    let out = list_new()
+    let body = _dlt_bundle_section(bundle_text, "#CAPSULE v1")
+    if len(body) == 0 { return out }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) >= 8 {
+                let head = substr(line, 0, 8)
+                if str_eq_bytes(head, "CAPSULE ") == 1 {
+                    let rest = substr(line, 8, len(line) - 8)
+                    let sp = find_char(rest, 32)
+                    if sp > 0 { push(out, substr(rest, 0, sp)) }
+                    else { push(out, rest) }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Extract skill names from a #SKILL v1 body. Line shape
+// "SKILL <name> <version> <policy_id> <tier> <installed_flag>".
+fn _dlt_bundle_skill_names(bundle_text) {
+    let out = list_new()
+    let body = _dlt_bundle_section(bundle_text, "#SKILL v1")
+    if len(body) == 0 { return out }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) >= 6 {
+                let head = substr(line, 0, 6)
+                if str_eq_bytes(head, "SKILL ") == 1 {
+                    let rest = substr(line, 6, len(line) - 6)
+                    let sp = find_char(rest, 32)
+                    if sp > 0 { push(out, substr(rest, 0, sp)) }
+                    else { push(out, rest) }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Extract pattern-capsule names from a #PATTERN v1 body. Line shape
+// "CAPSULE <name> <version>" -- exactly like _dlt_bundle_capsule_names
+// but scoped to the #PATTERN v1 section.
+fn _dlt_bundle_pattern_names(bundle_text) {
+    let out = list_new()
+    let body = _dlt_bundle_section(bundle_text, "#PATTERN v1")
+    if len(body) == 0 { return out }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) >= 8 {
+                let head = substr(line, 0, 8)
+                if str_eq_bytes(head, "CAPSULE ") == 1 {
+                    let rest = substr(line, 8, len(line) - 8)
+                    let sp = find_char(rest, 32)
+                    if sp > 0 { push(out, substr(rest, 0, sp)) }
+                    else { push(out, rest) }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Extract policy names from a #POLICY v1 body.
+fn _dlt_bundle_policy_names(bundle_text) {
+    let out = list_new()
+    let body = _dlt_bundle_section(bundle_text, "#POLICY v1")
+    if len(body) == 0 { return out }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) >= 7 {
+                let head = substr(line, 0, 7)
+                if str_eq_bytes(head, "POLICY ") == 1 {
+                    let rest = substr(line, 7, len(line) - 7)
+                    let sp = find_char(rest, 32)
+                    if sp > 0 { push(out, substr(rest, 0, sp)) }
+                    else { push(out, rest) }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- list helpers -------------------------------------------------------
+
+fn _dlt_list_has(lst, name) {
+    let i = 0
+    while i < len(lst) {
+        if str_eq_bytes(lst[i], name) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- delta compute ------------------------------------------------------
+//
+// Build the delta prefix (header + sections) from the mother's live
+// registries + a manifest + the (since, until] watermark window; sign
+// it; return the full delta text.
+
+fn _dlt_header(parent_fp, lo_wm, hi_wm, mname, now) {
+    let s = "#CROSSENGIN-KG-DELTA v1\n"
+    s = s + "#parent-bundle-fingerprint " + parent_fp + "\n"
+    s = s + "#since-watermark " + int_to_str(lo_wm) + "\n"
+    s = s + "#until-watermark " + int_to_str(hi_wm) + "\n"
+    s = s + "#manifest-name " + mname + "\n"
+    s = s + "#emitted-at " + int_to_str(now) + "\n"
+    return s
+}
+
+// Section: added atoms + retracted atoms.
+// - added: atoms whose atom_created(a) is in (since, until] AND that
+//          pass the manifest filter (same predicates R99 uses).
+// - retracted: kg_retractions_since(since) entries whose watermark is
+//              also <= until (both bounds respected).
+fn _dlt_kg_section(kgreg, manifest, capreg, lo_wm, hi_wm) {
+    let out = "\n#DELTA-KG v1\n"
+    let n_add = 0
+    let n_ret = 0
+    // Additions.
+    if kgreg != 0 {
+        let n = kg_count(kgreg)
+        let i = 0
+        while i < n {
+            let kg = kgreg[1][i]
+            let lbl = kg_label(kg)
+            let atoms = kg_atoms(kg)
+            let j = 0
+            while j < len(atoms) {
+                let a = atoms[j]
+                if a != 0 {
+                    let created = atom_created(a)
+                    if created > lo_wm {
+                        if created <= hi_wm {
+                            if kg_filter_matches(a, atom_id(a), lbl,
+                                                  manifest, capreg) == 1 {
+                                out = out + "+ATOM " + lbl
+                                          + " " + int_to_str(atom_id(a))
+                                          + " " + int_to_str(atom_kind(a))
+                                          + " " + int_to_str(atom_license(a))
+                                          + " " + int_to_str(atom_source_tier(a))
+                                          + " " + atom_label(a)
+                                          + "\n"
+                                n_add = n_add + 1
+                            }
+                        }
+                    }
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    // Retractions: log entries strictly after `since` and at or before
+    // `until`. Emit as "-ATOM <kg_label> <atom_label>" (both preserved
+    // so a child can look the atom up by name in its own KG).
+    let rets = kg_retractions_since(lo_wm)
+    let ri = 0
+    while ri < len(rets) {
+        let e = rets[ri]
+        if e[0] <= hi_wm {
+            out = out + "-ATOM " + e[1] + " " + e[2] + "\n"
+            n_ret = n_ret + 1
+        }
+        ri = ri + 1
+    }
+    let ret = list_new()
+    push(ret, out) push(ret, n_add) push(ret, n_ret)
+    return ret
+}
+
+// Section: added / removed capsules.
+// - added: capsules currently in the mother's registry, on the allowlist,
+//          and NOT in the source-bundle's capsule name list.
+//          (A capsule with the same name but bumped version is emitted
+//          as `+CAPSULE` to overwrite the child's copy -- last-write-wins.)
+// - removed: capsules that WERE in the source bundle but are no longer
+//            on the allowlist OR no longer in the mother's registry.
+fn _dlt_capsule_section(capreg, manifest, source_names) {
+    let out = "\n#DELTA-CAPSULE v1\n"
+    let n_add = 0
+    let n_rem = 0
+    let allow = bake_manifest_allowed_capsules(manifest)
+    // Additions.
+    if capreg != 0 {
+        let caps = capreg_capsules(capreg)
+        let i = 0
+        while i < len(caps) {
+            let c = caps[i]
+            let nm = capsule_name(c)
+            if _dlt_list_has(allow, nm) == 1 {
+                // Emit as +CAPSULE regardless of whether it was in the
+                // source (allows version bumps to override) -- child
+                // apply is idempotent on same-name/same-version.
+                let installed = capsule_installed(c)
+                out = out + "+CAPSULE " + nm
+                          + " " + capsule_version(c)
+                          + " " + capsule_license(c)
+                          + " " + int_to_str(installed)
+                          + "\n"
+                let desc = capsule_description(c)
+                if len(desc) > 0 { out = out + "DESC " + desc + "\n" }
+                n_add = n_add + 1
+            }
+            i = i + 1
+        }
+    }
+    // Removals: source had it, current allowlist / registry doesn't.
+    let si = 0
+    while si < len(source_names) {
+        let snm = source_names[si]
+        let keep = 0
+        if _dlt_list_has(allow, snm) == 1 {
+            if capreg != 0 {
+                if capreg_lookup(capreg, snm) != 0 { keep = 1 }
+            }
+        }
+        if keep == 0 {
+            out = out + "-CAPSULE " + snm + "\n"
+            n_rem = n_rem + 1
+        }
+        si = si + 1
+    }
+    let ret = list_new()
+    push(ret, out) push(ret, n_add) push(ret, n_rem)
+    return ret
+}
+
+fn _dlt_skill_section(skill_reg, manifest, source_names) {
+    let out = "\n#DELTA-SKILL v1\n"
+    let n_add = 0
+    let n_rem = 0
+    let allow = bake_manifest_allowed_skills(manifest)
+    if skill_reg != 0 {
+        let names = skill_registry_names(skill_reg)
+        let i = 0
+        while i < len(names) {
+            let nm = names[i]
+            if _dlt_list_has(allow, nm) == 1 {
+                let m = skill_registry_manifest(skill_reg, nm)
+                if m != 0 {
+                    let installed = skill_registry_is_installed(skill_reg, nm)
+                    out = out + "+SKILL " + skill_manifest_name(m)
+                              + " " + skill_manifest_version(m)
+                              + " " + int_to_str(skill_manifest_policy_id(m))
+                              + " " + int_to_str(skill_manifest_capability_tier(m))
+                              + " " + int_to_str(installed)
+                              + "\n"
+                    let desc = skill_manifest_description(m)
+                    if len(desc) > 0 { out = out + "DESC " + desc + "\n" }
+                    n_add = n_add + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    let si = 0
+    while si < len(source_names) {
+        let snm = source_names[si]
+        let keep = 0
+        if _dlt_list_has(allow, snm) == 1 {
+            if skill_reg != 0 {
+                if skill_registry_manifest(skill_reg, snm) != 0 { keep = 1 }
+            }
+        }
+        if keep == 0 {
+            out = out + "-SKILL " + snm + "\n"
+            n_rem = n_rem + 1
+        }
+        si = si + 1
+    }
+    let ret = list_new()
+    push(ret, out) push(ret, n_add) push(ret, n_rem)
+    return ret
+}
+
+fn _dlt_pattern_section(manifest, source_names) {
+    let out = "\n#DELTA-PATTERN v1\n"
+    let n_add = 0
+    let n_rem = 0
+    let allow = bake_manifest_allowed_patterns(manifest)
+    let names = pattern_registry_names()
+    let i = 0
+    while i < len(names) {
+        let nm = names[i]
+        if _dlt_list_has(allow, nm) == 1 {
+            let cap = pattern_registry_lookup(nm)
+            if cap != 0 {
+                out = out + "+PATTERN_CAPSULE " + pcapsule_name(cap)
+                          + " " + pcapsule_version(cap) + "\n"
+                let pats = pcapsule_patterns(cap)
+                let j = 0
+                while j < len(pats) {
+                    let p = pats[j]
+                    out = out + "PATTERN " + int_to_str(pcap_confidence(p))
+                              + " " + pcap_source_tag(p) + "\n"
+                    let trigs = pcap_triggers(p)
+                    out = out + "TRIGGER"
+                    let k = 0
+                    while k < len(trigs) {
+                        out = out + " " + trigs[k]
+                        k = k + 1
+                    }
+                    out = out + "\n"
+                    out = out + "GUIDANCE " + pcap_guidance(p) + "\n"
+                    j = j + 1
+                }
+                n_add = n_add + 1
+            }
+        }
+        i = i + 1
+    }
+    let si = 0
+    while si < len(source_names) {
+        let snm = source_names[si]
+        let keep = 0
+        if _dlt_list_has(allow, snm) == 1 {
+            if pattern_registry_lookup(snm) != 0 { keep = 1 }
+        }
+        if keep == 0 {
+            out = out + "-PATTERN_CAPSULE " + snm + "\n"
+            n_rem = n_rem + 1
+        }
+        si = si + 1
+    }
+    let ret = list_new()
+    push(ret, out) push(ret, n_add) push(ret, n_rem)
+    return ret
+}
+
+fn _dlt_policy_section(policy_reg, manifest, source_names) {
+    let out = "\n#DELTA-POLICY v1\n"
+    let n_add = 0
+    let n_rem = 0
+    let allow = bake_manifest_policy_allowlist(manifest)
+    if policy_reg != 0 {
+        let pols = policy_registry_policies(policy_reg)
+        let i = 0
+        while i < len(pols) {
+            let p = pols[i]
+            let nm = policy_name(p)
+            if _dlt_list_has(allow, nm) == 1 {
+                out = out + "+POLICY " + nm
+                          + " " + policy_action_to_name(policy_action(p)) + "\n"
+                let preds = policy_predicates(p)
+                let j = 0
+                while j < len(preds) {
+                    let pr = preds[j]
+                    let op = pr[POL_PRED_OP]
+                    let arg = pr[POL_PRED_ARG]
+                    let arg_str = ""
+                    if policy_op_arg_is_int(op) == 1 {
+                        arg_str = int_to_str(arg)
+                    } else {
+                        if op == POL_OP_ANY { arg_str = "0" }
+                        else                { arg_str = arg }
+                    }
+                    out = out + "PRED " + policy_op_to_name(op)
+                              + " " + arg_str + "\n"
+                    j = j + 1
+                }
+                n_add = n_add + 1
+            }
+            i = i + 1
+        }
+    }
+    let si = 0
+    while si < len(source_names) {
+        let snm = source_names[si]
+        let keep = 0
+        if _dlt_list_has(allow, snm) == 1 {
+            if policy_reg != 0 {
+                let all = policy_registry_names(policy_reg)
+                if _dlt_list_has(all, snm) == 1 { keep = 1 }
+            }
+        }
+        if keep == 0 {
+            out = out + "-POLICY " + snm + "\n"
+            n_rem = n_rem + 1
+        }
+        si = si + 1
+    }
+    let ret = list_new()
+    push(ret, out) push(ret, n_add) push(ret, n_rem)
+    return ret
+}
+
+// Sign prefix + wrap in signature footer (same shape as bake's
+// _bake_sign_and_wrap). Returns [ok, full_bundle, err].
+fn _dlt_sign_and_wrap(prefix, seed, pk) {
+    let ret = list_new()
+    let prefix_bytes = _dlt_bytes_from_string(prefix)
+    let sig_r = bundle_pkg_sign(prefix_bytes, seed, pk)
+    if sig_r[0] == 0 {
+        push(ret, 0) push(ret, "") push(ret, "sign failed") return ret
+    }
+    let sig = sig_r[1]
+    let sig_hex = bundle_hex_encode(sig)
+    let pk_hex  = bundle_hex_encode(pk)
+    let full = prefix + "#SIGNATURE " + sig_hex + "\n"
+                     + "#SIGNER-PK "  + pk_hex  + "\n"
+    push(ret, 1) push(ret, full) push(ret, "")
+    return ret
+}
+
+// Public entry point. Returns a DeltaResult record.
+//
+// Arguments:
+//   source_bundle_bytes  : the previous bundle (or delta) the child
+//                          is currently at. SHA-256 goes into the
+//                          delta's parent-bundle-fingerprint header.
+//                          Pass "" for a first delta with no parent
+//                          (parent-fp will be the SHA-256 of the empty
+//                          string, which callers may match against).
+//   manifest             : parsed BakeManifest; filters KG atoms +
+//                          allows/denies capsules/skills/etc.
+//   kgreg / capreg /
+//   skill_reg / policy_reg
+//                        : live mother registries (any may be 0).
+//   since_wm, until_wm   : watermark window (int, `(since, until]`).
+//   signer_seed / _pk    : Ed25519 key material (32 bytes each).
+//   now                  : logical-clock moment stamped on the delta.
+fn delta_compute(source_bundle_bytes, manifest, kgreg, capreg, skill_reg, policy_reg, since_wm, until_wm, signer_seed, signer_pk, now) {
+    if manifest == 0 { return _dlt_result_err("manifest is null") }
+    let v = bake_manifest_validate(manifest)
+    if v[0] == 0 { return _dlt_result_err(v[1]) }
+    if signer_seed == 0 { return _dlt_result_err("signer seed is null") }
+    if signer_pk   == 0 { return _dlt_result_err("signer public key is null") }
+    if len(signer_seed) != 32 { return _dlt_result_err("signer seed must be 32 bytes") }
+    if len(signer_pk)   != 32 { return _dlt_result_err("signer pk must be 32 bytes") }
+    if until_wm < since_wm { return _dlt_result_err("until_wm must be >= since_wm") }
+
+    // Parent-fingerprint = SHA-256 of the source bundle text.
+    let parent_fp = _dlt_hex_sha256(source_bundle_bytes)
+
+    let prefix = _dlt_header(parent_fp, since_wm, until_wm, bake_manifest_name(manifest), now)
+
+    // KG section.
+    let kg_r = _dlt_kg_section(kgreg, manifest, capreg, since_wm, until_wm)
+    prefix = prefix + kg_r[0]
+    let n_atoms_add = kg_r[1]
+    let n_atoms_ret = kg_r[2]
+
+    // Baselines from source bundle for capsule / skill / pattern / policy.
+    let src_cap_names   = _dlt_bundle_capsule_names(source_bundle_bytes)
+    let src_skill_names = _dlt_bundle_skill_names(source_bundle_bytes)
+    let src_pat_names   = _dlt_bundle_pattern_names(source_bundle_bytes)
+    let src_pol_names   = _dlt_bundle_policy_names(source_bundle_bytes)
+
+    let cap_r = _dlt_capsule_section(capreg, manifest, src_cap_names)
+    prefix = prefix + cap_r[0]
+    let n_caps_add = cap_r[1]
+    let n_caps_rem = cap_r[2]
+
+    let sk_r = _dlt_skill_section(skill_reg, manifest, src_skill_names)
+    prefix = prefix + sk_r[0]
+    let n_skills_add = sk_r[1]
+    let n_skills_rem = sk_r[2]
+
+    let pat_r = _dlt_pattern_section(manifest, src_pat_names)
+    prefix = prefix + pat_r[0]
+    let n_pats_add = pat_r[1]
+    let n_pats_rem = pat_r[2]
+
+    let pol_r = _dlt_policy_section(policy_reg, manifest, src_pol_names)
+    prefix = prefix + pol_r[0]
+    let n_pols_add = pol_r[1]
+    let n_pols_rem = pol_r[2]
+
+    let sw = _dlt_sign_and_wrap(prefix, signer_seed, signer_pk)
+    if sw[0] == 0 { return _dlt_result_err(sw[2]) }
+    // Delta-fingerprint = SHA-256 of the FINAL signed delta bytes. This
+    // is what the child stores as its current-bundle-fingerprint after a
+    // successful apply; the NEXT delta's parent-bundle-fingerprint header
+    // must match this. Chain check is `SHA256(source_bytes) == stored`.
+    let final_delta = sw[1]
+    let self_fp = _dlt_hex_sha256(final_delta)
+
+    let r = list_new()
+    push(r, 1)                      // OK
+    push(r, final_delta)            // DELTA text
+    push(r, "")                     // ERR
+    push(r, parent_fp)              // PARENT_FP
+    push(r, self_fp)                // DELTA_FP
+    push(r, since_wm)               // SINCE
+    push(r, until_wm)               // UNTIL
+    push(r, n_atoms_add)            // ATOMS_ADDED
+    push(r, n_atoms_ret)            // ATOMS_RETRACTED
+    push(r, n_caps_add)             // CAPSULES_ADDED
+    push(r, n_caps_rem)             // CAPSULES_REMOVED
+    push(r, n_skills_add)           // SKILLS_ADDED
+    push(r, n_skills_rem)           // SKILLS_REMOVED
+    push(r, n_pats_add)             // PATTERNS_ADDED
+    push(r, n_pats_rem)             // PATTERNS_REMOVED
+    push(r, n_pols_add)             // POLICIES_ADDED
+    push(r, n_pols_rem)             // POLICIES_REMOVED
+    push(r, 64)                     // SIG_LEN
+    return r
+}
+
+// ---- delta parse (used by verify + apply) -------------------------------
+
+// Extract a `#<key> <value>` header line's value; "" if absent.
+fn _dlt_header_value(text, key) {
+    let marker = "#" + key + " "
+    let idx = find_bytes(text, marker)
+    if idx < 0 { return "" }
+    if idx > 0 { if char_at(text, idx - 1) != 10 { return "" } }
+    let start = idx + len(marker)
+    let n = len(text)
+    let i = start
+    while i < n {
+        if char_at(text, i) == 10 {
+            return substr(text, start, i - start)
+        }
+        i = i + 1
+    }
+    return substr(text, start, n - start)
+}
+
+// Locate the "#SIGNATURE " line (starts a line). Returns byte position
+// or -1.
+fn _dlt_find_sig_line(text) {
+    return bake_verify_bundle_shim(text)
+}
+
+// Small shim to reuse bake's private line-finder. bake.nova exports
+// `bake_verify_bundle` which uses `_bake_find_sig_line_start` internally;
+// we replicate the same logic here so update_delta.nova stays independent.
+fn bake_verify_bundle_shim(text) {
+    let n = len(text)
+    let line_start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(text, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(text, line_start, i - line_start)
+            if len(line) >= 11 {
+                let head = substr(line, 0, 11)
+                if str_eq_bytes(head, "#SIGNATURE ") == 1 {
+                    return line_start
+                }
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- delta_verify -------------------------------------------------------
+//
+// Returns [ok, err]. ok=1 on all checks green; ok=0 + human-readable err
+// on any failure. `expected_parent_fingerprint` = "" bypasses the chain
+// check (used for the very first delta whose parent is the bake bundle
+// and where the caller has already resolved that separately).
+
+fn delta_verify(delta_text, expected_parent_fingerprint, anchor_pk) {
+    let ret = list_new()
+    if len(delta_text) == 0 {
+        push(ret, 0) push(ret, "empty delta") return ret
+    }
+    // Header banner.
+    let nl = find_char(delta_text, 10)
+    if nl < 0 { push(ret, 0) push(ret, "no newline in delta") return ret }
+    let banner = substr(delta_text, 0, nl)
+    if str_eq_bytes(banner, "#CROSSENGIN-KG-DELTA v1") == 0 {
+        push(ret, 0) push(ret, "bad banner") return ret
+    }
+    // Parent-fingerprint chain check (skip when "" passed by caller).
+    let hdr_parent = _dlt_header_value(delta_text, "parent-bundle-fingerprint")
+    if len(hdr_parent) == 0 {
+        push(ret, 0) push(ret, "missing parent-bundle-fingerprint") return ret
+    }
+    if len(expected_parent_fingerprint) > 0 {
+        if str_eq_bytes(hdr_parent, expected_parent_fingerprint) == 0 {
+            push(ret, 0) push(ret,
+              "parent-bundle-fingerprint mismatch: chain broken") return ret
+        }
+    }
+    // Signature check.
+    let sig_pos = _dlt_find_sig_line(delta_text)
+    if sig_pos < 0 {
+        push(ret, 0) push(ret, "no #SIGNATURE line in delta") return ret
+    }
+    let prefix = substr(delta_text, 0, sig_pos)
+    let rest = substr(delta_text, sig_pos, len(delta_text) - sig_pos)
+    let rest_nl = find_char(rest, 10)
+    if rest_nl <= 11 {
+        push(ret, 0) push(ret, "malformed #SIGNATURE line") return ret
+    }
+    let sig_hex = substr(rest, 11, rest_nl - 11)
+    let sig_bytes = bundle_hex_decode(sig_hex)
+    if sig_bytes == 0 {
+        push(ret, 0) push(ret, "signature hex malformed") return ret
+    }
+    let prefix_bytes = _dlt_bytes_from_string(prefix)
+    let v = bundle_pkg_verify(prefix_bytes, sig_bytes, anchor_pk)
+    if v[0] == 1 { push(ret, 1) push(ret, "") return ret }
+    push(ret, 0) push(ret, "delta signature refused: " + v[1])
+    return ret
+}
+
+// ---- delta_apply --------------------------------------------------------
+//
+// Parse the delta content section by section; apply each directive to
+// its target registry. Returns a DeltaResult record whose `delta` field
+// holds the delta-fingerprint (so callers can persist it as the new
+// current-bundle-fingerprint for chaining).
+//
+// Application is BEST-EFFORT-BUT-SAFE: unknown directives are skipped
+// (matches the R73/74/75 lenient parser), duplicate additions are
+// idempotent (last-write-wins on same name), and retractions of absent
+// atoms/capsules/... are treated as no-ops (recorded in the retraction
+// log so a chained delta correctly reports them).
+
+fn _dlt_apply_kg(body, kgreg, now) {
+    let counts = list_new()
+    push(counts, 0)     // added
+    push(counts, 0)     // retracted
+    if kgreg == 0 { return counts }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) >= 6 {
+                let head6 = substr(line, 0, 6)
+                if str_eq_bytes(head6, "+ATOM ") == 1 {
+                    // Format: "+ATOM <kg_label> <atom_id> <kind> <license> <source_tier> <label>"
+                    let rest = substr(line, 6, len(line) - 6)
+                    let parts = split_char(rest, 32)
+                    if len(parts) >= 6 {
+                        let kg_lbl = parts[0]
+                        let kind   = str_to_int(parts[2])
+                        let lic    = str_to_int(parts[3])
+                        let tier   = str_to_int(parts[4])
+                        // Label may contain spaces; join parts[5..].
+                        let label = parts[5]
+                        let pi = 6
+                        while pi < len(parts) {
+                            label = label + " " + parts[pi]
+                            pi = pi + 1
+                        }
+                        // Look up (or spawn) the KG by label.
+                        let kg = kg_find(kgreg, kg_lbl)
+                        if kg == 0 { kg = kg_spawn(kgreg, kg_lbl) }
+                        // Idempotency: if the KG already has an atom by
+                        // this label, treat this as a no-op (chained
+                        // deltas may re-apply).
+                        if kg_find_atom(kg, label) == 0 {
+                            let a = kg_add_atom(kg, kind, label, now)
+                            atom_set_license(a, lic)
+                            atom_set_source(a, tier, PROV_NONE)
+                            counts[0] = counts[0] + 1
+                            kg_mutation_watermark_tick()
+                        }
+                    }
+                } else { if str_eq_bytes(head6, "-ATOM ") == 1 {
+                    let rest = substr(line, 6, len(line) - 6)
+                    let sp = find_char(rest, 32)
+                    if sp > 0 {
+                        let kg_lbl = substr(rest, 0, sp)
+                        let alabel = substr(rest, sp + 1, len(rest) - sp - 1)
+                        let kg = kg_find(kgreg, kg_lbl)
+                        if kg != 0 {
+                            let a = kg_find_atom(kg, alabel)
+                            if a != 0 {
+                                let aid = atom_id(a)
+                                kg_remove_atom(kg, aid)
+                                counts[1] = counts[1] + 1
+                            }
+                        }
+                        // Always log retraction so chained deltas
+                        // reflect it, even if the local KG didn't
+                        // have the atom (idempotent no-op).
+                        kg_log_retraction(kg_lbl, alabel)
+                    }
+                } }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return counts
+}
+
+fn _dlt_apply_capsule(body, capreg, now) {
+    let counts = list_new()
+    push(counts, 0) push(counts, 0)
+    if capreg == 0 { return counts }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let cur = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) >= 9 {
+                let head = substr(line, 0, 9)
+                if str_eq_bytes(head, "+CAPSULE ") == 1 {
+                    let rest = substr(line, 9, len(line) - 9)
+                    let parts = split_char(rest, 32)
+                    if len(parts) >= 4 {
+                        let name = parts[0]
+                        let ver  = parts[1]
+                        let lic  = parts[2]
+                        let inst = str_to_int(parts[3])
+                        // Overwrite: remove any existing by name, add.
+                        capreg_remove(capreg, name)
+                        let c = capsule_new(name, ver, "", lic)
+                        capreg_register(capreg, c)
+                        if inst == 1 { capreg_install(capreg, name, now) }
+                        cur = c
+                        counts[0] = counts[0] + 1
+                    }
+                } else { if len(line) >= 9 {
+                    let head9 = substr(line, 0, 9)
+                    if str_eq_bytes(head9, "-CAPSULE ") == 1 {
+                        let name = substr(line, 9, len(line) - 9)
+                        if capreg_remove(capreg, name) == 1 {
+                            counts[1] = counts[1] + 1
+                        }
+                        cur = 0
+                    } else { if len(line) >= 5 {
+                        let head5 = substr(line, 0, 5)
+                        if str_eq_bytes(head5, "DESC ") == 1 {
+                            if cur != 0 {
+                                let desc = substr(line, 5, len(line) - 5)
+                                list_set(cur, CAP_DESCRIPTION, desc)
+                            }
+                        }
+                    } }
+                } }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return counts
+}
+
+fn _dlt_apply_skill(body, skill_reg) {
+    let counts = list_new()
+    push(counts, 0) push(counts, 0)
+    if skill_reg == 0 { return counts }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let cur = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) >= 7 {
+                let head = substr(line, 0, 7)
+                if str_eq_bytes(head, "+SKILL ") == 1 {
+                    let rest = substr(line, 7, len(line) - 7)
+                    let parts = split_char(rest, 32)
+                    if len(parts) >= 5 {
+                        let name = parts[0]
+                        let ver  = parts[1]
+                        let pid  = str_to_int(parts[2])
+                        let tier = str_to_int(parts[3])
+                        let m = skill_manifest_new(name, ver, "", pid)
+                        skill_manifest_set_tier(m, tier)
+                        skill_registry_register(skill_reg, m)
+                        cur = m
+                        counts[0] = counts[0] + 1
+                    }
+                } else { if str_eq_bytes(head, "-SKILL ") == 1 {
+                    let name = substr(line, 7, len(line) - 7)
+                    // skill_registry currently has no remove-by-name in
+                    // scope of this module; count the intent so the
+                    // caller has an accurate no-op number. (Skills stay
+                    // resident until the child re-boots; a follow-up
+                    // could add skill_registry_remove.)
+                    counts[1] = counts[1] + 1
+                    cur = 0
+                } else { if len(line) >= 5 {
+                    let head5 = substr(line, 0, 5)
+                    if str_eq_bytes(head5, "DESC ") == 1 {
+                        if cur != 0 {
+                            let desc = substr(line, 5, len(line) - 5)
+                            list_set(cur, SM_DESCRIPTION, desc)
+                        }
+                    }
+                } } }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return counts
+}
+
+fn _dlt_apply_pattern(body) {
+    let counts = list_new()
+    push(counts, 0) push(counts, 0)
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let cur_cap = 0
+    let cur_pat_open = 0
+    let cur_pat_conf = 0
+    let cur_pat_src  = ""
+    let cur_pat_trig = list_new()
+    let cur_pat_guid = ""
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) >= 17 {
+                let head = substr(line, 0, 17)
+                if str_eq_bytes(head, "+PATTERN_CAPSULE ") == 1 {
+                    // Flush prior open pattern.
+                    if cur_pat_open == 1 { if cur_cap != 0 {
+                        if len(cur_pat_trig) > 0 { if len(cur_pat_guid) > 0 {
+                            pcapsule_add(cur_cap,
+                                pcap_new(cur_pat_trig, cur_pat_guid,
+                                          cur_pat_src, cur_pat_conf))
+                        } }
+                    } }
+                    cur_pat_open = 0
+                    cur_pat_trig = list_new()
+                    cur_pat_guid = ""
+                    if cur_cap != 0 {
+                        pattern_registry_register(cur_cap)
+                        counts[0] = counts[0] + 1
+                    }
+                    let rest = substr(line, 17, len(line) - 17)
+                    let sp = find_char(rest, 32)
+                    if sp > 0 {
+                        let name = substr(rest, 0, sp)
+                        let ver  = substr(rest, sp + 1, len(rest) - sp - 1)
+                        cur_cap = pcapsule_new(name, ver)
+                    }
+                }
+            }
+            if len(line) >= 17 {
+                let head17 = substr(line, 0, 17)
+                if str_eq_bytes(head17, "-PATTERN_CAPSULE ") == 1 {
+                    // Register an empty replacement to effectively "clear"
+                    // the pattern registry entry by same name (last-write-wins).
+                    let name = substr(line, 17, len(line) - 17)
+                    let empty = pcapsule_new(name, "0")
+                    pattern_registry_register(empty)
+                    counts[1] = counts[1] + 1
+                    // Skip flushing anything that was in cur_cap for the
+                    // "-" line -- retract handles its own registration.
+                }
+            }
+            if len(line) >= 8 {
+                let head8 = substr(line, 0, 8)
+                if str_eq_bytes(head8, "PATTERN ") == 1 {
+                    if cur_cap != 0 {
+                        if cur_pat_open == 1 {
+                            if len(cur_pat_trig) > 0 { if len(cur_pat_guid) > 0 {
+                                pcapsule_add(cur_cap,
+                                    pcap_new(cur_pat_trig, cur_pat_guid,
+                                              cur_pat_src, cur_pat_conf))
+                            } }
+                        }
+                        cur_pat_trig = list_new()
+                        cur_pat_guid = ""
+                        let rest = substr(line, 8, len(line) - 8)
+                        let sp = find_char(rest, 32)
+                        if sp > 0 {
+                            let conf_s = substr(rest, 0, sp)
+                            let src    = substr(rest, sp + 1, len(rest) - sp - 1)
+                            cur_pat_open = 1
+                            cur_pat_conf = str_to_int(conf_s)
+                            cur_pat_src  = src
+                        }
+                    }
+                }
+            }
+            if len(line) >= 8 {
+                let head8b = substr(line, 0, 8)
+                if str_eq_bytes(head8b, "TRIGGER ") == 1 {
+                    if cur_pat_open == 1 {
+                        let rest = substr(line, 8, len(line) - 8)
+                        cur_pat_trig = split_char(rest, 32)
+                    }
+                }
+            }
+            if len(line) >= 9 {
+                let head9 = substr(line, 0, 9)
+                if str_eq_bytes(head9, "GUIDANCE ") == 1 {
+                    if cur_pat_open == 1 {
+                        cur_pat_guid = substr(line, 9, len(line) - 9)
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    // Final flush.
+    if cur_pat_open == 1 { if cur_cap != 0 {
+        if len(cur_pat_trig) > 0 { if len(cur_pat_guid) > 0 {
+            pcapsule_add(cur_cap,
+                pcap_new(cur_pat_trig, cur_pat_guid,
+                          cur_pat_src, cur_pat_conf))
+        } }
+    } }
+    if cur_cap != 0 {
+        pattern_registry_register(cur_cap)
+        counts[0] = counts[0] + 1
+    }
+    return counts
+}
+
+fn _dlt_apply_policy(body, policy_reg) {
+    let counts = list_new()
+    push(counts, 0) push(counts, 0)
+    if policy_reg == 0 { return counts }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let cur = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) >= 8 {
+                let head = substr(line, 0, 8)
+                if str_eq_bytes(head, "+POLICY ") == 1 {
+                    if cur != 0 {
+                        policy_registry_register(policy_reg, cur)
+                        cur = 0
+                    }
+                    let rest = substr(line, 8, len(line) - 8)
+                    let sp = find_char(rest, 32)
+                    if sp > 0 {
+                        let name = substr(rest, 0, sp)
+                        let act_name = substr(rest, sp + 1, len(rest) - sp - 1)
+                        let act = policy_action_from_name(act_name)
+                        if act >= 0 { if len(name) > 0 {
+                            // Remove any prior by name.
+                            policy_registry_remove_by_name(policy_reg, name)
+                            cur = policy_new(name, act)
+                            counts[0] = counts[0] + 1
+                        } }
+                    }
+                }
+            }
+            if len(line) >= 8 {
+                let head8 = substr(line, 0, 8)
+                if str_eq_bytes(head8, "-POLICY ") == 1 {
+                    if cur != 0 {
+                        policy_registry_register(policy_reg, cur)
+                        cur = 0
+                    }
+                    let name = substr(line, 8, len(line) - 8)
+                    let removed = policy_registry_remove_by_name(policy_reg, name)
+                    if removed > 0 { counts[1] = counts[1] + 1 }
+                    else            { counts[1] = counts[1] + 1 }
+                    // Count the intent even on a no-op (matches KG
+                    // retract semantics: idempotent).
+                }
+            }
+            if len(line) >= 5 {
+                let head5 = substr(line, 0, 5)
+                if str_eq_bytes(head5, "PRED ") == 1 {
+                    if cur != 0 {
+                        let rest = substr(line, 5, len(line) - 5)
+                        let sp = find_char(rest, 32)
+                        if sp > 0 {
+                            let op_name = substr(rest, 0, sp)
+                            let arg_str = substr(rest, sp + 1, len(rest) - sp - 1)
+                            let op = policy_op_from_name(op_name)
+                            if op >= 0 {
+                                let arg = arg_str
+                                if policy_op_arg_is_int(op) == 1 {
+                                    arg = str_to_int(arg_str)
+                                } else {
+                                    if op == POL_OP_ANY { arg = 0 }
+                                }
+                                push(cur[POL_PREDICATES], pol_pred(op, arg))
+                            }
+                        }
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if cur != 0 { policy_registry_register(policy_reg, cur) }
+    return counts
+}
+
+fn delta_apply(delta_text, kgreg, capreg, skill_reg, policy_reg, now) {
+    let r = _dlt_result_err("")
+    if len(delta_text) == 0 {
+        return _dlt_result_err("empty delta")
+    }
+    // Grab header values for the result record.
+    let hdr_parent = _dlt_header_value(delta_text, "parent-bundle-fingerprint")
+    let hdr_since  = str_to_int(_dlt_header_value(delta_text, "since-watermark"))
+    let hdr_until  = str_to_int(_dlt_header_value(delta_text, "until-watermark"))
+    // Delta-fingerprint = SHA-256 of the whole delta text (matches what
+    // delta_compute reports); the child stores this as its new
+    // current-bundle-fingerprint after a successful apply.
+    let self_fp = _dlt_hex_sha256(delta_text)
+    list_set(r, DR_PARENT_FP, hdr_parent)
+    list_set(r, DR_DELTA_FP,  self_fp)
+    list_set(r, DR_SINCE,     hdr_since)
+    list_set(r, DR_UNTIL,     hdr_until)
+
+    // Section by section. Each returns [added, removed].
+    let kg_body = _dlt_bundle_section(delta_text, "#DELTA-KG v1")
+    if len(kg_body) > 0 {
+        let c = _dlt_apply_kg(kg_body, kgreg, now)
+        list_set(r, DR_ATOMS_ADDED,     c[0])
+        list_set(r, DR_ATOMS_RETRACTED, c[1])
+    }
+    let cap_body = _dlt_bundle_section(delta_text, "#DELTA-CAPSULE v1")
+    if len(cap_body) > 0 {
+        let c = _dlt_apply_capsule(cap_body, capreg, now)
+        list_set(r, DR_CAPSULES_ADDED,   c[0])
+        list_set(r, DR_CAPSULES_REMOVED, c[1])
+    }
+    let sk_body = _dlt_bundle_section(delta_text, "#DELTA-SKILL v1")
+    if len(sk_body) > 0 {
+        let c = _dlt_apply_skill(sk_body, skill_reg)
+        list_set(r, DR_SKILLS_ADDED,   c[0])
+        list_set(r, DR_SKILLS_REMOVED, c[1])
+    }
+    let pat_body = _dlt_bundle_section(delta_text, "#DELTA-PATTERN v1")
+    if len(pat_body) > 0 {
+        let c = _dlt_apply_pattern(pat_body)
+        list_set(r, DR_PATTERNS_ADDED,   c[0])
+        list_set(r, DR_PATTERNS_REMOVED, c[1])
+    }
+    let pol_body = _dlt_bundle_section(delta_text, "#DELTA-POLICY v1")
+    if len(pol_body) > 0 {
+        let c = _dlt_apply_policy(pol_body, policy_reg)
+        list_set(r, DR_POLICIES_ADDED,   c[0])
+        list_set(r, DR_POLICIES_REMOVED, c[1])
+    }
+    list_set(r, DR_OK, 1)
+    list_set(r, DR_ERR, "")
+    return r
+}
