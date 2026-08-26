@@ -5172,6 +5172,137 @@ new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
   `bench/latency_v1/baseline.json` is an empty stub with a
   documented capture procedure.
 
+### 7.58 Agent production surface (R109 -- Phase J)
+
+R109 delivers ADR-0210 tier 2: **pattern-driven agents composed at
+runtime from `capsule + pattern + skill` triples**. Where a skill is a
+single reference implementation (ADR-0103), an *agent* is a persisted
+composition -- named, installable, snapshot-surviving -- that the wire
+can dispatch by name. Tier 1 (in-tree reference skills) already ships.
+Tier 3 (signed AgentPackage over the wire) is a follow-up round; R109
+ships unsigned `agent.compose` because the composition primitives all
+exist already (skill_registry, pattern_registry_match_scoped, persona
+style-pin, ownership overlay, snapshot).
+
+**AgentManifest** (line-oriented text, `AGENT-MANIFEST v1` banner):
+
+    AGENT-MANIFEST v1
+    NAME triage
+    VERSION 1.0.0
+    DESCRIPTION front-line triage agent
+    CAPSULE_DEP solar_system         # repeatable
+    SKILL_DEP research               # repeatable, in-order
+    SKILL_DEP echo
+    PATTERN_DEP debug_common         # repeatable; empty = all patterns
+    STYLE_PIN terse                  # optional style capsule override
+    PERSONA_PIN alice                # optional; else caller's persona
+    MIN_CONFIDENCE_MILLI 400
+    LICENSE Apache-2.0
+
+Validation: NAME + VERSION required; SKILL_DEP list non-empty. Parser
+lenient (blank lines + `#` comments + leading whitespace tolerated);
+unknown directives cause a refusal citing the head token.
+
+**Four wire verbs** (verb count 45 -> 49):
+
+* `agent.compose` -- cap `admin:agent-compose`. Args: `manifest_text`
+  or `manifest_path`. Parses, validates, registers into the session's
+  agent registry, installs (verifies each SKILL_DEP is a registered
+  skill), auto-stamps ownership under `OWN_KIND_AGENT` (mirrors R70).
+  Response: `{name, version, installed, capsule_deps, skill_deps,
+  pattern_deps, owner}`.
+* `agent.list` -- cap `nl:agent:list` (reader-tier). R107 cursor
+  pagination (`limit` / `after` / `next_after`). Filters by the
+  composed `visibility_visible(overlay, pref_reg, OWN_KIND_AGENT,
+  ...)` so a per-user preference disable hides an agent too.
+* `agent.run` -- cap `nl:agent:run` (skill_user-tier). Args: `name`,
+  `input`. Dispatch pipeline: (1) lookup + installed / retired check,
+  (2) visibility gate, (3) **per-skill CAP_SKILL_RUN check** (the
+  escalation-prevention gate; refusal names the specific skill the
+  caller can't reach), (4) resolve persona + clone with STYLE_PIN
+  override, (5) for each SKILL_DEP in order: filter patterns through
+  PATTERN_DEP allowlist, dispatch through `skill_run_scoped`; first
+  non-refused result at or above `AM_MIN_CONFIDENCE_MILLI` wins.
+  Response: `{ok, agent_name, agent_version, refusal_reason,
+  skill_used, attribution, proposal, pattern_matches, skill_traces}`.
+* `agent.retire` -- cap `admin:agent-retire`. Marks the agent retired;
+  entry preserved for audit. Retired agents cannot be re-installed
+  and subsequent `agent.run` refuses cleanly with "agent retired".
+
+**Composed-vs-shipped skill distinction.** A shipped skill (echo /
+research / coding_helper) is an in-tree reference implementation with
+its own manifest, policy function, and cap. A composed agent is a
+runtime record naming an existing shipped skill (or several) plus
+optional pattern + style pins. Agents never introduce new POLICY_ID
+values -- they compose what's already registered. This keeps the R109
+surface small and audit-transparent.
+
+**Per-skill cap-check (no escalation).** `capability_can_invoke_skill`
+in `src/sandbox/capability.nova` runs BEFORE dispatch and refuses if
+the caller lacks CAP_SKILL_RUN for any listed SKILL_DEP. The refusal
+message names the specific skill so operators can diagnose. Prevents
+an admin composing an agent whose `skill_deps` include a restricted
+skill and using it to give a reader-role caller execution access to
+that skill through the composition side door.
+
+**Style-pin persona clone mechanic.** When STYLE_PIN is set, `agent_run`
+calls `persona_clone(base_persona)` (new shallow-clone helper in
+`src/persona/persona.nova`) and mutates the CLONE's PER_STYLE_CAPSULE
+before threading it into the per-run supervisor. The caller's stored
+persona is never mutated -- so a shared persona registry stays clean
+across agent invocations that pin different styles.
+
+**Snapshot section** (`#AGENT v1` in `src/sandbox/session_snapshot.nova`):
+
+    #AGENT v1
+    AGENT triage 1.0.0 1 0             # <name> <version> <installed> <retired>
+    DESC front-line triage agent
+    CAPSULE_DEP solar_system
+    SKILL_DEP research
+    SKILL_DEP echo
+    PATTERN_DEP debug_common
+    STYLE_PIN terse
+    MIN_CONFIDENCE_MILLI 400
+    LICENSE Apache-2.0
+
+`session_snapshot_serialize_ex` and `session_snapshot_apply_ex` gained
+an `agent_reg` parameter AFTER `preference_reg` (per R101 convention).
+Every existing caller passes `0` for backward compatibility. New
+`SNAPRES_AGENTS` result slot + `snap_result_agents` accessor.
+
+**Bake pipeline.** `BakeManifest` gains `ALLOW_AGENT <name>` (repeatable);
+`bake_child_ex` accepts an `agent_reg` and emits the filtered
+`#AGENT v1` section via `_snap_agent_section_scoped`. Child-mode
+daemon threads `rpc_ctx_agent_reg(ctx)` into `session_snapshot_apply_ex`
+at boot so bundle-borne agents register into the child's live agent
+registry.
+
+**Child-mode allowance.** `agent.compose` + `agent.retire` are on the
+disable table (admin ops belong on the mother); `agent.run` +
+`agent.list` stay enabled -- reading and dispatching a baked agent is
+exactly what a child daemon exists for.
+
+**Files added / modified.** NEW: `src/agents/agent_manifest.nova`,
+`src/agents/agent_registry.nova`, `src/agents/agent_run.nova` (plural
+`agents/` to avoid collision with existing `src/agent/` coordination-
+loop modules -- disambiguates "composed agent" from "loop / coordination
+agent"). MODIFIED: `src/sandbox/{ownership,capability,session_snapshot}.nova`,
+`src/persona/persona.nova` (added `persona_clone`), `src/nl/rpc_verbs.nova`,
+`examples/crossengin_rpc_daemon.nova`, `src/factory/{bake,bake_manifest,child_mode}.nova`,
+`src/preference/user_preference.nova`, every caller of the `_ex`
+snapshot APIs.
+
+**Tests.** Five new unit-test files (`test_agent_manifest` 86 checks;
+`test_agent_registry` 51; `test_agent_run` 31; `test_agent_verbs` 56;
+`test_agent_snapshot` 40 -- 264 new checks total). Extended:
+`test_wire_pagination` (agent.list cursor pagination),
+`test_nl_rpc_verbs` (verb count 45 -> 49), `test_ownership`
+(`OWN_KIND_AGENT` + `test_agent_wrappers`), `test_user_preference`
+(`PREF_KIND_AGENT` + wildcard), `test_child_mode` (allow/deny),
+`test_bake_manifest` (ALLOW_AGENT directive), `test_session_snapshot`
+(#AGENT round-trip smoke), `test_admin_bake_child_verb` (verb count
+follow-up).
+
 **Phase I COMPLETE (R107 + R108 shipped).**
 - **R107 ✅** — Wire cursor pagination for list verbs (see §7.56).
   Uniform `limit` + `after` args plus a `next_after` field folded
@@ -5186,13 +5317,19 @@ new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
   work. 115 checks in `test_wire_pagination`; eight existing tests
   extended with `next_after` assertions.
 
-**Phase I COMPLETE (R107 + R108). Front-of-queue after Phase C / D / E / I / R103 / R105 / R106:**
+**Phase J COMPLETE (R109 shipped). Front-of-queue after Phase C / D / E / I / J / R103 / R105 / R106:**
 - **R104** — `self.override` (finishes Phase F; deferred by user).
-- **Phase J** — agent production surface
-  (`agent.compose/list/run/retire`).
-- **Backlog debt** — admin bulk-ops, DTLS-12 red-fix (72/450 checks
-  red since R86), bignum_256 / field25519 consolidation,
-  LICENSES/ folder authoring.
+- **R110** — CLI polish (`--json` mode, readline history, ANSI color).
+- **R111** — QPS per-holder (flip per-TOKEN → per-holder rate limiting).
+- **R112** — Signed AgentPackage (ADR-0210 tier 3; reuses
+  `bundle_pkg_sign` from R99 to sign a composed AgentManifest for
+  distribution).
+- **R113** — Admin bulk-ops (`admin.list_tokens`,
+  `admin.expire_all_before`, `admin.revoke_all_by_holder`).
+- **Backlog debt** — DTLS-12 red-fix (72/450 checks red since R86),
+  bignum_256 / field25519 consolidation, LICENSES/ folder authoring,
+  two pre-existing test reds (`test_child_mode_wire` verb-count,
+  `test_self_gaps_verb` names cap).
 - **Multimodal follow-ons** — per-keyframe image fanout in
   `video_records`, whisper/vosk STT wire-up on a permissive host,
   OCR wire-up once `png_decode.nova`'s DEFLATE dynamic-Huffman path

@@ -1,0 +1,335 @@
+// CrossEngin agents: agent.run dispatch runtime (R109, ADR-0210 tier 2).
+//
+// The composed-agent equivalent of skill_run: given an installed
+// agent name + a perception + all the live registries, dispatch the
+// first non-refused ProposalResult whose confidence >= min_confidence,
+// with pattern-scoped context + per-run persona style-pin.
+//
+// The 5 ADR-0103 hard guarantees pass through end-to-end because
+// dispatch delegates to skill_run_scoped for every constituent skill;
+// this module adds no new guarantee gaps.
+//
+// Escalation-prevention: agent.run refuses cleanly if the caller lacks
+// CAP_SKILL_RUN for ANY constituent skill_dep. The refusal names the
+// specific skill so operators can debug (see capability_can_invoke_skill
+// in src/sandbox/capability.nova).
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/agents/agent_manifest.nova + agent_registry.nova
+//   src/skills/skill_manifest.nova + skill_registry.nova +
+//     skill_supervisor.nova + skill_dispatch.nova
+//   src/persona/persona.nova + persona_registry.nova
+//   src/sandbox/ownership.nova + capability.nova
+//   src/capsules/pattern_capsule.nova
+//   src/parts/meta/meta_observer.nova
+//   src/util/str_safe.nova.
+
+import "./agent_manifest.nova"
+import "./agent_registry.nova"
+import "../skills/skill_manifest.nova"
+import "../skills/skill_registry.nova"
+import "../skills/skill_supervisor.nova"
+import "../skills/skill_dispatch.nova"
+import "../persona/persona.nova"
+import "../persona/persona_registry.nova"
+import "../capsules/pattern_capsule.nova"
+import "../sandbox/ownership.nova"
+import "../sandbox/capability.nova"
+import "../parts/meta/meta_observer.nova"
+import "../kg/atom_store.nova"
+import "../preference/user_preference.nova"
+import "../util/str_safe.nova"
+
+// ---- AgentRunResult slot layout ----------------------------------------
+//
+// A per-invocation record wrapping the winning (or last-tried)
+// ProposalResult with the pattern-match tail + attribution + per-skill
+// trace so wire callers can render a coherent response.
+//
+// This is a NEW shape distinct from ExecutionResult (which is nl.ask-
+// specific). agent.run exposes the ProposalResult directly via
+// _rpc_encode_proposal, plus the extra AR_* fields as top-level keys.
+
+let AR_R_OK               = 0    // 0/1 -- 1 = at least one skill produced
+                                 //           a non-refused proposal at/above
+                                 //           threshold
+let AR_R_AGENT_NAME       = 1    // string
+let AR_R_AGENT_VERSION    = 2    // string
+let AR_R_REFUSAL_REASON   = 3    // "" iff AR_R_OK==1
+let AR_R_PROPOSAL         = 4    // winning ProposalResult (0 if none)
+let AR_R_SKILL_USED       = 5    // name of the skill that produced the
+                                 // winning proposal, "" if refused
+let AR_R_SKILL_TRACES     = 6    // list<[skill_name, ok, confidence,
+                                 //        refusal_reason]>
+let AR_R_PATTERN_MATCHES  = 7    // list<Pattern> from pattern_deps filter
+                                 // (informational; not bound to skill body)
+let AR_R_ATTRIBUTION_TAG  = 8    // "src:agent:<name>:v<version>"
+let AR_R_SLOTS            = 9
+
+fn _ar_new(name, version, attribution) {
+    let r = list_new()
+    push(r, 0)                        // OK
+    push(r, name)                     // AGENT_NAME
+    push(r, version)                  // AGENT_VERSION
+    push(r, "")                       // REFUSAL_REASON
+    push(r, 0)                        // PROPOSAL
+    push(r, "")                       // SKILL_USED
+    push(r, list_new())               // SKILL_TRACES
+    push(r, list_new())               // PATTERN_MATCHES
+    push(r, attribution)              // ATTRIBUTION_TAG
+    return r
+}
+
+fn ar_result_ok(r)              { return r[AR_R_OK] }
+fn ar_result_agent_name(r)      { return r[AR_R_AGENT_NAME] }
+fn ar_result_agent_version(r)   { return r[AR_R_AGENT_VERSION] }
+fn ar_result_refusal_reason(r)  { return r[AR_R_REFUSAL_REASON] }
+fn ar_result_proposal(r)        { return r[AR_R_PROPOSAL] }
+fn ar_result_skill_used(r)      { return r[AR_R_SKILL_USED] }
+fn ar_result_skill_traces(r)    { return r[AR_R_SKILL_TRACES] }
+fn ar_result_pattern_matches(r) { return r[AR_R_PATTERN_MATCHES] }
+fn ar_result_attribution(r)     { return r[AR_R_ATTRIBUTION_TAG] }
+
+fn _ar_refuse(r, reason) {
+    list_set(r, AR_R_OK, 0)
+    list_set(r, AR_R_REFUSAL_REASON, reason)
+}
+
+fn _ar_succeed(r, pr, skill_name) {
+    list_set(r, AR_R_OK, 1)
+    list_set(r, AR_R_PROPOSAL, pr)
+    list_set(r, AR_R_SKILL_USED, skill_name)
+}
+
+// Push a per-skill trace row. `refusal` is "" on a clean run.
+fn _ar_push_trace(r, skill_name, ok, confidence, refusal) {
+    let t = list_new()
+    push(t, skill_name)
+    push(t, ok)
+    push(t, confidence)
+    push(t, refusal)
+    push(r[AR_R_SKILL_TRACES], t)
+}
+
+// ---- perception tokenization -------------------------------------------
+//
+// Pattern matching wants a token list. For the R109 scalar-perception
+// path we split on ASCII whitespace + treat unrecognized chars as
+// separators. Structured perceptions (research skill's [topic, kg_names])
+// use their topic slot as the token source. Matches R98's shape from
+// the classifier tokenizer -- keep loose so an operator's query works
+// without special escaping.
+
+fn _ar_is_word_char(c) {
+    if c >= 48 { if c <= 57  { return 1 } }        // 0-9
+    if c >= 65 { if c <= 90  { return 1 } }        // A-Z
+    if c >= 97 { if c <= 122 { return 1 } }        // a-z
+    if c == 95 { return 1 }                         // _
+    if c == 45 { return 1 }                         // -
+    return 0
+}
+
+// Lowercase ASCII letter, otherwise return unchanged.
+fn _ar_lower(c) {
+    if c >= 65 { if c <= 90 { return c + 32 } }
+    return c
+}
+
+fn _ar_tokenize(text) {
+    let out = list_new()
+    if len(text) == 0 { return out }
+    let n = len(text)
+    let cur = ""
+    let i = 0
+    while i < n {
+        let c = char_at(text, i)
+        if _ar_is_word_char(c) == 1 {
+            cur = cur + chr(_ar_lower(c))
+        } else {
+            if len(cur) > 0 { push(out, cur) cur = "" }
+        }
+        i = i + 1
+    }
+    if len(cur) > 0 { push(out, cur) }
+    return out
+}
+
+// If perception is a list, use element 0 as the topic source (matches
+// the research skill's [topic, kg_names] shape). Else treat as string.
+fn _ar_perception_topic(perception) {
+    if perception == 0 { return "" }
+    // NOVA lists are not strings; the exec model has no is_list builtin.
+    // We rely on the caller: agent.run always receives a string arg from
+    // the wire; the research adapter wraps it before skill_run. Keep
+    // this helper for future callers that pass through structured
+    // perceptions verbatim.
+    return perception
+}
+
+// ---- main entry point --------------------------------------------------
+//
+// agent_run_scoped(agent_reg, name, perception, kg_reg, capreg,
+//                  persona_reg, skill_reg, mo, overlay, pref_reg,
+//                  cap_reg, presented_token, holder, gaps_reg, topic, now)
+//   -> AgentRunResult
+//
+// Signature is long because dispatch touches every registry. Absent
+// registries (0) are tolerated where the underlying primitive
+// tolerates them (matches skill_run_scoped's shape).
+//
+//   cap_reg + presented_token: OPTIONAL escalation-prevention gate.
+//     When both wired, the per-skill CAP_SKILL_RUN check runs BEFORE
+//     dispatch. When either is 0, the check is skipped (test-friendly;
+//     wire callers set both when the sandbox is on).
+fn agent_run_scoped(agent_reg, name, perception, kg_reg, capreg,
+                    persona_reg, skill_reg, mo, overlay, pref_reg,
+                    cap_reg, presented_token, holder, gaps_reg,
+                    topic, now) {
+    // Lookup + terminal-state checks first so we can emit a coherent
+    // AgentRunResult even for "unknown agent" refusals.
+    let e = agent_registry_lookup(agent_reg, name)
+    if e == 0 {
+        let rr = _ar_new(name, "", "src:agent:" + name)
+        _ar_refuse(rr, "unknown agent: " + name)
+        return rr
+    }
+    let manifest = e[AR_MANIFEST]
+    let version = agent_manifest_version(manifest)
+    let attribution = agent_manifest_attribution(manifest)
+    let r = _ar_new(name, version, attribution)
+    if e[AR_RETIRED_AT] > 0 {
+        _ar_refuse(r, "agent retired: " + name)
+        return r
+    }
+    if e[AR_INSTALLED] == 0 {
+        _ar_refuse(r, "agent not installed: " + name)
+        return r
+    }
+    // Visibility check.
+    if visibility_visible(overlay, pref_reg, OWN_KIND_AGENT, name, holder) == 0 {
+        let who = holder
+        if len(who) == 0 { who = "anonymous" }
+        _ar_refuse(r, "agent not accessible to " + who + ": " + name)
+        return r
+    }
+    // Escalation-prevention: for every SKILL_DEP, the caller MUST hold
+    // CAP_SKILL_RUN. Only checked when a cap registry + token are wired
+    // (sandbox on).
+    let skill_deps = agent_manifest_skill_deps(manifest)
+    if cap_reg != 0 { if len(presented_token) > 0 {
+        let t = capability_registry_lookup(cap_reg, presented_token)
+        let ci = 0
+        while ci < len(skill_deps) {
+            let sdep = skill_deps[ci]
+            if capability_can_invoke_skill(t, sdep) == 0 {
+                _ar_refuse(r, "caller lacks cap for skill '"
+                              + sdep + "': " + CAP_SKILL_RUN)
+                return r
+            }
+            ci = ci + 1
+        }
+    } }
+    // Resolve persona: PERSONA_PIN overrides, else caller's user_id-
+    // scoped persona, else null (skill_run_scoped tolerates persona=0).
+    let base_persona = 0
+    let pin_uid = agent_manifest_persona_pin(manifest)
+    if len(pin_uid) > 0 {
+        if persona_reg != 0 {
+            base_persona = persona_registry_lookup(persona_reg, pin_uid)
+        }
+    } else {
+        if persona_reg != 0 { if len(holder) > 0 {
+            base_persona = persona_registry_lookup(persona_reg, holder)
+        } }
+    }
+    // Style-pin: clone the persona so the caller's stored style capsule
+    // isn't mutated by the agent.
+    let run_persona = base_persona
+    let style_pin = agent_manifest_style_pin(manifest)
+    if base_persona != 0 { if len(style_pin) > 0 {
+        run_persona = persona_clone(base_persona)
+        persona_set_style_capsule(run_persona, style_pin, now)
+    } }
+    // Pattern matches (informational): tokenize perception + filter.
+    // Only run when PATTERN_DEPS non-empty (empty = don't consult).
+    let pattern_deps = agent_manifest_pattern_deps(manifest)
+    if len(pattern_deps) > 0 {
+        let tokens = _ar_tokenize(topic)
+        let matches = pattern_registry_match_scoped(tokens, pattern_deps,
+                                                      overlay, holder)
+        list_set(r, AR_R_PATTERN_MATCHES, matches)
+    }
+    // Iterate SKILL_DEPS. For each: reuse the registry supervisor if
+    // installed; else register + install just-in-time (defensive --
+    // agent_registry_install verifies the skills exist as manifests).
+    let min_conf = agent_manifest_min_confidence_milli(manifest)
+    let last_refusal = ""
+    let si = 0
+    while si < len(skill_deps) {
+        let skname = skill_deps[si]
+        let sup = 0
+        if skill_reg != 0 {
+            sup = skill_registry_supervisor(skill_reg, skname)
+            if sup == 0 {
+                // Try to build a supervisor on the fly. Persona is the
+                // per-run cloned one; kg/cap/mo passed through.
+                let sm = skill_registry_manifest(skill_reg, skname)
+                if sm != 0 {
+                    sup = skill_supervisor_new(sm, kg_reg, capreg,
+                                                run_persona, 0, mo, now)
+                    skill_registry_install(skill_reg, skname, capreg,
+                                            sup, now)
+                }
+            }
+        }
+        if sup == 0 {
+            let msg = "skill not installed: " + skname
+            _ar_push_trace(r, skname, 0, 0, msg)
+            last_refusal = msg
+        } else {
+            let pr = skill_run_scoped(sup, perception, overlay, holder,
+                                        gaps_reg, topic)
+            let ok = skill_pr_ok(pr)
+            let conf = skill_pr_confidence(pr)
+            let reason = skill_pr_refusal_reason(pr)
+            _ar_push_trace(r, skname, ok, conf, reason)
+            if ok == 1 { if conf >= min_conf {
+                _ar_succeed(r, pr, skname)
+                // Attribute every touched atom under the AGENT's tag too
+                // (skill_run already tagged under the skill's tag; this
+                // adds the composed layer so an observer sees which
+                // agent surfaced the answer).
+                if mo != 0 {
+                    let atoms = skill_pr_atoms(pr)
+                    let ai = 0
+                    while ai < len(atoms) {
+                        let a = atoms[ai]
+                        if a != 0 {
+                            mo_attribute(mo, attribution, atom_id(a))
+                        }
+                        ai = ai + 1
+                    }
+                }
+                return r
+            } }
+            if len(reason) > 0 {
+                last_refusal = reason
+            } else {
+                if ok == 1 {
+                    last_refusal = "confidence " + int_to_str(conf)
+                        + "/1000 below agent threshold "
+                        + int_to_str(min_conf)
+                }
+            }
+        }
+        si = si + 1
+    }
+    // All skills refused or below-threshold.
+    let final_reason = last_refusal
+    if len(final_reason) == 0 {
+        final_reason = "no skill produced an acceptable proposal"
+    }
+    _ar_refuse(r, "agent '" + name + "' refused: " + final_reason)
+    return r
+}

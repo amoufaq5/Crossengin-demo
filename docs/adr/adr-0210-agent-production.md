@@ -2,13 +2,29 @@
 
 ## Status
 
-Proposed. Names three tiers of agent production and how the daemon
-composes them: in-tree reference skills (tier 1), runtime-composed
-pattern-driven agents (tier 2), and user-authored agents delivered
-as signed capsules (tier 3). Adds four wire verbs
-(`agent.compose`, `agent.list`, `agent.run`, `agent.retire`), all of
-which route through existing primitives — the R47 skill supervisor,
-the ADR-0107 pattern registry, the R54.2 signed-install path, the
+**Tier 1 shipped (R47 -- ADR-0103); tier 2 shipped R109 -- Phase J;
+tier 3 (signed AgentPackage over the wire) deferred to a follow-up
+round.**
+
+Tier-2 delivery: `src/agents/agent_manifest.nova`,
+`src/agents/agent_registry.nova`, `src/agents/agent_run.nova`, four
+wire verbs (`agent.compose`, `agent.list`, `agent.run`,
+`agent.retire`), `OWN_KIND_AGENT` overlay kind, `PREF_KIND_AGENT`
+preference kind, `#AGENT v1` snapshot section, `ALLOW_AGENT`
+BakeManifest directive, per-skill CAP_SKILL_RUN escalation-prevention
+gate, and style-pin persona clone. See docs/SHIP_AS_APP.md §7.58.
+
+Tier 3 (`agent.install <signed-package>`) is planned as R112 --
+reuses `bundle_pkg_sign` from R99 to sign a composed AgentManifest for
+distribution, verifies against `trust_anchor_registry` at install.
+
+Names three tiers of agent production and how the daemon composes
+them: in-tree reference skills (tier 1), runtime-composed pattern-
+driven agents (tier 2), and user-authored agents delivered as signed
+capsules (tier 3). Adds four wire verbs (`agent.compose`,
+`agent.list`, `agent.run`, `agent.retire`), all of which route through
+existing primitives — the R47 skill supervisor, the ADR-0107 pattern
+registry, the R54.2 signed-install path (deferred to tier 3), the
 meta-observer attribution stamp, and the review-gated ingest for any
 atoms the agent produces.
 

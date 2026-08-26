@@ -89,6 +89,9 @@ import "../ingest/pattern_pack.nova"
 // ../agent/ingestion_agent.nova. The R66 ingest.file verb uses
 // cerec_parse_text + jsonr_parse_text from those modules directly.
 import "../capsules/pattern_capsule.nova"
+import "../agents/agent_manifest.nova"
+import "../agents/agent_registry.nova"
+import "../agents/agent_run.nova"
 import "../parts/meta/meta_observer.nova"
 // R103 (Phase F part 1): gaps register + self.* introspection.
 import "../parts/meta/gaps_register.nova"
@@ -188,7 +191,14 @@ let RCTX_CURRENT_BUNDLE_FINGERPRINT = 20
 // cleanly with "no gaps register configured". A daemon that wants
 // introspection allocates via gaps_register_new at boot.
 let RCTX_GAPS_REG     = 21
-let RCTX_SLOTS        = 22
+// R109 (Phase J, ADR-0210 tier 2): composed pattern-driven agent
+// registry. When 0 (default) the agent.* verbs refuse cleanly with
+// "no agent registry in context"; when a daemon wires a fresh
+// registry via rpc_ctx_set_agent_reg at boot, agent.compose /
+// agent.list / agent.run / agent.retire operate on it and the
+// #AGENT v1 snapshot section round-trips.
+let RCTX_AGENT_REG    = 22
+let RCTX_SLOTS        = 23
 
 fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
                ingest_agent, review_queue, now) {
@@ -215,6 +225,7 @@ fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
     push(c, 0)          // PREFERENCE_REG (R101; 0 = no soft filter)
     push(c, "")         // CURRENT_BUNDLE_FINGERPRINT (R102; "" = first-apply)
     push(c, 0)          // GAPS_REG (R103; 0 = self.gaps refuses cleanly)
+    push(c, 0)          // AGENT_REG (R109; 0 = agent.* refuse cleanly)
     return c
 }
 
@@ -312,6 +323,17 @@ fn rpc_ctx_set_gaps_reg(ctx, reg) {
     return ctx
 }
 fn rpc_ctx_gaps_reg(c) { return c[RCTX_GAPS_REG] }
+
+// R109 (Phase J, ADR-0210 tier 2): agent registry mutator + accessor.
+// Daemon boot allocates a fresh AgentRegistry via agent_registry_new
+// and calls rpc_ctx_set_agent_reg. Absent this, the four agent.*
+// verbs refuse cleanly with "no agent registry in context" -- matches
+// the seam pattern R101 established for preference_reg.
+fn rpc_ctx_set_agent_reg(ctx, reg) {
+    list_set(ctx, RCTX_AGENT_REG, reg)
+    return ctx
+}
+fn rpc_ctx_agent_reg(c) { return c[RCTX_AGENT_REG] }
 
 // R102 mutator + accessor for the current-bundle-fingerprint chain
 // state. Boot code (crossengin_rpc_daemon.nova in child mode) seeds
@@ -3287,6 +3309,7 @@ fn _rpc_verb_session_save(args, ctx) {
         rpc_ctx_ingest_policy(ctx),
         rpc_ctx_skill_reg(ctx),
         rpc_ctx_preference_reg(ctx),
+        rpc_ctx_agent_reg(ctx),
         include_secrets,
         rpc_ctx_now(ctx))
     let path = _rpc_snap_path(ctx, name)
@@ -3369,6 +3392,7 @@ fn _rpc_verb_session_load(args, ctx) {
         rpc_ctx_ingest_policy(ctx),
         rpc_ctx_skill_reg(ctx),
         rpc_ctx_preference_reg(ctx),
+        rpc_ctx_agent_reg(ctx),
         rpc_ctx_now(ctx))
     if snap_result_ok(r) == 0 {
         return _rpc_err("snapshot apply failed: " + snap_result_err(r))
@@ -3599,13 +3623,14 @@ fn _rpc_verb_admin_bake_child(args, ctx) {
                        + "-" + bake_manifest_version(manifest) + ".bundle"
     }
     // ---- 5. Bake ----
-    let br = bake_child(manifest,
+    let br = bake_child_ex(manifest,
         rpc_ctx_persona_reg(ctx),
         rpc_ctx_kgreg(ctx),
         rpc_ctx_capreg(ctx),
         rpc_ctx_skill_reg(ctx),
         rpc_ctx_ingest_policy(ctx),
         rpc_ctx_ownership(ctx),
+        rpc_ctx_agent_reg(ctx),
         seed, pk, rpc_ctx_now(ctx))
     if bake_result_ok(br) == 0 {
         return _rpc_err("bake_child failed: " + bake_result_err(br))
@@ -4360,6 +4385,244 @@ fn _rpc_verb_self_gaps(args, ctx) {
     return _rpc_ok(_rpc_obj(kv))
 }
 
+// ---- R109 (Phase J): agent production surface verbs --------------------
+//
+// The composed-agent equivalent of the skill.* verb family. Four
+// verbs: agent.compose (create), agent.list (enumerate visible),
+// agent.run (dispatch), agent.retire (mark terminal).
+//
+// Caps: admin:agent-compose + admin:agent-retire for the mutators;
+// nl:agent:list (reader-tier) + nl:agent:run (skill_user-tier) for
+// the reads / dispatch.
+//
+// agent.run runs a per-skill CAP_SKILL_RUN check BEFORE dispatch so a
+// composed agent can NEVER escalate the caller's raw skill privileges.
+// The refusal names the specific skill that's out-of-reach.
+
+// agent.compose -- parse an AgentManifest text, validate, register,
+// auto-install (defer install_skill_reg check to agent_registry_install),
+// and auto-stamp ownership under OWN_KIND_AGENT.
+//   args: {manifest_text} (inline) OR {manifest_path}
+//   returns: {name, version, installed, capsule_deps, skill_deps,
+//             pattern_deps, owner}
+//   cap: admin:agent-compose
+fn _rpc_verb_agent_compose(args, ctx) {
+    let areg = rpc_ctx_agent_reg(ctx)
+    if areg == 0 { return _rpc_err("no agent registry in context") }
+    let text = ""
+    if _rpc_has_arg(args, "manifest_text") == 1 {
+        text = _rpc_arg(args, "manifest_text")
+    } else {
+        if _rpc_has_arg(args, "manifest_path") == 1 {
+            let path = _rpc_arg(args, "manifest_path")
+            text = _rpc_snap_read(path)
+            if len(text) == 0 {
+                return _rpc_err("manifest file unreadable or empty: " + path)
+            }
+        } else {
+            return _rpc_err("missing arg: manifest_text or manifest_path")
+        }
+    }
+    let pr = agent_manifest_parse(text)
+    if pr[0] == 0 { return _rpc_err("manifest parse failed: " + pr[2]) }
+    let m = pr[1]
+    let vr = agent_manifest_validate(m)
+    if vr[0] == 0 { return _rpc_err("manifest invalid: " + vr[1]) }
+    let name = agent_manifest_name(m)
+    // Auto-stamp ownership BEFORE registration so a cross-holder attempt
+    // to re-use an existing owned name refuses cleanly.
+    let overlay = rpc_ctx_ownership(ctx)
+    let holder = rpc_ctx_presented_holder(ctx)
+    let auth = _rpc_assign_ownership(overlay, OWN_KIND_AGENT, name, holder)
+    if auth[0] == 0 { return _rpc_err(auth[1]) }
+    let owner = auth[1]
+    // Register + install (install verifies skill deps exist).
+    if agent_registry_register(areg, m) == 0 {
+        return _rpc_err("agent already registered: " + name)
+    }
+    let code = agent_registry_install(areg, name,
+                                        rpc_ctx_skill_reg(ctx),
+                                        rpc_ctx_now(ctx))
+    // Non-fatal install-failure surfaced in the response.
+    let installed = agent_registry_is_installed(areg, name)
+    let cap_frags = list_new()
+    let cdeps = agent_manifest_capsule_deps(m)
+    let ci = 0
+    while ci < len(cdeps) { push(cap_frags, _rpc_str(cdeps[ci])) ci = ci + 1 }
+    let sk_frags = list_new()
+    let sdeps = agent_manifest_skill_deps(m)
+    let si = 0
+    while si < len(sdeps) { push(sk_frags, _rpc_str(sdeps[si])) si = si + 1 }
+    let pat_frags = list_new()
+    let pdeps = agent_manifest_pattern_deps(m)
+    let pi = 0
+    while pi < len(pdeps) { push(pat_frags, _rpc_str(pdeps[pi])) pi = pi + 1 }
+    let kv = list_new()
+    let a = list_new() push(a, "name")         push(a, _rpc_str(name))                          push(kv, a)
+    let b = list_new() push(b, "version")      push(b, _rpc_str(agent_manifest_version(m)))     push(kv, b)
+    let c = list_new() push(c, "installed")    push(c, _rpc_bool(installed))                    push(kv, c)
+    let d = list_new() push(d, "install_code") push(d, _rpc_str(agent_install_name(code)))      push(kv, d)
+    let e = list_new() push(e, "capsule_deps") push(e, _rpc_arr(cap_frags))                     push(kv, e)
+    let f = list_new() push(f, "skill_deps")   push(f, _rpc_arr(sk_frags))                      push(kv, f)
+    let g = list_new() push(g, "pattern_deps") push(g, _rpc_arr(pat_frags))                     push(kv, g)
+    let h = list_new() push(h, "owner")        push(h, _rpc_str(owner))                         push(kv, h)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
+// agent.list -- enumerate visible agents.
+//   args: {limit, after} (R107 pagination)
+//   returns: {agents: [{name, version, installed, retired}, ...], next_after}
+//   cap: nl:agent:list
+fn _rpc_verb_agent_list(args, ctx) {
+    let areg = rpc_ctx_agent_reg(ctx)
+    if areg == 0 { return _rpc_err("no agent registry in context") }
+    let overlay = rpc_ctx_ownership(ctx)
+    let pref_reg = rpc_ctx_preference_reg(ctx)
+    let holder = rpc_ctx_presented_holder(ctx)
+    let names = agent_registry_names(areg)
+    let ids = list_new()
+    let frags_all = list_new()
+    let i = 0
+    while i < len(names) {
+        let name = names[i]
+        if visibility_visible(overlay, pref_reg, OWN_KIND_AGENT,
+                               name, holder) == 1 {
+            let m = agent_registry_manifest(areg, name)
+            let installed = agent_registry_is_installed(areg, name)
+            let retired = agent_registry_is_retired(areg, name)
+            let kv = list_new()
+            let a = list_new() push(a, "name")      push(a, _rpc_str(name))                    push(kv, a)
+            if m != 0 {
+                let b = list_new() push(b, "version")     push(b, _rpc_str(agent_manifest_version(m)))     push(kv, b)
+                let c = list_new() push(c, "description") push(c, _rpc_str(agent_manifest_description(m))) push(kv, c)
+            }
+            let d = list_new() push(d, "installed") push(d, _rpc_bool(installed))   push(kv, d)
+            let e = list_new() push(e, "retired")   push(e, _rpc_bool(retired))     push(kv, e)
+            push(ids, name)
+            push(frags_all, _rpc_obj(kv))
+        }
+        i = i + 1
+    }
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(ids, after)
+    let out_frags = list_new()
+    let last_id = ""
+    let ei = start
+    while ei < len(frags_all) {
+        if len(out_frags) >= limit { ei = len(frags_all) }
+        else {
+            push(out_frags, frags_all[ei])
+            last_id = ids[ei]
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + len(out_frags) < len(frags_all) { next_after = last_id }
+    let kv = list_new()
+    let a = list_new() push(a, "agents") push(a, _rpc_arr(out_frags)) push(kv, a)
+    push(kv, _rpc_encode_next_after(next_after))
+    return _rpc_ok(_rpc_obj(kv))
+}
+
+// agent.run -- dispatch a composed agent.
+//   args: {name, input}
+//   returns: {ok, agent_name, agent_version, refusal_reason, skill_used,
+//             attribution, proposal, pattern_matches, skill_traces}
+//   cap: nl:agent:run  (plus per-skill CAP_SKILL_RUN, enforced by
+//                        agent_run_scoped's escalation-prevention gate)
+fn _rpc_verb_agent_run(args, ctx) {
+    let areg = rpc_ctx_agent_reg(ctx)
+    if areg == 0 { return _rpc_err("no agent registry in context") }
+    if _rpc_has_arg(args, "name") == 0 {
+        return _rpc_err("missing arg: name")
+    }
+    let name = _rpc_arg(args, "name")
+    let input = _rpc_arg(args, "input")
+    let holder = rpc_ctx_presented_holder(ctx)
+    // Dispatch through agent_run_scoped. Threads every registry so
+    // pattern-consulting skills honor R63 ownership + R101 preference,
+    // and gaps_register captures skill refusals.
+    let r = agent_run_scoped(areg, name, input,
+                              rpc_ctx_kgreg(ctx),
+                              rpc_ctx_capreg(ctx),
+                              rpc_ctx_persona_reg(ctx),
+                              rpc_ctx_skill_reg(ctx),
+                              rpc_ctx_mo(ctx),
+                              rpc_ctx_ownership(ctx),
+                              rpc_ctx_preference_reg(ctx),
+                              rpc_ctx_cap_reg(ctx),
+                              rpc_ctx_presented_token(ctx),
+                              holder,
+                              rpc_ctx_gaps_reg(ctx),
+                              input,
+                              rpc_ctx_now(ctx))
+    let traces = ar_result_skill_traces(r)
+    let trace_frags = list_new()
+    let ti = 0
+    while ti < len(traces) {
+        let t = traces[ti]
+        let tk = list_new()
+        let a = list_new() push(a, "skill")          push(a, _rpc_str(t[0]))     push(tk, a)
+        let b = list_new() push(b, "ok")             push(b, _rpc_bool(t[1]))    push(tk, b)
+        let c = list_new() push(c, "confidence")     push(c, _rpc_int(t[2]))     push(tk, c)
+        let d = list_new() push(d, "refusal_reason") push(d, _rpc_str(t[3]))     push(tk, d)
+        push(trace_frags, _rpc_obj(tk))
+        ti = ti + 1
+    }
+    // Pattern matches: emit just the source_tag + confidence (patterns
+    // may embed multi-line guidance the client can fetch via
+    // pattern.list). Kept compact for wire efficiency.
+    let patm = ar_result_pattern_matches(r)
+    let pat_frags = list_new()
+    let pi = 0
+    while pi < len(patm) {
+        let p = patm[pi]
+        let pk = list_new()
+        let a = list_new() push(a, "source_tag") push(a, _rpc_str(pcap_source_tag(p))) push(pk, a)
+        let b = list_new() push(b, "confidence") push(b, _rpc_int(pcap_confidence(p))) push(pk, b)
+        push(pat_frags, _rpc_obj(pk))
+        pi = pi + 1
+    }
+    let kv = list_new()
+    let a = list_new() push(a, "ok")              push(a, _rpc_bool(ar_result_ok(r)))              push(kv, a)
+    let b = list_new() push(b, "agent_name")      push(b, _rpc_str(ar_result_agent_name(r)))       push(kv, b)
+    let c = list_new() push(c, "agent_version")   push(c, _rpc_str(ar_result_agent_version(r)))    push(kv, c)
+    let d = list_new() push(d, "refusal_reason")  push(d, _rpc_str(ar_result_refusal_reason(r)))   push(kv, d)
+    let e = list_new() push(e, "skill_used")      push(e, _rpc_str(ar_result_skill_used(r)))       push(kv, e)
+    let f = list_new() push(f, "attribution")     push(f, _rpc_str(ar_result_attribution(r)))      push(kv, f)
+    let g = list_new() push(g, "proposal")        push(g, _rpc_encode_proposal(ar_result_proposal(r))) push(kv, g)
+    let h = list_new() push(h, "skill_traces")    push(h, _rpc_arr(trace_frags))                   push(kv, h)
+    let i = list_new() push(i, "pattern_matches") push(i, _rpc_arr(pat_frags))                     push(kv, i)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
+// agent.retire -- mark an agent retired. Entry stays in the registry
+// for audit; agent.run refuses cleanly with "agent retired". Not
+// reversible today (a future round can add agent.reinstate).
+//   args: {name}
+//   returns: {name, retired}
+//   cap: admin:agent-retire
+fn _rpc_verb_agent_retire(args, ctx) {
+    let areg = rpc_ctx_agent_reg(ctx)
+    if areg == 0 { return _rpc_err("no agent registry in context") }
+    if _rpc_has_arg(args, "name") == 0 {
+        return _rpc_err("missing arg: name")
+    }
+    let name = _rpc_arg(args, "name")
+    if agent_registry_lookup(areg, name) == 0 {
+        return _rpc_err("unknown agent: " + name)
+    }
+    let applied = agent_registry_retire(areg, name, rpc_ctx_now(ctx))
+    let retired = agent_registry_is_retired(areg, name)
+    let kv = list_new()
+    let a = list_new() push(a, "name")    push(a, _rpc_str(name))       push(kv, a)
+    let b = list_new() push(b, "retired") push(b, _rpc_bool(retired))   push(kv, b)
+    let c = list_new() push(c, "applied") push(c, _rpc_bool(applied))   push(kv, c)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
 // ---- top-level dispatch --------------------------------------------------
 
 // The one entry point a daemon calls. `verb` is the verb name string;
@@ -4438,6 +4701,11 @@ fn rpc_dispatch(verb, args, ctx) {
     // R103 (Phase F part 1) self-introspection verbs.
     if str_eq_bytes(verb, "self.confidence")   == 1 { return _rpc_verb_self_confidence(args, ctx) }
     if str_eq_bytes(verb, "self.gaps")         == 1 { return _rpc_verb_self_gaps(args, ctx) }
+    // R109 (Phase J) agent production surface.
+    if str_eq_bytes(verb, "agent.compose")     == 1 { return _rpc_verb_agent_compose(args, ctx) }
+    if str_eq_bytes(verb, "agent.list")        == 1 { return _rpc_verb_agent_list(args, ctx) }
+    if str_eq_bytes(verb, "agent.run")         == 1 { return _rpc_verb_agent_run(args, ctx) }
+    if str_eq_bytes(verb, "agent.retire")      == 1 { return _rpc_verb_agent_retire(args, ctx) }
     return _rpc_err("unknown verb: " + verb)
 }
 
@@ -4492,5 +4760,10 @@ fn rpc_verb_names() {
     // R103 Phase F part 1.
     push(v, "self.confidence")
     push(v, "self.gaps")
+    // R109 Phase J agent production surface.
+    push(v, "agent.compose")
+    push(v, "agent.list")
+    push(v, "agent.run")
+    push(v, "agent.retire")
     return v
 }
