@@ -5418,6 +5418,107 @@ registry at boot via `ovw_new()`), plus verb-count follow-ups in
 `test_nl_rpc_verbs`, `test_child_mode_wire`, `test_admin_bake_child_verb`,
 and `test_wire_pagination` (self.override.list case added).
 
+### 7.60 CLI polish — `--json` / history / color (R112 — Phase K part 3)
+
+R112 layers three operator-facing quality-of-life additions onto the
+interactive `crossengin-chat` REPL without touching the substrate.
+Each is opt-in and each is off by default so a vanilla
+`./bin/crossengin-chat` run stays bit-identical to R111.
+
+**`--json` mode.** One line of JSON per exchange, no banner, no
+`agent>` / `perceive(...)` chatter, no ANSI. Shape:
+
+    {"ok": 0|1, "input": "<raw>", "reply": "<text>",
+     "reasoning": "<router-trace>", "refusal_reason": "<sentinel>"}
+
+`ok=0` fires when the reply starts with `[refused]` (constitutional
+input veto) or `[silent]` (empty governed-speak); `refusal_reason` is
+`"refused"` / `"silent"` / `""` respectively. Suitable for scripted
+piping:
+
+    echo "what is water" | crossengin-chat  # (with --json enabled)
+
+emits one JSON line and exits (or continues turn-by-turn if stdin
+stays open). NOVA doesn't currently surface argv from user code, so
+in this container `--json` rides `CROSSENGIN_JSON_MODE=1`; the
+pure parser in `src/util/chat_cli_polish.nova::_chat_parse_args` is
+already argv-shaped for the day NOVA grows an argv seam.
+
+**History file.** Every non-empty, non-admin line the operator types
+is appended to `~/.crossengin_history`. Overrides:
+
+    CROSSENGIN_HISTORY_FILE=/path/to/hist  # override the default path
+    CROSSENGIN_HISTORY=0                   # disable entirely
+
+The file is opened `O_WRONLY | O_CREAT | O_APPEND` at boot with mode
+`0600` (owner-only; prompt logs may contain sensitive text). On
+startup, if the file exceeds **10 000 lines** it's rewritten to the
+last 10 000 (constant `CCP_HISTORY_DEFAULT_CAP`). Write-only for
+today — arrow-key recall waits on a readline seam in NOVA; the file
+is useful right now for `grep`ing past sessions:
+
+    grep "photosynthesis" ~/.crossengin_history
+
+If `HOME` is unset AND no override is provided, history is disabled
+with a one-line warning (suppressed in `--json` mode).
+
+**ANSI color.** Opt-in via `CROSSENGIN_COLOR=1`. The industry-
+standard `NO_COLOR` env var (any non-empty value) vetoes it, and
+`--json` mode forces it off (JSON must never carry ANSI escapes).
+Default OFF so non-TTY pipes and CI logs stay clean without the
+operator having to know about `NO_COLOR`.
+
+Colour palette (`chr(27)` wrapped, `\033[<code>m<text>\033[0m`):
+
+| Site           | SGR code | Rationale                     |
+|----------------|----------|-------------------------------|
+| `> ` prompt    | `36` (cyan)   | operator input line      |
+| `agent> `      | `36` (cyan)   | normal reply header      |
+| `agent> `      | `33` (yellow) | `[refused]` / `[silent]` |
+| meta lines     | `2;37` (dim gray) | perceive / reasoning / learned / promoted |
+
+Reply *content* is left uncoloured so copy-paste from the terminal
+stays clean.
+
+**Contract.** `NO_COLOR` beats `CROSSENGIN_COLOR=1`; JSON mode beats
+both. Any of the three switches turned off restores the R111
+behaviour for that facet.
+
+**Files.** NEW: `src/util/chat_cli_polish.nova` (parse-args + env
+fold-in, history split/trim/join, color gating + wrap via `chr(27)`
+frame, one-line JSON exchange encoder + `_ccp_json_escape` copy;
+pure helpers, no globals). NEW: `tests/unit/test_chat_cli_polish.nova`
+(69 checks across flag parsing, env fold-in, history trim/round-trip,
+color gating, wrap frame, JSON encoding, and path resolution).
+MODIFIED: `examples/crossengin_chat.nova` (import + four module-level
+state vars + boot-time env resolution + history open-with-trim +
+JSON-mode banner suppression + `> ` prompt wrap + per-input history
+append + JSON-vs-human output branching at the reply site + color-
+wrapped meta lines).
+
+**Manual smoke.**
+
+    # JSON mode:
+    CROSSENGIN_JSON_MODE=1 echo "hi" | ./bin/crossengin-chat
+    # -> {"ok":1,"input":"hi","reply":"...","reasoning":"...","refusal_reason":""}
+
+    # Color:
+    CROSSENGIN_COLOR=1 ./bin/crossengin-chat   # cyan prompt + agent header
+
+    # No color veto:
+    NO_COLOR=1 CROSSENGIN_COLOR=1 ./bin/crossengin-chat   # plain
+
+    # History disabled:
+    CROSSENGIN_HISTORY=0 ./bin/crossengin-chat
+
+    # Custom history path:
+    CROSSENGIN_HISTORY_FILE=/tmp/hist.txt ./bin/crossengin-chat
+
+The `test_chat_cli_polish` suite covers the pure-function branches
+in isolation; the wire integration is a manual smoke because the
+chat REPL doesn't run headlessly in this container (a pre-existing
+sandbox limitation unrelated to R112).
+
 **Phase I COMPLETE (R107 + R108 shipped).**
 - **R107 ✅** — Wire cursor pagination for list verbs (see §7.56).
   Uniform `limit` + `after` args plus a `next_after` field folded
@@ -5433,10 +5534,22 @@ and `test_wire_pagination` (self.override.list case added).
   extended with `next_after` assertions.
 
 **Phase J COMPLETE (R109 shipped). Phase K in progress (R110 + R111
-shipped). Front-of-queue after Phase C / D / E / I / J / K / R103 /
-R105 / R106 / R111:**
-- **R112** — CLI polish (`--json` mode, readline history, ANSI color;
-  was numbered R110 in earlier roadmap drafts).
++ R112 shipped). Front-of-queue after Phase C / D / E / I / J / K /
+R103 / R105 / R106 / R111 / R112:**
+- **R112 ✅** — CLI polish (see §7.60): `--json` mode
+  (`CROSSENGIN_JSON_MODE=1`; one JSON line per exchange, banner /
+  prompt / meta all suppressed, `ok` + `refusal_reason` folded in);
+  history file (`~/.crossengin_history` by default, override via
+  `CROSSENGIN_HISTORY_FILE`, disable via `CROSSENGIN_HISTORY=0`,
+  auto-trimmed to 10 000 lines at startup; write-only for now);
+  ANSI color (`CROSSENGIN_COLOR=1` opt-in, `NO_COLOR` industry-
+  standard veto, JSON mode forces off; cyan prompt / cyan agent
+  header / yellow refusal / dim-gray meta). No substrate change —
+  pure helpers in `src/util/chat_cli_polish.nova` + a boot-time init
+  block + a JSON-vs-human branch at the reply site. NOVA lacks an
+  argv seam today, so the `--json` flag rides its env-var equivalent
+  in this container; the pure parser is already argv-shaped for the
+  day NOVA grows one. 69 checks in `test_chat_cli_polish`.
 - **R113** — QPS per-holder (flip per-TOKEN → per-holder rate
   limiting; was numbered R111 in earlier roadmap drafts).
 - **R114** — Signed AgentPackage (ADR-0210 tier 3; reuses

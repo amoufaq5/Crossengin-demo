@@ -1,0 +1,301 @@
+// CLI polish helpers for the interactive chat REPL (R112 -- Phase K part 3).
+//
+// This module holds the pure helpers behind three operator-facing quality-of-
+// life additions:
+//   1. --json / CROSSENGIN_JSON_MODE=1 -- one line of JSON per exchange, no
+//      banner, no "agent>" prompt. Suitable for `echo "..." | crossengin-chat`
+//      piping and for scripts that want to parse replies.
+//   2. History file -- every non-empty, non-admin line the operator types is
+//      appended to `~/.crossengin_history` (override with
+//      CROSSENGIN_HISTORY_FILE; disable with CROSSENGIN_HISTORY=0). Capped at
+//      10 000 lines at startup so it stays bounded across sessions. Write-only
+//      for now -- arrow-key recall waits on a readline seam in NOVA. Useful
+//      today for `grep`ing past sessions.
+//   3. ANSI color -- opt-in via CROSSENGIN_COLOR=1, respectful of NO_COLOR
+//      (industry-standard veto). Default OFF so non-TTY pipes and CI logs
+//      stay clean. Silenced when JSON mode is active (JSON must never carry
+//      ANSI escape sequences).
+//
+// Every helper is a PURE function of its inputs -- no globals, no syscalls
+// (env reads happen at the wire in the chat's main()). This keeps the module
+// unit-testable without process-level state.
+//
+// NOVA quirks honored:
+//   * `str_eq` unreliable on short literals -- flag parsing uses
+//     `str_eq_bytes` from `../util/str_safe.nova`.
+//   * `len(0)` segfaults -- callers pass "" (never 0) for missing strings.
+//   * `getenv` guard: caller checks `== 0` AND `len == 0` before use.
+//
+// ADRs: none (this is UX polish, not a substrate change).
+// NOVA dependencies: builtins only.
+// CrossEngin dependencies: src/util/str_safe.nova.
+
+import "./str_safe.nova"
+
+// ---- flag constants ------------------------------------------------------
+
+// Slot indices into the parsed-args list returned by `_chat_parse_args`.
+let CCP_JSON_MODE = 0
+let CCP_ARGS_LEN  = 1
+
+// History-file default cap (lines). Change here if operators start filing
+// long-history complaints; keep in sync with the doc in SHIP_AS_APP.md §7.60.
+let CCP_HISTORY_DEFAULT_CAP = 10000
+
+// ANSI color codes we surface (numeric only; wrap adds the ESC[ ... m frame).
+let CCP_COLOR_PROMPT  = "36"      // cyan
+let CCP_COLOR_REFUSAL = "33"      // yellow
+let CCP_COLOR_META    = "2;37"    // dim gray
+
+// ---- argv parsing --------------------------------------------------------
+
+// Parse a list of argv strings (excluding argv[0]) into a compact record.
+// Returns a fixed-shape list:
+//   [ json_mode_int ]
+// The chat's main() calls this on whatever argv seam becomes available;
+// today it also honors CROSSENGIN_JSON_MODE=1 as an env-var equivalent for
+// containers where NOVA cannot see argv.
+//
+// Unknown flags are silently ignored so a launcher can pass extra tokens
+// without the chat aborting; the safety property here is that ONLY
+// recognised flags mutate behaviour.
+fn _chat_parse_args(argv) {
+    let r = list_new()
+    let json_mode = 0
+    let n = 0
+    if argv != 0 { n = len(argv) }
+    let i = 0
+    while i < n {
+        let a = argv[i]
+        if a != 0 {
+            if len(a) > 0 {
+                if str_eq_bytes(a, "--json") == 1 { json_mode = 1 }
+            }
+        }
+        i = i + 1
+    }
+    push(r, json_mode)
+    return r
+}
+
+// Fold in a `CROSSENGIN_JSON_MODE=1` env override. `env_val` is the raw
+// getenv result (either 0 for unset, or a string). Returns the effective
+// json_mode int (0 or 1). Keeps the env-var wiring out of the pure parser
+// so tests can exercise both paths independently.
+fn _chat_json_mode_effective(argv_json_mode, env_val) {
+    if argv_json_mode == 1 { return 1 }
+    if env_val == 0 { return 0 }
+    if len(env_val) == 0 { return 0 }
+    if str_eq_bytes(env_val, "0") == 1 { return 0 }
+    return 1
+}
+
+// ---- history-file trim ---------------------------------------------------
+
+// Given a list of history lines and a cap, return the last `cap` lines.
+// Pure: no I/O. When `len(lines) <= cap`, returns `lines` unchanged.
+// When `cap <= 0`, returns an empty list (safety -- a bogus cap should not
+// leak an unbounded history).
+fn _chat_history_trim(lines, cap) {
+    if cap <= 0 { return list_new() }
+    if lines == 0 { return list_new() }
+    let n = len(lines)
+    if n <= cap { return lines }
+    let out = list_new()
+    let start = n - cap
+    let i = start
+    while i < n {
+        push(out, lines[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Split a blob of history text (newline-separated) into a list of lines.
+// Empty trailing line (from a trailing \n) is dropped. Blank interior lines
+// are preserved. Returns an empty list if text is 0 or empty.
+fn _chat_history_lines(text) {
+    let out = list_new()
+    if text == 0 { return out }
+    let n = len(text)
+    if n == 0 { return out }
+    let i = 0
+    let start = 0
+    while i < n {
+        if char_at(text, i) == 10 {
+            push(out, substr(text, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        push(out, substr(text, start, n - start))
+    }
+    return out
+}
+
+// Re-join a list of lines with '\n' terminators. Every line (including the
+// final one) gets a trailing '\n' so `sys_write` of the result reproduces
+// the append-safe on-disk shape.
+fn _chat_history_join(lines) {
+    let out = ""
+    let n = 0
+    if lines != 0 { n = len(lines) }
+    let i = 0
+    while i < n {
+        out = out + lines[i] + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+// ---- color wrapping ------------------------------------------------------
+
+// Decide whether ANSI color should be emitted, given the three signals we
+// consult:
+//   * json_mode -- when the chat is in --json mode, color is FORBIDDEN
+//     (JSON callers parse the line; embedded ESC bytes corrupt that).
+//   * no_color_env -- the raw getenv("NO_COLOR") result. Non-empty means
+//     the operator has opted out (industry-standard).
+//   * color_env -- the raw getenv("CROSSENGIN_COLOR") result. "1" means opt
+//     in; anything else (including 0 / empty / "0") means DEFAULT OFF.
+//
+// The default-off stance means a non-TTY pipe or CI log stays clean without
+// requiring the operator to know about NO_COLOR. Operators who want color
+// must enable it explicitly.
+fn _chat_color_should_enable(json_mode, no_color_env, color_env) {
+    if json_mode == 1 { return 0 }
+    if no_color_env != 0 {
+        if len(no_color_env) > 0 { return 0 }
+    }
+    if color_env == 0 { return 0 }
+    if len(color_env) == 0 { return 0 }
+    if str_eq_bytes(color_env, "1") == 1 { return 1 }
+    return 0
+}
+
+// Wrap `text` in an ANSI SGR frame using `color_code` when `enabled == 1`;
+// otherwise return the raw text. Safe on empty text (returns "").
+//
+// The frame is ESC[<code>m<text>ESC[0m -- the trailing reset is required so
+// downstream lines aren't accidentally colored.
+fn _chat_color_wrap(text, color_code, enabled) {
+    if enabled == 0 { return text }
+    // NOVA does not surface \e in string literals; chr(27) is the ESC byte.
+    // Frame: ESC[<code>m<text>ESC[0m -- the trailing SGR 0 reset is required
+    // so downstream lines aren't accidentally colored.
+    let esc = chr(27)
+    return esc + "[" + color_code + "m" + text + esc + "[0m"
+}
+
+// ---- JSON encoding for exchanges ----------------------------------------
+
+// Escape a string for JSON. Same conservative shape as the chat's internal
+// `_json_escape` -- quote, backslash, and control bytes get the \uXXXX form.
+// Duplicated here so this module has no circular dep on the chat file.
+fn _ccp_json_escape(s) {
+    let out = ""
+    if s == 0 { return out }
+    let i = 0
+    let L = len(s)
+    while i < L {
+        let c = char_at(s, i)
+        if c == 34 {
+            out = out + "\\\""
+        } else {
+            if c == 92 {
+                out = out + "\\\\"
+            } else {
+                if c == 10 {
+                    out = out + "\\n"
+                } else {
+                    if c == 13 {
+                        out = out + "\\r"
+                    } else {
+                        if c == 9 {
+                            out = out + "\\t"
+                        } else {
+                            if c < 32 {
+                                out = out + "\\u00"
+                                let hi = c / 16
+                                let lo = c - hi * 16
+                                if hi < 10 { out = out + int_to_str(hi) } else { out = out + substr("abcdef", hi - 10, 1) }
+                                if lo < 10 { out = out + int_to_str(lo) } else { out = out + substr("abcdef", lo - 10, 1) }
+                            } else {
+                                out = out + substr(s, i, 1)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Encode one exchange as a single line of JSON. Shape:
+//   {"ok": 0|1, "input": "...", "reply": "...", "reasoning": "...",
+//    "refusal_reason": "..."}
+// `ok` is 0 when the reply starts with "[refused]" or "[silent]" (the two
+// governed-refusal sentinels the chat emits); the sentinel is copied into
+// `refusal_reason` so callers can branch cleanly. Any of the string args
+// may be "" or 0; the encoder normalises 0 to "".
+fn _chat_json_encode_exchange(input_text, reply_text, reasoning_text) {
+    let inp = input_text
+    let rep = reply_text
+    let rea = reasoning_text
+    if inp == 0 { inp = "" }
+    if rep == 0 { rep = "" }
+    if rea == 0 { rea = "" }
+    let ok = 1
+    let refusal = ""
+    let L = len(rep)
+    if L >= 9 {
+        // "[refused]" (9 bytes) at the start of reply
+        if str_eq_bytes(substr(rep, 0, 9), "[refused]") == 1 {
+            ok = 0
+            refusal = "refused"
+        }
+    }
+    if L >= 8 {
+        if str_eq_bytes(substr(rep, 0, 8), "[silent]") == 1 {
+            ok = 0
+            refusal = "silent"
+        }
+    }
+    let line = "{\"ok\":" + int_to_str(ok)
+        + ",\"input\":\"" + _ccp_json_escape(inp) + "\""
+        + ",\"reply\":\"" + _ccp_json_escape(rep) + "\""
+        + ",\"reasoning\":\"" + _ccp_json_escape(rea) + "\""
+        + ",\"refusal_reason\":\"" + _ccp_json_escape(refusal) + "\"}"
+    return line
+}
+
+// ---- history-file path resolution ----------------------------------------
+
+// Resolve the effective history-file path from the two env inputs:
+//   * hist_env -- getenv("CROSSENGIN_HISTORY_FILE") -- explicit override
+//   * home_env -- getenv("HOME") -- used to expand the default `~/.crossengin_history`
+// Returns "" when history is not writable (no HOME set and no override).
+// The chat's main() treats "" as "disable history" with a one-line warning.
+fn _chat_history_path(hist_env, home_env) {
+    if hist_env != 0 {
+        if len(hist_env) > 0 { return hist_env }
+    }
+    if home_env != 0 {
+        if len(home_env) > 0 { return home_env + "/.crossengin_history" }
+    }
+    return ""
+}
+
+// Decide whether history is enabled from the CROSSENGIN_HISTORY env var.
+// "0" (or missing HOME + missing override) disables. Anything else enables
+// (default-on so operators don't have to set an env var to get useful
+// history logging).
+fn _chat_history_enabled(disable_env) {
+    if disable_env == 0 { return 1 }
+    if len(disable_env) == 0 { return 1 }
+    if str_eq_bytes(disable_env, "0") == 1 { return 0 }
+    return 1
+}
