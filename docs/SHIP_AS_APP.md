@@ -5327,9 +5327,8 @@ follow-up).
 - **R113** — Admin bulk-ops (`admin.list_tokens`,
   `admin.expire_all_before`, `admin.revoke_all_by_holder`).
 - **Backlog debt** — DTLS-12 red-fix (72/450 checks red since R86),
-  bignum_256 / field25519 consolidation, LICENSES/ folder authoring,
-  two pre-existing test reds (`test_child_mode_wire` verb-count,
-  `test_self_gaps_verb` names cap).
+  bignum_256 / field25519 consolidation, LICENSES/ folder authoring.
+- R110: cleared 2 pre-existing test reds (test_child_mode_wire verb-count drift 43->49, test_self_gaps_verb cap-name alignment).
 - **Multimodal follow-ons** — per-keyframe image fanout in
   `video_records`, whisper/vosk STT wire-up on a permissive host,
   OCR wire-up once `png_decode.nova`'s DEFLATE dynamic-Huffman path
