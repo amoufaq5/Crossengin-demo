@@ -512,6 +512,80 @@ fn rpc_arg_kv(key, value) {
     return p
 }
 
+// ---- R107: uniform cursor pagination helpers ----------------------------
+//
+// Every wire list verb (kg.list / capsule.list / skill.list /
+// pattern.list / ownership.list / session.list / capability.list /
+// ingest.policy.list / nl.metrics / self.gaps) takes the same two
+// pagination args:
+//
+//   limit  int, default 50, clamped to [1, 500].
+//   after  string, default "".  When non-empty, response starts at the
+//          entry AFTER the one whose stable cursor id equals `after`.
+//          Unknown cursor gracefully re-starts from the beginning (a
+//          client with a stale cursor after a delete still gets valid
+//          output, just re-scanned).
+//
+// Response gains a `next_after` field: last-emitted cursor id if more
+// entries follow, "" if the current page is the tail. Callers loop
+// `while next_after != ""`. Backwards-compatible: clients that ignore
+// `next_after` see up to `limit` entries per call (truncated but valid).
+//
+// See docs/SHIP_AS_APP.md §7.56 for the per-verb cursor id table and
+// tests/unit/test_wire_pagination.nova for the invariants.
+
+// Read pagination args off the wire.  Returns [limit_int, after_str].
+// - "limit" missing -> 50.  Present but garbage (str_to_int -> 0)
+//   or non-positive -> clamped to 1.  Above 500 -> clamped to 500.
+// - "after" missing -> "".  Present but empty -> "" (start from head).
+fn _rpc_page_args(args) {
+    let limit = 50
+    if _rpc_has_arg(args, "limit") == 1 {
+        let raw = _rpc_arg(args, "limit")
+        let n = str_to_int(raw)
+        // Non-positive (0, negative, garbage) clamps to 1 so callers
+        // that pass "limit=0" don't hang the client waiting for a page.
+        if n < 1   { n = 1   }
+        if n > 500 { n = 500 }
+        limit = n
+    }
+    let after = ""
+    if _rpc_has_arg(args, "after") == 1 {
+        after = _rpc_arg(args, "after")
+    }
+    let out = list_new()
+    push(out, limit)
+    push(out, after)
+    return out
+}
+
+// Build the [k,v] pair for the response's `next_after` field. Callers
+// splice this into the `kv` list they hand to _rpc_obj alongside the
+// verb-specific entries field.
+fn _rpc_encode_next_after(cursor) {
+    let p = list_new()
+    push(p, "next_after")
+    push(p, _rpc_str(cursor))
+    return p
+}
+
+// Given a sorted list of stable cursor ids and the caller's `after`,
+// return the index in `ids` where the next page starts. Unknown or
+// empty `after` -> 0 (graceful start-from-head). `after` matching the
+// last id -> len(ids) (empty page, next_after=""). This is the ONE
+// walk over the id list; every verb reuses it so the cursor-skip
+// semantics stay consistent.
+fn _rpc_page_start_index(ids, after) {
+    if len(after) == 0 { return 0 }
+    let i = 0
+    while i < len(ids) {
+        if str_eq_bytes(ids[i], after) == 1 { return i + 1 }
+        i = i + 1
+    }
+    // Unknown cursor: start from beginning (documented behavior).
+    return 0
+}
+
 // ---- StructuredQuery encoder --------------------------------------------
 
 fn _rpc_encode_query(q) {
@@ -750,6 +824,8 @@ fn _rpc_verb_kg_list(args, ctx) {
     let overlay = rpc_ctx_ownership(ctx)
     let pref_reg = rpc_ctx_preference_reg(ctx)
     let holder = rpc_ctx_presented_holder(ctx)
+    // R107: gather visible labels in registry order (insertion-stable,
+    // matches previous wire behavior for callers that don't paginate).
     let labels = list_new()
     let i = 0
     let n = kg_count(reg)
@@ -757,7 +833,6 @@ fn _rpc_verb_kg_list(args, ctx) {
         let kg = kg_get(reg, i)
         if kg != 0 {
             let lab = kg_label(kg)
-            // R101: composed visibility (ownership AND preference).
             if visibility_visible(overlay, pref_reg, OWN_KIND_KG,
                                    lab, holder) == 1 {
                 push(labels, lab)
@@ -765,7 +840,28 @@ fn _rpc_verb_kg_list(args, ctx) {
         }
         i = i + 1
     }
-    return _rpc_ok(_rpc_arr_of_str(labels))
+    // R107: cursor pagination. `after` is a KG label.
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(labels, after)
+    let emitted = list_new()
+    let last_id = ""
+    let ei = start
+    while ei < len(labels) {
+        if len(emitted) >= limit { ei = len(labels) }
+        else {
+            push(emitted, labels[ei])
+            last_id = labels[ei]
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + len(emitted) < len(labels) { next_after = last_id }
+    let kv = list_new()
+    let a = list_new() push(a, "labels") push(a, _rpc_arr_of_str(emitted)) push(kv, a)
+    push(kv, _rpc_encode_next_after(next_after))
+    return _rpc_ok(_rpc_obj(kv))
 }
 
 // capsule.list -- name + version + install-state for every registered
@@ -777,12 +873,13 @@ fn _rpc_verb_capsule_list(args, ctx) {
     let pref_reg = rpc_ctx_preference_reg(ctx)
     let holder = rpc_ctx_presented_holder(ctx)
     let entries = capreg_capsules(cr)
-    let frags = list_new()
+    // R107: gather (id, fragment) pairs in insertion order.
+    let ids = list_new()
+    let frags_all = list_new()
     let i = 0
     while i < len(entries) {
         let c = entries[i]
         let name = capsule_name(c)
-        // R101: composed visibility (ownership AND preference).
         if visibility_visible(overlay, pref_reg, OWN_KIND_CAPSULE,
                                name, holder) == 1 {
             let installed = capreg_is_installed(cr, name)
@@ -790,11 +887,33 @@ fn _rpc_verb_capsule_list(args, ctx) {
             let a = list_new() push(a, "name")      push(a, _rpc_str(name))               push(kv, a)
             let b = list_new() push(b, "version")   push(b, _rpc_str(capsule_version(c))) push(kv, b)
             let d = list_new() push(d, "installed") push(d, _rpc_bool(installed))         push(kv, d)
-            push(frags, _rpc_obj(kv))
+            push(ids, name)
+            push(frags_all, _rpc_obj(kv))
         }
         i = i + 1
     }
-    return _rpc_ok(_rpc_arr(frags))
+    // R107: cursor pagination. `after` is a capsule name.
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(ids, after)
+    let out_frags = list_new()
+    let last_id = ""
+    let ei = start
+    while ei < len(frags_all) {
+        if len(out_frags) >= limit { ei = len(frags_all) }
+        else {
+            push(out_frags, frags_all[ei])
+            last_id = ids[ei]
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + len(out_frags) < len(frags_all) { next_after = last_id }
+    let kv = list_new()
+    let a = list_new() push(a, "capsules") push(a, _rpc_arr(out_frags)) push(kv, a)
+    push(kv, _rpc_encode_next_after(next_after))
+    return _rpc_ok(_rpc_obj(kv))
 }
 
 // ---- R71: helpers for ingest.file ownership pre-pass ------------------
@@ -890,11 +1009,12 @@ fn _rpc_verb_skill_list(args, ctx) {
     let pref_reg = rpc_ctx_preference_reg(ctx)
     let holder = rpc_ctx_presented_holder(ctx)
     let names = skill_registry_names(sr)
-    let frags = list_new()
+    // R107: gather (id, fragment) pairs in registry order.
+    let ids = list_new()
+    let frags_all = list_new()
     let i = 0
     while i < len(names) {
         let name = names[i]
-        // R101: composed visibility (ownership AND preference).
         if visibility_visible(overlay, pref_reg, OWN_KIND_SKILL,
                                name, holder) == 1 {
             let m = skill_registry_manifest(sr, name)
@@ -906,11 +1026,33 @@ fn _rpc_verb_skill_list(args, ctx) {
                 let c = list_new() push(c, "description") push(c, _rpc_str(skill_manifest_description(m))) push(kv, c)
             }
             let d = list_new() push(d, "installed") push(d, _rpc_bool(installed))   push(kv, d)
-            push(frags, _rpc_obj(kv))
+            push(ids, name)
+            push(frags_all, _rpc_obj(kv))
         }
         i = i + 1
     }
-    return _rpc_ok(_rpc_arr(frags))
+    // R107: cursor pagination. `after` is a skill name.
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(ids, after)
+    let out_frags = list_new()
+    let last_id = ""
+    let ei = start
+    while ei < len(frags_all) {
+        if len(out_frags) >= limit { ei = len(frags_all) }
+        else {
+            push(out_frags, frags_all[ei])
+            last_id = ids[ei]
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + len(out_frags) < len(frags_all) { next_after = last_id }
+    let kv = list_new()
+    let a = list_new() push(a, "skills") push(a, _rpc_arr(out_frags)) push(kv, a)
+    push(kv, _rpc_encode_next_after(next_after))
+    return _rpc_ok(_rpc_obj(kv))
 }
 
 // skill.run -- direct skill invocation. Bypasses the NL parse layer.
@@ -1404,13 +1546,37 @@ fn _rpc_verb_ingest_policy_list(args, ctx) {
     let reg = rpc_ctx_ingest_policy(ctx)
     if reg == 0 { return _rpc_err("no policy registry in context") }
     let ps = policy_registry_policies(reg)
-    let frags = list_new()
+    // R107: gather (id, fragment) pairs in registry order.
+    let ids = list_new()
+    let frags_all = list_new()
     let i = 0
     while i < len(ps) {
-        push(frags, _rpc_encode_policy(ps[i]))
+        push(ids, policy_name(ps[i]))
+        push(frags_all, _rpc_encode_policy(ps[i]))
         i = i + 1
     }
-    return _rpc_ok(_rpc_arr(frags))
+    // R107: cursor pagination. `after` is a policy name.
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(ids, after)
+    let out_frags = list_new()
+    let last_id = ""
+    let ei = start
+    while ei < len(frags_all) {
+        if len(out_frags) >= limit { ei = len(frags_all) }
+        else {
+            push(out_frags, frags_all[ei])
+            last_id = ids[ei]
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + len(out_frags) < len(frags_all) { next_after = last_id }
+    let kv = list_new()
+    let a = list_new() push(a, "policies") push(a, _rpc_arr(out_frags)) push(kv, a)
+    push(kv, _rpc_encode_next_after(next_after))
+    return _rpc_ok(_rpc_obj(kv))
 }
 
 fn _rpc_verb_ingest_policy_add(args, ctx) {
@@ -1495,11 +1661,12 @@ fn _rpc_verb_pattern_list(args, ctx) {
     let pref_reg = rpc_ctx_preference_reg(ctx)
     let holder = rpc_ctx_presented_holder(ctx)
     let names = pattern_registry_names()
-    let frags = list_new()
+    // R107: gather (id, fragment) pairs in registry order.
+    let ids = list_new()
+    let frags_all = list_new()
     let i = 0
     while i < len(names) {
         let name = names[i]
-        // R101: composed visibility (ownership AND preference).
         if visibility_visible(overlay, pref_reg, OWN_KIND_PATTERN,
                                name, holder) == 1 {
             let c = pattern_registry_lookup(name)
@@ -1507,10 +1674,6 @@ fn _rpc_verb_pattern_list(args, ctx) {
             let tag = ""
             if c != 0 {
                 pcount = pcapsule_count(c)
-                // Peek at the first pattern's source_tag as a summary
-                // handle (helps operators tell "authored" v1.0.0
-                // packs apart from "built-in" v1 packs without a
-                // separate metadata field).
                 let ps = pcapsule_patterns(c)
                 if len(ps) > 0 { tag = pcap_source_tag(ps[0]) }
             }
@@ -1522,11 +1685,33 @@ fn _rpc_verb_pattern_list(args, ctx) {
             push(kv, b)
             let d = list_new() push(d, "pattern_count") push(d, _rpc_int(pcount))            push(kv, d)
             let e = list_new() push(e, "source_tag")    push(e, _rpc_str(tag))               push(kv, e)
-            push(frags, _rpc_obj(kv))
+            push(ids, name)
+            push(frags_all, _rpc_obj(kv))
         }
         i = i + 1
     }
-    return _rpc_ok(_rpc_arr(frags))
+    // R107: cursor pagination. `after` is a pattern-capsule name.
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(ids, after)
+    let out_frags = list_new()
+    let last_id = ""
+    let ei = start
+    while ei < len(frags_all) {
+        if len(out_frags) >= limit { ei = len(frags_all) }
+        else {
+            push(out_frags, frags_all[ei])
+            last_id = ids[ei]
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + len(out_frags) < len(frags_all) { next_after = last_id }
+    let kv = list_new()
+    let a = list_new() push(a, "patterns") push(a, _rpc_arr(out_frags)) push(kv, a)
+    push(kv, _rpc_encode_next_after(next_after))
+    return _rpc_ok(_rpc_obj(kv))
 }
 
 // R62 + R63: pattern.install. R63 auto-assigns ownership to the
@@ -2021,7 +2206,9 @@ fn _rpc_verb_ownership_list(args, ctx) {
         holder_filter_present = 1
     }
     let entries = ownership_entries(overlay)
-    let frags = list_new()
+    // R107: gather (id, fragment) pairs; cursor id is "<kind>:<name>".
+    let ids = list_new()
+    let frags_all = list_new()
     let i = 0
     while i < len(entries) {
         let e = entries[i]
@@ -2040,11 +2227,33 @@ fn _rpc_verb_ownership_list(args, ctx) {
             let a = list_new() push(a, "kind")  push(a, _rpc_str(kind))  push(kv, a)
             let b = list_new() push(b, "name")  push(b, _rpc_str(name))  push(kv, b)
             let c = list_new() push(c, "owner") push(c, _rpc_str(owner)) push(kv, c)
-            push(frags, _rpc_obj(kv))
+            push(ids, kind + ":" + name)
+            push(frags_all, _rpc_obj(kv))
         }
         i = i + 1
     }
-    return _rpc_ok(_rpc_arr(frags))
+    // R107: cursor pagination. `after` is composite "<kind>:<name>".
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(ids, after)
+    let out_frags = list_new()
+    let last_id = ""
+    let ei = start
+    while ei < len(frags_all) {
+        if len(out_frags) >= limit { ei = len(frags_all) }
+        else {
+            push(out_frags, frags_all[ei])
+            last_id = ids[ei]
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + len(out_frags) < len(frags_all) { next_after = last_id }
+    let kv = list_new()
+    let a = list_new() push(a, "entries") push(a, _rpc_arr(out_frags)) push(kv, a)
+    push(kv, _rpc_encode_next_after(next_after))
+    return _rpc_ok(_rpc_obj(kv))
 }
 
 fn _rpc_verb_ownership_transfer(args, ctx) {
@@ -2651,8 +2860,9 @@ fn _rpc_verb_nl_metrics(args, ctx) {
         return _rpc_ok(_nlm_row_obj(t, u, at, s, f, ic_a, ic_h, ic_m))
     }
     // Full-registry branch: snapshot every row + aggregate.
+    // Aggregate is computed over ALL rows (independent of paging) so a
+    // dashboard tile reads the true system total even while paging.
     let rows = nl_metrics_snapshot(reg)
-    let holders_kv = list_new()
     let tot_total = 0
     let tot_unparsed = 0
     let tot_attempts = 0
@@ -2672,19 +2882,45 @@ fn _rpc_verb_nl_metrics(args, ctx) {
         tot_ic_att    = tot_ic_att    + nlms_ic_attempts(r)
         tot_ic_hit    = tot_ic_hit    + nlms_ic_hits(r)
         tot_ic_miss   = tot_ic_miss   + nlms_ic_misses(r)
-        let pair = list_new()
-        push(pair, nlms_holder(r))
-        push(pair, _nlm_encode_row(r))
-        push(holders_kv, pair)
         i = i + 1
     }
+    // R107: gather holder ids for cursor pagination. Registry order is
+    // insertion-stable (nl_metrics_snapshot walks NLM_HOLDERS index).
+    let ids = list_new()
+    let j = 0
+    while j < len(rows) {
+        push(ids, nlms_holder(rows[j]))
+        j = j + 1
+    }
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(ids, after)
+    let holders_kv = list_new()
+    let last_id = ""
+    let emitted = 0
+    let ei = start
+    while ei < len(rows) {
+        if emitted >= limit { ei = len(rows) }
+        else {
+            let r = rows[ei]
+            let pair = list_new()
+            push(pair, nlms_holder(r))
+            push(pair, _nlm_encode_row(r))
+            push(holders_kv, pair)
+            last_id = nlms_holder(r)
+            emitted = emitted + 1
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + emitted < len(rows) { next_after = last_id }
     // Aggregate row -- always present so a client can read a single
     // number for the "how bad is fallback right now?" dashboard tile
     // without summing per-holder rows itself. Key intentionally starts
-    // with an underscore so it can't clash with a real holder id
-    // (holders are user_ids / service names; leading underscores are
-    // conventionally reserved for internal keys everywhere else in
-    // this codebase).
+    // with an underscore so it can't clash with a real holder id.
+    // Included on every page (aggregate is over ALL rows, not the
+    // current page).
     let agg_pair = list_new()
     push(agg_pair, "_total_all_holders")
     push(agg_pair, _nlm_row_obj(tot_total, tot_unparsed,
@@ -2697,6 +2933,7 @@ fn _rpc_verb_nl_metrics(args, ctx) {
     push(holders_field, "holders")
     push(holders_field, _rpc_obj(holders_kv))
     push(outer_kv, holders_field)
+    push(outer_kv, _rpc_encode_next_after(next_after))
     return _rpc_ok(_rpc_obj(outer_kv))
 }
 
@@ -2730,7 +2967,14 @@ fn _rpc_verb_capability_list(args, ctx) {
     let reg = rpc_ctx_cap_reg(ctx)
     if reg == 0 { return _rpc_err("no capability registry in context") }
     let ts = capability_registry_tokens(reg)
-    let frags = list_new()
+    // R107: gather (id, fragment) pairs. Cursor id is token_id -- the
+    // internal handle we deliberately do NOT put in the response body
+    // (bearer-secret). Safe to use as the OPAQUE cursor because the
+    // client already presented the token to see this list (they cannot
+    // learn a NEW token from the cursor); and pagination requires
+    // holder+order stability, which token_id gives us cheaply.
+    let ids = list_new()
+    let frags_all = list_new()
     let i = 0
     while i < len(ts) {
         let t = ts[i]
@@ -2750,10 +2994,32 @@ fn _rpc_verb_capability_list(args, ctx) {
         let f = list_new() push(f, "qps_max")    push(f, _rpc_int(token_qps_max(t)))   push(kv, f)
         let g = list_new() push(g, "window_count")       push(g, _rpc_int(token_window_count(t))) push(kv, g)
         let h = list_new() push(h, "window_start_nanos") push(h, _rpc_int(token_window_start(t))) push(kv, h)
-        push(frags, _rpc_obj(kv))
+        push(ids, token_id(t))
+        push(frags_all, _rpc_obj(kv))
         i = i + 1
     }
-    return _rpc_ok(_rpc_arr(frags))
+    // R107: cursor pagination. `after` is a token_id.
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(ids, after)
+    let out_frags = list_new()
+    let last_id = ""
+    let ei = start
+    while ei < len(frags_all) {
+        if len(out_frags) >= limit { ei = len(frags_all) }
+        else {
+            push(out_frags, frags_all[ei])
+            last_id = ids[ei]
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + len(out_frags) < len(frags_all) { next_after = last_id }
+    let kv = list_new()
+    let a = list_new() push(a, "tokens") push(a, _rpc_arr(out_frags)) push(kv, a)
+    push(kv, _rpc_encode_next_after(next_after))
+    return _rpc_ok(_rpc_obj(kv))
 }
 
 // ---- session lifecycle verbs (R55.3, ADR-0105) --------------------------
@@ -3175,7 +3441,10 @@ fn _rpc_verb_session_list(args, ctx) {
     let idx_path = _rpc_snap_index_path(ctx)
     let text = _rpc_snap_read(idx_path)
     let entries = _rpc_snap_index_parse(text)
-    let frags = list_new()
+    // R107: gather (id, fragment) pairs. Index order is chronological
+    // (append-only R76 index); we keep it and cursor by name.
+    let ids = list_new()
+    let frags_all = list_new()
     let i = 0
     while i < len(entries) {
         let e = entries[i]
@@ -3188,10 +3457,32 @@ fn _rpc_verb_session_list(args, ctx) {
         let b = list_new() push(b, "path")     push(b, _rpc_str(path)) push(kv, b)
         let c = list_new() push(c, "bytes")    push(c, _rpc_int(bytes)) push(kv, c)
         let d = list_new() push(d, "saved_at") push(d, _rpc_int(sav))  push(kv, d)
-        push(frags, _rpc_obj(kv))
+        push(ids, name)
+        push(frags_all, _rpc_obj(kv))
         i = i + 1
     }
-    return _rpc_ok(_rpc_arr(frags))
+    // R107: cursor pagination. `after` is a session name.
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(ids, after)
+    let out_frags = list_new()
+    let last_id = ""
+    let ei = start
+    while ei < len(frags_all) {
+        if len(out_frags) >= limit { ei = len(frags_all) }
+        else {
+            push(out_frags, frags_all[ei])
+            last_id = ids[ei]
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + len(out_frags) < len(frags_all) { next_after = last_id }
+    let kv = list_new()
+    let a = list_new() push(a, "sessions") push(a, _rpc_arr(out_frags)) push(kv, a)
+    push(kv, _rpc_encode_next_after(next_after))
+    return _rpc_ok(_rpc_obj(kv))
 }
 
 // session.delete -- remove a snapshot's .snap file + its R76 index
@@ -4016,15 +4307,18 @@ fn _rpc_verb_self_gaps(args, ctx) {
                           + " (want no_match|low_confidence|refused|unparsed|skill_refused)")
         }
     }
-    let limit = 50
-    if _rpc_has_arg(args, "limit") == 1 {
-        let lv = str_to_int(_rpc_arg(args, "limit"))
-        if lv > 0 { limit = lv }
-    }
-    if limit > 500 { limit = 500 }
-    // Walk entries oldest-first, keep the matching ones up to `limit`.
+    // R107: uniform page args (limit default 50, clamp [1,500]) + `after`.
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    // Walk entries oldest-first, keep the matching ones.
+    // Cursor id per entry: "<timestamp_nanos>:<idx_within_ns>" so
+    // events sharing a timestamp still page uniquely.
     let entries = gaps_entries(reg)
     let picks = list_new()
+    let ids = list_new()
+    let last_ts = -1
+    let same_ts_ix = 0
     let i = 0
     while i < len(entries) {
         let e = entries[i]
@@ -4035,25 +4329,34 @@ fn _rpc_verb_self_gaps(args, ctx) {
                 if gap_event_reason(e) != want_reason { keep = 0 }
             }
         }
-        if keep == 1 { push(picks, e) }
+        if keep == 1 {
+            let ts = gap_event_timestamp(e)
+            if ts == last_ts { same_ts_ix = same_ts_ix + 1 }
+            else             { same_ts_ix = 0 last_ts = ts }
+            push(picks, e)
+            push(ids, int_to_str(ts) + ":" + int_to_str(same_ts_ix))
+        }
         i = i + 1
     }
-    // Trim to limit (keep the OLDEST `limit`; matches deterministic wire
-    // shape -- clients that want the tail pass a small limit and re-
-    // query with an updated `after` in a later round).
+    let start = _rpc_page_start_index(ids, after)
     let out_frags = list_new()
-    let oi = 0
+    let last_id = ""
+    let oi = start
     while oi < len(picks) {
-        if oi >= limit { oi = len(picks) }
+        if len(out_frags) >= limit { oi = len(picks) }
         else {
             push(out_frags, _rpc_encode_gap_event(picks[oi]))
+            last_id = ids[oi]
             oi = oi + 1
         }
     }
+    let next_after = ""
+    if start + len(out_frags) < len(picks) { next_after = last_id }
     let kv = list_new()
     let a1 = list_new() push(a1, "holder")  push(a1, _rpc_str(holder))         push(kv, a1)
     let a2 = list_new() push(a2, "count")   push(a2, _rpc_int(len(out_frags))) push(kv, a2)
     let a3 = list_new() push(a3, "entries") push(a3, _rpc_arr(out_frags))      push(kv, a3)
+    push(kv, _rpc_encode_next_after(next_after))
     return _rpc_ok(_rpc_obj(kv))
 }
 

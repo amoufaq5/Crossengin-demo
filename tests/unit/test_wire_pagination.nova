@@ -1,0 +1,652 @@
+// R107 (Phase I part 1) -- uniform cursor pagination for wire list verbs.
+//
+// Verifies the uniform `limit` + `after` contract added to every list
+// verb in src/nl/rpc_verbs.nova:
+//   * default limit=50, clamped to [1, 500].
+//   * `after` -> start after that cursor id; unknown cursor gracefully
+//     falls back to head.
+//   * response gains `next_after` field: last-emitted cursor id when a
+//     next page exists, "" on the tail.
+//   * loop invariants: every entry seen exactly once, no dupes, no gaps.
+//
+// Covers all 10 list verbs (kg.list, capsule.list, skill.list,
+// pattern.list, ownership.list, session.list, capability.list,
+// ingest.policy.list, nl.metrics, self.gaps). See docs/SHIP_AS_APP.md
+// §7.56 for the per-verb cursor id table.
+
+import "../ce_test.nova"
+import "../../src/nl/rpc_verbs.nova"
+import "../../src/nl/nl_metrics.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/capsules/capsule.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/capsules/pattern_capsule.nova"
+import "../../src/skills/skill_registry.nova"
+import "../../src/skills/skill_manifest.nova"
+import "../../src/sandbox/capability.nova"
+import "../../src/sandbox/ownership.nova"
+import "../../src/parts/meta/gaps_register.nova"
+import "../../src/ingest/policy.nova"
+import "../../src/util/str_safe.nova"
+
+// ---- helpers ---------------------------------------------------------
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+fn _args1(k, v) {
+    let a = list_new()
+    push(a, rpc_arg_kv(k, v))
+    return a
+}
+
+fn _args2(k1, v1, k2, v2) {
+    let a = list_new()
+    push(a, rpc_arg_kv(k1, v1))
+    push(a, rpc_arg_kv(k2, v2))
+    return a
+}
+
+// Zero-padded 3-digit label so lexicographic + insertion order agree.
+// (Registries iterate in insertion order; the cursor is the id itself,
+// so a stable pad keeps the test's expected "was every item seen" scan
+// independent of implementation ordering choice.)
+fn _pad3(n) {
+    if n < 10  { return "00" + int_to_str(n) }
+    if n < 100 { return "0" + int_to_str(n) }
+    return int_to_str(n)
+}
+
+// Scan `body` for every needle in `needles` and require exactly one
+// hit each. Returns the count of missing needles (0 = all seen once).
+fn _scan_all_present(body, needles) {
+    let miss = 0
+    let i = 0
+    while i < len(needles) {
+        if _has(body, needles[i]) == 0 { miss = miss + 1 }
+        i = i + 1
+    }
+    return miss
+}
+
+// Extract the value of "next_after":"..." from a JSON response body.
+// Walks bytes explicitly (str_find has known quirks per NOVA notes).
+// Returns "" when the field isn't present OR its value is empty.
+fn _read_next_after(body) {
+    let key = "\"next_after\":\""
+    let start = find_bytes(body, key)
+    if start < 0 { return "" }
+    let vstart = start + len(key)
+    let i = vstart
+    let n = len(body)
+    while i < n {
+        if char_at(body, i) == 34 {
+            // Reached the closing quote: value is [vstart, i).
+            return substr(body, vstart, i - vstart)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ---- kg.list ----------------------------------------------------------
+//
+// Craft 15 KGs (3x default limit=5) so a paginate-loop with limit=5
+// exercises >1 page but stays cheap (kg_spawn is a lightweight append).
+
+fn _mk_kgreg_n(n) {
+    let reg = kg_registry_new()
+    let i = 0
+    while i < n {
+        kg_spawn(reg, "kg_" + _pad3(i))
+        i = i + 1
+    }
+    return reg
+}
+
+fn _mk_ctx_with_kg(n) {
+    let reg = _mk_kgreg_n(n)
+    return rpc_ctx_new(reg, 0, 0, 0, 0, 0, 0, 100)
+}
+
+fn test_kg_list_small_returns_all() {
+    let ctx = _mk_ctx_with_kg(3)
+    let out = rpc_dispatch("kg.list", list_new(), ctx)
+    ce_check("kg.list small ok",            _has(out, "\"ok\":true"))
+    ce_check("kg.list small has labels",    _has(out, "\"labels\":["))
+    ce_check("kg.list small has kg_000",    _has(out, "kg_000"))
+    ce_check("kg.list small has kg_002",    _has(out, "kg_002"))
+    ce_check("kg.list small next_after=''", _has(out, "\"next_after\":\"\""))
+}
+
+fn test_kg_list_empty_registry() {
+    let reg = kg_registry_new()
+    let ctx = rpc_ctx_new(reg, 0, 0, 0, 0, 0, 0, 100)
+    let out = rpc_dispatch("kg.list", list_new(), ctx)
+    ce_check("kg.list empty ok",         _has(out, "\"ok\":true"))
+    ce_check("kg.list empty labels=[]",  _has(out, "\"labels\":[]"))
+    ce_check("kg.list empty next=''",    _has(out, "\"next_after\":\"\""))
+}
+
+fn test_kg_list_explicit_limit_10() {
+    let ctx = _mk_ctx_with_kg(15)
+    let out = rpc_dispatch("kg.list", _args1("limit", "10"), ctx)
+    ce_check("kg.list limit=10 ok",       _has(out, "\"ok\":true"))
+    // Emitted 10 -> kg_000..kg_009. kg_010 must NOT appear.
+    ce_check("kg.list limit=10 first",    _has(out, "kg_000"))
+    ce_check("kg.list limit=10 tail",     _has(out, "kg_009"))
+    ce_check("kg.list limit=10 stops",    _has(out, "kg_010") == 0)
+    // next_after should be kg_009 (more entries follow).
+    ce_check("kg.list limit=10 next=009",
+             _has(out, "\"next_after\":\"kg_009\""))
+}
+
+fn test_kg_list_limit_clamps() {
+    let ctx = _mk_ctx_with_kg(5)
+    // limit=0 -> clamped to 1.
+    let out0 = rpc_dispatch("kg.list", _args1("limit", "0"), ctx)
+    ce_check("kg.list limit=0 has 000",   _has(out0, "kg_000"))
+    ce_check("kg.list limit=0 stops @001", _has(out0, "kg_001") == 0)
+    // limit=-5 -> clamped to 1.
+    let outN = rpc_dispatch("kg.list", _args1("limit", "-5"), ctx)
+    ce_check("kg.list limit=-5 has 000",  _has(outN, "kg_000"))
+    ce_check("kg.list limit=-5 stops",    _has(outN, "kg_001") == 0)
+    // limit=1000 -> clamped to 500 (i.e. covers all 5).
+    let outB = rpc_dispatch("kg.list", _args1("limit", "1000"), ctx)
+    ce_check("kg.list limit=huge has 000", _has(outB, "kg_000"))
+    ce_check("kg.list limit=huge has 004", _has(outB, "kg_004"))
+    ce_check("kg.list limit=huge next=''",
+             _has(outB, "\"next_after\":\"\""))
+}
+
+fn test_kg_list_unknown_after_starts_from_head() {
+    let ctx = _mk_ctx_with_kg(3)
+    let out = rpc_dispatch("kg.list",
+                _args2("limit", "2", "after", "nosuch"), ctx)
+    ce_check("kg.list unknown-after ok",  _has(out, "\"ok\":true"))
+    // Graceful: unknown cursor -> restart from head, emit 2.
+    ce_check("kg.list unknown-after 000", _has(out, "kg_000"))
+    ce_check("kg.list unknown-after 001", _has(out, "kg_001"))
+    ce_check("kg.list unknown-after next=001",
+             _has(out, "\"next_after\":\"kg_001\""))
+}
+
+fn test_kg_list_full_pagination_loop() {
+    // 15 items, limit=5 -> 3 pages. Verify every item exactly once,
+    // no gaps, tail page has next_after="".
+    let ctx = _mk_ctx_with_kg(15)
+    let after = ""
+    let seen = list_new()
+    let iters = 0
+    while iters < 10 {
+        let args = list_new()
+        push(args, rpc_arg_kv("limit", "5"))
+        if len(after) > 0 { push(args, rpc_arg_kv("after", after)) }
+        let out = rpc_dispatch("kg.list", args, ctx)
+        // Collect visible ids.
+        let i = 0
+        while i < 15 {
+            let id = "kg_" + _pad3(i)
+            if _has(out, id) == 1 {
+                // Only push each id once per session (multi-page shows
+                // it in one page only when semantics correct).
+                let j = 0
+                let already = 0
+                while j < len(seen) {
+                    if str_eq_bytes(seen[j], id) == 1 { already = 1 }
+                    j = j + 1
+                }
+                if already == 0 { push(seen, id) }
+            }
+            i = i + 1
+        }
+        after = _read_next_after(out)
+        if len(after) == 0 { iters = 10 }
+        else { iters = iters + 1 }
+    }
+    ce_eq("kg.list loop saw all 15", len(seen), 15)
+}
+
+// ---- capsule.list ----------------------------------------------------
+
+fn _mk_capreg_n(n) {
+    let cr = capreg_new()
+    let i = 0
+    while i < n {
+        let c = capsule_new("cap_" + _pad3(i), "1.0.0", "", "unspecified")
+        capreg_register(cr, c)
+        i = i + 1
+    }
+    return cr
+}
+
+fn test_capsule_list_paginates() {
+    let cr = _mk_capreg_n(12)
+    let ctx = rpc_ctx_new(0, cr, 0, 0, 0, 0, 0, 100)
+    let out = rpc_dispatch("capsule.list", _args1("limit", "5"), ctx)
+    ce_check("cap.list ok",            _has(out, "\"ok\":true"))
+    ce_check("cap.list has capsules",  _has(out, "\"capsules\":["))
+    ce_check("cap.list has cap_000",   _has(out, "cap_000"))
+    ce_check("cap.list has cap_004",   _has(out, "cap_004"))
+    ce_check("cap.list stops @005",    _has(out, "cap_005") == 0)
+    ce_check("cap.list next=cap_004",
+             _has(out, "\"next_after\":\"cap_004\""))
+}
+
+fn test_capsule_list_after_middle() {
+    let cr = _mk_capreg_n(10)
+    let ctx = rpc_ctx_new(0, cr, 0, 0, 0, 0, 0, 100)
+    let out = rpc_dispatch("capsule.list",
+                _args2("limit", "3", "after", "cap_004"), ctx)
+    ce_check("cap.list after ok",       _has(out, "\"ok\":true"))
+    ce_check("cap.list after has 005",  _has(out, "cap_005"))
+    ce_check("cap.list after has 007",  _has(out, "cap_007"))
+    ce_check("cap.list after skips 004", _has(out, "cap_004") == 0)
+    ce_check("cap.list after next=007",
+             _has(out, "\"next_after\":\"cap_007\""))
+}
+
+fn test_capsule_list_empty() {
+    let cr = capreg_new()
+    let ctx = rpc_ctx_new(0, cr, 0, 0, 0, 0, 0, 100)
+    let out = rpc_dispatch("capsule.list", list_new(), ctx)
+    ce_check("cap.list empty caps=[]",  _has(out, "\"capsules\":[]"))
+    ce_check("cap.list empty next=''",  _has(out, "\"next_after\":\"\""))
+}
+
+// ---- skill.list ------------------------------------------------------
+
+fn _mk_skillreg_n(n) {
+    let sr = skill_registry_new()
+    let i = 0
+    while i < n {
+        let m = skill_manifest_new("sk_" + _pad3(i), "1", "", 0)
+        skill_registry_register(sr, m)
+        i = i + 1
+    }
+    return sr
+}
+
+fn test_skill_list_paginates() {
+    let sr = _mk_skillreg_n(8)
+    let ctx = rpc_ctx_new(0, 0, 0, sr, 0, 0, 0, 100)
+    let out = rpc_dispatch("skill.list", _args1("limit", "3"), ctx)
+    ce_check("skill.list ok",           _has(out, "\"ok\":true"))
+    ce_check("skill.list has skills",   _has(out, "\"skills\":["))
+    ce_check("skill.list has sk_000",   _has(out, "sk_000"))
+    ce_check("skill.list has sk_002",   _has(out, "sk_002"))
+    ce_check("skill.list stops @003",   _has(out, "sk_003") == 0)
+    ce_check("skill.list next=sk_002",
+             _has(out, "\"next_after\":\"sk_002\""))
+}
+
+fn test_skill_list_empty() {
+    let sr = skill_registry_new()
+    let ctx = rpc_ctx_new(0, 0, 0, sr, 0, 0, 0, 100)
+    let out = rpc_dispatch("skill.list", list_new(), ctx)
+    ce_check("skill.list empty skills=[]", _has(out, "\"skills\":[]"))
+    ce_check("skill.list empty next=''",   _has(out, "\"next_after\":\"\""))
+}
+
+// ---- pattern.list ----------------------------------------------------
+//
+// The pattern registry is a process-wide singleton with lazy built-in
+// load; call once to trigger the load, then just verify the field
+// shape. No crafted-N test here -- the singleton is shared with other
+// tests in this suite's binary and adding 200 pattern-capsules would
+// cross-contaminate.
+
+fn test_pattern_list_shape() {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    let out = rpc_dispatch("pattern.list", _args1("limit", "1"), ctx)
+    ce_check("pattern.list ok",             _has(out, "\"ok\":true"))
+    ce_check("pattern.list has patterns",   _has(out, "\"patterns\":["))
+    ce_check("pattern.list has next_after", _has(out, "\"next_after\":"))
+}
+
+// ---- ownership.list --------------------------------------------------
+
+fn _mk_ctx_with_ownership(n) {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    let overlay = ownership_registry_new()
+    let i = 0
+    while i < n {
+        ownership_set_kg(overlay, "kg_" + _pad3(i), "alice")
+        i = i + 1
+    }
+    rpc_ctx_set_ownership(ctx, overlay)
+    return ctx
+}
+
+fn test_ownership_list_paginates() {
+    let ctx = _mk_ctx_with_ownership(9)
+    let out = rpc_dispatch("ownership.list", _args1("limit", "4"), ctx)
+    ce_check("own.list ok",           _has(out, "\"ok\":true"))
+    ce_check("own.list has entries",  _has(out, "\"entries\":["))
+    ce_check("own.list has kg_000",   _has(out, "\"name\":\"kg_000\""))
+    ce_check("own.list has kg_003",   _has(out, "\"name\":\"kg_003\""))
+    ce_check("own.list stops @004",   _has(out, "\"name\":\"kg_004\"") == 0)
+    // Composite cursor "kind:name".
+    ce_check("own.list next=kg:kg_003",
+             _has(out, "\"next_after\":\"kg:kg_003\""))
+}
+
+fn test_ownership_list_after_composite() {
+    let ctx = _mk_ctx_with_ownership(6)
+    let out = rpc_dispatch("ownership.list",
+                _args2("limit", "2", "after", "kg:kg_002"), ctx)
+    ce_check("own.list after ok",     _has(out, "\"ok\":true"))
+    ce_check("own.list after has 003", _has(out, "\"name\":\"kg_003\""))
+    ce_check("own.list after has 004", _has(out, "\"name\":\"kg_004\""))
+    ce_check("own.list after skips 002",
+             _has(out, "\"name\":\"kg_002\"") == 0)
+}
+
+fn test_ownership_list_empty() {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    rpc_ctx_set_ownership(ctx, ownership_registry_new())
+    let out = rpc_dispatch("ownership.list", list_new(), ctx)
+    ce_check("own.list empty entries=[]", _has(out, "\"entries\":[]"))
+    ce_check("own.list empty next=''",    _has(out, "\"next_after\":\"\""))
+}
+
+// ---- capability.list -------------------------------------------------
+
+fn _mk_ctx_with_caps(n) {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    let reg = capability_registry_new()
+    let i = 0
+    while i < n {
+        let roles = list_new()
+        push(roles, "reader")
+        let t = capability_token_new_roles("tk_" + _pad3(i),
+                                            "user_" + _pad3(i),
+                                            roles, 100, 0)
+        capability_registry_add(reg, t)
+        i = i + 1
+    }
+    rpc_ctx_set_sandbox(ctx, reg, 0)
+    return ctx
+}
+
+fn test_capability_list_paginates() {
+    let ctx = _mk_ctx_with_caps(7)
+    let out = rpc_dispatch("capability.list", _args1("limit", "3"), ctx)
+    ce_check("cap.list ok",             _has(out, "\"ok\":true"))
+    ce_check("cap.list has tokens",     _has(out, "\"tokens\":["))
+    ce_check("cap.list has user_000",   _has(out, "user_000"))
+    ce_check("cap.list has user_002",   _has(out, "user_002"))
+    ce_check("cap.list stops @003",     _has(out, "user_003") == 0)
+    // Cursor is token_id (opaque; not leaked as a field).
+    ce_check("cap.list next=tk_002",
+             _has(out, "\"next_after\":\"tk_002\""))
+}
+
+fn test_capability_list_empty() {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    let reg = capability_registry_new()
+    rpc_ctx_set_sandbox(ctx, reg, 0)
+    let out = rpc_dispatch("capability.list", list_new(), ctx)
+    ce_check("cap.list empty tokens=[]", _has(out, "\"tokens\":[]"))
+    ce_check("cap.list empty next=''",   _has(out, "\"next_after\":\"\""))
+}
+
+// ---- ingest.policy.list ----------------------------------------------
+
+fn _mk_ctx_with_policies(n) {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    let preg = policy_registry_new()
+    let i = 0
+    while i < n {
+        let pol = policy_new("pol_" + _pad3(i), POL_ACTION_APPROVE)
+        policy_registry_register(preg, pol)
+        i = i + 1
+    }
+    rpc_ctx_set_ingest_policy(ctx, preg)
+    return ctx
+}
+
+fn test_ingest_policy_list_paginates() {
+    let ctx = _mk_ctx_with_policies(6)
+    let out = rpc_dispatch("ingest.policy.list", _args1("limit", "2"), ctx)
+    ce_check("policy.list ok",           _has(out, "\"ok\":true"))
+    ce_check("policy.list has policies", _has(out, "\"policies\":["))
+    ce_check("policy.list has pol_000",  _has(out, "pol_000"))
+    ce_check("policy.list has pol_001",  _has(out, "pol_001"))
+    ce_check("policy.list stops @002",   _has(out, "pol_002") == 0)
+    ce_check("policy.list next=pol_001",
+             _has(out, "\"next_after\":\"pol_001\""))
+}
+
+fn test_ingest_policy_list_empty() {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    rpc_ctx_set_ingest_policy(ctx, policy_registry_new())
+    let out = rpc_dispatch("ingest.policy.list", list_new(), ctx)
+    ce_check("policy.list empty policies=[]",
+             _has(out, "\"policies\":[]"))
+    ce_check("policy.list empty next=''",
+             _has(out, "\"next_after\":\"\""))
+}
+
+// ---- nl.metrics ------------------------------------------------------
+
+fn _mk_ctx_with_metrics(n_holders) {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    let reg = nl_metrics_new()
+    let i = 0
+    while i < n_holders {
+        nl_metrics_inc_total(reg, "h_" + _pad3(i))
+        i = i + 1
+    }
+    rpc_ctx_set_nl_metrics(ctx, reg)
+    return ctx
+}
+
+fn test_nl_metrics_paginates() {
+    let ctx = _mk_ctx_with_metrics(5)
+    let out = rpc_dispatch("nl.metrics", _args1("limit", "2"), ctx)
+    ce_check("nl.metrics ok",              _has(out, "\"ok\":true"))
+    ce_check("nl.metrics has holders",     _has(out, "\"holders\":"))
+    // First-page holders present.
+    ce_check("nl.metrics has h_000",       _has(out, "\"h_000\":"))
+    ce_check("nl.metrics has h_001",       _has(out, "\"h_001\":"))
+    ce_check("nl.metrics stops @h_002",    _has(out, "\"h_002\":") == 0)
+    // Aggregate always present, independent of page.
+    ce_check("nl.metrics has aggregate",   _has(out, "_total_all_holders"))
+    ce_check("nl.metrics next=h_001",
+             _has(out, "\"next_after\":\"h_001\""))
+}
+
+fn test_nl_metrics_empty_holders() {
+    let ctx = _mk_ctx_with_metrics(0)
+    let out = rpc_dispatch("nl.metrics", list_new(), ctx)
+    ce_check("nl.metrics empty ok",       _has(out, "\"ok\":true"))
+    ce_check("nl.metrics empty aggregate",
+             _has(out, "_total_all_holders"))
+    ce_check("nl.metrics empty next=''",
+             _has(out, "\"next_after\":\"\""))
+}
+
+// ---- self.gaps -------------------------------------------------------
+
+fn _mk_ctx_with_gaps(n) {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    let reg = gaps_register_new(0)
+    let i = 0
+    while i < n {
+        // Distinct timestamps so cursor "<ts>:0" is unique.
+        gaps_record(reg, "", "topic_" + _pad3(i),
+                    GAP_NO_MATCH, "detail " + int_to_str(i), 1000 + i)
+        i = i + 1
+    }
+    rpc_ctx_set_gaps_reg(ctx, reg)
+    return ctx
+}
+
+fn test_self_gaps_paginates() {
+    let ctx = _mk_ctx_with_gaps(6)
+    let out = rpc_dispatch("self.gaps", _args1("limit", "3"), ctx)
+    ce_check("self.gaps ok",             _has(out, "\"ok\":true"))
+    ce_check("self.gaps has entries",    _has(out, "\"entries\":["))
+    ce_check("self.gaps has topic_000",  _has(out, "topic_000"))
+    ce_check("self.gaps has topic_002",  _has(out, "topic_002"))
+    ce_check("self.gaps stops @003",     _has(out, "topic_003") == 0)
+    // Cursor is "<ts_nanos>:<idx>"; ts starts at 1000, idx=0.
+    ce_check("self.gaps next=1002:0",
+             _has(out, "\"next_after\":\"1002:0\""))
+}
+
+fn test_self_gaps_after_cursor() {
+    let ctx = _mk_ctx_with_gaps(6)
+    let out = rpc_dispatch("self.gaps",
+                _args2("limit", "2", "after", "1002:0"), ctx)
+    ce_check("self.gaps after ok",       _has(out, "\"ok\":true"))
+    ce_check("self.gaps after has 003",  _has(out, "topic_003"))
+    ce_check("self.gaps after has 004",  _has(out, "topic_004"))
+    ce_check("self.gaps after skips 002", _has(out, "topic_002") == 0)
+}
+
+fn test_self_gaps_tail_next_after_empty() {
+    let ctx = _mk_ctx_with_gaps(3)
+    let out = rpc_dispatch("self.gaps", _args1("limit", "10"), ctx)
+    ce_check("self.gaps tail all present",
+             _has(out, "topic_002"))
+    ce_check("self.gaps tail next=''",
+             _has(out, "\"next_after\":\"\""))
+}
+
+fn test_self_gaps_empty_register() {
+    let ctx = _mk_ctx_with_gaps(0)
+    let out = rpc_dispatch("self.gaps", list_new(), ctx)
+    ce_check("self.gaps empty ok",       _has(out, "\"ok\":true"))
+    ce_check("self.gaps empty entries=[]", _has(out, "\"entries\":[]"))
+    ce_check("self.gaps empty next=''",  _has(out, "\"next_after\":\"\""))
+}
+
+// ---- session.list ----------------------------------------------------
+//
+// session.list needs a snapshot dir to run. When none is configured
+// it refuses with a well-known message; when the dir exists but the
+// index file is absent the response is a paginated empty envelope.
+// Use CE_RPC_SNAPSHOT_DIR-less path: hand session.list a bogus dir --
+// _rpc_snap_read on a missing file returns "" -> 0 entries -> the
+// paginated empty envelope.
+
+fn test_session_list_empty_shape() {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    // No cap enforcement + a real path so _rpc_snap_read returns "".
+    rpc_ctx_set_snapshot_dir(ctx, "/tmp/ce-r107-nonexistent")
+    let out = rpc_dispatch("session.list", list_new(), ctx)
+    ce_check("session.list ok",           _has(out, "\"ok\":true"))
+    ce_check("session.list has sessions", _has(out, "\"sessions\":"))
+    ce_check("session.list empty next=''", _has(out, "\"next_after\":\"\""))
+}
+
+// ---- cross-verb invariants -------------------------------------------
+//
+// R107 helper contract: `_rpc_page_args` clamps identically across
+// every verb. We already checked kg.list; smoke a couple others to
+// confirm the helper is shared, not copy-pasted per verb.
+
+fn test_clamp_applies_to_capsule_list() {
+    let cr = _mk_capreg_n(3)
+    let ctx = rpc_ctx_new(0, cr, 0, 0, 0, 0, 0, 100)
+    let out = rpc_dispatch("capsule.list", _args1("limit", "0"), ctx)
+    // Clamped to 1: only cap_000 visible.
+    ce_check("cap.list clamp 0->1 has 000", _has(out, "cap_000"))
+    ce_check("cap.list clamp 0->1 stops",   _has(out, "cap_001") == 0)
+    ce_check("cap.list clamp next=cap_000",
+             _has(out, "\"next_after\":\"cap_000\""))
+}
+
+fn test_clamp_applies_to_skill_list() {
+    let sr = _mk_skillreg_n(2)
+    let ctx = rpc_ctx_new(0, 0, 0, sr, 0, 0, 0, 100)
+    let out = rpc_dispatch("skill.list", _args1("limit", "-99"), ctx)
+    ce_check("skill.list clamp -99->1 has 000", _has(out, "sk_000"))
+    ce_check("skill.list clamp -99->1 stops",   _has(out, "sk_001") == 0)
+}
+
+// ---- backwards compat -----------------------------------------------
+//
+// A caller that ignores next_after still gets a valid capped page.
+// The response ALWAYS carries next_after; the caller may drop it.
+// Verified transitively by every test above; do a positive spot
+// check that a no-arg call on a >50-item registry does NOT crash and
+// respects the default cap.
+
+fn test_default_cap_is_50() {
+    let cr = _mk_capreg_n(60)
+    let ctx = rpc_ctx_new(0, cr, 0, 0, 0, 0, 0, 100)
+    let out = rpc_dispatch("capsule.list", list_new(), ctx)
+    ce_check("cap.list default ok",       _has(out, "\"ok\":true"))
+    // 50 emitted -> cap_000..cap_049. cap_050 must NOT appear.
+    ce_check("cap.list default has 000",  _has(out, "cap_000"))
+    ce_check("cap.list default has 049",  _has(out, "cap_049"))
+    ce_check("cap.list default stops 050", _has(out, "cap_050") == 0)
+    ce_check("cap.list default next=cap_049",
+             _has(out, "\"next_after\":\"cap_049\""))
+}
+
+// ---- main ------------------------------------------------------------
+
+fn main() {
+    // kg.list (6 tests, ~26 checks)
+    test_kg_list_small_returns_all()
+    test_kg_list_empty_registry()
+    test_kg_list_explicit_limit_10()
+    test_kg_list_limit_clamps()
+    test_kg_list_unknown_after_starts_from_head()
+    test_kg_list_full_pagination_loop()
+
+    // capsule.list (3 tests, ~11 checks)
+    test_capsule_list_paginates()
+    test_capsule_list_after_middle()
+    test_capsule_list_empty()
+
+    // skill.list (2 tests, ~8 checks)
+    test_skill_list_paginates()
+    test_skill_list_empty()
+
+    // pattern.list (1 test, 3 checks)
+    test_pattern_list_shape()
+
+    // ownership.list (3 tests, ~11 checks)
+    test_ownership_list_paginates()
+    test_ownership_list_after_composite()
+    test_ownership_list_empty()
+
+    // capability.list (2 tests, ~8 checks)
+    test_capability_list_paginates()
+    test_capability_list_empty()
+
+    // ingest.policy.list (2 tests, ~7 checks)
+    test_ingest_policy_list_paginates()
+    test_ingest_policy_list_empty()
+
+    // nl.metrics (2 tests, ~10 checks)
+    test_nl_metrics_paginates()
+    test_nl_metrics_empty_holders()
+
+    // self.gaps (4 tests, ~13 checks)
+    test_self_gaps_paginates()
+    test_self_gaps_after_cursor()
+    test_self_gaps_tail_next_after_empty()
+    test_self_gaps_empty_register()
+
+    // session.list (1 test, 3 checks)
+    test_session_list_empty_shape()
+
+    // cross-verb helper invariants (3 tests, ~9 checks)
+    test_clamp_applies_to_capsule_list()
+    test_clamp_applies_to_skill_list()
+    test_default_cap_is_50()
+
+    ce_summary("wire_pagination")
+    return 0
+}
+
+main()

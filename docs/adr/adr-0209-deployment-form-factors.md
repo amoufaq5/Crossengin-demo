@@ -8,6 +8,14 @@ authentication, update path, current status, and next work for each.
 This ADR is the operator-facing map of "what can I actually deploy
 today, and what is coming next."
 
+**Round status:** R107 shipped uniform cursor pagination across 10
+list verbs (`kg.list`, `capsule.list`, `skill.list`, `pattern.list`,
+`ownership.list`, `session.list`, `capability.list`,
+`ingest.policy.list`, `nl.metrics`, `self.gaps`) — mobile-friendly
+wire pre-work for Mode 4 (client-app) scaling and Phase I part 2
+(R108: web SPA polish that consumes the new `next_after` field).
+See `docs/SHIP_AS_APP.md` §7.56.
+
 ## Date
 
 2026-08-22

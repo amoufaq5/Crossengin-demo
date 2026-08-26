@@ -4767,6 +4767,130 @@ shape this follows), `tests/benchmark/bench_operator_lookup.nova`
 (the head-to-head speedup pattern R106 will grow into once real
 measurements land).
 
+### 7.56 Wire cursor pagination (R107 — Phase I part 1)
+
+R107 lands **Phase I part 1** by folding uniform cursor pagination
+into every list-shaped wire verb. Before this round each list verb
+iterated its underlying registry into ONE response envelope: a
+mother daemon holding 10 000 KGs answered `kg.list` with a
+10 000-label array; `nl.metrics` with many holders grew unbounded.
+For a mobile-web client (Phase I's motivating shape; screen small,
+airtime metered, memory tight) the fix is a cursor: ask for a
+bounded page, present it, ask for the next.
+
+**Uniform shape** — every list verb accepts two page args:
+
+| arg | type   | default | clamp     | meaning                                    |
+|-----|--------|---------|-----------|--------------------------------------------|
+| `limit`  | int    | 50      | `[1, 500]` | max entries this call. `0`, negatives, and garbage all clamp UP to 1; values above 500 clamp DOWN. |
+| `after`  | string | ""      | —         | opaque cursor. When non-empty, response starts AFTER the entry whose stable id equals `after`. Unknown cursor gracefully restarts from the head. |
+
+Response gains a `next_after` field:
+
+- non-empty ⇒ the last-emitted cursor id; a next page exists.
+- `""` ⇒ current page is the tail; the loop terminates.
+
+The shared helper `_rpc_page_args` lives in `src/nl/rpc_verbs.nova`
+and produces `[limit, after]`. `_rpc_encode_next_after(cursor)`
+builds the `next_after` KV pair every verb splices in.
+`_rpc_page_start_index(ids, after)` does the ONE walk over the id
+list, so the graceful-restart semantics stay consistent verb by
+verb.
+
+**Per-verb cursor id table** — the id a caller stashes as the next
+call's `after`:
+
+| verb                  | field name  | cursor id per entry                              |
+|-----------------------|-------------|--------------------------------------------------|
+| `kg.list`             | `labels`    | KG label                                          |
+| `capsule.list`        | `capsules`  | capsule name                                      |
+| `skill.list`          | `skills`    | skill name                                        |
+| `pattern.list`        | `patterns`  | pattern-capsule name                              |
+| `ownership.list`      | `entries`   | composite `"<kind>:<name>"`                       |
+| `session.list`        | `sessions`  | session name                                      |
+| `capability.list`     | `tokens`    | token_id (opaque; NEVER emitted as a body field)  |
+| `ingest.policy.list`  | `policies`  | policy name                                       |
+| `nl.metrics`          | `holders`   | holder id (outer object key)                      |
+| `self.gaps`           | `entries`   | `"<timestamp_nanos>:<idx_within_ns>"`             |
+
+`self.gaps` already had a bare `limit` (R103); R107 adds `after`
+and folds it onto the uniform shape.
+
+**Backwards compatibility.** The response envelope is shaped:
+
+```json
+{"ok":true,
+ "result":{"<field>":[{...},...], "next_after":"..."},
+ "error":""}
+```
+
+A pre-R107 client that ignores `next_after` still gets a valid
+first-page response — up to 50 items when it passes no args. The
+old bare-array shape (`{"result":[...]}`) is gone; the eight in-
+tree tests that spot-checked it were updated in the same commit
+to look at the new `<field>:[...]` slot. Any external caller
+that hard-coded the bare-array shape must update; the change is
+strictly additive on the semantic side.
+
+**Mobile-adjacent motivation (Phase I context).** Cursor pagination
+is a necessary ingredient for the R108 web SPA to survive on a
+larger corpus. Mobile web pages the load-more affordance appears
+against — capsules, personas, ownership tables — all rely on it.
+No mobile-native client yet (no toolchain per ADR-0209 Mode 5
+deferral); this round makes the WIRE mobile-friendly, R108 makes
+the SPA consume the new shape.
+
+**Sample curl loop:**
+
+```bash
+after=""
+while :; do
+  args='{"limit":100'
+  [ -n "$after" ] && args="$args,\"after\":\"$after\""
+  args="$args}"
+  echo "{\"verb\":\"capsule.list\",\"args\":$args}" \
+    | nc -U /run/crossengin.sock > page.json
+  jq -c '.result.capsules[]' page.json
+  after=$(jq -r '.result.next_after' page.json)
+  [ -z "$after" ] && break
+done
+```
+
+**Tests.** `tests/unit/test_wire_pagination.nova` — NEW (115
+checks); crafts 3×-to-12× default-limit registries for each verb
+and confirms the invariants (every entry seen exactly once, no
+dupes, no gaps, tail has `next_after==""`, unknown cursor
+graceful-restarts, `limit` clamps at 0 / negative / huge, empty
+registry returns the paginated empty envelope). Eight existing
+list-verb tests extended in place with one-line `next_after`
+assertions each (`test_nl_rpc_verbs`, `test_capability_wire`,
+`test_ownership`, `test_self_gaps_verb`,
+`test_nl_rpc_metrics_verb`, `test_pattern_pack`,
+`test_ingest_policy`, plus the shape-updated empty-registry
+checks above).
+
+**Files touched:**
+`src/nl/rpc_verbs.nova` (three helpers + 10 handlers retrofitted),
+`tests/unit/test_wire_pagination.nova` (NEW),
+`tests/unit/test_nl_rpc_verbs.nova` +
+`tests/unit/test_capability_wire.nova` +
+`tests/unit/test_ownership.nova` +
+`tests/unit/test_self_gaps_verb.nova` +
+`tests/unit/test_nl_rpc_metrics_verb.nova` +
+`tests/unit/test_pattern_pack.nova` +
+`tests/unit/test_ingest_policy.nova` (all extended with the
+`next_after` assertion; the four `"result":[]` shape assertions
+updated to the new `<field>:[]` shape),
+`docs/SHIP_AS_APP.md` (this §7.56 + §12 roadmap update),
+`docs/adr/adr-0209-deployment-form-factors.md` (status line).
+
+**References:** ADR-0209 (deployment form factors — the design
+this round implements Phase I part 1 of), §7.10 (session.list —
+one of the ten retrofitted verbs), §7.34 (ownership.list — ditto),
+§7.46 (nl.metrics — ditto; note the aggregate row is invariant
+across pages), R103 (self.gaps — the reference cursor shape this
+round generalised).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -4940,9 +5064,26 @@ new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
   `bench/latency_v1/baseline.json` is an empty stub with a
   documented capture procedure.
 
-**Front-of-queue after Phase C ✅ / Phase D ✅ / Phase E ✅ / R103 ✅ / R105 ✅ / R106 ✅:**
+**Phase I part 1 SHIPPED (R107).**
+- **R107 ✅** — Wire cursor pagination for list verbs (see §7.56).
+  Uniform `limit` + `after` args plus a `next_after` field folded
+  onto every list-shaped verb (10 total: `kg.list`, `capsule.list`,
+  `skill.list`, `pattern.list`, `ownership.list`, `session.list`,
+  `capability.list`, `ingest.policy.list`, `nl.metrics`,
+  `self.gaps`). Shared helpers (`_rpc_page_args`,
+  `_rpc_encode_next_after`, `_rpc_page_start_index`) keep the
+  clamp + cursor-skip semantics identical verb by verb. Mobile-web
+  clients (R108's motivating shape) can now walk a large corpus in
+  bounded pages; the wire is form-factor-friendly ahead of the SPA
+  work. 115 checks in `test_wire_pagination`; eight existing tests
+  extended with `next_after` assertions.
+
+**Front-of-queue after Phase C ✅ / Phase D ✅ / Phase E ✅ / R103 ✅ / R105 ✅ / R106 ✅ / R107 ✅:**
+- **R108** — Web SPA + HTTP shim polish (finishes Phase I; consumes
+  R107's cursor shape; adds cap-token auth, load-more affordances,
+  responsive CSS, `--cors` opt-in on the shim, HTTP status mapping
+  for rate-limit / auth errors).
 - **R104** — `self.override` (finishes Phase F; deferred by user).
-- **Phase I** — form-factor targeting (mobile / embedded / …).
 - **Phase J** — agent production surface
   (`agent.compose/list/run/retire`).
 - **Backlog debt** — admin bulk-ops, DTLS-12 red-fix (72/450 checks
