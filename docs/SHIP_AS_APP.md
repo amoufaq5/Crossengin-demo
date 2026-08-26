@@ -4653,6 +4653,120 @@ on ingest.file — the stamping rule now covers image / audio /
 video), `src/io/transducers/*` (the transducer inventory the
 importers compose).
 
+### 7.55 Performance harness (R106 — Phase H)
+
+R106 lands **Phase H** by shipping the wall-clock latency harness
+ADR-0208 has been asking for: a synthetic KG corpus generator, a
+NOVA bench file that times each stage of the NL pipeline, a shell
+driver with `--json` / `--compare` modes, and three Makefile targets
+that wrap it. The bench feeds a per-phase `crossengin-bench-v1`
+JSON payload (schema shared with `scripts/bench.sh`) into a
+compare-mode diff that exits 2 on any median-ns regression past 1.5x
+baseline.
+
+**Modules shipped**:
+
+- `tests/benchmark/kg_synthetic_loader.nova` — a corpus generator.
+  `syn_kg_new_at_scale(atom_count)` builds a KG with N atoms cycled
+  through `ATOM_FACT` / `ATOM_CONCEPT` / `ATOM_RELATION`, per-atom
+  belief deterministic in `i`, provenance tier cycled through
+  `SRC_A` / `SRC_B` / `SRC_C`. `syn_kg_add_relations` and
+  `syn_kg_add_capsule_refs` fill out edges and capsule ownership.
+  Three named scale presets: `SCALE_SMALL` (1000 atoms + 5000 rels
+  + 10 caps), `SCALE_MEDIUM` (10000/50000/100), `SCALE_LARGE`
+  (100000/1000000/1000, behind `CROSSENGIN_BENCH_LARGE=1`).
+- `tests/benchmark/bench_nl_verbs.nova` — the harness itself. Ten
+  phases measured on the SMALL corpus with median + p99 ns per
+  phase: `grammar_parse`, `nl_ic_try_classify`,
+  `nl_llm_try_fallback` (sidecar in test-mode; no fork),
+  `nl_execute_scoped_ex`, `templater_render`, plus full
+  `rpc_dispatch("nl.ask", …)` for the five query kinds
+  research / relate / contradict_scan / is_a / skill_run:echo.
+- `scripts/bench_nl_verbs.sh` — driver with `--json <path>`
+  (save), `--compare <baseline>` (diff, exit 2 on regression),
+  and stdout-JSON default. Empty-baseline case is a no-op (exit 0).
+- `bench/latency_v1/baseline.json` — an **empty stub** in this
+  container (nanotime is broken; see below). Real baseline is
+  captured on a permissive host via `make bench-nl-baseline`.
+- `bench/latency_v1/README.md` — captures the procedure.
+- `Makefile` — three new targets: `bench-nl`, `bench-nl-compare`,
+  `bench-nl-baseline`, plus a `help` entry for each.
+
+**Nanotime graceful-skip.** The harness's very first act inside
+`main()` samples `nanotime()` twice. If both come back 0, or the
+second sample is `<=` the first, the runtime clock is treated as
+non-monotonic, and the harness prints a single
+
+```
+SKIP: nanotime not functional in this environment
+(see docs/NOVA_RUNTIME_GAPS.md R-2; harness graceful-skip)
+```
+
+line and exits 0. `docs/NOVA_RUNTIME_GAPS.md` R-2 documents that
+this container's NOVA build returns 0 for `nanotime` for the whole
+process, so `make bench-nl` cleanly skips here. The pattern mirrors
+`tests/unit/test_ed25519.nova:498-513` — the only other place a
+NOVA test needs to defend against the broken clock. The driver
+script recognizes the SKIP line and emits an empty-results JSON
+payload with a `skip_reason` field so downstream tooling stays
+schema-uniform.
+
+**Scale presets + env gate.** `SCALE_SMALL` is the default and
+runs everywhere. `SCALE_MEDIUM` (10000 atoms) is loader-supported
+for permissive-host baseline capture. `SCALE_LARGE` (100000 atoms
++ 10^6 edges) is gated behind `CROSSENGIN_BENCH_LARGE=1` because
+the atom + relation count is memory-heavy — the loader honors it,
+the R106 bench core still uses SMALL so results stay
+host-comparable.
+
+**Baseline-capture procedure (permissive host)**:
+
+```
+$ make bench-nl-baseline
+$ git add bench/latency_v1/baseline.json
+$ git commit -m 'perf(bench): R106 baseline captured on <host>'
+```
+
+Subsequent rounds run `make bench-nl-compare` which prints a
+markdown-diff table (baseline_ns | current_ns | delta% | verdict
+one of REGRESS / SLOWER / NOMINAL / FASTER / NEW / MISSING). Exit
+codes: 0 = ok or empty baseline, 2 = REGRESS on any phase.
+
+**Regression-gate semantics** (from ADR-0208 "Regression gate"):
+a PR that regresses any phase's median_ns past 1.5x baseline
+(REGRESS) either fixes the regression or bumps the budget in
+ADR-0208 with justification. The exit-2 shape maps directly into
+CI without extra glue.
+
+**ADR-0208 cross-reference.** The budget table at
+`docs/adr/adr-0208-latency-and-inference-budget.md` lines 47-58
+is the contract the harness measures against once real numbers land.
+Each per-kind row (`is_a`, `research`, `relate`, `contradict_scan`,
+`skill_run (echo)`, …) maps 1:1 to a phase name in the JSON
+payload (`rpc_nl_ask_is_a`, `rpc_nl_ask_research`, …). The p99 row
+in the ADR maps to the `p99_ns` field; the p50 row maps to
+`median_ns`. Widening a budget requires an ADR-0208 amendment.
+
+**Modules touched**:
+`tests/benchmark/kg_synthetic_loader.nova` (NEW),
+`tests/benchmark/bench_nl_verbs.nova` (NEW),
+`scripts/bench_nl_verbs.sh` (NEW; executable),
+`bench/latency_v1/baseline.json` (NEW; empty),
+`bench/latency_v1/README.md` (NEW),
+`Makefile` (3 targets + help + `.PHONY` update),
+`docs/SHIP_AS_APP.md` (§7.55 + §12 roadmap update),
+`docs/adr/adr-0208-latency-and-inference-budget.md` (status line).
+
+**References:** ADR-0208 (latency-and-inference-budget; the design
+lock this round implements), `docs/NOVA_RUNTIME_GAPS.md` R-2 (the
+broken-nanotime record that motivates the graceful-skip),
+`scripts/bench.sh` (the R25E master harness whose
+`crossengin-bench-v1` schema this reuses),
+`tests/benchmark/bench_kg_query.nova` (the canonical bench-file
+shape this follows), `tests/benchmark/bench_operator_lookup.nova`
+(the head-to-head speedup pattern R106 will grow into once real
+measurements land).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -4813,10 +4927,27 @@ new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
   perceptual atoms flow through `rq_submit` + `ingest.policy` per
   ADR-0202. ADR-0202 design lock now composed in code.
 
-**Front-of-queue after Phase C ✅ / Phase D ✅ / Phase E ✅ / R103 ✅ / R105 ✅:**
+**Phase H COMPLETE (R106 shipped).**
+- **R106 ✅** — NL-verb latency harness + synthetic corpus +
+  baseline stub (see §7.55). `tests/benchmark/kg_synthetic_loader.nova`
+  seeds a KG at three named scales; `tests/benchmark/bench_nl_verbs.nova`
+  times ten NL-pipeline phases; `scripts/bench_nl_verbs.sh` wraps
+  it with `--json` / `--compare` modes and exit-2 regression gating;
+  three Makefile targets (`bench-nl`, `bench-nl-compare`,
+  `bench-nl-baseline`) plug it into CI. Nanotime graceful-skip on a
+  broken-clock host (this container, per NOVA_RUNTIME_GAPS.md R-2).
+  Real baseline pending permissive-host capture; the shipped
+  `bench/latency_v1/baseline.json` is an empty stub with a
+  documented capture procedure.
+
+**Front-of-queue after Phase C ✅ / Phase D ✅ / Phase E ✅ / R103 ✅ / R105 ✅ / R106 ✅:**
 - **R104** — `self.override` (finishes Phase F; deferred by user).
-- **Phase H** — perf/benchmark harness per ADR-0208.
 - **Phase I** — form-factor targeting (mobile / embedded / …).
+- **Phase J** — agent production surface
+  (`agent.compose/list/run/retire`).
+- **Backlog debt** — admin bulk-ops, DTLS-12 red-fix (72/450 checks
+  red since R86), bignum_256 / field25519 consolidation,
+  LICENSES/ folder authoring.
 - **Multimodal follow-ons** — per-keyframe image fanout in
   `video_records`, whisper/vosk STT wire-up on a permissive host,
   OCR wire-up once `png_decode.nova`'s DEFLATE dynamic-Huffman path

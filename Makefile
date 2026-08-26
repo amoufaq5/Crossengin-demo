@@ -29,7 +29,7 @@ KGSYNC_PUB  := examples/crossengin_kg_publisher.nova
 KGSYNC_SUB  := examples/crossengin_kg_subscriber.nova
 FED_COORD   := examples/crossengin_fed_coordinator.nova
 
-.PHONY: all build test benchmark coverage lint-ints install integration clean check-nova help cross-windows smoke-windows-ce
+.PHONY: all build test benchmark bench-nl bench-nl-compare bench-nl-baseline coverage lint-ints install integration clean check-nova help cross-windows smoke-windows-ce
 
 all: build
 
@@ -217,6 +217,25 @@ benchmark: check-nova
 	  "$(NOVA)" run "$$b" 2>&1 | grep -v '^Compiled:'; \
 	done
 
+# R106 / Phase H -- NL-verb latency harness (ADR-0208). Three convenience
+# targets wrap scripts/bench_nl_verbs.sh:
+#   bench-nl           run and print the crossengin-bench-v1 JSON
+#   bench-nl-compare   run and diff against bench/latency_v1/baseline.json
+#                       exit 2 on regression (>50% slower on any phase)
+#   bench-nl-baseline  run and overwrite the baseline JSON
+# On a host with broken nanotime (see docs/NOVA_RUNTIME_GAPS.md R-2)
+# the harness gracefully skips and exits 0 -- these targets never
+# break `make test`.
+bench-nl:
+	@bash scripts/bench_nl_verbs.sh
+
+bench-nl-compare:
+	@bash scripts/bench_nl_verbs.sh --compare bench/latency_v1/baseline.json
+
+bench-nl-baseline:
+	@bash scripts/bench_nl_verbs.sh --json bench/latency_v1/baseline.json
+	@echo "Baseline written to bench/latency_v1/baseline.json"
+
 install: build
 	@mkdir -p $(BIN)
 	@if [ -f "$(SELFCHECK)" ]; then \
@@ -311,6 +330,9 @@ help:
 	@echo "  build       compile every implemented NOVA module under src/"
 	@echo "  test        compile and run every unit test under tests/unit/"
 	@echo "  benchmark   run every benchmark under tests/benchmark/"
+	@echo "  bench-nl    R106/Phase H NL-verb latency harness (ADR-0208)"
+	@echo "  bench-nl-compare   run bench-nl and diff vs bench/latency_v1/baseline.json (exit 2 on regression)"
+	@echo "  bench-nl-baseline  run bench-nl and overwrite bench/latency_v1/baseline.json"
 	@echo "  coverage    report module-level unit-test coverage (static)"
 	@echo "  lint-ints   flag large-literal arithmetic at risk of codegen bug #11"
 	@echo "  install     build the self-check, companion-spine, unified daemon, kg-sync pub/sub, and fed-coordinator into ./bin/"

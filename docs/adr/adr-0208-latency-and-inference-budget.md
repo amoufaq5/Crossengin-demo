@@ -127,6 +127,28 @@ The harness is not the ADR; the ADR is the discipline. Rounds that
 land the harness itself and successive tuning rounds are Phase B
 work.
 
+### Implementation status
+
+- **R106 (Phase H) — harness IMPLEMENTED.** The harness described
+  above ships in tree as `tests/benchmark/bench_nl_verbs.nova` +
+  `tests/benchmark/kg_synthetic_loader.nova` +
+  `scripts/bench_nl_verbs.sh`, wrapped by three Makefile targets
+  (`bench-nl`, `bench-nl-compare`, `bench-nl-baseline`). The
+  `crossengin-bench-v1` JSON payload emitted matches
+  `scripts/bench.sh`; `--compare` exits 2 on any phase whose
+  `median_ns` regresses past 1.5× baseline.
+- **Baseline PENDING permissive-host capture.** The shipped
+  `bench/latency_v1/baseline.json` is an empty stub; the container
+  this repo currently ships in has broken `nanotime()` (see
+  `docs/NOVA_RUNTIME_GAPS.md` R-2), so measurements from here would
+  all be zeros. The harness gracefully skips on a broken-clock host
+  (prints `SKIP: nanotime not functional …` and exits 0). Capture
+  the real numbers on a permissive host via
+  `make bench-nl-baseline` and commit the resulting JSON.
+- **CI hookup PENDING.** No CI workflow file lives in the tree
+  yet (`docs/SHIP_AS_APP.md` §12 notes CI is Makefile-driven); the
+  exit-2 semantics are ready for a workflow when one lands.
+
 ## Consequences
 
 ### Positive
