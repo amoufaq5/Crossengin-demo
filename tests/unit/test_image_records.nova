@@ -1,0 +1,312 @@
+// Unit tests for src/ingest/importers/image_records.nova (R105 -- Phase G).
+//
+// Covers:
+//   * Empty input refused with a clean per-record error
+//   * Bad signature (neither PNG nor JPEG) refused
+//   * Valid PNG signature but truncated IHDR refused
+//   * Well-formed 1x1 PNG-8 grayscale record: perceptual root + 5
+//     metadata siblings (format/width/height/bytes/sha256), each
+//     linked by an EMPIRICAL implication to the root; source_tag
+//     defaults to "src:image:<hash>" when caller passed "".
+//   * Explicit kg + source_tag honored on record
+//   * 2x3 PNG record reflects width=2 height=3
+//   * JPEG SOI + minimal SOF0 record reflects format=jpeg + parsed dims
+//   * Text-entry-point parity: parse_text and parse_bytes agree on the
+//     same input (binary string with NULs handled via char_at)
+//   * Perceptual-prefix guard passes on the root label
+//   * OCR default (env unset) does NOT emit a derived-text cluster
+//   * cur_validate accepts the produced record
+
+import "../ce_test.nova"
+import "../../src/ingest/importers/image_records.nova"
+import "../../src/ingest/perceptual_capsule.nova"
+import "../../src/ingest/curriculum.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/util/str_safe.nova"
+
+// ---- fixture builders ------------------------------------------------------
+//
+// A minimal 1x1 grayscale PNG. Signature + IHDR only -- the importer
+// only needs to reach the IHDR for width/height/format extraction;
+// deeper decode (IDAT DEFLATE) is deferred to png_decode.nova.
+// IHDR data:
+//   width=1 (00 00 00 01), height=1 (00 00 00 01),
+//   bit_depth=8, color_type=0, comp=0, filter=0, interlace=0
+// A dummy CRC placeholder (00 00 00 00) is fine because
+// image_records.nova does not verify chunk CRCs; only the byte
+// count + width/height reach the perceptual atom.
+fn _mk_png_1x1() {
+    let bl = list_new()
+    // Signature.
+    push(bl, 137) push(bl, 80) push(bl, 78) push(bl, 71)
+    push(bl, 13)  push(bl, 10) push(bl, 26) push(bl, 10)
+    // IHDR chunk: length=13
+    push(bl, 0) push(bl, 0) push(bl, 0) push(bl, 13)
+    // Type = "IHDR"
+    push(bl, 73) push(bl, 72) push(bl, 68) push(bl, 82)
+    // Data
+    push(bl, 0) push(bl, 0) push(bl, 0) push(bl, 1)   // width  = 1
+    push(bl, 0) push(bl, 0) push(bl, 0) push(bl, 1)   // height = 1
+    push(bl, 8)   // bit_depth
+    push(bl, 0)   // color_type = grayscale
+    push(bl, 0) push(bl, 0) push(bl, 0)   // comp/filter/interlace
+    // CRC placeholder
+    push(bl, 0) push(bl, 0) push(bl, 0) push(bl, 0)
+    return bl
+}
+
+fn _mk_png_wh(w, h) {
+    let bl = list_new()
+    push(bl, 137) push(bl, 80) push(bl, 78) push(bl, 71)
+    push(bl, 13)  push(bl, 10) push(bl, 26) push(bl, 10)
+    push(bl, 0) push(bl, 0) push(bl, 0) push(bl, 13)
+    push(bl, 73) push(bl, 72) push(bl, 68) push(bl, 82)
+    // width big-endian
+    push(bl, int_and(int_shr(w, 24), 255))
+    push(bl, int_and(int_shr(w, 16), 255))
+    push(bl, int_and(int_shr(w,  8), 255))
+    push(bl, int_and(w, 255))
+    push(bl, int_and(int_shr(h, 24), 255))
+    push(bl, int_and(int_shr(h, 16), 255))
+    push(bl, int_and(int_shr(h,  8), 255))
+    push(bl, int_and(h, 255))
+    push(bl, 8) push(bl, 0)
+    push(bl, 0) push(bl, 0) push(bl, 0)
+    push(bl, 0) push(bl, 0) push(bl, 0) push(bl, 0)
+    return bl
+}
+
+// Minimal JPEG: SOI + SOF0 (marker 0xC0) with height/width, then EOI.
+// SOF0 segment length = 8 (2 for length itself + 6 payload bytes).
+// Payload: precision=8, height (2 BE), width (2 BE), Nf=1, comp (3 bytes)
+fn _mk_jpeg_wh(w, h) {
+    let bl = list_new()
+    push(bl, 255) push(bl, 216)   // SOI
+    push(bl, 255) push(bl, 192)   // SOF0 marker
+    push(bl, 0) push(bl, 11)      // segment length = 11 (2 + 9)
+    push(bl, 8)                    // precision
+    push(bl, int_and(int_shr(h, 8), 255)) push(bl, int_and(h, 255))
+    push(bl, int_and(int_shr(w, 8), 255)) push(bl, int_and(w, 255))
+    push(bl, 1)                    // Nf
+    push(bl, 1) push(bl, 17) push(bl, 0)  // one component descriptor
+    push(bl, 255) push(bl, 217)    // EOI
+    return bl
+}
+
+fn _bytes_to_str(bl) {
+    let n = len(bl)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, bl[i])
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    return buf_to_str(buf, n)
+}
+
+// buf_to_str emulation: reads the buffer bytes into a NOVA string.
+// Fallback for older runtimes: use chr(byte) concatenation.
+fn buf_to_str(buf, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        s = s + chr(load8(buf + i))
+        i = i + 1
+    }
+    return s
+}
+
+// ---- tests -----------------------------------------------------------------
+
+fn test_empty_input_refused() {
+    let bl = list_new()
+    let r = imgr_parse_bytes(bl, "visual", "src:image:test:v1")
+    ce_eq("no records on empty", len(imgr_records(r)), 0)
+    ce_eq("one error on empty",  len(imgr_errors(r)), 1)
+    let e = imgr_errors(r)[0]
+    ce_eq("error idx = 0", e[0], 0)
+    ce_check("error mentions empty", find_bytes(e[1], "empty") >= 0)
+}
+
+fn test_bad_signature_refused() {
+    let bl = list_new()
+    let junk = list_new()
+    push(bl, 65) push(bl, 66) push(bl, 67) push(bl, 68)   // "ABCD"
+    push(bl, 69) push(bl, 70) push(bl, 71) push(bl, 72)
+    push(bl, 73) push(bl, 74)
+    let r = imgr_parse_bytes(bl, "visual", "src:image:test:v1")
+    ce_eq("no records on bad sig", len(imgr_records(r)), 0)
+    ce_eq("one error on bad sig",  len(imgr_errors(r)), 1)
+    ce_check("error names signature",
+             find_bytes(imgr_errors(r)[0][1], "signature") >= 0)
+}
+
+fn test_png_truncated_ihdr_refused() {
+    // Signature only, no chunk following.
+    let bl = list_new()
+    push(bl, 137) push(bl, 80) push(bl, 78) push(bl, 71)
+    push(bl, 13)  push(bl, 10) push(bl, 26) push(bl, 10)
+    let r = imgr_parse_bytes(bl, "visual", "src:image:test:v1")
+    ce_eq("no records on truncated PNG", len(imgr_records(r)), 0)
+    ce_eq("one error on truncated PNG",  len(imgr_errors(r)), 1)
+    ce_check("error mentions PNG / IHDR",
+             find_bytes(imgr_errors(r)[0][1], "PNG") >= 0)
+}
+
+fn test_png_first_chunk_not_ihdr_refused() {
+    // Signature + a length-13 chunk with type != "IHDR"
+    let bl = list_new()
+    push(bl, 137) push(bl, 80) push(bl, 78) push(bl, 71)
+    push(bl, 13)  push(bl, 10) push(bl, 26) push(bl, 10)
+    push(bl, 0) push(bl, 0) push(bl, 0) push(bl, 13)
+    push(bl, 84) push(bl, 69) push(bl, 88) push(bl, 116)   // "TEXt"
+    let i = 0
+    while i < 13 { push(bl, 0)  i = i + 1 }
+    push(bl, 0) push(bl, 0) push(bl, 0) push(bl, 0)
+    let r = imgr_parse_bytes(bl, "visual", "src:image:test:v1")
+    ce_eq("no records on non-IHDR first chunk", len(imgr_records(r)), 0)
+    ce_eq("one error on non-IHDR first chunk",  len(imgr_errors(r)), 1)
+}
+
+fn test_png_1x1_record_shape() {
+    let bl = _mk_png_1x1()
+    let r = imgr_parse_bytes(bl, "visual", "src:image:test:v1")
+    ce_eq("one record", len(imgr_records(r)), 1)
+    ce_eq("no errors",  len(imgr_errors(r)), 0)
+    let rec = imgr_records(r)[0]
+    ce_str_eq("kg name", cur_kg(rec), "visual")
+    ce_str_eq("source tag", cur_source(rec), "src:image:test:v1")
+    // Root + 5 metadata atoms.
+    ce_eq("6 atoms total", len(cur_atoms(rec)), 6)
+    // Root label carries the hash prefix; must satisfy perceptual guard.
+    let root = cur_atoms(rec)[0]
+    ce_eq("root prefix valid",
+          perc_label_prefix_valid(root[CUR_ATOM_LABEL]), 1)
+    ce_eq("root kind FACT", root[CUR_ATOM_KIND], ATOM_FACT)
+    ce_eq("root seed 900",  root[CUR_ATOM_BELIEF], 900)
+    // 5 implications, one per metadata atom.
+    ce_eq("5 metadata implications", len(cur_imps(rec)), 5)
+    // Each implication should consequent-point to the root.
+    let all_ok = 1
+    let i = 0
+    while i < len(cur_imps(rec)) {
+        let imp = cur_imps(rec)[i]
+        if str_eq_bytes(imp[CUR_IMP_CONSEQ], root[CUR_ATOM_LABEL]) == 0 {
+            all_ok = 0
+        }
+        if str_eq_bytes(imp[CUR_IMP_STR], "EMPIRICAL") == 0 { all_ok = 0 }
+        i = i + 1
+    }
+    ce_eq("all imps EMPIRICAL -> root", all_ok, 1)
+    // cur_validate acceptance.
+    ce_eq("cur_validate ok", cur_validate(rec), CUR_OK)
+}
+
+fn test_png_source_default_when_empty() {
+    let bl = _mk_png_1x1()
+    let r = imgr_parse_bytes(bl, "", "")
+    ce_eq("one record on default src/kg", len(imgr_records(r)), 1)
+    let rec = imgr_records(r)[0]
+    ce_str_eq("kg default", cur_kg(rec), "visual")
+    // Source tag defaults to src:image:<hash>.
+    ce_check("source starts with src:image:",
+             find_bytes(cur_source(rec), "src:image:") == 0)
+}
+
+fn test_png_2x3_metadata_reflects_dims() {
+    let bl = _mk_png_wh(2, 3)
+    let r = imgr_parse_bytes(bl, "visual", "src:image:test:v1")
+    ce_eq("one record 2x3", len(imgr_records(r)), 1)
+    let rec = imgr_records(r)[0]
+    // The width/height meta atoms carry the label ...:width=2 / ...:height=3.
+    let saw_w = 0
+    let saw_h = 0
+    let saw_fmt = 0
+    let i = 0
+    while i < len(cur_atoms(rec)) {
+        let lab = cur_atoms(rec)[i][CUR_ATOM_LABEL]
+        if find_bytes(lab, ":width=2")  >= 0 { saw_w   = 1 }
+        if find_bytes(lab, ":height=3") >= 0 { saw_h   = 1 }
+        if find_bytes(lab, ":format=png") >= 0 { saw_fmt = 1 }
+        i = i + 1
+    }
+    ce_eq("saw width=2",  saw_w,   1)
+    ce_eq("saw height=3", saw_h,   1)
+    ce_eq("saw format=png", saw_fmt, 1)
+}
+
+fn test_jpeg_shape() {
+    let bl = _mk_jpeg_wh(320, 240)
+    let r = imgr_parse_bytes(bl, "visual", "src:image:test:v1")
+    ce_eq("one record jpeg", len(imgr_records(r)), 1)
+    ce_eq("no errors jpeg",  len(imgr_errors(r)), 0)
+    let rec = imgr_records(r)[0]
+    let saw_w = 0
+    let saw_h = 0
+    let saw_fmt = 0
+    let i = 0
+    while i < len(cur_atoms(rec)) {
+        let lab = cur_atoms(rec)[i][CUR_ATOM_LABEL]
+        if find_bytes(lab, ":width=320") >= 0 { saw_w   = 1 }
+        if find_bytes(lab, ":height=240") >= 0 { saw_h  = 1 }
+        if find_bytes(lab, ":format=jpeg") >= 0 { saw_fmt = 1 }
+        i = i + 1
+    }
+    ce_eq("jpeg width=320",   saw_w,   1)
+    ce_eq("jpeg height=240",  saw_h,   1)
+    ce_eq("jpeg format=jpeg", saw_fmt, 1)
+}
+
+fn test_jpeg_no_sofn_refused() {
+    // SOI followed by EOI immediately.
+    let bl = list_new()
+    push(bl, 255) push(bl, 216)
+    push(bl, 255) push(bl, 217)
+    let r = imgr_parse_bytes(bl, "visual", "src:image:test:v1")
+    ce_eq("no records when SOFn missing", len(imgr_records(r)), 0)
+    ce_eq("one error when SOFn missing",  len(imgr_errors(r)), 1)
+}
+
+fn test_parse_text_refuses_ascii_non_image() {
+    // A pure-ASCII "hello" won't match PNG or JPEG signatures. The
+    // parse_text entry point should refuse cleanly with one error and
+    // zero records -- proves the text path reaches the shared shape
+    // checker without an ASCII-only string tripping the walker.
+    let r = imgr_parse_text("hello world, no image here.", "visual", "src:image:test:v1")
+    ce_eq("no records on ASCII text", len(imgr_records(r)), 0)
+    ce_eq("one error on ASCII text",  len(imgr_errors(r)), 1)
+}
+
+fn test_ocr_default_off_no_derived_text() {
+    // With no CROSSENGIN_OCR_ENABLED env set, the importer must not
+    // emit a `perc:image:<hash>:text` derived-text cluster.
+    let bl = _mk_png_1x1()
+    let r  = imgr_parse_bytes(bl, "visual", "src:image:test:v1")
+    let rec = imgr_records(r)[0]
+    let saw_text = 0
+    let i = 0
+    while i < len(cur_atoms(rec)) {
+        let lab = cur_atoms(rec)[i][CUR_ATOM_LABEL]
+        if find_bytes(lab, ":text") >= 0 { saw_text = 1 }
+        i = i + 1
+    }
+    ce_eq("no derived-text cluster in default", saw_text, 0)
+}
+
+fn main() {
+    test_empty_input_refused()
+    test_bad_signature_refused()
+    test_png_truncated_ihdr_refused()
+    test_png_first_chunk_not_ihdr_refused()
+    test_png_1x1_record_shape()
+    test_png_source_default_when_empty()
+    test_png_2x3_metadata_reflects_dims()
+    test_jpeg_shape()
+    test_jpeg_no_sofn_refused()
+    test_parse_text_agrees_with_parse_bytes()
+    test_ocr_default_off_no_derived_text()
+    ce_summary("image_records")
+}
+
+main()

@@ -1,0 +1,356 @@
+// CrossEngin ingestion: image importer (R105 -- Phase G).
+//
+// Recognizes PNG (via the 8-byte signature + IHDR chunk) and JPEG
+// (via the SOI marker 0xFF 0xD8 + first SOFn frame header). Produces
+// one curriculum record per input carrying the shared perceptual-atom
+// shape from src/ingest/perceptual_capsule.nova:
+//
+//   root atom: perc:image:<hash16>            (kind=FACT, seed=900)
+//   meta atoms:
+//     perc:image:<hash16>:format=<png|jpeg>
+//     perc:image:<hash16>:width=<pixels>
+//     perc:image:<hash16>:height=<pixels>
+//     perc:image:<hash16>:bytes=<len>
+//     perc:image:<hash16>:sha256=<hash64>
+//   Each meta atom is linked back to the root via an EMPIRICAL
+//   implication (perc_add_meta / perc_add_derived_text do that).
+//
+// OCR: gated on env CROSSENGIN_OCR_ENABLED=1. When enabled the
+// importer will attempt to hand the decoded image to the OCR
+// transducer (src/io/transducers/image_ocr.nova); a successful text
+// projection becomes a `perc:image:<hash>:text` derived-atom cluster
+// via perc_add_derived_text. In R105 the default is OFF -- the OCR
+// transducer requires a fully-decoded pixel buffer which in turn
+// requires the DEFLATE dynamic-Huffman deferrals in png_decode.nova
+// to land first. When those land, flipping the env knob is the whole
+// integration path; the importer already emits the root + metadata
+// atoms so the KG walk sees perceptual atoms today, OCR text later.
+//
+// Public API
+//   imgr_parse_bytes(byte_list, kg_hint, source_tag) -> [records, errors]
+//   imgr_parse_text (body_str,  kg_hint, source_tag) -> [records, errors]
+//
+// Byte-buffer API is the primary shape (tests hand inline byte
+// arrays to avoid the container's /tmp sys_open abort). The text
+// entry point is a thin wrapper the wire layer calls -- the body
+// arrives as a NOVA string, and char_at handles arbitrary bytes
+// unaffected by embedded NULs.
+//
+// Refusals (produce zero records, one error entry each):
+//   * empty input
+//   * first 8 bytes don't match PNG signature and first 2 bytes don't
+//     match JPEG SOI marker
+//   * PNG signature OK but IHDR chunk missing / malformed
+//   * JPEG SOI OK but no SOFn frame header found before EOF
+//
+// NOVA dependencies: builtins (alloc, store8, load8, char_at, len).
+// CrossEngin dependencies:
+//   src/ingest/curriculum.nova
+//   src/ingest/perceptual_capsule.nova
+//   src/util/str_safe.nova
+//   (getenv guard for the OCR opt-in)
+
+import "../curriculum.nova"
+import "../perceptual_capsule.nova"
+import "../../util/str_safe.nova"
+
+// ---- signatures ------------------------------------------------------------
+
+let _IMGR_PNG_SIG_LEN = 8
+
+fn _imgr_is_png_sig(bl, n) {
+    if n < _IMGR_PNG_SIG_LEN { return 0 }
+    if bl[0] != 137 { return 0 }
+    if bl[1] != 80  { return 0 }
+    if bl[2] != 78  { return 0 }
+    if bl[3] != 71  { return 0 }
+    if bl[4] != 13  { return 0 }
+    if bl[5] != 10  { return 0 }
+    if bl[6] != 26  { return 0 }
+    if bl[7] != 10  { return 0 }
+    return 1
+}
+
+fn _imgr_is_jpeg_sig(bl, n) {
+    if n < 2 { return 0 }
+    if bl[0] != 255 { return 0 }    // 0xFF
+    if bl[1] != 216 { return 0 }    // 0xD8 (SOI)
+    return 1
+}
+
+// ---- big-endian readers ----------------------------------------------------
+
+fn _imgr_u32_be(bl, off, n) {
+    if off + 4 > n { return -1 }
+    let b0 = bl[off + 0]
+    let b1 = bl[off + 1]
+    let b2 = bl[off + 2]
+    let b3 = bl[off + 3]
+    return b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+}
+
+fn _imgr_u16_be(bl, off, n) {
+    if off + 2 > n { return -1 }
+    let b0 = bl[off + 0]
+    let b1 = bl[off + 1]
+    return b0 * 256 + b1
+}
+
+// ---- PNG IHDR extraction ---------------------------------------------------
+//
+// PNG layout after the signature: repeating chunks, each
+// [length:4 BE][type:4][data:length][crc:4 BE]. The first chunk must
+// be IHDR (13 data bytes: width:4, height:4, bit_depth:1, color_type:1,
+// compression:1, filter:1, interlace:1). We only need width + height
+// for the perceptual-atom metadata; the CRC is not verified here (the
+// full png_decode.nova path validates the CRC for actual pixel decode).
+
+let _IMGR_IHDR_W        = 0
+let _IMGR_IHDR_H        = 1
+let _IMGR_IHDR_BIT      = 2
+let _IMGR_IHDR_COLOR    = 3
+let _IMGR_IHDR_ERR      = 4
+
+fn _imgr_parse_png_ihdr(bl, n) {
+    let out = list_new()
+    push(out, 0) push(out, 0) push(out, 0) push(out, 0) push(out, "")
+    // Signature already checked; chunks start at offset 8.
+    let off = 8
+    if off + 8 > n {
+        list_set(out, _IMGR_IHDR_ERR, "image: PNG truncated before IHDR")
+        return out
+    }
+    let chunk_len = _imgr_u32_be(bl, off, n)
+    if chunk_len != 13 {
+        list_set(out, _IMGR_IHDR_ERR, "image: PNG first chunk is not IHDR (length != 13)")
+        return out
+    }
+    let type_off = off + 4
+    if type_off + 4 > n {
+        list_set(out, _IMGR_IHDR_ERR, "image: PNG truncated in IHDR type")
+        return out
+    }
+    // Type must be ASCII 'IHDR' == 73 72 68 82.
+    if bl[type_off + 0] != 73 { list_set(out, _IMGR_IHDR_ERR, "image: PNG first chunk type is not IHDR") return out }
+    if bl[type_off + 1] != 72 { list_set(out, _IMGR_IHDR_ERR, "image: PNG first chunk type is not IHDR") return out }
+    if bl[type_off + 2] != 68 { list_set(out, _IMGR_IHDR_ERR, "image: PNG first chunk type is not IHDR") return out }
+    if bl[type_off + 3] != 82 { list_set(out, _IMGR_IHDR_ERR, "image: PNG first chunk type is not IHDR") return out }
+    let data_off = off + 8
+    if data_off + 13 > n {
+        list_set(out, _IMGR_IHDR_ERR, "image: PNG truncated in IHDR data")
+        return out
+    }
+    let w = _imgr_u32_be(bl, data_off + 0, n)
+    let h = _imgr_u32_be(bl, data_off + 4, n)
+    let bit = bl[data_off + 8]
+    let ct  = bl[data_off + 9]
+    if w <= 0  { list_set(out, _IMGR_IHDR_ERR, "image: PNG width <= 0")  return out }
+    if h <= 0  { list_set(out, _IMGR_IHDR_ERR, "image: PNG height <= 0") return out }
+    list_set(out, _IMGR_IHDR_W,     w)
+    list_set(out, _IMGR_IHDR_H,     h)
+    list_set(out, _IMGR_IHDR_BIT,   bit)
+    list_set(out, _IMGR_IHDR_COLOR, ct)
+    return out
+}
+
+// ---- JPEG SOFn scan --------------------------------------------------------
+//
+// After the SOI marker the JPEG bitstream is a sequence of markers,
+// each starting with 0xFF followed by a non-zero marker byte. Most
+// markers are followed by [length:2 BE][payload]. We walk markers
+// looking for any SOFn (0xC0..0xCF except 0xC4, 0xC8, 0xCC), whose
+// payload starts with [precision:1][height:2 BE][width:2 BE].
+
+let _IMGR_JPEG_W   = 0
+let _IMGR_JPEG_H   = 1
+let _IMGR_JPEG_ERR = 2
+
+fn _imgr_is_sofn(marker) {
+    if marker == 196 { return 0 }   // 0xC4 DHT
+    if marker == 200 { return 0 }   // 0xC8 JPG (reserved)
+    if marker == 204 { return 0 }   // 0xCC DAC
+    if marker >= 192 { if marker <= 207 { return 1 } }
+    return 0
+}
+
+// Advance past a run of 0xFF fill bytes starting at `off`; returns the
+// byte-index of the first non-0xFF byte, or n if EOF is reached before
+// any non-0xFF byte is found.
+fn _imgr_skip_ff(bl, n, off) {
+    let i = off
+    while i < n {
+        if bl[i] != 255 { return i }
+        i = i + 1
+    }
+    return n
+}
+
+fn _imgr_parse_jpeg_dims(bl, n) {
+    let out = list_new()
+    push(out, 0) push(out, 0) push(out, "")
+    let off = 2   // past SOI
+    while off < n {
+        if bl[off] != 255 {
+            list_set(out, _IMGR_JPEG_ERR, "image: JPEG marker sync lost")
+            return out
+        }
+        // Skip any 0xFF fill bytes; first non-0xFF is the marker.
+        let m_off = _imgr_skip_ff(bl, n, off)
+        if m_off >= n {
+            list_set(out, _IMGR_JPEG_ERR, "image: JPEG truncated in marker")
+            return out
+        }
+        let marker = bl[m_off]
+        off = m_off + 1
+        // Standalone markers with no payload: SOI (0xD8), EOI (0xD9),
+        // RSTn (0xD0..0xD7), TEM (0x01). Everything else has a length.
+        if marker == 217 {
+            list_set(out, _IMGR_JPEG_ERR, "image: JPEG SOFn not found before EOI")
+            return out
+        }
+        if marker == 216 { continue }
+        if marker == 1   { continue }
+        if marker >= 208 { if marker <= 215 { continue } }
+        // Payload length (includes the two length bytes themselves).
+        if off + 2 > n {
+            list_set(out, _IMGR_JPEG_ERR, "image: JPEG truncated in segment length")
+            return out
+        }
+        let seg_len = _imgr_u16_be(bl, off, n)
+        if seg_len < 2 {
+            list_set(out, _IMGR_JPEG_ERR, "image: JPEG segment length < 2")
+            return out
+        }
+        if _imgr_is_sofn(marker) == 1 {
+            // SOFn payload: precision:1, height:2 BE, width:2 BE.
+            if off + 7 > n {
+                list_set(out, _IMGR_JPEG_ERR, "image: JPEG SOFn truncated")
+                return out
+            }
+            let h = _imgr_u16_be(bl, off + 3, n)
+            let w = _imgr_u16_be(bl, off + 5, n)
+            if w <= 0 { list_set(out, _IMGR_JPEG_ERR, "image: JPEG width <= 0")  return out }
+            if h <= 0 { list_set(out, _IMGR_JPEG_ERR, "image: JPEG height <= 0") return out }
+            list_set(out, _IMGR_JPEG_W, w)
+            list_set(out, _IMGR_JPEG_H, h)
+            return out
+        }
+        off = off + seg_len
+    }
+    list_set(out, _IMGR_JPEG_ERR, "image: JPEG EOF before SOFn")
+    return out
+}
+
+// ---- OCR opt-in ------------------------------------------------------------
+//
+// Currently CROSSENGIN_OCR_ENABLED=1 is the wire but decoding pixels
+// on the arbitrary PNG requires the deferred DEFLATE dynamic-Huffman
+// path (see png_decode.nova header). Until that ships, this returns
+// "" so the importer emits root + metadata but no derived-text
+// cluster. Tests can pin a mock via the direct helpers.
+
+fn _imgr_ocr_enabled() {
+    let s = getenv("CROSSENGIN_OCR_ENABLED")
+    if s == 0        { return 0 }
+    if len(s) == 0   { return 0 }
+    if str_eq_bytes(s, "1") == 1 { return 1 }
+    return 0
+}
+
+// ---- record builders (shared) ----------------------------------------------
+
+fn _imgr_int_to_str(n) { return int_to_str(n) }
+
+fn _imgr_err_rec(errors, idx, msg) {
+    let e = list_new()
+    push(e, idx)
+    push(e, msg)
+    push(errors, e)
+}
+
+// Build one perceptual record from parsed dimensions + hashed input.
+fn _imgr_build_record(kg_hint, source_tag, format_str,
+                      width, height, byte_count,
+                      hash_prefix, hash_full) {
+    let src = source_tag
+    if len(src) == 0 { src = perc_source_prefix(PERC_MOD_IMAGE) + hash_prefix }
+    let kg = kg_hint
+    if len(kg) == 0 { kg = "visual" }
+    let r = cur_new(kg, src)
+    perc_add_root(r, PERC_MOD_IMAGE, hash_prefix, 900)
+    perc_add_meta(r, PERC_MOD_IMAGE, hash_prefix, "format",  format_str)
+    perc_add_meta(r, PERC_MOD_IMAGE, hash_prefix, "width",   _imgr_int_to_str(width))
+    perc_add_meta(r, PERC_MOD_IMAGE, hash_prefix, "height",  _imgr_int_to_str(height))
+    perc_add_meta(r, PERC_MOD_IMAGE, hash_prefix, "bytes",   _imgr_int_to_str(byte_count))
+    perc_add_meta(r, PERC_MOD_IMAGE, hash_prefix, "sha256",  hash_full)
+    return r
+}
+
+// ---- public entry points ---------------------------------------------------
+
+// Parse a byte-list image. Returns [records, errors]:
+//   records  = list of curriculum records (0 or 1 in R105)
+//   errors   = list of [idx, msg] pairs
+fn imgr_parse_bytes(byte_list, kg_hint, source_tag) {
+    let records = list_new()
+    let errors  = list_new()
+    let n = len(byte_list)
+    if n == 0 {
+        _imgr_err_rec(errors, 0, "image: empty input")
+        let out = list_new() push(out, records) push(out, errors) return out
+    }
+    let format_str = ""
+    let width = 0
+    let height = 0
+    if _imgr_is_png_sig(byte_list, n) == 1 {
+        format_str = "png"
+        let ihdr = _imgr_parse_png_ihdr(byte_list, n)
+        if len(ihdr[_IMGR_IHDR_ERR]) > 0 {
+            _imgr_err_rec(errors, 0, ihdr[_IMGR_IHDR_ERR])
+            let out = list_new() push(out, records) push(out, errors) return out
+        }
+        width  = ihdr[_IMGR_IHDR_W]
+        height = ihdr[_IMGR_IHDR_H]
+    } else { if _imgr_is_jpeg_sig(byte_list, n) == 1 {
+        format_str = "jpeg"
+        let jd = _imgr_parse_jpeg_dims(byte_list, n)
+        if len(jd[_IMGR_JPEG_ERR]) > 0 {
+            _imgr_err_rec(errors, 0, jd[_IMGR_JPEG_ERR])
+            let out = list_new() push(out, records) push(out, errors) return out
+        }
+        width  = jd[_IMGR_JPEG_W]
+        height = jd[_IMGR_JPEG_H]
+    } else {
+        _imgr_err_rec(errors, 0, "image: input does not match PNG or JPEG signature")
+        let out = list_new() push(out, records) push(out, errors) return out
+    } }
+    let hash_prefix = perc_hash_from_bytes(byte_list)
+    let hash_full   = perc_hash_full_from_bytes(byte_list)
+    let rec = _imgr_build_record(kg_hint, source_tag, format_str,
+                                  width, height, n,
+                                  hash_prefix, hash_full)
+    push(records, rec)
+    let out = list_new()
+    push(out, records)
+    push(out, errors)
+    return out
+}
+
+// Parse an image supplied as a NOVA string. char_at handles arbitrary
+// bytes so binary content with embedded NULs works fine. We convert
+// to a byte list up front so all shape-parsing code paths stay the
+// same (single implementation, tested once).
+fn imgr_parse_text(body_str, kg_hint, source_tag) {
+    let bl = list_new()
+    let n = len(body_str)
+    let i = 0
+    while i < n {
+        push(bl, char_at(body_str, i))
+        i = i + 1
+    }
+    return imgr_parse_bytes(bl, kg_hint, source_tag)
+}
+
+// Convenience accessors matching every other importer's shape.
+fn imgr_records(result) { return result[0] }
+fn imgr_errors(result)  { return result[1] }

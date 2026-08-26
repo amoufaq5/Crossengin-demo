@@ -1,0 +1,282 @@
+// CrossEngin ingestion: perceptual capsule + unified-atom shape (R105).
+//
+// ADR-0202 (cognitive sandbox + multimodal learning) fixes one atom
+// shape for every perceptual observation regardless of modality --
+// image, audio, video all land as "perceptual atoms" carrying a
+// modality tag, a source-blob hash (for dedup + provenance), optional
+// feature slots, optional derived text (OCR / STT), and standard
+// metadata. R105 ships the composition wiring (Phase G, first round);
+// this module is the shared shape every perceptual importer emits.
+//
+// Path B (see ADR-0202 R105 design notes): perceptual atoms are
+// encoded on top of the existing curriculum-record schema by using
+// a special LABEL PREFIX per modality. The KG doesn't grow a new
+// atom kind; it grows a naming convention every walker can recognize.
+// If a follow-on round proves that too limiting, the migration to
+// Path A (a dedicated ATOM_PERCEPTUAL kind + payload slots) is a
+// local edit on this module + the importers -- no wire re-shaping.
+//
+// Label-prefix convention (case-sensitive, ASCII-only):
+//
+//   perc:image:<hash>              root image atom
+//   perc:image:<hash>:width=800    metadata atom, edge from root
+//   perc:image:<hash>:height=600
+//   perc:image:<hash>:format=png
+//   perc:image:<hash>:text         derived-text root (OCR); the OCR
+//                                   text itself is content, stored as
+//                                   the atom label of a derived text
+//                                   atom (kind ATOM_FACT) linked via
+//                                   implication to the root.
+//   perc:audio:<hash>              root audio atom
+//   perc:audio:<hash>:rate=16000   sample rate (Hz)
+//   perc:audio:<hash>:channels=1
+//   perc:audio:<hash>:duration_ms=1234
+//   perc:audio:<hash>:text         derived-text root (STT), same shape
+//   perc:video:<hash>              root video atom
+//   perc:video:<hash>:width=640
+//   perc:video:<hash>:height=480
+//   perc:video:<hash>:fps=30
+//
+// `<hash>` is the first 16 hex chars of SHA-256(blob) -- 64 bits of
+// collision resistance, enough to dedupe on a single-machine KG
+// without ballooning label sizes. Two blobs with the same 64-bit
+// prefix would be a curiosity worth investigating; the full hash is
+// available as an atom metadata sibling (perc:image:<hash>:sha256=<full>).
+//
+// Public API
+//   PERC_MOD_IMAGE / _AUDIO / _VIDEO / _TEXT_DERIVED  -- modality tag
+//   perc_modality_prefix(mod)          -> "perc:image:" | ...
+//   perc_modality_name(mod)            -> "image" | "audio" | ...
+//   perc_source_prefix(mod)            -> "src:image:" | ...
+//   perc_hash_from_bytes(byte_list)    -> 16-char hex string
+//   perc_hash_from_string(body_str)    -> 16-char hex string
+//   perc_hash_full_from_bytes(byte_list) -> 64-char hex string
+//   perc_hash_full_from_string(body_str) -> 64-char hex string
+//   perc_root_label(mod, hash_prefix)  -> "perc:image:<hash>"
+//   perc_meta_label(mod, hash_prefix, k, v) -> "perc:image:<hash>:k=v"
+//   perc_derived_root_label(mod, hash_prefix) -> "perc:image:<hash>:text"
+//   perc_label_prefix_valid(label)     -> 1 if starts with any perc: prefix
+//   perc_add_root(rec, mod, hash_prefix, seed_belief_milli)
+//   perc_add_meta(rec, mod, hash_prefix, key, val_str)
+//   perc_add_derived_text(rec, mod, hash_prefix, text)
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/ingest/curriculum.nova (cur_add_atom / cur_add_imp)
+//   src/kg/atom_store.nova     (ATOM_FACT / ATOM_CONCEPT)
+//   src/safety/sha256.nova     (sha256_oneshot)
+//   src/util/str_safe.nova     (str_eq_bytes)
+
+import "./curriculum.nova"
+import "../kg/atom_store.nova"
+import "../safety/sha256.nova"
+import "../util/str_safe.nova"
+
+// ---- modality enum ---------------------------------------------------------
+
+let PERC_MOD_UNKNOWN      = 0
+let PERC_MOD_IMAGE        = 1
+let PERC_MOD_AUDIO        = 2
+let PERC_MOD_VIDEO        = 3
+let PERC_MOD_TEXT_DERIVED = 4
+
+// Short hash-prefix length in hex characters (first 8 bytes of SHA-256).
+let PERC_HASH_PREFIX_HEX_LEN = 16
+let PERC_HASH_FULL_HEX_LEN   = 64
+
+// ---- modality helpers ------------------------------------------------------
+
+fn perc_modality_name(mod) {
+    if mod == PERC_MOD_IMAGE        { return "image" }
+    if mod == PERC_MOD_AUDIO        { return "audio" }
+    if mod == PERC_MOD_VIDEO        { return "video" }
+    if mod == PERC_MOD_TEXT_DERIVED { return "text" }
+    return "unknown"
+}
+
+fn perc_modality_prefix(mod) {
+    if mod == PERC_MOD_IMAGE        { return "perc:image:" }
+    if mod == PERC_MOD_AUDIO        { return "perc:audio:" }
+    if mod == PERC_MOD_VIDEO        { return "perc:video:" }
+    if mod == PERC_MOD_TEXT_DERIVED { return "perc:text:" }
+    return "perc:unknown:"
+}
+
+// The `src:...:` prefix used by importers so ingest.policy rules can
+// route perceptual origins without conflicting with existing text
+// formats (which own src:cerec: / src:json: / src:yaml: / ...).
+fn perc_source_prefix(mod) {
+    if mod == PERC_MOD_IMAGE        { return "src:image:" }
+    if mod == PERC_MOD_AUDIO        { return "src:audio:" }
+    if mod == PERC_MOD_VIDEO        { return "src:video:" }
+    if mod == PERC_MOD_TEXT_DERIVED { return "src:text:derived:" }
+    return "src:perc:"
+}
+
+// ---- hex encode ------------------------------------------------------------
+
+fn _perc_nibble_hex(n) {
+    if n < 10 { return n + 48 }
+    return n + 87
+}
+
+fn _perc_bytes_to_hex_prefix(buf, want_bytes) {
+    let s = ""
+    let i = 0
+    while i < want_bytes {
+        let b = load8(buf + i)
+        let hi = _perc_nibble_hex(int_and(int_shr(b, 4), 15))
+        let lo = _perc_nibble_hex(int_and(b, 15))
+        s = s + chr(hi) + chr(lo)
+        i = i + 1
+    }
+    return s
+}
+
+// ---- hash ------------------------------------------------------------------
+
+// Hash a NOVA byte list (each element is a 0..255 int -- the shape
+// image/audio/video tests build inline to avoid the /tmp sys_open
+// abort in the container). Returns the 16-char hex prefix.
+fn perc_hash_from_bytes(byte_list) {
+    let n = len(byte_list)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, byte_list[i])
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let digest = sha256_oneshot(buf, n)
+    return _perc_bytes_to_hex_prefix(digest, 8)
+}
+
+// Full 64-char hex hash of a byte list -- for the sha256=<full>
+// metadata atom.
+fn perc_hash_full_from_bytes(byte_list) {
+    let n = len(byte_list)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, byte_list[i])
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let digest = sha256_oneshot(buf, n)
+    return _perc_bytes_to_hex_prefix(digest, 32)
+}
+
+// Hash a NOVA string (used by the wire path where the body arrives
+// as a string -- char_at is unaffected by embedded NULs so binary
+// bodies work fine here).
+fn perc_hash_from_string(body_str) {
+    let n = len(body_str)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(body_str, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let digest = sha256_oneshot(buf, n)
+    return _perc_bytes_to_hex_prefix(digest, 8)
+}
+
+fn perc_hash_full_from_string(body_str) {
+    let n = len(body_str)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, char_at(body_str, i))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    let digest = sha256_oneshot(buf, n)
+    return _perc_bytes_to_hex_prefix(digest, 32)
+}
+
+// ---- label builders --------------------------------------------------------
+
+fn perc_root_label(mod, hash_prefix) {
+    return perc_modality_prefix(mod) + hash_prefix
+}
+
+fn perc_meta_label(mod, hash_prefix, key, val_str) {
+    return perc_modality_prefix(mod) + hash_prefix + ":" + key + "=" + val_str
+}
+
+fn perc_derived_root_label(mod, hash_prefix) {
+    return perc_modality_prefix(mod) + hash_prefix + ":text"
+}
+
+// ---- label-prefix guard ----------------------------------------------------
+//
+// Returns 1 iff `label` starts with any recognized perceptual prefix.
+// Used by tests + downstream walkers that want to identify perceptual
+// atoms without knowing the specific modality up front.
+fn _perc_starts_with(label, prefix) {
+    let ln = len(label)
+    let pn = len(prefix)
+    if ln < pn { return 0 }
+    let i = 0
+    while i < pn {
+        if char_at(label, i) != char_at(prefix, i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn perc_label_prefix_valid(label) {
+    if _perc_starts_with(label, "perc:image:")   == 1 { return 1 }
+    if _perc_starts_with(label, "perc:audio:")   == 1 { return 1 }
+    if _perc_starts_with(label, "perc:video:")   == 1 { return 1 }
+    if _perc_starts_with(label, "perc:text:")    == 1 { return 1 }
+    return 0
+}
+
+// ---- record builders -------------------------------------------------------
+//
+// Every perceptual importer builds a curriculum record via cur_new,
+// then adds the root perceptual atom + N metadata siblings via these
+// helpers. The metadata atoms carry small structured payloads via
+// label-embedded key=value tuples (the "poor-person's payload slot"
+// -- deliberately restrained to keep Path B simple; Path A migration
+// promotes these to real per-slot payloads).
+//
+// Every metadata / derived-text atom is linked back to the root via an
+// EMPIRICAL implication: `metadata_label => root_label`. That makes
+// the KG walk find the root from any perceptual sibling in one hop
+// (the same way OCR-derived text atoms link back to their image).
+
+fn perc_add_root(rec, mod, hash_prefix, seed_belief_milli) {
+    let lab = perc_root_label(mod, hash_prefix)
+    cur_add_atom(rec, lab, ATOM_FACT, seed_belief_milli)
+    return lab
+}
+
+fn perc_add_meta(rec, mod, hash_prefix, key, val_str) {
+    let root = perc_root_label(mod, hash_prefix)
+    let lab  = perc_meta_label(mod, hash_prefix, key, val_str)
+    cur_add_atom(rec, lab, ATOM_CONCEPT, 800)
+    cur_add_imp(rec, lab, root, "EMPIRICAL")
+    return lab
+}
+
+// Add a derived-text sibling. Under Path B the text is stored as the
+// atom's LABEL (not payload) -- this matches how every text-ingest
+// importer stores facts, so downstream semantic search finds OCR
+// hits with no format-specific code. The root text-atom
+// (perc:image:<hash>:text) is a small marker; the actual content is
+// a separate atom labeled with the text and linked to the marker.
+// Empty text is a no-op (returns "").
+fn perc_add_derived_text(rec, mod, hash_prefix, text) {
+    if len(text) == 0 { return "" }
+    let root       = perc_root_label(mod, hash_prefix)
+    let text_root  = perc_derived_root_label(mod, hash_prefix)
+    cur_add_atom(rec, text_root, ATOM_CONCEPT, 700)
+    cur_add_imp(rec, text_root, root, "EMPIRICAL")
+    // The text itself.
+    cur_add_atom(rec, text, ATOM_FACT, 600)
+    cur_add_imp(rec, text, text_root, "EMPIRICAL")
+    return text_root
+}

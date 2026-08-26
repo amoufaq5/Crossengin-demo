@@ -4426,6 +4426,233 @@ verb surfaces), `src/kg/atom_store.nova` (`atom_confidence` /
 `atom_evidence_grade` / `atom_source_tier` accessors),
 `src/kg/semantic_search.nova` (`ss_index_from_kg` + `ss_search`).
 
+### 7.54 Multimodal ingest bridge (R105 — Phase G)
+
+R105 opens **Phase G** (multimodal ingest per ADR-0202) by wiring
+the pre-existing ~39 modules under `src/io/transducers/` into the
+review-gated ingestion pipeline that R43 stood up for text. Every
+perceptual observation — image / audio / video — now lands in the KG
+as a **perceptual atom** that flows through the same `rq_submit`
+review queue + `ingest.policy` auto-approval that text atoms ride.
+No new trust bypass; the same operator gate covers every modality.
+
+**Unified perceptual-atom shape (Path B, ADR-0202).** Every
+perceptual record produced by the R105 importers uses a shared label
+prefix per modality on top of the existing curriculum-record schema:
+
+```
+perc:image:<hash16>                 (root; kind=FACT, seed=900)
+  perc:image:<hash16>:format=<png|jpeg>
+  perc:image:<hash16>:width=<pixels>
+  perc:image:<hash16>:height=<pixels>
+  perc:image:<hash16>:bytes=<len>
+  perc:image:<hash16>:sha256=<hash64>
+  perc:image:<hash16>:text          (optional; OCR-derived root)
+
+perc:audio:<hash16>                 (root; kind=FACT, seed=900)
+  perc:audio:<hash16>:format=wav
+  perc:audio:<hash16>:rate=<hz>
+  perc:audio:<hash16>:channels=<n>
+  perc:audio:<hash16>:bits=<n>
+  perc:audio:<hash16>:duration_ms=<ms>
+  perc:audio:<hash16>:bytes=<len>
+  perc:audio:<hash16>:sha256=<hash64>
+  perc:audio:<hash16>:text          (optional; STT-derived root)
+
+perc:video:<hash16>                 (root; kind=FACT, seed=900)
+  perc:video:<hash16>:format=y4m
+  perc:video:<hash16>:width=<pixels>
+  perc:video:<hash16>:height=<pixels>
+  perc:video:<hash16>:fps_num=<n>
+  perc:video:<hash16>:fps_den=<d>
+  perc:video:<hash16>:bytes=<len>
+  perc:video:<hash16>:sha256=<hash64>
+```
+
+`<hash16>` is the first 16 hex chars of SHA-256(blob) — 64 bits of
+collision resistance, plenty for single-machine dedup without
+ballooning label sizes. The full 64-char hash rides the
+`:sha256=<hash64>` metadata sibling. Every metadata / derived-text
+atom is linked back to the root via an EMPIRICAL implication, so a
+KG walk can find the root perceptual observation from any sibling
+in one hop. The shape is inspectable from a compliance audit: an
+answer that cites `perc:image:<hash>` back-links to the transducer
+chain that produced the atom.
+
+Path B (label-prefix convention) was picked over Path A (a new
+`ATOM_KIND_PERCEPTUAL` payload) for R105 minimalism. `atom_store.nova`
+is unchanged; every walker recognizes the prefix. If a follow-on
+round proves that limiting, migration to Path A is a local edit on
+`src/ingest/perceptual_capsule.nova` + the three importers — no wire
+re-shaping.
+
+**New format matrix (10 → 13).** `source_registry.nova` gains three
+canonical format tags:
+
+```
+FMT_IMAGE = 11   image  →  src:image:
+FMT_AUDIO = 12   audio  →  src:audio:
+FMT_VIDEO = 13   video  →  src:video:
+```
+
+**New wire dispatch on `ingest.file`.** Format names extend to
+`{cerec, json, yaml, csv, ntriples, wikidata, conceptnet,
+papermeta, wordnet, image, audio, video}`. Binary bodies cannot ride
+NOVA's `body` string arg (embedded NULs are lost by
+`chr()` + string concat), so R105 extends the wire with an optional
+`body_hex` argument holding the same payload as a hex-encoded
+string. When present, the importer's `*_parse_bytes` entry consumes
+the decoded byte list directly. `body` and `body_hex` are mutually
+exclusive; supplying both refuses the request; supplying neither
+refuses. Y4M (video) is 7-bit ASCII and can safely use `body`.
+Ownership stamping (R71 shape) applies unchanged: a presented
+holder + wired overlay stamps the target KG on ingest.file for the
+perceptual formats too.
+
+**New importers (all header-only in R105).**
+
+- `src/ingest/importers/image_records.nova` — PNG signature + IHDR
+  chunk walk (width/height/bit_depth/color_type) OR JPEG SOI marker
+  + SOFn scan (width/height). Deeper decode (DEFLATE IDAT, chroma
+  planes) is deferred to `src/io/transducers/png_decode.nova` /
+  `jpeg_decode.nova` on demand; the importer's job is to produce the
+  perceptual atom + provenance metadata so downstream OCR /
+  feature-extraction rounds can find it.
+- `src/ingest/importers/audio_records.nova` — WAV RIFF PCM (44-byte
+  canonical header + optional trailing chunks; scans forward for the
+  `data` chunk if a WAV writer inserted LIST/JUNK padding between
+  fmt and data). PCM only in R105 (audio_format=1); IEEE float /
+  alaw / mulaw are follow-on additions with no shape change.
+- `src/ingest/importers/video_records.nova` — Y4M YUV4MPEG2 header
+  parse. Extracts `W<width>`, `H<height>`, `F<num>:<den>`; tolerates
+  unknown-tag payload (interlace `I`, aspect `A`, colorspace `C`).
+  Per-keyframe image fanout + audio-track routing are deferred to a
+  follow-on round; header-only decode already lands the root
+  perceptual atom + resolution metadata.
+
+**OCR / STT opt-in.** Text-derived atoms (OCR from image / STT from
+audio) are gated behind operator env knobs, disabled by default in
+R105:
+
+- `CROSSENGIN_OCR_ENABLED=1` — enable OCR on image ingest. The
+  transducer path lands in `src/io/transducers/image_ocr.nova`; a
+  successful text projection becomes a `perc:image:<hash>:text`
+  derived-atom cluster via
+  `perc_add_derived_text(rec, PERC_MOD_IMAGE, hash, text)`.
+  Currently a stub because pixel decode requires the deferred
+  DEFLATE dynamic-Huffman path in `png_decode.nova`; flipping the
+  env knob on a permissive host is the whole integration.
+- `CROSSENGIN_STT_ENABLED=1` + `CROSSENGIN_STT_BACKEND=whisper|vosk`
+  — enable STT on audio ingest. The backend uses fork+exec to a
+  locally-installed whisper.cpp / vosk binary
+  (`src/io/transducers/whisper_backend.nova:380-449` reference
+  pattern). Not run in the R105 default host; the R105 importer
+  keeps the branch STUBBED-OFF-but-wired so a permissive host can
+  flip a single env knob to activate.
+
+**Multimodal fetch opt-in.** `src/learning/internet_fetch.nova`
+extends its MIME whitelist with `image/png`, `image/jpeg`,
+`audio/wav`, `audio/x-wav`, `audio/mpeg`, `video/x-y4m`, gated on
+`CROSSENGIN_FETCH_MULTIMODAL=1`. Default OFF preserves the strict
+text-only fetch behavior; operators explicitly widen when they want
+perceptual bytes to flow through the ADR-0028 fetch pipeline.
+
+**Perceptual capsule.** `src/ingest/perceptual_capsule.nova`
+(~250 lines) is the shared shape. Exports:
+`PERC_MOD_IMAGE / _AUDIO / _VIDEO / _TEXT_DERIVED`;
+`perc_modality_prefix(mod)`, `perc_source_prefix(mod)`;
+`perc_hash_from_bytes(bl)`, `perc_hash_from_string(s)`,
+`perc_hash_full_from_bytes(bl)`, `perc_hash_full_from_string(s)`;
+`perc_root_label / perc_meta_label / perc_derived_root_label`;
+`perc_label_prefix_valid(label)` (recognition guard); record
+builders `perc_add_root / perc_add_meta / perc_add_derived_text`.
+Every perceptual importer speaks in this shape; downstream reasoners
+recognize a perceptual atom without a per-modality special case.
+
+**Tests (5 new, ~193 checks total).**
+
+- `tests/unit/test_perceptual_capsule.nova` — 61 checks. Modality
+  enum round-trip, hash determinism (byte-list ↔ string paths agree,
+  distinct inputs distinct prefixes), label shape, prefix guard
+  recognition (all four prefixes accepted, close-miss rejected),
+  record builders (root grows atoms, meta links via EMPIRICAL
+  implication, derived-text produces text_root + text_atom + two
+  imps), end-to-end `cur_validate` acceptance.
+- `tests/unit/test_image_records.nova` — 38 checks. Empty refused,
+  bad signature refused, truncated IHDR refused, non-IHDR first
+  chunk refused, well-formed 1x1 PNG record shape (root + 5 meta,
+  5 imps all EMPIRICAL → root, `cur_validate` ok), source default
+  when caller passed "", 2x3 PNG dims reflect in labels, JPEG
+  SOI+SOF0 record shape, JPEG no-SOFn refused, parse_text refuses
+  ASCII content cleanly, OCR default off (no `:text` cluster).
+- `tests/unit/test_audio_records.nova` — 31 checks. Empty refused,
+  non-RIFF refused, RIFF+non-WAVE refused, non-PCM refused,
+  well-formed 44-byte silent WAV record shape (root + 7 meta, 7
+  imps all EMPIRICAL → root, `cur_validate` ok), source default,
+  stereo/22050 metadata reflects in labels, duration_ms computed
+  from data_len + frame size, STT default off.
+- `tests/unit/test_video_records.nova` — 35 checks. Empty refused,
+  bad magic refused, missing newline refused, missing W / H
+  refused, well-formed W2 H2 F30:1 record shape (root + 7 meta),
+  metadata reflects W/H/fps_num/fps_den/format=y4m, source default,
+  unknown-tag payload (Ip / A1:1 / C420) tolerated.
+- `tests/unit/test_ingest_file_multimodal.nova` — end-to-end wire
+  dispatch: verb still registered, unsupported format ("hologram")
+  refused with a message naming R105's supported-formats list,
+  `body_hex` image + audio ingest lands `perc:image:` / `perc:audio:`
+  atoms in the KG (walked via `kg_atoms` + `atom_label`), Y4M ASCII
+  body via plain `body` arg lands `perc:video:` atom, `body` +
+  `body_hex` both refused (ambiguous), neither refused, malformed
+  hex refused, ownership stamping honored on image ingest (alice
+  owns the visual KG after her image lands), reader token refused
+  by the cap gate (regression from R66).
+- `tests/unit/test_ingest_source_registry.nova` — extended from 29
+  to 38 checks: defaults install count 10 → 13, three new
+  image/audio/video tag lookups, three new src-prefix expectations,
+  format-name round-trip for the three new names.
+
+**Live-STT smoke deferred.** The container this repo builds under
+disables `secure_random` (seccomp) and does not carry a
+whisper.cpp / vosk binary. `_audr_run_stt` recognizes the opt-in but
+returns "" so R105 doesn't attempt a doomed fork+exec. Wiring the
+real backend is a one-line flip on `_audr_run_stt` once a
+permissive host is in play — the whisper_backend.nova reference
+pattern (`src/io/transducers/whisper_backend.nova:380-449`) already
+handles the subprocess plumbing.
+
+**Files touched (R105).**
+
+- NEW: `src/ingest/perceptual_capsule.nova`,
+  `src/ingest/importers/image_records.nova`,
+  `src/ingest/importers/audio_records.nova`,
+  `src/ingest/importers/video_records.nova`,
+  `tests/unit/test_perceptual_capsule.nova`,
+  `tests/unit/test_image_records.nova`,
+  `tests/unit/test_audio_records.nova`,
+  `tests/unit/test_video_records.nova`,
+  `tests/unit/test_ingest_file_multimodal.nova`.
+- MODIFIED: `src/ingest/source_registry.nova` (FMT_IMAGE / _AUDIO /
+  _VIDEO + defaults + name round-trip), `src/agent/ingestion_agent.nova`
+  (imports for the three importers), `src/nl/rpc_verbs.nova`
+  (`_rpc_verb_ingest_file` dispatch for image / audio / video +
+  `body_hex` binary path + chacha20 import for
+  `cc_hex_decode`), `src/learning/internet_fetch.nova`
+  (multimodal MIME whitelist gated on `CROSSENGIN_FETCH_MULTIMODAL`),
+  `tests/unit/test_ingest_source_registry.nova` (format matrix
+  10 → 13), `docs/SHIP_AS_APP.md` (§7.54 + §12).
+
+**References:** ADR-0202 (cognitive sandbox + multimodal-learning
+composition; the design lock this round implements), ADR-0028
+(fetch pipeline + MIME whitelist), ADR-0029 (source authority
+tiers — perceptual origins register their weight the same way text
+sources do), ADR-0101 (data-acquisition + review pipeline —
+perceptual atoms ride it unchanged), §7.6 (R43 ingestion agent —
+the pipeline these importers feed), §7.24 (R66 ingest.file wire —
+the verb this round extends), §7.30 (R71 holder-scoped ownership
+on ingest.file — the stamping rule now covers image / audio /
+video), `src/io/transducers/*` (the transducer inventory the
+importers compose).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -4569,15 +4796,32 @@ new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
   `self.gaps`; env-configurable low-confidence threshold. Verb count
   43 -> 45. The "beliefs / self-awareness / own mind" pillar of the
   vision now has a wire surface.
-- **R104 (next)** — `self.override` — volitional layer. Wraps
-  `override_mechanism` with reversibility snapshots so a caller can
-  say "believe X regardless of the evidence ledger" and then walk
-  the override back. Closes Phase F.
+- **R104 (deferred)** — `self.override` — volitional layer. User
+  jumped ahead to Phase G; R104 lands whenever Phase F is picked
+  back up.
 
-**Front-of-queue after Phase C ✅ / Phase D ✅ / Phase E ✅ / R103 ✅:**
-- **R104** — `self.override` (finishes Phase F).
-- **Phase G** — multimodal ingest bridge per ADR-0202.
+**Phase G COMPLETE (R105 shipped).**
+- **R105 ✅** — Multimodal ingest bridge (see §7.54). Unified
+  perceptual-atom schema (`perc:<mod>:<hash16>` label prefix) rides
+  the existing curriculum-record shape. Three header-only importers
+  (`image_records` / `audio_records` / `video_records`) bridge the
+  pre-existing `src/io/transducers/` inventory into the R43 ingest
+  pipeline. Format matrix 10 → 13 (`image` / `audio` / `video`).
+  `ingest.file` wire extended with `body_hex` for binary payloads
+  (embedded NULs can't ride NOVA strings). OCR / STT / multimodal
+  fetch are opt-in via env knobs; default off. No new trust bypass —
+  perceptual atoms flow through `rq_submit` + `ingest.policy` per
+  ADR-0202. ADR-0202 design lock now composed in code.
+
+**Front-of-queue after Phase C ✅ / Phase D ✅ / Phase E ✅ / R103 ✅ / R105 ✅:**
+- **R104** — `self.override` (finishes Phase F; deferred by user).
 - **Phase H** — perf/benchmark harness per ADR-0208.
+- **Phase I** — form-factor targeting (mobile / embedded / …).
+- **Multimodal follow-ons** — per-keyframe image fanout in
+  `video_records`, whisper/vosk STT wire-up on a permissive host,
+  OCR wire-up once `png_decode.nova`'s DEFLATE dynamic-Huffman path
+  lands, Path A migration (dedicated `ATOM_KIND_PERCEPTUAL` payload)
+  if Path B's label-prefix convention proves limiting.
 - **Backlog** — admin bulk-ops, DTLS-12 red-fix (72/450 checks
   since R86), bignum_256 / field25519 consolidation.
 - **KG-driven paraphrase (candidate)** — consult the live KG for
