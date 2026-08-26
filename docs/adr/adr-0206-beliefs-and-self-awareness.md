@@ -12,6 +12,15 @@ authority. Adds three wire verbs: `self.confidence`, `self.gaps`,
 `src/parts/meta/`, `src/safety/`, and `src/learning/`; this ADR
 composes them into a coherent self-model.
 
+**R103 shipped `self.confidence` + `self.gaps`** (the read-only
+introspection half; see SHIP_AS_APP §7.53). **R111 shipped
+`self.override` + `self.override.list`** (the volitional-layer
+mutator + audit read-back; see SHIP_AS_APP §7.59). Snapshot
+round-trip for the queryable audit list is DEFERRED — the underlying
+DLK_OVERRIDE / DLK_CORRECTION decision-log entries still persist via
+the pre-existing `#DL` snapshot infrastructure, so the audit trail
+survives restarts even without the in-memory registry doing so.
+
 ## Date
 
 2026-08-22

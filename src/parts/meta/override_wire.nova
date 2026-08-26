@@ -1,0 +1,273 @@
+// CrossEngin meta: override wire -- volitional layer wrapper (R111, Phase K
+// part 2 / Phase F part 2 deferred from R104; ADR-0206 §Volitional layer).
+//
+// Purpose
+//   Wire-facing wrapper around `src/safety/override_mechanism.nova`. That
+//   module owns the four graded interventions of ADR-0044 (belief_edit,
+//   goal_veto, hard_stop, kill_switch) + resume; this module adds the
+//   wire ergonomics R111 needs:
+//
+//     1. Reversibility snapshot for belief_edit -- capture prior
+//        [alpha, beta] + pin state BEFORE the write, so an `undo` action
+//        can restore the atom later.
+//     2. Structured audit trail -- underlying `audit_override` /
+//        `audit_correction` still fire (DLK_OVERRIDE / DLK_CORRECTION in
+//        the decision log; ADR-0043 ordering intact); this module keeps a
+//        queryable in-memory list of override entries keyed by monotonic
+//        `override_id` so `self.override.list` can page over them without
+//        parsing the decision log.
+//     3. Per-holder rate budget -- mirror the `au_budget` pattern from
+//        `src/learning/ask_user_to_teach.nova` (`AU_WINDOW` /
+//        `AU_MAX_PER_WINDOW`). Default 5 overrides per rolling 1-hour
+//        window per holder; operator-tunable via
+//        `CROSSENGIN_SELF_OVERRIDE_MAX_PER_HOUR`.
+//
+//   OverrideRegistry OWNS the log / goal engine / veto registry / safety
+//   state that the underlying `override_mechanism.nova` fns need. Wiring
+//   these through `rpc_ctx` would add four slots for a feature only the
+//   self.override verb touches; keeping them inside the reg is
+//   self-contained + test-friendly (a test constructs a reg and gets a
+//   working goal engine + log for free).
+//
+//   Snapshot round-trip (persistence across daemon restarts) is DEFERRED
+//   per the R111 plan recommendation -- the DLK_OVERRIDE trail in the
+//   decision log already persists via existing infrastructure. The
+//   queryable audit list here is daemon-lifetime only.
+//
+// ADRs implemented: ADR-0206 (cognitive layer -> volitional surface),
+//   composes ADR-0044 (override mechanism) + ADR-0043 (decision log).
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/safety/override_mechanism.nova   -- the underlying tier-0 primitives
+//   src/audit/audit_writer.nova         -- audit_open (owns the decision log)
+//   src/parts/goals/goal_engine.nova    -- goal veto target
+//   src/kg/atom_store.nova              -- atom_belief for the snapshot capture
+//   src/util/str_safe.nova              -- str_eq_bytes (holder + action names)
+
+import "../../safety/override_mechanism.nova"
+import "../../audit/audit_writer.nova"
+import "../goals/goal_engine.nova"
+import "../../kg/atom_store.nova"
+import "../../util/str_safe.nova"
+
+// ---- action enum ---------------------------------------------------------
+// Stable ints; new actions APPEND. `action_from_name` maps wire strings to
+// these ints; `action_name` inverts. UNDO is a wire-only pseudo-action
+// (no underlying override_mechanism fn) that reverses a prior BELIEF_EDIT
+// by re-calling override_belief_edit with the captured snapshot.
+let OVW_ACT_BELIEF_EDIT = 1
+let OVW_ACT_GOAL_VETO   = 2
+let OVW_ACT_HARD_STOP   = 3
+let OVW_ACT_RESUME      = 4
+let OVW_ACT_KILL_SWITCH = 5
+let OVW_ACT_UNDO        = 6
+
+fn ovw_action_name(act) {
+    if act == OVW_ACT_BELIEF_EDIT { return "belief_edit" }
+    if act == OVW_ACT_GOAL_VETO   { return "goal_veto" }
+    if act == OVW_ACT_HARD_STOP   { return "hard_stop" }
+    if act == OVW_ACT_RESUME      { return "resume" }
+    if act == OVW_ACT_KILL_SWITCH { return "kill_switch" }
+    if act == OVW_ACT_UNDO        { return "undo" }
+    return ""
+}
+
+// Returns 0 for unknown names (0 is not a valid action int -- callers
+// distinguish miss from a valid action).
+fn ovw_action_from_name(name) {
+    if str_eq_bytes(name, "belief_edit") == 1 { return OVW_ACT_BELIEF_EDIT }
+    if str_eq_bytes(name, "goal_veto")   == 1 { return OVW_ACT_GOAL_VETO }
+    if str_eq_bytes(name, "hard_stop")   == 1 { return OVW_ACT_HARD_STOP }
+    if str_eq_bytes(name, "resume")      == 1 { return OVW_ACT_RESUME }
+    if str_eq_bytes(name, "kill_switch") == 1 { return OVW_ACT_KILL_SWITCH }
+    if str_eq_bytes(name, "undo")        == 1 { return OVW_ACT_UNDO }
+    return 0
+}
+
+// ---- entry slot layout ---------------------------------------------------
+let OVW_ID                  = 0   // int; monotonic
+let OVW_TIMESTAMP           = 1   // int nanos (wire-supplied `now`)
+let OVW_HOLDER              = 2   // string
+let OVW_ACTION              = 3   // int enum above
+let OVW_ARGS_JSON           = 4   // string; per-action serialized args
+let OVW_SNAPSHOT_ALPHA      = 5   // int; belief_edit prior alpha; else 0
+let OVW_SNAPSHOT_BETA       = 6   // int; belief_edit prior beta;  else 0
+let OVW_SNAPSHOT_PIN        = 7   // int; belief_edit prior pin;   else 0
+let OVW_SNAPSHOT_ATOM_LABEL = 8   // string; belief_edit atom label; else ""
+let OVW_UNDONE              = 9   // int; 1 if a later UNDO reverted this
+
+fn ovw_entry_id(e)                 { return e[OVW_ID] }
+fn ovw_entry_timestamp(e)          { return e[OVW_TIMESTAMP] }
+fn ovw_entry_holder(e)             { return e[OVW_HOLDER] }
+fn ovw_entry_action(e)             { return e[OVW_ACTION] }
+fn ovw_entry_args_json(e)          { return e[OVW_ARGS_JSON] }
+fn ovw_entry_snapshot_alpha(e)     { return e[OVW_SNAPSHOT_ALPHA] }
+fn ovw_entry_snapshot_beta(e)      { return e[OVW_SNAPSHOT_BETA] }
+fn ovw_entry_snapshot_pin(e)       { return e[OVW_SNAPSHOT_PIN] }
+fn ovw_entry_snapshot_atom_label(e){ return e[OVW_SNAPSHOT_ATOM_LABEL] }
+fn ovw_entry_undone(e)             { return e[OVW_UNDONE] }
+
+// Was a reversibility snapshot captured? True only for BELIEF_EDIT entries
+// whose recorded atom_label is non-empty (goal_veto / hard_stop / resume /
+// kill_switch / undo carry no snapshot).
+fn ovw_entry_snapshot_captured(e) {
+    if e[OVW_ACTION] != OVW_ACT_BELIEF_EDIT { return 0 }
+    if len(e[OVW_SNAPSHOT_ATOM_LABEL]) == 0 { return 0 }
+    return 1
+}
+
+// ---- registry ------------------------------------------------------------
+// Slot layout kept intentionally flat so serialisation (if a later round
+// adds it) can walk a fixed shape.
+let OVR_TAG        = 0
+let OVR_ENTRIES    = 1   // list<entry>
+let OVR_NEXT_ID    = 2   // int; monotonic counter starting at 1
+let OVR_LOG        = 3   // decision log (audit_open())
+let OVR_ENGINE     = 4   // goal engine (goal_engine_new())
+let OVR_VETO_REG   = 5   // veto registry (veto_registry_new())
+let OVR_SAFETY     = 6   // safety state (safety_state_new())
+
+let OVR_TAG_VALUE = 4441   // distinctive tag; different from SS_TAG (4401)
+
+fn ovw_new() {
+    let r = list_new()
+    push(r, OVR_TAG_VALUE)
+    push(r, list_new())
+    push(r, 1)
+    push(r, audit_open())
+    push(r, goal_engine_new())
+    push(r, veto_registry_new())
+    push(r, safety_state_new())
+    return r
+}
+
+fn ovw_entries(reg)   { return reg[OVR_ENTRIES] }
+fn ovw_log(reg)       { return reg[OVR_LOG] }
+fn ovw_engine(reg)    { return reg[OVR_ENGINE] }
+fn ovw_veto_reg(reg)  { return reg[OVR_VETO_REG] }
+fn ovw_safety(reg)    { return reg[OVR_SAFETY] }
+
+fn ovw_next_id(reg) {
+    let id = reg[OVR_NEXT_ID]
+    list_set(reg, OVR_NEXT_ID, id + 1)
+    return id
+}
+
+// Append one entry. Returns the assigned override_id.
+fn ovw_record(reg, action, args_json, holder, snap_alpha, snap_beta,
+              snap_pin, snap_atom_label, now) {
+    let id = ovw_next_id(reg)
+    let e = list_new()
+    push(e, id)
+    push(e, now)
+    push(e, holder)
+    push(e, action)
+    push(e, args_json)
+    push(e, snap_alpha)
+    push(e, snap_beta)
+    push(e, snap_pin)
+    push(e, snap_atom_label)
+    push(e, 0)                // undone
+    push(reg[OVR_ENTRIES], e)
+    return id
+}
+
+// Linear lookup by id. 0 on miss (0 is not a valid override_id, which
+// starts at 1; callers can distinguish via `!= 0`).
+fn ovw_get(reg, override_id) {
+    let es = reg[OVR_ENTRIES]
+    let i = 0
+    while i < len(es) {
+        if es[i][OVW_ID] == override_id { return es[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+// Mark a specific entry undone. Returns 1 if it flipped 0->1, 0 if the
+// entry was missing OR was already marked undone.
+fn ovw_mark_undone(reg, override_id) {
+    let e = ovw_get(reg, override_id)
+    if e == 0 { return 0 }
+    if e[OVW_UNDONE] == 1 { return 0 }
+    list_set(e, OVW_UNDONE, 1)
+    return 1
+}
+
+// Filter helpers. Each returns a fresh list preserving append order.
+fn ovw_entries_for_holder(reg, holder) {
+    let out = list_new()
+    let es = reg[OVR_ENTRIES]
+    let i = 0
+    while i < len(es) {
+        if str_eq_bytes(es[i][OVW_HOLDER], holder) == 1 { push(out, es[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+fn ovw_entries_by_action(reg, action) {
+    let out = list_new()
+    let es = reg[OVR_ENTRIES]
+    let i = 0
+    while i < len(es) {
+        if es[i][OVW_ACTION] == action { push(out, es[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- rate budget ---------------------------------------------------------
+// 1-hour rolling window per holder. Count entries recorded within
+// (now - _OVW_HOUR_NANOS, now] for that holder; refuse when the count is
+// already >= max_per_hour. Well within int range (3.6e12 << 2^62).
+let _OVW_HOUR_NANOS = 3600000000000
+
+// Default budget: 5 overrides per rolling 1-hour window per holder.
+// `CROSSENGIN_SELF_OVERRIDE_MAX_PER_HOUR` overrides. Guard for both the
+// "unset -> 0" and "empty string -> str_to_int returns 0" NOVA quirks.
+let _CE_OVW_MAX_DEFAULT = 5
+
+fn ovw_max_per_hour_default() {
+    let s = getenv("CROSSENGIN_SELF_OVERRIDE_MAX_PER_HOUR")
+    if s == 0        { return _CE_OVW_MAX_DEFAULT }
+    if len(s) == 0   { return _CE_OVW_MAX_DEFAULT }
+    let v = str_to_int(s)
+    if v <= 0        { return _CE_OVW_MAX_DEFAULT }
+    return v
+}
+
+// Count entries this holder recorded within the last hour. UNDO entries
+// count too (they are a wire-visible action a caller chose to spend).
+fn ovw_recent_count(reg, holder, now) {
+    let cutoff = now - _OVW_HOUR_NANOS
+    let n = 0
+    let es = reg[OVR_ENTRIES]
+    let i = 0
+    while i < len(es) {
+        let e = es[i]
+        if str_eq_bytes(e[OVW_HOLDER], holder) == 1 {
+            if e[OVW_TIMESTAMP] > cutoff { n = n + 1 }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// May this holder record another override at `now`? Returns 1 if the
+// budget is not yet exhausted. max_per_hour == 0 means unlimited (the
+// operator explicitly opted out of rate-limiting).
+fn ovw_can_afford(reg, holder, now, max_per_hour) {
+    if max_per_hour <= 0 { return 1 }
+    if ovw_recent_count(reg, holder, now) < max_per_hour { return 1 }
+    return 0
+}
+
+// Remaining budget in the current window. max_per_hour == 0 -> -1
+// (sentinel for "unlimited", so wire clients can render "unbounded").
+fn ovw_remaining_budget(reg, holder, now, max_per_hour) {
+    if max_per_hour <= 0 { return -1 }
+    let used = ovw_recent_count(reg, holder, now)
+    if used >= max_per_hour { return 0 }
+    return max_per_hour - used
+}

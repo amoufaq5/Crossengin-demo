@@ -5142,9 +5142,16 @@ new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
   `self.gaps`; env-configurable low-confidence threshold. Verb count
   43 -> 45. The "beliefs / self-awareness / own mind" pillar of the
   vision now has a wire surface.
-- **R104 (deferred)** — `self.override` — volitional layer. User
-  jumped ahead to Phase G; R104 lands whenever Phase F is picked
-  back up.
+- **R111 ✅** — `self.override` + `self.override.list` (see §7.59).
+  The volitional half of ADR-0206 that R103 had deferred (originally
+  planned as R104): six graded interventions (`belief_edit` /
+  `goal_veto` / `hard_stop` / `resume` / `kill_switch` / `undo`) on
+  an admin-only wire cap, reader-tier list read-back, reversibility
+  snapshot on `belief_edit` powering `undo`, per-holder rate budget
+  (`CROSSENGIN_SELF_OVERRIDE_MAX_PER_HOUR`, default 5), `kill_switch`
+  clean-only (panic mode never wire-accessible). Snapshot round-trip
+  DEFERRED; DLK_OVERRIDE/CORRECTION persist via the pre-existing
+  decision-log snapshot infrastructure. Verb count 49 -> 51.
 
 **Phase G COMPLETE (R105 shipped).**
 - **R105 ✅** — Multimodal ingest bridge (see §7.54). Unified
@@ -5303,6 +5310,114 @@ snapshot APIs.
 (#AGENT round-trip smoke), `test_admin_bake_child_verb` (verb count
 follow-up).
 
+### 7.59 self.override + self.override.list (R111 -- Phase K part 2 / Phase F part 2 deferred from R104)
+
+R111 closes the volitional half of the ADR-0206 cognitive layer that
+R103 opened. Where `self.confidence` + `self.gaps` are read-only
+introspection, `self.override` is the mutation surface: the six graded
+ADR-0044 interventions (`belief_edit` / `goal_veto` / `hard_stop` /
+`resume` / `kill_switch` / `undo`) reached over the wire under an
+admin-only cap, with reversibility snapshots on `belief_edit` + a
+per-holder rate budget layered on top. `self.override.list` is the
+paired read-back that lets audit dashboards page over the trail
+without parsing the decision log.
+
+**New wire verbs** (verb count 49 -> 51):
+
+```
+self.override action=belief_edit atom_label=<lbl> alpha=<int> beta=<int> [pin=0|1]
+self.override action=goal_veto goal_id=<int>
+self.override action=hard_stop
+self.override action=resume
+self.override action=kill_switch clean=1
+self.override action=undo override_id=<int>
+  -> {ok, override_id, action, snapshot_captured, remaining_budget}
+
+self.override.list [holder=<other>] [action=<name>] [limit=<int>] [after=<cursor>]
+  -> {holder, count,
+      entries: [{override_id, timestamp, holder, action, args_json,
+                 snapshot_captured, undone}, ...],
+      next_after}
+```
+
+**Six actions.** Each `self.override` dispatch branches on the required
+`action` arg. `belief_edit` looks up the atom by label across every KG
+in the ctx registry (first match wins, matching `self.confidence`'s
+exact-lookup shape), snapshots the atom's `[alpha, beta, pin]` state
+BEFORE calling `override_belief_edit`, then records the entry with the
+snapshot slots populated. `goal_veto` calls `override_goal_veto`
+against the OverrideRegistry's own goal engine + veto registry (goals
+seeded via `goal_new(ovw_engine(reg), ...)` -- typically by an
+in-process kernel; the wire cannot mint goals itself). `hard_stop` /
+`resume` flip the registry's safety state via `override_hard_stop` /
+`override_resume`. `kill_switch` REQUIRES `clean=1`; panic mode is
+NEVER wire-accessible (it skips both audit and snapshot, and the wire
+must never let a holder exit the process without a trail). `undo` is
+supported only for `belief_edit` overrides -- it re-calls
+`override_belief_edit` with the captured snapshot, marks the original
+entry `undone=1`, and appends its own UNDO entry naming the original
+`override_id` in `args_json`.
+
+**Reversibility snapshot.** OverrideRegistry entries carry four
+snapshot slots (`snapshot_alpha`, `snapshot_beta`, `snapshot_pin`,
+`snapshot_atom_label`); non-belief_edit actions leave them zero-valued
++ empty-string. `snapshot_captured` in both the verb response and the
+list-entry shape is `true` iff the entry is a `belief_edit` with a
+non-empty atom_label -- the flag the client uses to decide whether
+`undo` will succeed.
+
+**Per-holder rate budget.** Mirrors `au_budget` (ask-user-to-teach):
+5 overrides per rolling 1-hour window per holder, override-tunable
+via `CROSSENGIN_SELF_OVERRIDE_MAX_PER_HOUR` (0 = unlimited). Every
+override (including `undo`) charges one against the presented
+holder's budget; a refusal returns `"self-override rate limit
+exceeded"` with the wire envelope's standard `{ok:false, error:...}`
+shape. The response's `remaining_budget` field renders the count
+still available at request time (`-1` sentinel when unlimited).
+
+**Audit trail.** The underlying `override_mechanism.nova` fns still
+fire -- `audit_correction` writes DLK_CORRECTION for `belief_edit`
+(the CORRECTION half of ADR-0043), `audit_override` writes
+DLK_OVERRIDE for `goal_veto` / `hard_stop` / `kill_switch=clean`. The
+in-memory OverrideRegistry list added here is a QUERYABLE overlay
+(readable via `self.override.list` in stable insertion order) --
+not a replacement for the decision log. Snapshot round-trip across
+daemon restarts is DEFERRED: the DLK_* trail persists via existing
+`#DL` snapshot infrastructure (that carries the audit records); the
+in-memory registry is daemon-lifetime only.
+
+**Cap gate.** `self.override` requires `CAP_ADMIN_SELF_OVERRIDE`
+(`admin:self-override`); reader / skill_user / curator / service
+roles do NOT carry it. `self.override.list` reuses
+`CAP_NL_SELF_READ` -- the same reader-tier cap `self.confidence` +
+`self.gaps` use -- so audit dashboards can consume the trail without
+holding the mutation cap. `holder=<other>` on the list verb requires
+`CAP_ADMIN_SANDBOX` (matches `self.gaps` shape); a reader can only
+read their own presented_holder entries.
+
+**Child mode.** `self.override` is on the disable table (mutations
+belong on the mother); `self.override.list` stays enabled -- reading
+the volitional audit trail is exactly the introspection surface a
+child daemon exposes.
+
+**Files.** NEW: `src/parts/meta/override_wire.nova` (registry,
+snapshots, rate budget, action-enum <-> name helpers),
+`tests/unit/test_override_wire.nova` (89 checks),
+`tests/unit/test_self_override_verb.nova` (66 checks),
+`tests/unit/test_self_override_list_verb.nova` (42 checks).
+MODIFIED: `src/nl/rpc_verbs.nova` (2 new verbs + RCTX_OVERRIDE_REG +
+dispatch + names), `src/sandbox/capability.nova`
+(`CAP_ADMIN_SELF_OVERRIDE` + verb-required table + admin role bundle
++ `capability_is_known_cap`), `src/safety/override_mechanism.nova`
+(SS_* slot constants renamed to OMSS_* to avoid link-time symbol
+collision with `semantic_search.nova`'s pre-existing `SS_TAG` once
+override_mechanism enters the rpc_verbs import graph),
+`src/factory/child_mode.nova` (`self.override` on the disable
+table), `examples/crossengin_rpc_daemon.nova` (allocate override
+registry at boot via `ovw_new()`), plus verb-count follow-ups in
+`test_nl_rpc_verbs`, `test_child_mode_wire`, `test_admin_bake_child_verb`,
+and `test_wire_pagination` (self.override.list case added).
+
 **Phase I COMPLETE (R107 + R108 shipped).**
 - **R107 ✅** — Wire cursor pagination for list verbs (see §7.56).
   Uniform `limit` + `after` args plus a `next_after` field folded
@@ -5317,14 +5432,17 @@ follow-up).
   work. 115 checks in `test_wire_pagination`; eight existing tests
   extended with `next_after` assertions.
 
-**Phase J COMPLETE (R109 shipped). Front-of-queue after Phase C / D / E / I / J / R103 / R105 / R106:**
-- **R104** — `self.override` (finishes Phase F; deferred by user).
-- **R110** — CLI polish (`--json` mode, readline history, ANSI color).
-- **R111** — QPS per-holder (flip per-TOKEN → per-holder rate limiting).
-- **R112** — Signed AgentPackage (ADR-0210 tier 3; reuses
+**Phase J COMPLETE (R109 shipped). Phase K in progress (R110 + R111
+shipped). Front-of-queue after Phase C / D / E / I / J / K / R103 /
+R105 / R106 / R111:**
+- **R112** — CLI polish (`--json` mode, readline history, ANSI color;
+  was numbered R110 in earlier roadmap drafts).
+- **R113** — QPS per-holder (flip per-TOKEN → per-holder rate
+  limiting; was numbered R111 in earlier roadmap drafts).
+- **R114** — Signed AgentPackage (ADR-0210 tier 3; reuses
   `bundle_pkg_sign` from R99 to sign a composed AgentManifest for
   distribution).
-- **R113** — Admin bulk-ops (`admin.list_tokens`,
+- **R115** — Admin bulk-ops (`admin.list_tokens`,
   `admin.expire_all_before`, `admin.revoke_all_by_holder`).
 - **Backlog debt** — DTLS-12 red-fix (72/450 checks red since R86),
   bignum_256 / field25519 consolidation, LICENSES/ folder authoring.
