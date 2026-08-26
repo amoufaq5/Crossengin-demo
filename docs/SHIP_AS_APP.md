@@ -4262,6 +4262,170 @@ verbs and ad-hoc admin mutation stay refused.
 ADR-0105 (Sandbox Architecture), §7.49 (R99 bake pipeline), §7.50
 (R100 child-mode runtime).
 
+### 7.53 self.confidence + self.gaps (R103 — Phase F part 1)
+
+R103 opens **Phase F** (cognitive layer as first-class per ADR-0206)
+with two read-only introspection verbs: the daemon can now be asked
+what it believes about a topic, and what it knows it does not know.
+The pillar of the vision that reads *"beliefs and self awareness and
+its own mind"* now has a wire surface.
+
+**New wire verbs:**
+
+```
+self.confidence topic=<string> [mode=exact|fuzzy|hybrid]
+  -> {topic, mode, matched_atom_count, aggregate_confidence_milli,
+      epistemic_status, matches: [{label, confidence_milli, tier,
+      grade, evidence_count, similarity_milli}, ... top 5]}
+
+self.gaps [holder=<other>] [reason=<name>] [limit=<int>] [summary=0|1]
+  # entries mode (default)
+  -> {holder, count, entries: [{timestamp, holder, topic, reason,
+      detail}, ...]}
+  # summary mode
+  -> {total,
+      by_reason: [{reason, count}, ...],
+      by_holder: [{holder, count}, ...]}
+```
+
+`self.confidence` composes existing primitives — `kg_find_atom`
+(O(1) label lookup) for the exact rung, `ss_index_from_kg` +
+`ss_search` (TF-IDF cosine) for the fuzzy rung, `atom_confidence`
+(beta-distribution mean, integer milli) + `atom_source_tier` +
+`atom_evidence_grade` per atom, and `epistemic_status(reg=0, a)`
+from `src/parts/reasoning/epistemic_status.nova` for the
+`EP_PROVEN` / `EP_CORROBORATED` / `EP_BELIEVED` / `EP_CONTESTED` /
+`EP_REFUTED` / `EP_UNKNOWN` classification. Modes:
+
+- `exact` — one O(1) label lookup; weight 1000; single-atom aggregate.
+- `fuzzy` — build the TF-IDF index across every KG in the registry
+  (`ss_index_from_kg` composed over the multi-KG manager), grab the
+  top-10 hits, weight each by its cosine-similarity milli.
+- `hybrid` (default) — try `exact`; if hit, use it; else fall through
+  to `fuzzy`. The response's `mode` field echoes which rung actually
+  produced the result.
+
+The aggregate is a weighted mean of the atoms' `atom_confidence`
+values (integer arithmetic; conservative default when no atoms
+match: 0 with `epistemic_status="unknown"`). Note: the TF-IDF index
+is REBUILT PER CALL for now — cheap at the sizes we've measured, but
+a later optimization can cache the index against the registry
+watermark.
+
+**Gaps register.** New module `src/parts/meta/gaps_register.nova`
+(~280 lines) — a bounded ring-buffer of "gap events" recording where
+the daemon refused, whiffed, or under-answered. Copied verbatim from
+`dp_query_log`'s shape in `src/safety/differential_privacy.nova`:
+append + rebuild-without-head on overflow. Default cap
+`GAPS_DEFAULT_CAP = 1024`. In-memory only for R103; no snapshot
+round-trip (per-daemon-life diagnostic).
+
+Gap-reason enum (stable wire names — never reorder):
+
+| Int | Name              | Fires when                                                  |
+|-----|-------------------|-------------------------------------------------------------|
+| 1   | `no_match`        | successful `nl.ask` produced 0 touched atoms                |
+| 2   | `low_confidence`  | successful `nl.ask` confidence below the env threshold      |
+| 3   | `refused`         | executor substantive refusal (null query, invalid, missing) |
+| 4   | `unparsed`        | grammar + HDC classifier + LLM sidecar all failed           |
+| 5   | `skill_refused`   | skill supervisor set `PR_REFUSAL_REASON`                    |
+
+**Threshold env.** `CROSSENGIN_GAP_CONFIDENCE_MIN_MILLI` (default
+`400` = 40% confidence). A successful `nl.ask` whose
+`skill_pr_confidence` falls below this threshold records one
+`GAP_LOW_CONFIDENCE` event. Read once at module init via the
+canonical `getenv` guard (checks both `== 0` and `len == 0`; clamps
+to `[1, 1000]`; unset / garbage falls back to the default).
+
+**Cap gate.** `CAP_NL_SELF_READ = "nl:self:read"`. Bundled into the
+`reader` and `admin` role expansions (introspection is a legitimate
+curiosity surface, not a mutation). The `self.gaps` `holder=<other>`
+override (targeting a different holder's gaps) additionally requires
+`CAP_ADMIN_SANDBOX`, checked inside the verb impl.
+
+**Wire hooks (feed the register):**
+
+- `src/nl/executor.nova` — `nl_execute_scoped_ex` gains a trailing
+  `gaps_reg` param. Every substantive refusal along its path
+  (`null query`, `invalid query`, `NLK_UNPARSED`, missing registries,
+  ownership/preference block, unknown query kind) records one event.
+  `nl_execute_scoped` (10-arg) stays byte-identical for R60..R102
+  callers — it pins `gaps_reg=0` on the way through to
+  `_ex`. Existing 9 test call sites need no changes.
+- `src/skills/skill_dispatch.nova` — `skill_run_scoped` gains
+  trailing `gaps_reg` + `topic` params. When a pre- or post-policy
+  refusal fires, one `GAP_SKILL_REFUSED` event is recorded. The
+  R47p2 wrapper `skill_run(sup, perception)` remains 2-arg and pins
+  the new args to `0, ""`.
+- `src/nl/rpc_verbs.nova` — `_rpc_verb_nl_ask` threads the wired
+  register through `nl_execute_scoped_ex` AND, after a successful
+  dispatch, inspects the `ProposalResult`: 0 touched atoms →
+  `GAP_NO_MATCH`; confidence below the env threshold →
+  `GAP_LOW_CONFIDENCE`. `_rpc_verb_skill_run` threads the register
+  through `skill_run_scoped`.
+
+**RpcContext.** New slot `RCTX_GAPS_REG = 21`; mutator
+`rpc_ctx_set_gaps_reg`, accessor `rpc_ctx_gaps_reg`. Default 0 →
+seam inert (records short-circuit; `self.gaps` refuses with `"no
+gaps register configured"`). `examples/crossengin_rpc_daemon.nova`
+allocates via `gaps_register_new(0)` at boot right next to the
+preference-registry allocation.
+
+**Files:**
+
+  * `src/parts/meta/gaps_register.nova`  -- ring-buffer + reason
+                                            enum + summary + name
+                                            mapping (~285 lines,
+                                            new)
+  * `src/nl/executor.nova`                -- `_ex` signature +6th
+                                            arg; 5 gap records
+                                            (~30 lines added)
+  * `src/skills/skill_dispatch.nova`      -- `skill_run_scoped`
+                                            signature +2 args; 2
+                                            gap records (~20 lines
+                                            added)
+  * `src/nl/rpc_verbs.nova`               -- 2 new verb handlers
+                                            + RCTX slot + mutator/
+                                            accessor + threshold
+                                            env + hooks into
+                                            nl.ask/skill.run
+                                            (~370 lines added)
+  * `src/sandbox/capability.nova`         -- CAP_NL_SELF_READ +
+                                            verb-required table +
+                                            reader/admin bundles +
+                                            capability_is_known_cap
+  * `examples/crossengin_rpc_daemon.nova` -- allocate register at
+                                            boot (~7 lines added)
+
+**Tests:** `test_gaps_register` (87 checks — ring-buffer, filters,
+summary, reason-name bijection), `test_self_confidence_verb` (~55
+checks — exact/fuzzy/hybrid, empty KG, missing/empty topic + bad
+mode refusals, cap gate, reader token authorised), `test_self_gaps_verb`
+(~45 checks — presented-holder default, summary mode, reason
+filter, limit, admin holder-override, cap gate),
+`test_nl_pipeline_gap_recording` (~30 checks — UNPARSED via
+gibberish nl.ask, NO_MATCH / LOW_CONFIDENCE via successful nl.ask,
+SKILL_REFUSED via research-over-empty-KG, no-register no-op,
+ring-buffer trim across pipeline calls). `test_nl_rpc_verbs` verb
+count bumped 43 → 45. `test_coding_helper` + `test_nl_executor`
+call-site accommodations for the new signatures.
+
+**Interaction with ADR-0211 (fallback rate).** The R95..R98 pipeline
+already drives fallback rate as a scalar. R103 gives operators the
+*specific* misses behind that number. A run of high `unparsed` counts
+in `self.gaps` names the concrete input patterns the grammar +
+classifier + sidecar all fail on — the operator can then extend the
+grammar or the HDC training corpus with those exact utterances (the
+"fallback-rate driven grammar backfill loop" candidate from §12).
+
+**References:** ADR-0206 (cognitive layer as first-class), ADR-0086
+(calibrated truth-seeking output), §7.9 (R55.2 ownership overlay —
+the `self.gaps` `holder=` override composes with it),
+`src/parts/reasoning/epistemic_status.nova` (the classifier this
+verb surfaces), `src/kg/atom_store.nova` (`atom_confidence` /
+`atom_evidence_grade` / `atom_source_tier` accessors),
+`src/kg/semantic_search.nova` (`ss_index_from_kg` + `ss_search`).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -4397,8 +4561,21 @@ projects only opted-in items via the new `user.preference.*` verb
 family. Composes on top of R55.2 ownership; snapshot round-trips a
 new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
 
-**Front-of-queue after Phase C ✅ / Phase D ✅ / Phase E ✅:**
-- **Phase F** — cognitive layer as first-class per ADR-0206.
+**Phase F (in progress) — cognitive layer as first-class (ADR-0206).**
+- **R103 ✅** — `self.confidence` + `self.gaps` (see §7.53).
+  Read-only introspection over the KG + a fresh gaps register that
+  captures every substantive refusal along the NL / skill path.
+  Reader-tier cap `nl:self:read`; admin-tier `holder=` override on
+  `self.gaps`; env-configurable low-confidence threshold. Verb count
+  43 -> 45. The "beliefs / self-awareness / own mind" pillar of the
+  vision now has a wire surface.
+- **R104 (next)** — `self.override` — volitional layer. Wraps
+  `override_mechanism` with reversibility snapshots so a caller can
+  say "believe X regardless of the evidence ledger" and then walk
+  the override back. Closes Phase F.
+
+**Front-of-queue after Phase C ✅ / Phase D ✅ / Phase E ✅ / R103 ✅:**
+- **R104** — `self.override` (finishes Phase F).
 - **Phase G** — multimodal ingest bridge per ADR-0202.
 - **Phase H** — perf/benchmark harness per ADR-0208.
 - **Backlog** — admin bulk-ops, DTLS-12 red-fix (72/450 checks

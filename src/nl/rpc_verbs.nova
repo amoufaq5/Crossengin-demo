@@ -90,6 +90,11 @@ import "../ingest/pattern_pack.nova"
 // cerec_parse_text + jsonr_parse_text from those modules directly.
 import "../capsules/pattern_capsule.nova"
 import "../parts/meta/meta_observer.nova"
+// R103 (Phase F part 1): gaps register + self.* introspection.
+import "../parts/meta/gaps_register.nova"
+import "../kg/atom_store.nova"
+import "../kg/semantic_search.nova"
+import "../parts/reasoning/epistemic_status.nova"
 import "../sandbox/capability.nova"
 import "../sandbox/skill_signature.nova"
 import "../sandbox/ownership.nova"
@@ -101,6 +106,26 @@ import "../factory/child_mode.nova"
 import "../factory/update_delta.nova"
 import "../persistence/bundle_signing.nova"
 import "../util/str_safe.nova"
+
+// ---- R103 threshold env ---------------------------------------------
+// CROSSENGIN_GAP_CONFIDENCE_MIN_MILLI -- confidence below this milli
+// value triggers a GAP_LOW_CONFIDENCE record on a successful nl.ask.
+// Default 400 (= 40%). Read once at module init via the canonical
+// getenv guard (guard for both the "unset -> 0" and "empty string ->
+// str_to_int returns 0" NOVA quirks). Operators pin their tolerance
+// through the env var; tests can pass their own threshold via the
+// direct low-level helpers.
+let _CE_GAP_CONFIDENCE_MIN_DEFAULT = 400
+
+fn _rpc_gap_confidence_min_milli() {
+    let s = getenv("CROSSENGIN_GAP_CONFIDENCE_MIN_MILLI")
+    if s == 0        { return _CE_GAP_CONFIDENCE_MIN_DEFAULT }
+    if len(s) == 0   { return _CE_GAP_CONFIDENCE_MIN_DEFAULT }
+    let v = str_to_int(s)
+    if v <= 0        { return _CE_GAP_CONFIDENCE_MIN_DEFAULT }
+    if v > 1000      { return 1000 }
+    return v
+}
 
 // ---- RpcContext slot layout ---------------------------------------------
 let RCTX_KGREG        = 0    // multi_kg_manager registry (may be 0)
@@ -156,7 +181,13 @@ let RCTX_PREFERENCE_REG = 19
 // value persists via child_mode_current_fingerprint_save() to survive
 // daemon restarts.
 let RCTX_CURRENT_BUNDLE_FINGERPRINT = 20
-let RCTX_SLOTS        = 21
+// R103 (Phase F part 1, ADR-0206): gaps register slot. When 0 (default),
+// the executor / skill supervisor / nl.ask paths still work end-to-end
+// (gaps_record short-circuits on reg==0); the `self.gaps` verb refuses
+// cleanly with "no gaps register configured". A daemon that wants
+// introspection allocates via gaps_register_new at boot.
+let RCTX_GAPS_REG     = 21
+let RCTX_SLOTS        = 22
 
 fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
                ingest_agent, review_queue, now) {
@@ -182,6 +213,7 @@ fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
     push(c, 0)          // CHILD_MODE_BITS (R100; 0 = mother mode)
     push(c, 0)          // PREFERENCE_REG (R101; 0 = no soft filter)
     push(c, "")         // CURRENT_BUNDLE_FINGERPRINT (R102; "" = first-apply)
+    push(c, 0)          // GAPS_REG (R103; 0 = self.gaps refuses cleanly)
     return c
 }
 
@@ -268,6 +300,17 @@ fn rpc_ctx_set_preference_reg(ctx, reg) {
     return ctx
 }
 fn rpc_ctx_preference_reg(c) { return c[RCTX_PREFERENCE_REG] }
+
+// R103 (Phase F part 1): gaps register mutator + accessor. When wired,
+// nl.ask records GAP_UNPARSED / GAP_LOW_CONFIDENCE / GAP_REFUSED events
+// through the executor + skill supervisor call-chain, and self.gaps
+// surfaces the entries. When 0 the wire behaviour is byte-identical to
+// R102 (no records happen; self.gaps refuses with "no gaps register").
+fn rpc_ctx_set_gaps_reg(ctx, reg) {
+    list_set(ctx, RCTX_GAPS_REG, reg)
+    return ctx
+}
+fn rpc_ctx_gaps_reg(c) { return c[RCTX_GAPS_REG] }
 
 // R102 mutator + accessor for the current-bundle-fingerprint chain
 // state. Boot code (crossengin_rpc_daemon.nova in child mode) seeds
@@ -638,12 +681,49 @@ fn _rpc_verb_nl_ask(args, ctx) {
     // pass straight through untouched (no classifier attempt, no
     // sidecar attempt -- the fast path stays fast).
     q = nl_pipeline_try_fallback_rungs(q, text, metrics, holder)
+    // R103: gaps register wired through so executor + supervisor
+    // refusals record events. Additionally after the call we inspect
+    // the ProposalResult for LOW_CONFIDENCE / NO_MATCH and record
+    // one gap per successful-but-thin dispatch (executor doesn't see
+    // atom counts; that decision is a wire-layer policy).
+    let gaps = rpc_ctx_gaps_reg(ctx)
     let er = nl_execute_scoped_ex(q, rpc_ctx_kgreg(ctx), rpc_ctx_capreg(ctx),
                                 rpc_ctx_persona_reg(ctx), rpc_ctx_skill_reg(ctx),
                                 rpc_ctx_mo(ctx), uid, rpc_ctx_now(ctx),
                                 rpc_ctx_ownership(ctx),
                                 rpc_ctx_preference_reg(ctx),
-                                rpc_ctx_presented_holder(ctx))
+                                rpc_ctx_presented_holder(ctx),
+                                gaps)
+    // R103: post-execution introspection. Only record if the executor
+    // reached the skill path (er.ok=1 AND proposal_result attached).
+    // A refused executor already recorded via gaps_record inside; a
+    // skill-refused proposal already recorded via the supervisor path.
+    if gaps != 0 {
+        if nl_er_ok(er) == 1 {
+            let pr = nl_er_proposal_result(er)
+            if pr != 0 {
+                if skill_pr_ok(pr) == 1 {
+                    let atoms = skill_pr_atoms(pr)
+                    let conf = skill_pr_confidence(pr)
+                    let min_conf = _rpc_gap_confidence_min_milli()
+                    if len(atoms) == 0 {
+                        gaps_record(gaps, holder, text, GAP_NO_MATCH,
+                                    "policy produced 0 touched atoms",
+                                    rpc_ctx_now(ctx))
+                    } else {
+                        if conf < min_conf {
+                            gaps_record(gaps, holder, text,
+                                        GAP_LOW_CONFIDENCE,
+                                        "confidence " + int_to_str(conf)
+                                          + "/1000 below threshold "
+                                          + int_to_str(min_conf),
+                                        rpc_ctx_now(ctx))
+                        }
+                    }
+                }
+            }
+        }
+    }
     let persona = 0
     let preg = rpc_ctx_persona_reg(ctx)
     if preg != 0 {
@@ -881,9 +961,18 @@ fn _rpc_verb_skill_run(args, ctx) {
     // pattern-consulting policies (coding_helper today) honor the
     // R63 pattern ownership overlay. Absent an overlay this is
     // byte-identical to R47p2/R57 behavior.
+    // R103: thread the gaps register + a topic slice so a skill
+    // refusal (persona-missing / kg-empty / capsule-uninstalled /
+    // min-confidence) records one GAP_SKILL_REFUSED event for
+    // `self.gaps` to surface. The topic is the arg for scalar-
+    // perception policies; for the research policy we use its
+    // `topic` slot inside the perception list.
+    let gap_topic = arg
     let pr = skill_run_scoped(sup, perception,
                                rpc_ctx_ownership(ctx),
-                               rpc_ctx_presented_holder(ctx))
+                               rpc_ctx_presented_holder(ctx),
+                               rpc_ctx_gaps_reg(ctx),
+                               gap_topic)
     return _rpc_ok(_rpc_encode_proposal(pr))
 }
 
@@ -3532,6 +3621,369 @@ fn _rpc_verb_user_preference_clear(args, ctx) {
     return _rpc_ok(_rpc_obj(kv))
 }
 
+// ---- R103 self.confidence + self.gaps (Phase F part 1) -------------------
+
+// Iterate every atom in every KG registered under `kg_reg`, feeding
+// each atom_id -> label into a fresh TF-IDF index. Mirrors
+// ss_index_from_kg(kg) but composes across the whole registry, since
+// `self.confidence` is not scoped to one named KG. Returns the index
+// plus a parallel list mapping atom_id -> atom_ref so the confidence
+// aggregator can pull belief / provenance in one pass.
+fn _rpc_self_build_ix(kg_reg) {
+    let ix = ss_index_new()
+    let id_to_atom = list_new()   // list<[atom_id, atom_ref]>
+    if kg_reg == 0 {
+        let early = list_new()
+        push(early, ix)
+        push(early, id_to_atom)
+        return early
+    }
+    let n = kg_count(kg_reg)
+    let ki = 0
+    // We synthesize a fresh atom_id namespace per aggregation so
+    // duplicate label ids across KGs don't collide: id = ki * 100000
+    // + kg_atom_id. Cap KG count at 100 (well beyond any current
+    // deployment) so the multiply stays under NOVA's pointer
+    // threshold.
+    while ki < n {
+        let kg = kg_get(kg_reg, ki)
+        if kg != 0 {
+            let atoms = kg_atoms(kg)
+            let ai = 0
+            while ai < len(atoms) {
+                let a = atoms[ai]
+                if a != 0 {
+                    let synth_id = ki * 100000 + atom_id(a)
+                    ss_index_add_atom(ix, synth_id, atom_label(a))
+                    let row = list_new()
+                    push(row, synth_id)
+                    push(row, a)
+                    push(id_to_atom, row)
+                }
+                ai = ai + 1
+            }
+        }
+        ki = ki + 1
+    }
+    let out = list_new()
+    push(out, ix)
+    push(out, id_to_atom)
+    return out
+}
+
+// Look up the atom_ref by synthesized atom_id (from _rpc_self_build_ix).
+// Returns 0 on miss.
+fn _rpc_self_atom_by_synth(id_to_atom, sid) {
+    let i = 0
+    while i < len(id_to_atom) {
+        if id_to_atom[i][0] == sid { return id_to_atom[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+// Look up an atom by exact label across every KG in `kg_reg`. Returns
+// the first match found (KG registry iteration order); 0 on miss.
+fn _rpc_self_kg_find_exact(kg_reg, label) {
+    if kg_reg == 0 { return 0 }
+    let n = kg_count(kg_reg)
+    let i = 0
+    while i < n {
+        let kg = kg_get(kg_reg, i)
+        if kg != 0 {
+            let a = kg_find_atom(kg, label)
+            if a != 0 { return a }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Encode a per-match record for the `matches` array of self.confidence.
+fn _rpc_encode_confidence_match(a, weight_milli) {
+    let kv = list_new()
+    let p1 = list_new() push(p1, "label")            push(p1, _rpc_str(atom_label(a)))               push(kv, p1)
+    let p2 = list_new() push(p2, "confidence_milli") push(p2, _rpc_int(atom_confidence(a)))          push(kv, p2)
+    let p3 = list_new() push(p3, "tier")             push(p3, _rpc_int(atom_source_tier(a)))         push(kv, p3)
+    let p4 = list_new() push(p4, "grade")            push(p4, _rpc_int(atom_evidence_grade(a)))      push(kv, p4)
+    let p5 = list_new() push(p5, "evidence_count")   push(p5, _rpc_int(atom_evidence(a)))            push(kv, p5)
+    let p6 = list_new() push(p6, "similarity_milli") push(p6, _rpc_int(weight_milli))                push(kv, p6)
+    return _rpc_obj(kv)
+}
+
+// self.confidence -- aggregate confidence over KG atoms matching a topic.
+//
+// Args: {topic (required), mode (optional: exact|fuzzy|hybrid;
+//        default hybrid)}
+// Cap : CAP_NL_SELF_READ.
+// Returns:
+//   {topic, mode, matched_atom_count, aggregate_confidence_milli,
+//    epistemic_status, matches: [top 5 per_match records]}
+fn _rpc_verb_self_confidence(args, ctx) {
+    if _rpc_has_arg(args, "topic") == 0 { return _rpc_err("missing arg: topic") }
+    let topic = _rpc_arg(args, "topic")
+    if len(topic) == 0 { return _rpc_err("topic must be non-empty") }
+    let mode = _rpc_arg(args, "mode")
+    if len(mode) == 0 { mode = "hybrid" }
+    if str_eq_bytes(mode, "exact")  != 1 {
+        if str_eq_bytes(mode, "fuzzy")  != 1 {
+            if str_eq_bytes(mode, "hybrid") != 1 {
+                return _rpc_err("unknown mode: " + mode
+                              + " (want exact|fuzzy|hybrid)")
+            }
+        }
+    }
+    let kg_reg = rpc_ctx_kgreg(ctx)
+    // Track selected atoms + their weights (milli 0..1000). Exact hits
+    // get weight 1000 (fully certain-match); fuzzy hits carry cosine
+    // similarity milli from ss_search.
+    let picks = list_new()      // list<[atom_ref, weight_milli]>
+    let used_mode = mode
+    // Exact / hybrid: try O(1) label lookup first.
+    let did_exact = 0
+    if str_eq_bytes(mode, "exact") == 1 { did_exact = 1 }
+    if str_eq_bytes(mode, "hybrid") == 1 { did_exact = 1 }
+    if did_exact == 1 {
+        let a = _rpc_self_kg_find_exact(kg_reg, topic)
+        if a != 0 {
+            let row = list_new()
+            push(row, a)
+            push(row, 1000)
+            push(picks, row)
+            used_mode = "exact"
+        }
+    }
+    // Fuzzy / hybrid-with-no-exact: build the TF-IDF index and grab top-10.
+    let do_fuzzy = 0
+    if str_eq_bytes(mode, "fuzzy") == 1 { do_fuzzy = 1 }
+    if str_eq_bytes(mode, "hybrid") == 1 {
+        if len(picks) == 0 { do_fuzzy = 1 }
+    }
+    if do_fuzzy == 1 {
+        let built = _rpc_self_build_ix(kg_reg)
+        let ix = built[0]
+        let id_to_atom = built[1]
+        let hits = ss_search(ix, topic, 10)
+        let hi = 0
+        while hi < len(hits) {
+            let h = hits[hi]
+            let a = _rpc_self_atom_by_synth(id_to_atom, h[0])
+            if a != 0 {
+                let row = list_new()
+                push(row, a)
+                push(row, h[1])
+                push(picks, row)
+            }
+            hi = hi + 1
+        }
+        if str_eq_bytes(used_mode, "exact") != 1 { used_mode = "fuzzy" }
+    }
+    // Aggregate: weighted mean confidence + majority epistemic_status.
+    // Weighted mean = sum(conf * weight) / sum(weight). Deliberately
+    // integer arithmetic; a zero-weight aggregate (impossible today
+    // since we only add picks with positive weight) yields 0.
+    let ep_counts = list_new()  // list<[status_int, count]>
+    let total_w = 0
+    let weighted_sum = 0
+    let pi = 0
+    while pi < len(picks) {
+        let a = picks[pi][0]
+        let w = picks[pi][1]
+        let c = atom_confidence(a)
+        weighted_sum = weighted_sum + c * w
+        total_w = total_w + w
+        // epistemic_status: pass reg=0 (no proof registry threaded
+        // through the wire ctx; FORMAL atoms fall through to the
+        // belief-based ladder, which is the conservative default).
+        let s = epistemic_status(0, a)
+        let fj = 0
+        let bumped = 0
+        while fj < len(ep_counts) {
+            if ep_counts[fj][0] == s {
+                list_set(ep_counts[fj], 1, ep_counts[fj][1] + 1)
+                bumped = 1
+                fj = len(ep_counts)
+            }
+            fj = fj + 1
+        }
+        if bumped == 0 {
+            let row = list_new()
+            push(row, s)
+            push(row, 1)
+            push(ep_counts, row)
+        }
+        pi = pi + 1
+    }
+    let agg_conf = 0
+    if total_w > 0 { agg_conf = weighted_sum / total_w }
+    // Majority epistemic status (highest count; ties -> first).
+    let majority = EP_UNKNOWN
+    let best_ct = 0
+    let ei = 0
+    while ei < len(ep_counts) {
+        if ep_counts[ei][1] > best_ct {
+            best_ct = ep_counts[ei][1]
+            majority = ep_counts[ei][0]
+        }
+        ei = ei + 1
+    }
+    // Emit top-5 per-match records (already in similarity order for
+    // fuzzy; exact single-hit is trivially first).
+    let matches_frags = list_new()
+    let mi = 0
+    let cap = 5
+    while mi < len(picks) {
+        if mi >= cap { mi = len(picks) }
+        else {
+            push(matches_frags, _rpc_encode_confidence_match(picks[mi][0],
+                                                             picks[mi][1]))
+            mi = mi + 1
+        }
+    }
+    let kv = list_new()
+    let a = list_new() push(a, "topic")                         push(a, _rpc_str(topic))                              push(kv, a)
+    let b = list_new() push(b, "mode")                          push(b, _rpc_str(used_mode))                          push(kv, b)
+    let c = list_new() push(c, "matched_atom_count")            push(c, _rpc_int(len(picks)))                         push(kv, c)
+    let d = list_new() push(d, "aggregate_confidence_milli")    push(d, _rpc_int(agg_conf))                           push(kv, d)
+    let e = list_new() push(e, "epistemic_status")              push(e, _rpc_str(epistemic_status_name(majority)))    push(kv, e)
+    let f = list_new() push(f, "matches")                       push(f, _rpc_arr(matches_frags))                      push(kv, f)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
+// Encode one gap-event as a wire object.
+fn _rpc_encode_gap_event(e) {
+    let kv = list_new()
+    let p1 = list_new() push(p1, "timestamp") push(p1, _rpc_int(gap_event_timestamp(e)))                            push(kv, p1)
+    let p2 = list_new() push(p2, "holder")    push(p2, _rpc_str(gap_event_holder(e)))                               push(kv, p2)
+    let p3 = list_new() push(p3, "topic")     push(p3, _rpc_str(gap_event_topic(e)))                                push(kv, p3)
+    let p4 = list_new() push(p4, "reason")    push(p4, _rpc_str(gaps_reason_name(gap_event_reason(e))))             push(kv, p4)
+    let p5 = list_new() push(p5, "detail")    push(p5, _rpc_str(gap_event_detail(e)))                               push(kv, p5)
+    return _rpc_obj(kv)
+}
+
+// self.gaps -- enumerate the daemon's known-unknowns.
+//
+// Args:
+//   holder   (optional; admin-only override when != presented_holder)
+//   reason   (optional; filter by name: no_match|low_confidence|refused|unparsed|skill_refused)
+//   limit    (optional; default 50, max 500)
+//   summary  (optional; "1" returns rollup instead of entries)
+// Cap: CAP_NL_SELF_READ.
+fn _rpc_verb_self_gaps(args, ctx) {
+    let reg = rpc_ctx_gaps_reg(ctx)
+    if reg == 0 { return _rpc_err("no gaps register configured") }
+    let presented = rpc_ctx_presented_holder(ctx)
+    // Holder override: only admins may target another holder's gaps.
+    let holder = presented
+    if _rpc_has_arg(args, "holder") == 1 {
+        let asked = _rpc_arg(args, "holder")
+        if str_eq_bytes(asked, presented) != 1 {
+            // Cross-holder access requires ADMIN_SANDBOX.
+            let cap_reg = rpc_ctx_cap_reg(ctx)
+            let tid = rpc_ctx_presented_token(ctx)
+            let is_admin = 0
+            if cap_reg != 0 {
+                if len(tid) > 0 {
+                    let t = capability_registry_lookup(cap_reg, tid)
+                    if t != 0 {
+                        if token_has_cap(t, CAP_ADMIN_SANDBOX) == 1 { is_admin = 1 }
+                    }
+                }
+            }
+            // If enforcement is OFF (no cap registry), permit the
+            // override -- the wire is unauthenticated already, so an
+            // extra gate here would be theater.
+            if cap_reg == 0 { is_admin = 1 }
+            if is_admin == 0 {
+                return _rpc_err("holder override requires admin:sandbox")
+            }
+            holder = asked
+        }
+    }
+    // Summary mode.
+    if _rpc_has_arg(args, "summary") == 1 {
+        let sflag = _rpc_arg(args, "summary")
+        if str_eq_bytes(sflag, "1") == 1 {
+            let s = gaps_summary(reg)
+            let by_r_frags = list_new()
+            let bri = 0
+            let by_r = gaps_summary_by_reason(s)
+            while bri < len(by_r) {
+                let rkv = list_new()
+                let ra = list_new() push(ra, "reason") push(ra, _rpc_str(gaps_reason_name(by_r[bri][0]))) push(rkv, ra)
+                let rb = list_new() push(rb, "count")  push(rb, _rpc_int(by_r[bri][1]))                  push(rkv, rb)
+                push(by_r_frags, _rpc_obj(rkv))
+                bri = bri + 1
+            }
+            let by_h_frags = list_new()
+            let bhi = 0
+            let by_h = gaps_summary_by_holder(s)
+            while bhi < len(by_h) {
+                let hkv = list_new()
+                let ha = list_new() push(ha, "holder") push(ha, _rpc_str(by_h[bhi][0])) push(hkv, ha)
+                let hb = list_new() push(hb, "count")  push(hb, _rpc_int(by_h[bhi][1])) push(hkv, hb)
+                push(by_h_frags, _rpc_obj(hkv))
+                bhi = bhi + 1
+            }
+            let kv = list_new()
+            let a1 = list_new() push(a1, "total")     push(a1, _rpc_int(gaps_summary_total(s))) push(kv, a1)
+            let a2 = list_new() push(a2, "by_reason") push(a2, _rpc_arr(by_r_frags))            push(kv, a2)
+            let a3 = list_new() push(a3, "by_holder") push(a3, _rpc_arr(by_h_frags))            push(kv, a3)
+            return _rpc_ok(_rpc_obj(kv))
+        }
+    }
+    // Entries mode. Filter by holder (always) + optionally by reason,
+    // then apply limit.
+    let want_reason = 0
+    if _rpc_has_arg(args, "reason") == 1 {
+        let rname = _rpc_arg(args, "reason")
+        want_reason = gaps_reason_from_name(rname)
+        if want_reason == 0 {
+            return _rpc_err("unknown reason: " + rname
+                          + " (want no_match|low_confidence|refused|unparsed|skill_refused)")
+        }
+    }
+    let limit = 50
+    if _rpc_has_arg(args, "limit") == 1 {
+        let lv = str_to_int(_rpc_arg(args, "limit"))
+        if lv > 0 { limit = lv }
+    }
+    if limit > 500 { limit = 500 }
+    // Walk entries oldest-first, keep the matching ones up to `limit`.
+    let entries = gaps_entries(reg)
+    let picks = list_new()
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let keep = 1
+        if str_eq_bytes(gap_event_holder(e), holder) != 1 { keep = 0 }
+        if keep == 1 {
+            if want_reason != 0 {
+                if gap_event_reason(e) != want_reason { keep = 0 }
+            }
+        }
+        if keep == 1 { push(picks, e) }
+        i = i + 1
+    }
+    // Trim to limit (keep the OLDEST `limit`; matches deterministic wire
+    // shape -- clients that want the tail pass a small limit and re-
+    // query with an updated `after` in a later round).
+    let out_frags = list_new()
+    let oi = 0
+    while oi < len(picks) {
+        if oi >= limit { oi = len(picks) }
+        else {
+            push(out_frags, _rpc_encode_gap_event(picks[oi]))
+            oi = oi + 1
+        }
+    }
+    let kv = list_new()
+    let a1 = list_new() push(a1, "holder")  push(a1, _rpc_str(holder))         push(kv, a1)
+    let a2 = list_new() push(a2, "count")   push(a2, _rpc_int(len(out_frags))) push(kv, a2)
+    let a3 = list_new() push(a3, "entries") push(a3, _rpc_arr(out_frags))      push(kv, a3)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
 // ---- top-level dispatch --------------------------------------------------
 
 // The one entry point a daemon calls. `verb` is the verb name string;
@@ -3607,6 +4059,9 @@ fn rpc_dispatch(verb, args, ctx) {
     if str_eq_bytes(verb, "user.preference.set")   == 1 { return _rpc_verb_user_preference_set(args, ctx) }
     if str_eq_bytes(verb, "user.preference.list")  == 1 { return _rpc_verb_user_preference_list(args, ctx) }
     if str_eq_bytes(verb, "user.preference.clear") == 1 { return _rpc_verb_user_preference_clear(args, ctx) }
+    // R103 (Phase F part 1) self-introspection verbs.
+    if str_eq_bytes(verb, "self.confidence")   == 1 { return _rpc_verb_self_confidence(args, ctx) }
+    if str_eq_bytes(verb, "self.gaps")         == 1 { return _rpc_verb_self_gaps(args, ctx) }
     return _rpc_err("unknown verb: " + verb)
 }
 
@@ -3658,5 +4113,8 @@ fn rpc_verb_names() {
     push(v, "user.preference.set")
     push(v, "user.preference.list")
     push(v, "user.preference.clear")
+    // R103 Phase F part 1.
+    push(v, "self.confidence")
+    push(v, "self.gaps")
     return v
 }
