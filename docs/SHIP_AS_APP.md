@@ -5519,6 +5519,114 @@ in isolation; the wire integration is a manual smoke because the
 chat REPL doesn't run headlessly in this container (a pre-existing
 sandbox limitation unrelated to R112).
 
+### 7.61 QPS per-holder aggregate rate window (R113 — Phase K part 4)
+
+R113 closes Phase K by adding a SECOND rate window keyed by TOKEN
+HOLDER that runs alongside the pre-existing per-TOKEN window
+(`token_check_rate`, R56). Both must pass for a request to proceed.
+The motivation is a mobile-mesh use case the per-token window
+handles wrong from either direction:
+
+- **N devices sharing one token** — per-token window gives ZERO
+  isolation between the devices; a chatty phone drains the same
+  bucket a laptop is trying to use.
+- **N devices each carrying its own token** — per-token window
+  gives each device its OWN full ceiling; the aggregate a user can
+  emit is `N * qps_max`, not `qps_max`.
+
+Neither is right. The per-holder window caps the SUM of all
+requests attributed to one holder inside a 1-second fixed window,
+regardless of how many tokens the holder presents.
+
+**Two-window architecture.** `capability_authorize_ex` gains a
+`holder_rate_reg` parameter (see
+`src/sandbox/holder_rate.nova::holder_rate_check`). When the
+daemon threads a non-zero registry through
+`rpc_ctx_set_holder_rate_reg`, dispatch consults it right after
+the per-TOKEN window. Legacy callers pass `0` and see byte-
+identical R56 behaviour. Both windows use a 1-second fixed rolling
+window; the per-holder refusal is worded
+`"rate limit exceeded: max N req/s per holder"` so operators
+grepping logs can distinguish it from the per-TOKEN refusal
+(`"... for this token"`).
+
+**Gate ordering.** Highest-precedence first:
+
+    child-mode  >  token-rate  >  holder-rate  >  cap-error
+
+An operator sees the FIRST refusal that fires. A caller who blew
+their per-holder budget sees the per-holder refusal even if they
+also lack a cap for the target verb — the rate-limit hit is the
+actionable signal (retry later); the cap error might not even
+apply to their next attempt.
+
+**Env-var default.**
+
+    CROSSENGIN_HOLDER_QPS_DEFAULT=10   # holders w/o explicit setting
+
+Unset defaults to `10 req/s per holder` — small enough to make a
+chatty mobile fleet think, large enough to leave interactive
+typing unaffected. `0` = unlimited default (window effectively off
+unless an operator adds a per-holder override). Empty string /
+non-numeric value falls back to `10` (loud default beats silent
+disable on a typo).
+
+**New verbs (count 51 → 53), both admin:sandbox-gated:**
+
+- **`admin.set_holder_qps`** `{holder, qps} -> {holder, qps,
+  previous_qps}` — assign an explicit per-holder cap. `qps=0` marks
+  the holder as unlimited; a bare `"0"` string is required so a
+  typo like `"nope"` doesn't silently unlimit (str_to_int returns 0
+  for garbage). `previous_qps` echoes the RESOLVED prior cap
+  (explicit if any, else current default) so operators can undo
+  without a follow-up list call.
+- **`admin.list_holder_qps`** `{limit, after}` (R107 uniform
+  pagination) `-> {default_qps, holders: [{holder, qps_max,
+  explicit, current_count, window_age_seconds}, ...], next_after}`
+  — dashboard view. `explicit=false` means the row is running
+  under the default; a subsequent `set_default` reshapes it on the
+  NEXT window boundary. Cursor id is the holder string; the
+  anonymous bucket `""` sorts first when present.
+
+**Anonymous holder handling.** The empty-string holder `""` is a
+LEGITIMATE key, and all anonymous callers (no token, or a token
+with no holder set) share ONE aggregate window. This is the
+tightest cap we can offer without pretending to know who they
+are. An operator worried about an anonymous flood can shrink that
+bucket independently:
+
+    admin.set_holder_qps  holder=""  qps=1
+
+which caps ALL anonymous traffic at 1/s without touching any
+authenticated holder. The alternative (skip the check entirely
+for anon) was rejected: an unauthenticated flood is exactly the
+case a rate window should defend against.
+
+**Files.** NEW: `src/sandbox/holder_rate.nova` (registry + check +
+snapshot); `tests/unit/test_holder_rate.nova` (330 checks — window
+lifecycle, isolation, unlimited-per-holder, anonymous bucket,
+reset, snapshot shape, null guards; the count inflates through
+tight per-request loops asserting each request's outcome);
+`tests/unit/test_admin_set_holder_qps_verb.nova` (26 checks);
+`tests/unit/test_admin_list_holder_qps_verb.nova` (30 checks).
+MODIFIED: `src/sandbox/capability.nova` (extend
+`capability_authorize_ex` signature + new
+`_capability_authorize_with_holder` inner path with the reordered
+gates); `src/nl/rpc_verbs.nova` (2 new verbs, `RCTX_HOLDER_RATE_REG`
+slot, mutator/accessor, dispatch pass-through, verb-name list);
+`examples/crossengin_rpc_daemon.nova` (env parse + registry
+allocation at boot); `tests/unit/test_capability_wire.nova` (three
+new gate-ordering tests: holder-rate-beats-cap, token-rate-beats-
+holder-rate, null-reg-is-inert); `tests/unit/test_nl_rpc_verbs.nova`
+(verb count 51 → 53); `tests/unit/test_wire_pagination.nova`
+(`admin.list_holder_qps` case); `tests/unit/test_child_mode_wire.nova`
+(three `capability_authorize_ex` call sites gain the new
+`holder_rate_reg` argument, verb-count mirror bumped).
+
+**Phase K COMPLETE.** R110 (test-red cleanup), R111 (`self.override`
++ `self.override.list`), R112 (CLI polish), and R113 (per-holder
+rate window) all shipped.
+
 **Phase I COMPLETE (R107 + R108 shipped).**
 - **R107 ✅** — Wire cursor pagination for list verbs (see §7.56).
   Uniform `limit` + `after` args plus a `next_after` field folded
@@ -5533,9 +5641,9 @@ sandbox limitation unrelated to R112).
   work. 115 checks in `test_wire_pagination`; eight existing tests
   extended with `next_after` assertions.
 
-**Phase J COMPLETE (R109 shipped). Phase K in progress (R110 + R111
-+ R112 shipped). Front-of-queue after Phase C / D / E / I / J / K /
-R103 / R105 / R106 / R111 / R112:**
+**Phase J COMPLETE (R109 shipped). Phase K COMPLETE (R110 + R111 +
+R112 + R113 shipped). Front-of-queue after Phase C / D / E / I / J /
+K / R103 / R105 / R106 / R111 / R112 / R113:**
 - **R112 ✅** — CLI polish (see §7.60): `--json` mode
   (`CROSSENGIN_JSON_MODE=1`; one JSON line per exchange, banner /
   prompt / meta all suppressed, `ok` + `refusal_reason` folded in);
@@ -5550,13 +5658,26 @@ R103 / R105 / R106 / R111 / R112:**
   argv seam today, so the `--json` flag rides its env-var equivalent
   in this container; the pure parser is already argv-shaped for the
   day NOVA grows one. 69 checks in `test_chat_cli_polish`.
-- **R113** — QPS per-holder (flip per-TOKEN → per-holder rate
-  limiting; was numbered R111 in earlier roadmap drafts).
+- **R113 ✅** — QPS per-holder aggregate rate window (see §7.61):
+  second rate window keyed by TOKEN HOLDER that runs alongside the
+  R56 per-TOKEN window. Both must pass; gate ordering is
+  `child-mode > token-rate > holder-rate > cap-error`.
+  `CROSSENGIN_HOLDER_QPS_DEFAULT` names the default cap (10 req/s
+  per holder). Two new admin verbs (`admin.set_holder_qps` +
+  `admin.list_holder_qps`, count 51 → 53). Anonymous callers
+  (`""` holder) share one aggregate bucket, tunable independently.
+  Closes the mobile-share-a-token risk from ADR-0209.
 - **R114** — Signed AgentPackage (ADR-0210 tier 3; reuses
   `bundle_pkg_sign` from R99 to sign a composed AgentManifest for
   distribution).
 - **R115** — Admin bulk-ops (`admin.list_tokens`,
   `admin.expire_all_before`, `admin.revoke_all_by_holder`).
+- **General observability layer** — a broader counter registry
+  beyond the R95 NL-scoped one; per-verb latency + refusal-reason
+  histograms.
+- **Enterprise readiness** — audit-log sink, per-tenant snapshot
+  isolation, hardware-key-backed admin bootstrap (yubikey
+  attestation on `capability.issue` for the first admin token).
 - **Backlog debt** — DTLS-12 red-fix (72/450 checks red since R86),
   bignum_256 / field25519 consolidation, LICENSES/ folder authoring.
 - R110: cleared 2 pre-existing test reds (test_child_mode_wire verb-count drift 43->49, test_self_gaps_verb cap-name alignment).
@@ -5592,8 +5713,8 @@ immediate targets):**
    `ownership.transfer` and `admin.set_holder` events.
 - Per-source rate budgets controllable via admin wire verb (aggregate
   ceilings across many tokens from one origin).
-- Per-holder aggregate rate limits (an owner's tokens share a
-  combined ceiling).
+- ~~Per-holder aggregate rate limits (an owner's tokens share a
+  combined ceiling).~~ Shipped R113 (see §7.61).
 - Hardware-key-backed admin bootstrap (yubikey attestation on
   `capability.issue` for the first admin token).
 - DTLS-12 red-fix (72/450 checks red since R86; unrelated to the

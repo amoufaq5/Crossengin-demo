@@ -103,6 +103,10 @@ import "../kg/atom_store.nova"
 import "../kg/semantic_search.nova"
 import "../parts/reasoning/epistemic_status.nova"
 import "../sandbox/capability.nova"
+// R113 (Phase K part 4): per-holder aggregate rate window registry
+// used by admin.set_holder_qps + admin.list_holder_qps and threaded
+// into capability_authorize_ex via rpc_ctx.
+import "../sandbox/holder_rate.nova"
 import "../sandbox/skill_signature.nova"
 import "../sandbox/ownership.nova"
 import "../sandbox/session_snapshot.nova"
@@ -210,7 +214,13 @@ let RCTX_AGENT_REG    = 22
 // + goal engine + veto reg + safety state (self-contained per R111
 // design; not routed through rpc_ctx to keep the seam small).
 let RCTX_OVERRIDE_REG = 23
-let RCTX_SLOTS        = 24
+// R113 (Phase K part 4): per-holder aggregate rate window registry
+// (src/sandbox/holder_rate.nova). Daemon boot allocates via
+// holder_rate_registry_new(CROSSENGIN_HOLDER_QPS_DEFAULT). Absent
+// this the second window is inert and dispatch behaves
+// byte-identically to R112 (only the per-TOKEN window applies).
+let RCTX_HOLDER_RATE_REG = 24
+let RCTX_SLOTS        = 25
 
 fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
                ingest_agent, review_queue, now) {
@@ -239,6 +249,8 @@ fn rpc_ctx_new(kgreg, capreg, persona_reg, skill_reg, mo,
     push(c, 0)          // GAPS_REG (R103; 0 = self.gaps refuses cleanly)
     push(c, 0)          // AGENT_REG (R109; 0 = agent.* refuse cleanly)
     push(c, 0)          // OVERRIDE_REG (R111; 0 = self.override.* refuse)
+    push(c, 0)          // HOLDER_RATE_REG (R113; 0 = per-holder window
+                        //   inert -- only the per-TOKEN window applies)
     return c
 }
 
@@ -357,6 +369,18 @@ fn rpc_ctx_set_override_reg(ctx, reg) {
     return ctx
 }
 fn rpc_ctx_override_reg(c) { return c[RCTX_OVERRIDE_REG] }
+
+// R113 (Phase K part 4, ADR-0105): per-holder aggregate rate window
+// registry mutator + accessor. Daemon boot allocates via
+// holder_rate_registry_new(getenv("CROSSENGIN_HOLDER_QPS_DEFAULT")).
+// Absent this, the per-holder window is inert (dispatch consults it
+// with reg=0 -> capability_authorize_ex skips the check). The per-
+// TOKEN window in capability.nova is unaffected.
+fn rpc_ctx_set_holder_rate_reg(ctx, reg) {
+    list_set(ctx, RCTX_HOLDER_RATE_REG, reg)
+    return ctx
+}
+fn rpc_ctx_holder_rate_reg(c) { return c[RCTX_HOLDER_RATE_REG] }
 
 // R102 mutator + accessor for the current-bundle-fingerprint chain
 // state. Boot code (crossengin_rpc_daemon.nova in child mode) seeds
@@ -2792,6 +2816,135 @@ fn _rpc_verb_admin_set_holder(args, ctx) {
     return _rpc_ok(_rpc_obj(kv))
 }
 
+// ---- R113 admin.set_holder_qps + admin.list_holder_qps ------------------
+//
+// The two admin surfaces for the per-holder aggregate rate window
+// (src/sandbox/holder_rate.nova). Complements the pre-existing
+// R79 admin.set_qps which targets a single TOKEN.
+//
+// admin.set_holder_qps -- assign an explicit per-holder cap.
+//
+//   args: {holder, qps}
+//     holder: non-empty string; the empty-string "" bucket is a
+//             legitimate target (see holder_rate.nova's anonymous
+//             handling), but we still require the arg BE PRESENT so
+//             a client typo isn't silently interpreted as "aim at
+//             anonymous". Callers who really mean the anonymous
+//             bucket pass holder="" explicitly.
+//     qps: int >= 0. 0 = unlimited for this holder (bypasses check).
+//   returns: {holder, qps, previous_qps}
+//   cap: admin:sandbox
+//
+// previous_qps is the RESOLVED cap that was in effect for the
+// holder before this call (explicit setting if one existed, else the
+// current default). Lets an operator undo mistakes without a
+// follow-up admin.list_holder_qps.
+//
+// Does NOT reset window_start / window_count -- see the same-shape
+// note in holder_rate_set.
+fn _rpc_verb_admin_set_holder_qps(args, ctx) {
+    let reg = rpc_ctx_holder_rate_reg(ctx)
+    if reg == 0 { return _rpc_err("no holder-rate registry in context") }
+    if _rpc_has_arg(args, "holder") == 0 {
+        return _rpc_err("missing arg: holder")
+    }
+    if _rpc_has_arg(args, "qps") == 0 {
+        return _rpc_err("missing arg: qps")
+    }
+    let h = _rpc_arg(args, "holder")
+    let qps_str = _rpc_arg(args, "qps")
+    // Reject non-numeric qps: str_to_int returns 0 for garbage; that
+    // would silently unlimit the holder. Require the string be either
+    // "0" or a positive numeric literal to distinguish "intentional
+    // unlimited" from a typo.
+    let qps = str_to_int(qps_str)
+    if qps < 0 { return _rpc_err("qps must be >= 0") }
+    if qps == 0 {
+        if str_eq_bytes(qps_str, "0") == 0 {
+            return _rpc_err("qps must be a non-negative integer")
+        }
+    }
+    let previous = holder_rate_get(reg, h)
+    holder_rate_set(reg, h, qps)
+    let kv = list_new()
+    let a = list_new() push(a, "holder")       push(a, _rpc_str(h))        push(kv, a)
+    let b = list_new() push(b, "qps")          push(b, _rpc_int(qps))      push(kv, b)
+    let c = list_new() push(c, "previous_qps") push(c, _rpc_int(previous)) push(kv, c)
+    return _rpc_ok(_rpc_obj(kv))
+}
+
+// admin.list_holder_qps -- enumerate every holder with an
+// EXPLICIT per-holder setting, plus every holder that has drawn
+// against the current window. Rows carry the resolved cap, the
+// current window count, and the window age in seconds; a small
+// aggregate is included so a dashboard tile can show one number.
+//
+//   args: {limit, after}     R107 uniform pagination.
+//   returns:
+//     {default_qps,
+//      holders: [{holder, qps_max, explicit, current_count,
+//                 window_age_seconds}, ...],
+//      next_after}
+//   cap: admin:sandbox
+//
+// window_age_seconds is derived at response-build time as
+//   (nanotime() - window_start) / 1e9
+// with window_start == 0 mapping to 0 (no request has been observed
+// yet OR reset has been called).
+//
+// The cursor id is the holder string. Empty-string "" is a valid
+// cursor id (the anonymous bucket sorts first when present).
+fn _rpc_verb_admin_list_holder_qps(args, ctx) {
+    let reg = rpc_ctx_holder_rate_reg(ctx)
+    if reg == 0 { return _rpc_err("no holder-rate registry in context") }
+    let rows = holder_rate_snapshot(reg)
+    // Gather cursor ids (holder string) for pagination.
+    let ids = list_new()
+    let i = 0
+    while i < len(rows) {
+        push(ids, hrs_holder(rows[i]))
+        i = i + 1
+    }
+    let page = _rpc_page_args(args)
+    let limit = page[0]
+    let after = page[1]
+    let start = _rpc_page_start_index(ids, after)
+    let now_nanos = nanotime()
+    let out_frags = list_new()
+    let last_id = ""
+    let emitted = 0
+    let ei = start
+    while ei < len(rows) {
+        if emitted >= limit { ei = len(rows) }
+        else {
+            let r = rows[ei]
+            let ws = hrs_window_start(r)
+            let age_s = 0
+            if ws > 0 {
+                age_s = (now_nanos - ws) / 1000000000
+                if age_s < 0 { age_s = 0 }
+            }
+            let ekv = list_new()
+            let ea = list_new() push(ea, "holder")             push(ea, _rpc_str(hrs_holder(r)))         push(ekv, ea)
+            let eb = list_new() push(eb, "qps_max")            push(eb, _rpc_int(hrs_qps_max(r)))        push(ekv, eb)
+            let ec = list_new() push(ec, "explicit")           push(ec, _rpc_bool(hrs_explicit(r)))      push(ekv, ec)
+            let ed = list_new() push(ed, "current_count")      push(ed, _rpc_int(hrs_window_count(r)))   push(ekv, ed)
+            let ee = list_new() push(ee, "window_age_seconds") push(ee, _rpc_int(age_s))                 push(ekv, ee)
+            push(out_frags, _rpc_obj(ekv))
+            last_id = hrs_holder(r)
+            emitted = emitted + 1
+            ei = ei + 1
+        }
+    }
+    let next_after = ""
+    if start + emitted < len(rows) { next_after = last_id }
+    let kv = list_new()
+    let da = list_new() push(da, "default_qps") push(da, _rpc_int(holder_rate_default(reg))) push(kv, da)
+    let ha = list_new() push(ha, "holders")     push(ha, _rpc_arr(out_frags))                push(kv, ha)
+    push(kv, _rpc_encode_next_after(next_after))
+    return _rpc_ok(_rpc_obj(kv))
+}
+
 // ---- R96 nl.metrics wire verb -------------------------------------------
 //
 // Expose the R95 per-holder counter registry (src/nl/nl_metrics.nova)
@@ -4986,6 +5139,7 @@ fn rpc_dispatch(verb, args, ctx) {
     let cap_err = capability_authorize_ex(
         rpc_ctx_child_mode_bits(ctx),
         cm_disabled,
+        rpc_ctx_holder_rate_reg(ctx),
         rpc_ctx_cap_enforced(ctx),
         rpc_ctx_cap_reg(ctx),
         rpc_ctx_presented_token(ctx),
@@ -5048,6 +5202,9 @@ fn rpc_dispatch(verb, args, ctx) {
     // R111 (Phase K part 2 / Phase F part 2) volitional-layer wire.
     if str_eq_bytes(verb, "self.override")      == 1 { return _rpc_verb_self_override(args, ctx) }
     if str_eq_bytes(verb, "self.override.list") == 1 { return _rpc_verb_self_override_list(args, ctx) }
+    // R113 Phase K part 4: per-holder aggregate rate window admin.
+    if str_eq_bytes(verb, "admin.set_holder_qps")  == 1 { return _rpc_verb_admin_set_holder_qps(args, ctx) }
+    if str_eq_bytes(verb, "admin.list_holder_qps") == 1 { return _rpc_verb_admin_list_holder_qps(args, ctx) }
     return _rpc_err("unknown verb: " + verb)
 }
 
@@ -5110,5 +5267,8 @@ fn rpc_verb_names() {
     // R111 Phase K part 2 / Phase F part 2 volitional-layer wire.
     push(v, "self.override")
     push(v, "self.override.list")
+    // R113 Phase K part 4 per-holder aggregate rate window.
+    push(v, "admin.set_holder_qps")
+    push(v, "admin.list_holder_qps")
     return v
 }

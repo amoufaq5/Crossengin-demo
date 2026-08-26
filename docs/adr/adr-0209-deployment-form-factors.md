@@ -29,6 +29,22 @@ mapping (429 / 401 / 403 / 405), and compact JSON dumps. See
 mobile) still deferred: no toolchain in-tree, and the web SPA is
 touch-usable enough that a native rewrite is a long-horizon call.
 
+**R113 closes the mobile-share-a-token risk with per-holder
+aggregate window.** The R56 per-TOKEN rate limit gave zero isolation
+between N devices sharing one token (Mode 4 / Mode 5 mesh case) and
+gave each device with its own token a fresh full ceiling (aggregate
+`N * qps_max` for one holder). R113 adds a SECOND 1-second fixed
+window keyed by TOKEN HOLDER in `src/sandbox/holder_rate.nova`;
+`capability_authorize_ex` consults it right after the per-TOKEN
+window (gate order:
+`child-mode > token-rate > holder-rate > cap-error`). Default cap
+is `CROSSENGIN_HOLDER_QPS_DEFAULT` (10 req/s per holder; unset
+falls back to 10, `0` = unlimited). Two new admin verbs
+(`admin.set_holder_qps` + `admin.list_holder_qps`, count 51 → 53)
+manage per-holder overrides at runtime. The anonymous holder `""`
+is a single aggregate bucket, tunable independently as a defense
+against unauthenticated flood. See `docs/SHIP_AS_APP.md` §7.61.
+
 ## Date
 
 2026-08-22

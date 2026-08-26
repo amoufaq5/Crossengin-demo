@@ -1,0 +1,278 @@
+// CrossEngin Sandbox: per-holder aggregate rate window (R113, Phase K
+// part 4). Complements the per-TOKEN rate window in capability.nova
+// (see token_check_rate at src/sandbox/capability.nova:626) with a
+// second bucket keyed by TOKEN HOLDER, so a user carrying N tokens
+// -- or N devices sharing one token -- can still be capped as one
+// entity.
+//
+// Motivation (mobile mesh):
+//   * N devices sharing one token -> per-token window has ZERO
+//     isolation between the devices; a chatty phone drains the same
+//     bucket a laptop is trying to use.
+//   * N devices each carrying its own token -> per-token window
+//     gives each device its OWN full ceiling; the aggregate a user
+//     can send is N * qps_max, not qps_max.
+//   Neither is right. The holder-rate window fixes both by capping
+//   the SUM of all requests attributed to one holder inside a
+//   1-second fixed window, no matter how many tokens the holder
+//   presents.
+//
+// Semantics mirror token_check_rate:
+//   * Fixed 1-second window (rolls when now - window_start >= 1s).
+//   * qps_max == 0 means unlimited (skip check).
+//   * Refusal is a string; "" means OK. Callers check len() > 0.
+//
+// The registry stores an EXPLICIT per-holder ceiling when
+// holder_rate_set is called for that holder; otherwise a DEFAULT
+// ceiling applies. The default is set at registry construction
+// (typically from CROSSENGIN_HOLDER_QPS_DEFAULT at daemon boot) and
+// can be re-tuned at runtime via holder_rate_set_default.
+//
+// Anonymous handling: the empty-string holder "" is a real key.
+// All anonymous callers (no token, or a token with no holder set)
+// share ONE aggregate window. This is the honest choice: anonymous
+// callers cannot be attributed individually, so lumping them into
+// one bucket is the tightest cap we can offer without pretending to
+// know who they are. An operator worried about anonymous flood can
+// set the "" bucket's ceiling explicitly via
+//   holder_rate_set(reg, "", <smaller_qps>)
+// without affecting authenticated holders.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies: src/util/str_safe.nova (str_eq_bytes).
+
+import "../util/str_safe.nova"
+
+// ---- registry slot layout -----------------------------------------------
+// Registry shape: two parallel-plus-scalar layout. Slot 0 keeps the
+// default qps; slots 1..4 are parallel per-holder columns matching
+// the nl_metrics.nova pattern (holder-id / qps_max / window_start
+// nanos / window_count).
+let HR_DEFAULT_QPS   = 0    // default qps_max applied when a holder has
+                            // no explicit setting
+let HR_HOLDERS       = 1    // list of holder-id strings
+let HR_QPS_MAX       = 2    // list of int, explicit per-holder cap
+                            // (0 = unlimited for that holder; sentinel
+                            //  0-1 (-1) = "no explicit setting -- use default")
+let HR_WINDOW_START  = 3    // list of int, nanotime when window opened
+let HR_WINDOW_COUNT  = 4    // list of int, requests seen in current window
+let HR_SLOTS         = 5
+
+// Sentinel: "no explicit per-holder setting -- use default". Stored in
+// HR_QPS_MAX for rows created by the check path so we can distinguish
+// "explicitly set to 0 (unlimited)" from "never set; inherit default".
+let HR_QPS_UNSET     = 0 - 1
+
+// 1 second in nanoseconds (matches _TOK_WINDOW_NS in capability.nova).
+let _HOLDER_WINDOW_NS = 1000000000
+
+// ---- snapshot record layout --------------------------------------------
+// nl_metrics_snapshot-style row so callers (admin.list_holder_qps,
+// tests) can walk the registry without touching internal slots.
+let HRS_HOLDER       = 0
+let HRS_QPS_MAX      = 1    // resolved (never HR_QPS_UNSET); explicit
+                            // if set, else the current default
+let HRS_WINDOW_COUNT = 2
+let HRS_WINDOW_START = 3
+let HRS_EXPLICIT     = 4    // 1 = holder-specific setting; 0 = default
+let HRS_ROW_SLOTS    = 5
+
+// ---- constructor --------------------------------------------------------
+//
+// default_qps_max: applied to every holder without an explicit setting.
+// 0 = unlimited default (holder-rate check is effectively off unless
+// an explicit setting is added for a particular holder). Negative
+// values clamp to 0.
+fn holder_rate_registry_new(default_qps_max) {
+    let d = default_qps_max
+    if d < 0 { d = 0 }
+    let r = list_new()
+    push(r, d)              // HR_DEFAULT_QPS
+    push(r, list_new())     // HR_HOLDERS
+    push(r, list_new())     // HR_QPS_MAX
+    push(r, list_new())     // HR_WINDOW_START
+    push(r, list_new())     // HR_WINDOW_COUNT
+    return r
+}
+
+// ---- default read/write -------------------------------------------------
+
+fn holder_rate_default(reg) {
+    if reg == 0 { return 0 }
+    return reg[HR_DEFAULT_QPS]
+}
+
+// Change the default cap that applies to holders without an explicit
+// setting. Only affects the NEXT window boundary for holders currently
+// running under the default; existing counters keep their state so
+// mid-window shifts don't cause spurious flushes. Returns 1 on
+// success, 0 when reg == 0.
+fn holder_rate_set_default(reg, qps_max) {
+    if reg == 0 { return 0 }
+    let d = qps_max
+    if d < 0 { d = 0 }
+    list_set(reg, HR_DEFAULT_QPS, d)
+    return 1
+}
+
+// ---- internal row lookup / allocate -------------------------------------
+
+fn _hr_row_for(reg, holder) {
+    if reg == 0 { return 0 - 1 }
+    let holders = reg[HR_HOLDERS]
+    let i = 0
+    while i < len(holders) {
+        if str_eq_bytes(holders[i], holder) == 1 { return i }
+        i = i + 1
+    }
+    // Not present: allocate with UNSET sentinel + fresh window state.
+    push(reg[HR_HOLDERS], holder)
+    push(reg[HR_QPS_MAX], HR_QPS_UNSET)
+    push(reg[HR_WINDOW_START], 0)
+    push(reg[HR_WINDOW_COUNT], 0)
+    return len(holders) - 1
+}
+
+fn _hr_find_row(reg, holder) {
+    if reg == 0 { return 0 - 1 }
+    let holders = reg[HR_HOLDERS]
+    let i = 0
+    while i < len(holders) {
+        if str_eq_bytes(holders[i], holder) == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- get / set per-holder qps -------------------------------------------
+
+// Resolve the effective cap for a holder. If an explicit setting
+// exists AND is not the UNSET sentinel, return it; otherwise the
+// current default. Does NOT allocate a row (so getters have no
+// side effects the way NLM getters don't).
+fn holder_rate_get(reg, holder) {
+    if reg == 0 { return 0 }
+    let idx = _hr_find_row(reg, holder)
+    if idx < 0 { return reg[HR_DEFAULT_QPS] }
+    let q = reg[HR_QPS_MAX][idx]
+    if q == HR_QPS_UNSET { return reg[HR_DEFAULT_QPS] }
+    return q
+}
+
+// Set an explicit per-holder cap. qps_max == 0 marks this holder as
+// UNLIMITED (bypasses the check). A negative value clamps to 0.
+// Allocates the row if needed (so a set is durable across resets).
+// Returns 1 on success, 0 when reg == 0.
+//
+// Does NOT reset window_start / window_count -- an operator dialing
+// a ceiling should not accidentally hand a caller a fresh budget.
+// (Matches admin.set_qps's documented "resets window" story for
+// per-TOKEN qps; the difference: token_set_qps_max resets because a
+// token's window state is intimate to the token; a holder's window
+// state may span many admins and shouldn't be zeroed on a routine
+// tune.)
+fn holder_rate_set(reg, holder, qps_max) {
+    if reg == 0 { return 0 }
+    let q = qps_max
+    if q < 0 { q = 0 }
+    let idx = _hr_row_for(reg, holder)
+    list_set(reg[HR_QPS_MAX], idx, q)
+    return 1
+}
+
+// ---- check-and-increment ------------------------------------------------
+//
+// Returns "" on OK, a refusal string on limit exceeded. Mirrors the
+// token_check_rate contract precisely so a rpc_dispatch caller can
+// chain them without special-casing.
+//
+// Refusal format is fixed:
+//   "rate limit exceeded: max N req/s per holder"
+// (per-holder wording distinguishes it from the per-TOKEN refusal
+// "rate limit exceeded: max N req/s for this token" so operators
+// grepping logs can tell the two apart).
+//
+// When the effective cap is 0 (unlimited) the check is a no-op and
+// we do NOT allocate a row -- keeps registries small in the common
+// "default=0, no explicit per-holder tuning" case.
+fn holder_rate_check(reg, holder, now_nanos) {
+    if reg == 0 { return "" }
+    let qps = holder_rate_get(reg, holder)
+    if qps <= 0 { return "" }                   // unlimited -> no check
+    let idx = _hr_row_for(reg, holder)
+    let ws = reg[HR_WINDOW_START][idx]
+    let wc = reg[HR_WINDOW_COUNT][idx]
+    if ws == 0 {
+        list_set(reg[HR_WINDOW_START], idx, now_nanos)
+        list_set(reg[HR_WINDOW_COUNT], idx, 1)
+        return ""
+    }
+    if now_nanos - ws >= _HOLDER_WINDOW_NS {
+        list_set(reg[HR_WINDOW_START], idx, now_nanos)
+        list_set(reg[HR_WINDOW_COUNT], idx, 1)
+        return ""
+    }
+    if wc >= qps {
+        return "rate limit exceeded: max " + int_to_str(qps)
+             + " req/s per holder"
+    }
+    list_set(reg[HR_WINDOW_COUNT], idx, wc + 1)
+    return ""
+}
+
+// ---- admin helpers ------------------------------------------------------
+
+// Zero the counter for one holder. Does NOT change the per-holder
+// qps_max. Returns 1 if a row existed (regardless of whether it was
+// dirty), 0 if the holder wasn't tracked or reg == 0.
+fn holder_rate_reset(reg, holder) {
+    if reg == 0 { return 0 }
+    let idx = _hr_find_row(reg, holder)
+    if idx < 0 { return 0 }
+    list_set(reg[HR_WINDOW_START], idx, 0)
+    list_set(reg[HR_WINDOW_COUNT], idx, 0)
+    return 1
+}
+
+// Snapshot: list of rows, each [holder, resolved_qps_max,
+// window_count, window_start, explicit]. Insertion order.
+fn holder_rate_snapshot(reg) {
+    let out = list_new()
+    if reg == 0 { return out }
+    let holders = reg[HR_HOLDERS]
+    let default_q = reg[HR_DEFAULT_QPS]
+    let i = 0
+    while i < len(holders) {
+        let raw = reg[HR_QPS_MAX][i]
+        let resolved = raw
+        let explicit = 1
+        if raw == HR_QPS_UNSET {
+            resolved = default_q
+            explicit = 0
+        }
+        let row = list_new()
+        push(row, holders[i])
+        push(row, resolved)
+        push(row, reg[HR_WINDOW_COUNT][i])
+        push(row, reg[HR_WINDOW_START][i])
+        push(row, explicit)
+        push(out, row)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- snapshot-row accessors --------------------------------------------
+
+fn hrs_holder(row)        { return row[HRS_HOLDER] }
+fn hrs_qps_max(row)       { return row[HRS_QPS_MAX] }
+fn hrs_window_count(row)  { return row[HRS_WINDOW_COUNT] }
+fn hrs_window_start(row)  { return row[HRS_WINDOW_START] }
+fn hrs_explicit(row)      { return row[HRS_EXPLICIT] }
+
+// ---- count helper (for observability + tests) ---------------------------
+
+fn holder_rate_count(reg) {
+    if reg == 0 { return 0 }
+    return len(reg[HR_HOLDERS])
+}
