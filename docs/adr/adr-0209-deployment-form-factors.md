@@ -16,6 +16,19 @@ wire pre-work for Mode 4 (client-app) scaling and Phase I part 2
 (R108: web SPA polish that consumes the new `next_after` field).
 See `docs/SHIP_AS_APP.md` §7.56.
 
+**R108 shipped web SPA + shim polish; native mobile client remains
+long-horizon.** Mode 4 (client apps) now has a first-class web SPA:
+cap-token login modal, `localStorage` token persistence, load-more
+affordances on every list panel (consuming R107's `next_after`),
+banner rail for rate-limit / auth / cap / network errors, and a
+`<= 640 px` mobile CSS block with 44 px touch targets. The stdlib
+Python shim (`scripts/rpc_web_shim.py`) gains `--cors <origin>` opt-in
+(default: no CORS headers, loopback-first), wire-error to HTTP status
+mapping (429 / 401 / 403 / 405), and compact JSON dumps. See
+`docs/SHIP_AS_APP.md` §7.57 and `docs/WEB_UI.md`. Mode 5 (native
+mobile) still deferred: no toolchain in-tree, and the web SPA is
+touch-usable enough that a native rewrite is a long-horizon call.
+
 ## Date
 
 2026-08-22

@@ -4891,6 +4891,114 @@ one of the ten retrofitted verbs), §7.34 (ownership.list — ditto),
 across pages), R103 (self.gaps — the reference cursor shape this
 round generalised).
 
+### 7.57 Web SPA + HTTP shim polish (R108 — Phase I part 2)
+
+R108 finishes Phase I by making the web SPA + HTTP shim actually
+consume R107 pagination and adding the operator-facing polish an
+ADR-0209 Mode 4 client needs: cap-token auth in the browser, HTTP
+status mapping on the shim, CORS opt-in, mobile CSS, and additional
+panels for the verbs the R51 SPA never surfaced. See
+`docs/WEB_UI.md` for the operator + user guide.
+
+**Six concrete deliverables:**
+
+1. **Cap-token auth in the SPA.** First-load login modal writes to
+   `localStorage` under `crossengin_token`; every `rpc()` call folds
+   the token into the top-level of the wire body (where
+   `rpc_server.nova` lifts it into the `RpcContext`). A 401 response
+   re-opens the modal automatically; a logout button clears the
+   token.
+2. **Load-more pagination.** Per-panel state
+   `{items, next_after}` for every list panel. Initial call sends no
+   cursor; a **Load more** button appears while the envelope's
+   `next_after` is non-empty, hides at tail. Consumes R107 verbatim.
+3. **Additional panels.** New sidebar tabs for **Capsules**
+   (`capsule.list`), **Patterns** (`pattern.list`), **Confidence**
+   (`self.confidence`), **Gaps** (`self.gaps`), **NL metrics**
+   (`nl.metrics` — full per-holder table with aggregate row), and
+   **Preferences** (`user.preference.set/list/clear`). Skills + KGs
+   panels retained from R51 and now paginated. `persona.list` was
+   dropped from the plan — no such verb exists (only `persona.show`
+   / `persona.project`).
+4. **Error UX.** A banner rail (rate-limit amber, auth red, cap red,
+   network grey) reads the HTTP status set by the shim, auto-
+   dismisses after 5 s, clears on the next successful call. Auth
+   errors re-open the login modal.
+5. **Responsive layout.** Two breakpoints. `≤ 780 px` collapses the
+   sidebar into a chip strip (R51 behaviour kept). `≤ 640 px` hides
+   the sidebar entirely, adds a hamburger toggle in the header,
+   stacks panels single-column, bumps base font to 15.5 px, sets
+   every button/input to a 44 px minimum height (iOS accessibility
+   guideline), and expands the login modal to fill the viewport.
+   `<meta name="viewport">` was already in place from R51.
+6. **HTTP shim polish.** `scripts/rpc_web_shim.py`:
+   - **`--cors <origin>`** CLI flag (repeatable) + `CE_WEB_CORS`
+     env var. Default remains loopback-first with NO CORS headers.
+     Matching origins receive `Access-Control-Allow-Origin: <echoed>`
+     plus `Methods: POST, OPTIONS` and `Headers: Content-Type`;
+     `OPTIONS` preflights return `204` in one round-trip.
+   - **Verb allow-list extended** with `capsule.list`,
+     `pattern.list`, `session.list`, `ownership.list`, `nl.metrics`,
+     `self.confidence`, `self.gaps`,
+     `user.preference.set/list/clear`. Unlisted verbs return `405`.
+   - **Wire-error → HTTP status mapping** (browser-first signals;
+     envelope body preserved verbatim so curl clients still parse
+     `.error`):
+
+     | envelope                                        | status |
+     |-------------------------------------------------|:------:|
+     | `{ok:true, ...}`                                |  200   |
+     | `"rate limit exceeded: ..."`                    |  429   |
+     | `"capability required: unknown token"` etc.     |  401   |
+     | `"capability required: <cap>"`                  |  403   |
+     | `"unknown verb: <name>"`                        |  405   |
+     | any other `{ok:false, ...}`                     |  400   |
+     | shim allow-list rejects                         |  405   |
+     | daemon unreachable                              |  502   |
+   - **JSON compaction.** Envelope bodies now dump with
+     `separators=(",", ":")` — ~30 % payload reduction on small
+     responses.
+
+**Manual smoke** (this container has no seccomp-permissive socket
+posture for the daemon, so the loop below is documented in
+`docs/WEB_UI.md` for a permissive host):
+
+- `curl -s http://127.0.0.1:8080/healthz` returns `ok`.
+- `curl -X POST http://127.0.0.1:8080/rpc/kg.list -d '{"limit":1}'`
+  yields a compact JSON envelope with `"next_after":"..."`.
+- `curl -X OPTIONS ... -H 'Origin: http://localhost:9000'` returns
+  `204` with the three CORS headers when the shim is launched with
+  `--cors http://localhost:9000`.
+- Chrome DevTools device toolbar 375×667 confirms no horizontal
+  scroll; sidebar collapses under the hamburger; every interactive
+  control is ≥ 44 px tall.
+
+**No NOVA `.nova` unit tests were added or changed.** R108 is a
+Python + HTML/CSS/JS round; the wire is unchanged (tokens ride the
+existing top-level `token` field on the wire message, discovered
+via `rpc_server.nova:225`). Existing wire tests
+(`test_wire_pagination`, `test_capability_wire`, `test_nl_rpc_verbs`)
+were not touched and still compile clean.
+
+**Files touched:**
+`web/index.html` (login modal + sidebar + nine panel views),
+`web/app.js` (rpc-with-token, banner rail, pagination state
+machine, per-panel handlers, tab switcher, mobile hamburger),
+`web/styles.css` (banner + modal styles + `≤ 640 px` mobile
+responsive block + metrics-table style),
+`scripts/rpc_web_shim.py` (allow-list + `--cors` flag + status
+mapping + compact JSON + `OPTIONS` handler),
+`docs/WEB_UI.md` (NEW, operator + user guide),
+`docs/SHIP_AS_APP.md` (this §7.57 + §12 roadmap update),
+`docs/adr/adr-0209-deployment-form-factors.md` (status line).
+
+**References:** ADR-0209 (deployment form factors — this round
+finishes Mode 4 SPA + shim), §7.5 (R51 baseline the SPA extends),
+§7.7 (capability tokens — the auth boundary the modal collects for),
+§7.46 (nl.metrics — the metrics dashboard panel), §7.53
+(self.confidence + self.gaps — the two new introspection panels),
+§7.56 (R107 pagination — the wire contract the SPA now consumes).
+
 ## 12. What comes next (R90+)
 
 **TLS build-out (R86..R94) is COMPLETE.** Primitives, handshake,
@@ -5064,7 +5172,7 @@ new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
   `bench/latency_v1/baseline.json` is an empty stub with a
   documented capture procedure.
 
-**Phase I part 1 SHIPPED (R107).**
+**Phase I COMPLETE (R107 + R108 shipped).**
 - **R107 ✅** — Wire cursor pagination for list verbs (see §7.56).
   Uniform `limit` + `after` args plus a `next_after` field folded
   onto every list-shaped verb (10 total: `kg.list`, `capsule.list`,
@@ -5078,11 +5186,7 @@ new `#PREFERENCE v1` section. Verb count 38 -> 41. See §7.51.
   work. 115 checks in `test_wire_pagination`; eight existing tests
   extended with `next_after` assertions.
 
-**Front-of-queue after Phase C ✅ / Phase D ✅ / Phase E ✅ / R103 ✅ / R105 ✅ / R106 ✅ / R107 ✅:**
-- **R108** — Web SPA + HTTP shim polish (finishes Phase I; consumes
-  R107's cursor shape; adds cap-token auth, load-more affordances,
-  responsive CSS, `--cors` opt-in on the shim, HTTP status mapping
-  for rate-limit / auth errors).
+**Phase I COMPLETE (R107 + R108). Front-of-queue after Phase C / D / E / I / R103 / R105 / R106:**
 - **R104** — `self.override` (finishes Phase F; deferred by user).
 - **Phase J** — agent production surface
   (`agent.compose/list/run/retire`).
