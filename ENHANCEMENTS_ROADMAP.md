@@ -347,8 +347,16 @@ Three focused rounds closing the open threads left by ADR-0072..0085:
   ratio crosses `CROSSENGIN_AUTOCOMPACT_THRESHOLD_PERMILLE`, subject to a
   per-KG `MIN_INTERVAL_TICKS` cooldown. Wired into `agent_cycle`; primary
   production caller of ADR-0079's in-place compactor.
-- **R2 -- GC observability (planned, ADR-0087).** Per-agent GC-metrics
-  registry + `/gc-stats` chat command.
+- **R2 -- GC observability (SHIPPED, ADR-0087).** Per-agent GC-metrics
+  registry at `src/kg/gc_metrics.nova` counts reclaim / sweep /
+  operator-premise / operator-conclusion / episodic-member / alias
+  protection events, plus compact runs (with atoms removed + last tick) and
+  the latest freelist size + ratio sample per KG. The autonomous loop
+  threads the registry through `adm_sweep_ep_metric`, `kg_compact_metric`,
+  and the ADR-0086 auto-compact watcher; `agent_new` installs it as the
+  module-level default so the new `/gc-stats [kg=<label>]` chat command
+  can read it back without an agent in scope. Existing GC callers stay
+  unchanged (a `metrics_reg == 0` sentinel disables attribution).
 - **R3 -- Cross-KG xref query-time traversal (planned, ADR-0088).** Extend the
   reader's neighborhood-expansion to follow xrefs across KGs.
 

@@ -36,6 +36,7 @@ import "../kg/cross_kg_references.nova"
 import "../parts/meta/meta_observer.nova"
 import "../kg/episodic.nova"
 import "./entity_resolve.nova"   // ADR-0082: alias-table id-holder (er_aliases_has_canonical). entity_resolve does NOT import this file, so no cycle.
+import "../kg/gc_metrics.nova"   // ADR-0087: per-KG GC counters (metrics_reg == 0 disables).
 import "../util/str_safe.nova"
 
 let DEATH_STRENGTH  = 20    // 0.02 activation floor
@@ -232,6 +233,86 @@ fn adm_is_collectable_ep(reg, atom, prot) {
 // (ADR-0080); `adm_prot_new(0, aliases)` to spare alias resolution targets
 // (ADR-0082); `0` for no protection beyond the base gate.
 fn adm_sweep_ep(reg, kg, mo, prot) {
+    return _adm_sweep_ep_metric(reg, kg, mo, prot, 0, 0)
+}
+
+// ADR-0087 (Phase L R2): distinguish WHICH operator role protected an atom --
+// premise vs conclusion -- so the /gc-stats metrics can attribute the
+// protection to the right counter. Returns 1 if some live operator names
+// `atom` as its `premise`, 2 for `conclusion`, 0 for neither. Mirrors
+// `_adm_is_operator_referenced` but reports the role instead of collapsing
+// both to a boolean. O(atoms) in the same way; a future edge-index consumer
+// can lift this to O(degree).
+fn _adm_operator_reason(reg, atom) {
+    let kg = kg_find(reg, atom_kg(atom))
+    if kg == 0 { return 0 }
+    let target = atom_id(atom)
+    let atoms = kg_atoms(kg)
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            if atom_payload_has(a, "premise") == 1 {
+                if atom_payload_get(a, "premise") == target { return 1 }
+                if atom_payload_get(a, "conclusion") == target { return 2 }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// The metric-attributed collectability gate. Same decision as
+// `adm_is_collectable_ep`, but walks the same checks in-line so the specific
+// protection type that FIRST refused collection can be recorded on `mreg`
+// (via the appropriate `gcm_inc_protected_*`). Protection order matches
+// `adm_is_collectable` + `adm_is_collectable_ep` exactly: hard protection ->
+// activation -> belief -> xref -> operator (premise|conclusion) -> episodic
+// -> alias. Base-gate refusals (hard protection / activation / belief / xref)
+// are NOT attributed -- they are the ordinary "atom is alive" cases, not the
+// specialized protection gates the operator observability tracks.
+//
+// `mreg == 0` disables all attribution; the return value is identical to
+// `adm_is_collectable_ep(reg, atom, prot)` in that case.
+fn _adm_collectable_metric(reg, atom, prot, mreg, kg_label) {
+    if adm_is_protected(atom) == 1 { return 0 }
+    if adm_act(atom) >= DEATH_STRENGTH { return 0 }
+    if bel_strength(atom_belief(atom)) >= DEATH_BELIEF { return 0 }
+    if adm_is_referenced(reg, atom) == 1 { return 0 }
+    let op_reason = _adm_operator_reason(reg, atom)
+    if op_reason == 1 {
+        if mreg != 0 { gcm_inc_protected_operator_premise(mreg, kg_label) }
+        return 0
+    }
+    if op_reason == 2 {
+        if mreg != 0 { gcm_inc_protected_operator_conclusion(mreg, kg_label) }
+        return 0
+    }
+    if _adm_is_episodic_member(_adm_prot_eas(prot), atom) == 1 {
+        if mreg != 0 { gcm_inc_protected_episodic_member(mreg, kg_label) }
+        return 0
+    }
+    if _adm_is_alias_referenced(_adm_prot_aliases(prot), atom) == 1 {
+        if mreg != 0 { gcm_inc_protected_alias(mreg, kg_label) }
+        return 0
+    }
+    return 1
+}
+
+// ADR-0087: the metric-aware sweep core. Identical to `adm_sweep_ep` in
+// tombstone/rescue/removal semantics, plus:
+//   - increments `gcm_inc_reclaimed(mreg, kg_label)` for each atom whose slot
+//     is freed on this sweep (mirrors kg_reclaim_atom's own attribution site
+//     -- ensures the counter tracks the sweep-driven reclaim rate);
+//   - runs each collectability check through `_adm_collectable_metric` so
+//     protection refusals are recorded against the right counter.
+// When `mreg == 0` (the back-compat default), all attribution is disabled
+// and the sweep is byte-equivalent to `adm_sweep_ep`. The `kg_label` is
+// passed explicitly rather than read via `kg_label(kg)` because the sweep
+// core has always taken the raw KG object, and the caller (an autonomous
+// loop or a test) already knows the label under which the counters should
+// live -- one lookup instead of two.
+fn _adm_sweep_ep_metric(reg, kg, mo, prot, mreg, kg_label) {
     let atoms = kg_atoms(kg)
     let tombstoned = 0
     let removed = 0
@@ -242,11 +323,17 @@ fn adm_sweep_ep(reg, kg, mo, prot) {
         if a != 0 {   // reclamation: skip freed (0) slots
             if adm_is_dead(a) == 0 {
                 if adm_is_tombstoned(a) == 1 {
-                    if adm_is_collectable_ep(reg, a, prot) == 1 {
+                    if _adm_collectable_metric(reg, a, prot, mreg, kg_label) == 1 {
                         atom_payload_set(a, "dead", 1)
                         removed = removed + 1
                         // P1.6: observer attribution at the death-decision call site.
                         if mo != 0 { mo_record_death(mo, atom_id(a)) }
+                        // ADR-0087: record the sweep-driven reclaim so /gc-stats
+                        // can distinguish sweep-triggered reclaims (this call
+                        // site) from any hand-invoked kg_reclaim_atom (which
+                        // increments the same counter via its own metric
+                        // wrapper). Both roll up into `reclaimed_total`.
+                        if mreg != 0 { gcm_inc_reclaimed(mreg, kg_label) }
                         // P1.7 Phase B (ADR-0075): a dead atom is now actually
                         // reclaimed -- slot nulled, unindexed, edge index reset.
                         // The `dead` payload stays set on the (still-referenced)
@@ -257,7 +344,7 @@ fn adm_sweep_ep(reg, kg, mo, prot) {
                         rescued = rescued + 1
                     }
                 } else {
-                    if adm_is_collectable_ep(reg, a, prot) == 1 {
+                    if _adm_collectable_metric(reg, a, prot, mreg, kg_label) == 1 {
                         atom_payload_set(a, "tomb", 1)
                         tombstoned = tombstoned + 1
                     }
@@ -273,6 +360,25 @@ fn adm_sweep_ep(reg, kg, mo, prot) {
     return out
 }
 
+// ADR-0087: the metric-aware, episodic-aware sweep -- the public entry point
+// the autonomous loop calls. Wraps `_adm_sweep_ep_metric` with the same
+// `(reg, kg, mo, prot)` positional prefix `adm_sweep_ep` uses, plus
+// `metrics_reg` and `kg_label` at the tail. Callers that don't want metrics
+// keep calling `adm_sweep_ep` unchanged (it delegates here with mreg=0).
+// The `swept_episodic_total` counter tracks removals that went through the
+// EPISODIC-aware path (this variant); `swept_total` tracks the non-episodic
+// `adm_sweep_attributed_metric` path -- see the counter's docstring in
+// gc_metrics.nova for the split.
+fn adm_sweep_ep_metric(reg, kg, mo, prot, metrics_reg, kg_label) {
+    let out = _adm_sweep_ep_metric(reg, kg, mo, prot, metrics_reg, kg_label)
+    if metrics_reg != 0 {
+        // out[1] == removed. Every removed atom passed through the episodic-
+        // aware collectability path, so it also increments swept_episodic.
+        if out[1] > 0 { gcm_inc_swept_episodic(metrics_reg, kg_label, out[1]) }
+    }
+    return out
+}
+
 // One GC sweep over a KG with optional meta-observer attribution (P1.6).
 // Tombstones newly-collectable atoms; hard-removes ones still collectable from
 // a prior tombstone; rescues reactivated tombstoned ones. Returns
@@ -285,6 +391,20 @@ fn adm_sweep_ep(reg, kg, mo, prot) {
 // bumped at the moment of death.
 fn adm_sweep_attributed(reg, kg, mo) {
     return adm_sweep_ep(reg, kg, mo, 0)
+}
+
+// ADR-0087: metric-aware variant of `adm_sweep_attributed`. Adds `metrics_reg`
+// and `kg_label` at the tail so the autonomous loop / tests can thread the
+// per-agent GC counters through. Every removed atom bumps `swept_total`
+// (the non-episodic sweep path); protection refusals bump the appropriate
+// `protected_*` counter. `metrics_reg == 0` disables attribution (byte-
+// equivalent to `adm_sweep_attributed(reg, kg, mo)`).
+fn adm_sweep_attributed_metric(reg, kg, mo, metrics_reg, kg_label) {
+    let out = _adm_sweep_ep_metric(reg, kg, mo, 0, metrics_reg, kg_label)
+    if metrics_reg != 0 {
+        if out[1] > 0 { gcm_inc_swept(metrics_reg, kg_label, out[1]) }
+    }
+    return out
 }
 
 // Legacy entry point: same sweep, no observer attribution, no episodic

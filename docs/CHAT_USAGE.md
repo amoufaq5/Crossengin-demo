@@ -221,6 +221,56 @@ detailed in their per-round audit docs (`AUDIO_AUDIT.md`, `IMAGE_AUDIT.md`,
 | `/__metrics__`     | Internal: machine-readable `key=value` block for `web.py`'s `/metrics` scraper. You can call it interactively for raw counters. |
 | `/__atoms__`       | Internal: machine-readable `ATOM ...` block for `web.py`'s `/api/atoms` search. |
 | `/ann_query LABEL` | Debug: top-5 nearest atoms by LSH-bucketed cosine.            |
+| `/gc-stats [kg=L]` | GC observability report (ADR-0087). Per-KG reclaim / sweep / compact / protection counters + latest freelist sample. Optional `kg=<label>` filter reports only that KG. |
+
+#### `/gc-stats` -- GC observability (ADR-0087)
+
+Renders the per-agent GC-metrics registry populated by the autonomous
+loop's memory-lifecycle machinery. Every counter is per-KG; the report
+prints one block per KG the registry has metrics for:
+
+```
+> /gc-stats
+KG experience:
+  reclaimed=47  swept=12  swept_episodic=35
+  protected_operator_premise=8  ...conclusion=6  episodic_member=14  alias=21
+  compact_runs=2  atoms_removed=44  last_tick=4096
+  freelist_size=0  freelist_ratio_permille=0
+```
+
+Filter to a single KG when the daemon runs multiple:
+
+```
+> /gc-stats kg=experience
+KG experience:
+  ...
+```
+
+**Reading the counters:**
+
+- `reclaimed` -- total atoms whose slot was hard-freed by the GC across
+  the agent's lifetime (both sweep-driven and hand-invoked reclaims).
+- `swept` -- atoms removed by non-episodic `adm_sweep_attributed_metric`
+  calls; `swept_episodic` -- atoms removed by the episodic-aware
+  `adm_sweep_ep_metric` (the autonomous loop's ADR-0081 sweep).
+- `protected_*` -- number of times each protection gate refused to
+  collect an atom. Zero across the board means either the daemon has
+  seen no collectable-but-protected atoms, or the ADR-0081/0082/0084
+  protection gates are cold. A `protected_alias > 0` alongside
+  `reclaimed_total > 0` is the healthy signal: the alias gate is
+  preventing fragmentation while unrelated weak atoms are still being
+  collected.
+- `compact_runs` / `atoms_removed` / `last_tick` -- ADR-0086 auto-
+  compact stats. A `compact_runs` that grows too fast means the
+  `CROSSENGIN_AUTOCOMPACT_THRESHOLD_PERMILLE` is too low for the churn
+  profile; `atoms_removed / compact_runs` is the average hole-collapse
+  yield per compaction.
+- `freelist_size` / `freelist_ratio_permille` -- the most recent sample
+  (overwritten each check tick). A freelist that grows without runs
+  firing means the threshold has not been crossed yet, or the watcher
+  is disabled via `CROSSENGIN_AUTOCOMPACT_ENABLED=0`.
+
+Fresh chat REPL with no daemon running prints `no GC activity yet`.
 
 ### Exit
 
