@@ -45,6 +45,10 @@ import "../learning/entity_resolve.nova"
 import "../parts/soul/state.nova"
 import "../learning/atom_death_monitor.nova"
 import "../kg/episodic.nova"
+// multi_kg_manager is transitively imported (via entity_resolve.nova) but the
+// ADR-0086 auto-compact watcher below calls kg_freelist_ratio_permille and
+// kg_compact directly, so the reliance is worth being explicit about --
+// documented here rather than adding an idempotent duplicate import.
 
 // ---- agent state -----------------------------------------------------------
 let AGENT_OBJ_TAG = 2600
@@ -72,10 +76,98 @@ let AG_OBS_STREAM = 18  // ADR-0082: dedicated observation moment stream. Each
                         // THIS stream (not AG_STREAM) so recurring observations
                         // mint a cluster -- kept separate from AG_STREAM so the
                         // tool-moment metric (ms_count == 90) stays intact.
+let AG_LAST_COMPACT = 19  // ADR-0086: per-KG rate-limiting for the auto-compact
+                          // trigger. A list of [kg_label, last_compact_tick]
+                          // pairs -- one entry per KG that has been compacted
+                          // at least once during this agent's lifetime. The
+                          // watcher (`_ag_maybe_autocompact`) refuses to fire
+                          // on a KG whose last_compact_tick is within
+                          // MIN_INTERVAL_TICKS of `now`, so back-to-back
+                          // threshold-crossings can never thrash-compact the
+                          // same KG.
 
 let AG_MAX_STEPS = 100   // per-episode step budget on the task world
 let AG_GC_EVERY  = 8     // ADR-0081: run the memory-lifecycle maintenance
                          // (consolidate + episodic-aware GC sweep) every N cycles
+
+// ---- ADR-0086: auto-compact trigger ---------------------------------------
+// Rate-limited freelist watcher: every CHECK_EVERY_TICKS, sample each KG's
+// (freelist / atoms_alive) ratio in permille; when a KG's ratio exceeds
+// THRESHOLD_PERMILLE AND its last compaction was more than MIN_INTERVAL_TICKS
+// ago, invoke kg_compact on it. Defaults chosen so a small daemon does at
+// most a few compactions per hour under sustained reclaim churn.
+//
+// Env-var contract (read once at first invocation, lazy-initialized here):
+//   CROSSENGIN_AUTOCOMPACT_ENABLED             -- default 1 (on)
+//   CROSSENGIN_AUTOCOMPACT_THRESHOLD_PERMILLE  -- default 200 (20%)
+//   CROSSENGIN_AUTOCOMPACT_MIN_INTERVAL_TICKS  -- default 1000
+//   CROSSENGIN_AUTOCOMPACT_CHECK_EVERY_TICKS   -- default 64
+let _AC_DEFAULT_THRESHOLD_PERMILLE = 200
+let _AC_DEFAULT_MIN_INTERVAL_TICKS = 1000
+let _AC_DEFAULT_CHECK_EVERY_TICKS  = 64
+
+// Module-level cached config -- populated on first call by _ac_config_load().
+// The four config slots plus a `loaded` flag so we lazy-init only once.
+let _ac_cfg_loaded  = 0
+let _ac_cfg_enabled = 1
+let _ac_cfg_thresh  = 200
+let _ac_cfg_min_iv  = 1000
+let _ac_cfg_every   = 64
+
+// Canonical env-var guard: getenv can return 0 on unset OR "" for present-
+// but-empty. Both fall back to `def`. str_to_int returns 0 for garbage, so a
+// non-positive parse also falls back rather than silently disabling.
+fn _ac_env_int(name, def) {
+    let env = getenv(name)
+    if env == 0 { return def }
+    if len(env) == 0 { return def }
+    let v = str_to_int(env)
+    if v <= 0 { return def }
+    return v
+}
+
+// Enabled-flag env-var: "0" means off, anything else (or unset) leaves the
+// default. Uses str_eq (short literal "0" is 1 byte so bug-#11's short-literal
+// str_eq unreliability does not apply). Return 0 (off) or 1 (on).
+fn _ac_env_enabled(def) {
+    let env = getenv("CROSSENGIN_AUTOCOMPACT_ENABLED")
+    if env == 0 { return def }
+    if len(env) == 0 { return def }
+    if str_eq(env, "0") == 1 { return 0 }
+    return 1
+}
+
+// Populate the module-level config from the environment on first call.
+// Subsequent calls are a no-op: the config is treated as boot-time and does
+// not re-read partway through a run (a re-read mid-run would be surprising
+// and racy). Tests that flip envs BETWEEN runs must call _ac_config_reset()
+// (below) to force the next call to re-read.
+fn _ac_config_load() {
+    if _ac_cfg_loaded != 0 { return 1 }
+    _ac_cfg_enabled = _ac_env_enabled(1)
+    _ac_cfg_thresh  = _ac_env_int("CROSSENGIN_AUTOCOMPACT_THRESHOLD_PERMILLE",
+                                  _AC_DEFAULT_THRESHOLD_PERMILLE)
+    _ac_cfg_min_iv  = _ac_env_int("CROSSENGIN_AUTOCOMPACT_MIN_INTERVAL_TICKS",
+                                  _AC_DEFAULT_MIN_INTERVAL_TICKS)
+    _ac_cfg_every   = _ac_env_int("CROSSENGIN_AUTOCOMPACT_CHECK_EVERY_TICKS",
+                                  _AC_DEFAULT_CHECK_EVERY_TICKS)
+    _ac_cfg_loaded  = 1
+    return 1
+}
+
+// Test-only: force the next _ac_config_load() to re-read from the env. Not
+// invoked by production code paths. Kept minimal (a single flag flip) so
+// the state machine is easy to reason about.
+fn _ac_config_reset() {
+    _ac_cfg_loaded = 0
+    return 1
+}
+
+// Accessors -- exposed so tests can assert the loaded values match the env.
+fn _ac_config_enabled() { _ac_config_load(); return _ac_cfg_enabled }
+fn _ac_config_threshold_permille() { _ac_config_load(); return _ac_cfg_thresh }
+fn _ac_config_min_interval_ticks() { _ac_config_load(); return _ac_cfg_min_iv }
+fn _ac_config_check_every_ticks()  { _ac_config_load(); return _ac_cfg_every }
 
 fn _ag_build_plan() {
     let plan = plan_new()
@@ -122,7 +214,97 @@ fn agent_new(seed) {
     push(a, 0)                                // accepted edits
     push(a, episodic_atoms_new())             // AG_EAS: episodic store
     push(a, ms_new())                         // AG_OBS_STREAM: observation moments (ADR-0082)
+    push(a, list_new())                       // AG_LAST_COMPACT (ADR-0086): per-KG last-compact-tick map
     return a
+}
+
+// ADR-0086: last-compaction-tick per KG label. Small linear-scan list on the
+// agent (the registry is small; the map form would hit NOVA's 16-key builtin-
+// map cap and adds no value here). Returns 0 -- "never compacted" -- when the
+// label is absent.
+fn _ag_last_compact_get(ag, kg_label) {
+    if len(ag) <= AG_LAST_COMPACT { return 0 }
+    let m = ag[AG_LAST_COMPACT]
+    if m == 0 { return 0 }
+    let i = 0
+    while i < len(m) {
+        if str_eq(m[i][0], kg_label) == 1 { return m[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _ag_last_compact_set(ag, kg_label, tick) {
+    // Auto-grow legacy agents (built before ADR-0086) so setting works even on
+    // an agent whose new-slot was not pushed at construction time. Not expected
+    // in this codebase (agent_new always pushes it) but the guard is cheap.
+    while len(ag) <= AG_LAST_COMPACT { push(ag, list_new()) }
+    if ag[AG_LAST_COMPACT] == 0 { list_set(ag, AG_LAST_COMPACT, list_new()) }
+    let m = ag[AG_LAST_COMPACT]
+    let i = 0
+    while i < len(m) {
+        if str_eq(m[i][0], kg_label) == 1 {
+            list_set(m[i], 1, tick)
+            return 1
+        }
+        i = i + 1
+    }
+    let entry = list_new()
+    push(entry, kg_label)
+    push(entry, tick)
+    push(m, entry)
+    return 1
+}
+
+// ADR-0086: cheap freelist-ratio watcher. Called from `agent_cycle`; every
+// CHECK_EVERY_TICKS iterates the KG registry, samples the ratio, and fires
+// `kg_compact(reg, kg)` on any KG whose freelist has grown past THRESHOLD
+// AND whose last compaction is more than MIN_INTERVAL ticks in the past. The
+// registry is walked in-order; kg_get lets a numeric-id iteration reach every
+// live KG (kg_count == KREG_NEXT is bumped only by kg_spawn).
+//
+// This is the ONLY caller of kg_compact in the production loop -- the primary
+// wiring gate for ADR-0079's in-place compactor.
+fn _ag_maybe_autocompact(ag, reg, now_tick) {
+    _ac_config_load()
+    if _ac_cfg_enabled == 0 { return 0 }
+    let every = _ac_cfg_every
+    if every <= 0 { return 0 }
+    // Only sample every N ticks. `now_tick` is 1-based in agent_run so
+    // `now_tick % every == 0` gives a stable per-N-tick schedule.
+    if int_mod(now_tick, every) != 0 { return 0 }
+    let thresh = _ac_cfg_thresh
+    let min_iv = _ac_cfg_min_iv
+    let n = kg_count(reg)
+    let fired = 0
+    let i = 0
+    while i < n {
+        let kg = kg_get(reg, i)
+        if kg != 0 {
+            let ratio = kg_freelist_ratio_permille(kg)
+            if ratio >= thresh {
+                let label = kg_label(kg)
+                let last = _ag_last_compact_get(ag, label)
+                // A KG that has never been compacted has last == 0. Guarantee
+                // a first compaction fires (rather than being suppressed by
+                // an accidental initial no-compaction interval near tick 0)
+                // by treating last == 0 as unbounded age.
+                let due = 0
+                if last == 0 {
+                    due = 1
+                } else {
+                    if now_tick - last >= min_iv { due = 1 }
+                }
+                if due == 1 {
+                    kg_compact(reg, kg)
+                    _ag_last_compact_set(ag, label, now_tick)
+                    fired = fired + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return fired
 }
 
 fn agent_cycle_count(a) { return a[AG_CYCLE] }
@@ -249,6 +431,13 @@ fn agent_cycle(a, approved, now) {
         episodic_consolidate(a[AG_EAS], a[AG_OBS_STREAM], 0, 0)
         adm_sweep_ep(a[AG_KGREG], a[AG_KG], 0, adm_prot_new(a[AG_EAS], a[AG_ALIASES]))
     }
+
+    // ADR-0086 (Phase L R1): rate-limited auto-compact trigger. Every
+    // CHECK_EVERY_TICKS, walk the KG registry and compact any KG whose
+    // freelist / atoms_alive ratio has crossed the threshold, subject to
+    // per-KG MIN_INTERVAL_TICKS cooldown. `now` is 1-based (see agent_run) so
+    // the sample cadence is stable across the run.
+    _ag_maybe_autocompact(a, a[AG_KGREG], now)
 
     list_set(a, AG_CYCLE, cyc + 1)
     let r = list_new()

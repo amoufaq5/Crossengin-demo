@@ -335,6 +335,23 @@ P1 HDC embeddings  ──►  P2 predictive coding + 3-factor  ──►  P3 ing
                           P5 sim + self-improve  ◄──  P4 agentic tooling
 ```
 
+---
+
+## Phase L — Memory-lifecycle GC arc completion (in progress)
+
+Three focused rounds closing the open threads left by ADR-0072..0085:
+
+- **R1 -- Auto-compact trigger (SHIPPED, ADR-0086).** A rate-limited freelist
+  watcher in the autonomous loop samples per-KG `freelist/atoms_alive` every
+  `CROSSENGIN_AUTOCOMPACT_CHECK_EVERY_TICKS` and invokes `kg_compact` when the
+  ratio crosses `CROSSENGIN_AUTOCOMPACT_THRESHOLD_PERMILLE`, subject to a
+  per-KG `MIN_INTERVAL_TICKS` cooldown. Wired into `agent_cycle`; primary
+  production caller of ADR-0079's in-place compactor.
+- **R2 -- GC observability (planned, ADR-0087).** Per-agent GC-metrics
+  registry + `/gc-stats` chat command.
+- **R3 -- Cross-KG xref query-time traversal (planned, ADR-0088).** Extend the
+  reader's neighborhood-expansion to follow xrefs across KGs.
+
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet
   *requires*; whether they compose into general intelligence is unproven and is
