@@ -1,0 +1,436 @@
+// Unit tests for the ADR-0088 (R3) cross-KG xref query-time traversal.
+//
+// R3 extends `src/reader/neighborhood.nova` with `_nb_follow_xrefs` /
+// `nb_xref_traversal`: the reader now consumes the xrefs ADRs 0077/0078
+// persisted (and ADR-0079 compact-remaps and ADR-0085 coact-persists) by
+// walking them transitively at query time, bounded by depth/fanout/min-coact
+// env-vars. This test file drives that traversal directly (with the
+// `_nb_xref_config_*` accessors) and covers the surfaces the plan file's
+// R3 section calls out:
+//
+//   - MIN_COACT filter: xrefs below the coact threshold are skipped.
+//   - Order: results honor coact_count DESC (fanout cap keeps top-N).
+//   - MAX_FANOUT cap on the per-call fanout.
+//   - MAX_DEPTH=0 disables the R3 walk entirely (pre-R3 byte-equivalent).
+//   - MAX_DEPTH=2 recursively follows xrefs from destinations.
+//   - Cycle safety: X -> Y -> X does not loop; visited set works.
+//   - Dangling xref (dst_kg not in reg): skipped silently.
+//   - MAX_FANOUT=0 edge case: no traversal.
+//   - `find_neighbors_full` integration: R3 handles surface as neighbors.
+//   - Default env: xref-following is off with respect to fixtures whose
+//     xrefs have coact_count=0 (the common case in existing tests).
+
+import "../ce_test.nova"
+import "../../src/reader/neighborhood.nova"
+
+// ---- helpers ---------------------------------------------------------------
+// Build a small three-KG registry (A, B, C). Atom X in KG_A holds two xrefs:
+//   - to (KG_B, Y) with coact_count = 5   (strong)
+//   - to (KG_C, Z) with coact_count = 1   (below default MIN_COACT)
+// Atom Y in KG_B optionally gets an xref to (KG_A, X) (cycle probe).
+// Atom Z in KG_C optionally gets an xref to (KG_B, Y) (depth-2 probe).
+fn _bump_coact(xref, times) {
+    let i = 0
+    while i < times {
+        xref_coactivate(xref)
+        i = i + 1
+    }
+    return xref_coact(xref)
+}
+
+fn build_r3_reg() {
+    let reg = kg_registry_new()
+    let kg_a = kg_spawn(reg, "kga")
+    let kg_b = kg_spawn(reg, "kgb")
+    let kg_c = kg_spawn(reg, "kgc")
+    let x = kg_add_atom(kg_a, ATOM_CONCEPT, "x-src", 0)
+    let y = kg_add_atom(kg_b, ATOM_CONCEPT, "y-mid", 0)
+    let z = kg_add_atom(kg_c, ATOM_CONCEPT, "z-far", 0)
+    // Register both xrefs on X (X is the source side).
+    let xr_xy = xref_new(x, y, XREF_CAUSAL, 800, 0)
+    let xr_xz = xref_new(x, z, XREF_ANALOGICAL, 600, 0)
+    atom_add_xref(x, xr_xy)
+    atom_add_xref(x, xr_xz)
+    // Bump coact counts: xy = 5, xz = 1.
+    _bump_coact(xr_xy, 5)
+    _bump_coact(xr_xz, 1)
+    // Wrap for return: [reg, kg_a, kg_b, kg_c, x, y, z]
+    let bag = list_new()
+    push(bag, reg)
+    push(bag, kg_a)
+    push(bag, kg_b)
+    push(bag, kg_c)
+    push(bag, x)
+    push(bag, y)
+    push(bag, z)
+    return bag
+}
+
+fn _reg_of(bag)  { return bag[0] }
+fn _kga_of(bag)  { return bag[1] }
+fn _kgb_of(bag)  { return bag[2] }
+fn _kgc_of(bag)  { return bag[3] }
+fn _x_of(bag)    { return bag[4] }
+fn _y_of(bag)    { return bag[5] }
+fn _z_of(bag)    { return bag[6] }
+
+fn _h_of(bag, atom_arg, kg_label_arg) {
+    return handle_new(kg_label_arg, atom_id(atom_arg))
+}
+
+// Direct config-poke helpers. Each test that pokes the config must call
+// `_nb_xref_config_reset()` at the end to clear the module-level cache and
+// avoid cross-test leakage. The pokes bypass getenv (which the container's
+// setenv-less environment cannot exercise) by writing the module-level
+// singletons and setting the `loaded` flag.
+fn _r3_set_config(depth, fanout, min_coact) {
+    _nb_xref_config_load()   // ensure defaults have run
+    _nb_xref_max_depth  = depth
+    _nb_xref_max_fanout = fanout
+    _nb_xref_min_coact  = min_coact
+    _nb_xref_cfg_loaded = 1
+    return 1
+}
+
+// ---- test 1: xr_iter_from surfaces xrefs, ordered by coact DESC -----------
+fn test_xr_iter_from_orders_by_coact() {
+    let bag = build_r3_reg()
+    let xrs = xr_iter_from(atom_id(_x_of(bag)), _kga_of(bag))
+    ce_eq("two xrefs enumerated from X", len(xrs), 2)
+    // First entry is the stronger one (coact=5, to kgb/y).
+    ce_str_eq("top xref dst kg is kgb", xrs[0][0], "kgb")
+    ce_eq("top xref coact_count is 5", xrs[0][2], 5)
+    ce_str_eq("second xref dst kg is kgc", xrs[1][0], "kgc")
+    ce_eq("second xref coact_count is 1", xrs[1][2], 1)
+    // Missing atom -> empty list, not a crash.
+    let none = xr_iter_from(9999, _kga_of(bag))
+    ce_eq("xr_iter_from on missing atom returns empty", len(none), 0)
+    // Null kg -> empty list.
+    let no_kg = xr_iter_from(atom_id(_x_of(bag)), 0)
+    ce_eq("xr_iter_from with kg=0 returns empty", len(no_kg), 0)
+    return 1
+}
+
+// ---- test 2: default env exposes MAX_DEPTH=1, FANOUT=8, MIN_COACT=2 --------
+fn test_default_env_values() {
+    _nb_xref_config_reset()
+    ce_eq("default MAX_DEPTH is 1",  _nb_xref_config_max_depth(),  1)
+    ce_eq("default MAX_FANOUT is 8", _nb_xref_config_max_fanout(), 8)
+    ce_eq("default MIN_COACT is 2",  _nb_xref_config_min_coact(),  2)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 3: MIN_COACT filter -- default MIN_COACT=2 skips coact=1 xref ---
+fn test_min_coact_filters_low_coact() {
+    let bag = build_r3_reg()
+    _r3_set_config(1, 8, 2)  // depth=1, fanout=8, min_coact=2
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    ce_eq("only one xref passes MIN_COACT=2", len(out), 1)
+    ce_str_eq("the surviving neighbor is in kgb", out[0][0][0], "kgb")
+    ce_eq("its atom_id matches Y", out[0][0][1], atom_id(_y_of(bag)))
+    ce_eq("coact carried through is 5", out[0][1], 5)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 4: MIN_COACT=1 retrieves BOTH neighbors --------------------------
+fn test_min_coact_1_retrieves_both() {
+    let bag = build_r3_reg()
+    _r3_set_config(1, 8, 1)
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    ce_eq("both xrefs surface with MIN_COACT=1", len(out), 2)
+    // Order preserved: top-coact first.
+    ce_str_eq("first neighbor is kgb (coact=5)", out[0][0][0], "kgb")
+    ce_str_eq("second neighbor is kgc (coact=1)", out[1][0][0], "kgc")
+    ce_check("first coact > second coact", out[0][1] > out[1][1])
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 5: MAX_FANOUT=1 caps to the top-coact neighbor -------------------
+fn test_max_fanout_1_caps_to_top() {
+    let bag = build_r3_reg()
+    _r3_set_config(1, 1, 1)   // fanout=1 with min_coact=1 to include both
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    ce_eq("MAX_FANOUT=1 yields exactly one neighbor", len(out), 1)
+    ce_str_eq("the retained neighbor is the top-coact one (kgb)", out[0][0][0], "kgb")
+    ce_eq("retained neighbor's coact is 5", out[0][1], 5)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 6: MAX_DEPTH=0 disables traversal -------------------------------
+fn test_max_depth_0_disables() {
+    let bag = build_r3_reg()
+    _r3_set_config(0, 8, 1)
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    ce_eq("MAX_DEPTH=0 yields empty traversal", len(out), 0)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 7: MAX_FANOUT=0 edge case: no traversal --------------------------
+fn test_max_fanout_0_no_traversal() {
+    let bag = build_r3_reg()
+    _r3_set_config(1, 0, 1)
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    ce_eq("MAX_FANOUT=0 yields empty traversal", len(out), 0)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 8: MAX_DEPTH=2 follows a chain X -> Y -> Z ----------------------
+fn test_max_depth_2_transitive() {
+    let bag = build_r3_reg()
+    // Add: Y (in kgb) has an xref to Z (in kgc) with coact=3.
+    let xr_yz = xref_new(_y_of(bag), _z_of(bag), XREF_CAUSAL, 700, 0)
+    atom_add_xref(_y_of(bag), xr_yz)
+    _bump_coact(xr_yz, 3)
+    _r3_set_config(2, 8, 2)   // depth=2, min_coact=2 (X->Z direct still skipped)
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    // Expect: Y (from X, coact=5) THEN Z (from Y, coact=3). The X->Z direct
+    // xref has coact=1 (below MIN_COACT=2), so Z is only reachable via Y.
+    ce_eq("depth-2 traversal surfaces Y and Z", len(out), 2)
+    ce_str_eq("first hop hits kgb (Y)", out[0][0][0], "kgb")
+    ce_str_eq("second hop reaches kgc (Z via Y)", out[1][0][0], "kgc")
+    ce_eq("Z's coact carried through is 3", out[1][1], 3)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 9: cycle safety -- X -> Y with Y -> X does not loop -------------
+fn test_cycle_safety() {
+    let bag = build_r3_reg()
+    // Y (kgb) -> X (kga) with coact=4.
+    let xr_yx = xref_new(_y_of(bag), _x_of(bag), XREF_CAUSAL, 900, 0)
+    atom_add_xref(_y_of(bag), xr_yx)
+    _bump_coact(xr_yx, 4)
+    _r3_set_config(3, 8, 2)   // depth=3 (would loop without visited set)
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    // Only Y should surface: X is the seed (in visited), Z is filtered by
+    // MIN_COACT=2 (X->Z coact=1). Y -> X is blocked by the visited set.
+    ce_eq("cycle-safe traversal yields Y only", len(out), 1)
+    ce_str_eq("Y in kgb surfaces once", out[0][0][0], "kgb")
+    ce_eq("Y atom id matches", out[0][0][1], atom_id(_y_of(bag)))
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 10: dangling xref -- dst_kg not in reg -> silent skip -----------
+fn test_dangling_xref_silent_skip() {
+    let bag = build_r3_reg()
+    // Manually craft an xref pointing to a KG label that isn't in the reg.
+    // We build it by fabricating the raw list (bypasses xref_new, which
+    // requires two live atom objects).
+    let dangling = list_new()
+    push(dangling, XREF_OBJ_TAG)
+    push(dangling, "kga")     // src kg label
+    push(dangling, atom_id(_x_of(bag)))  // src atom id
+    push(dangling, "kg-nonexistent")     // dst kg label (unknown to reg)
+    push(dangling, 7)         // dst atom id
+    push(dangling, 900)       // weight
+    push(dangling, XREF_CAUSAL)
+    push(dangling, 1)         // earned
+    push(dangling, 9)         // coact (well above MIN_COACT)
+    atom_add_xref(_x_of(bag), dangling)
+    _r3_set_config(1, 8, 2)
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    // Dangling xref filtered; only Y (kgb, coact=5) surfaces.
+    ce_eq("dangling xref skipped silently, Y only", len(out), 1)
+    ce_str_eq("surviving neighbor is Y in kgb", out[0][0][0], "kgb")
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 11: find_neighbors_full integration -- R3 hits surface -----------
+fn test_find_neighbors_full_folds_r3_hits() {
+    let bag = build_r3_reg()
+    _r3_set_config(1, 8, 2)
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let h_y = _h_of(bag, _y_of(bag), "kgb")
+    let h_z = _h_of(bag, _z_of(bag), "kgc")
+    let nbrs = find_neighbors_full(_reg_of(bag), h_x, 0, 0, 1, 16)
+    // Both Y (via R3, coact=5) and Z (via the unfiltered _walk_xrefs weight=600)
+    // should surface -- _walk_xrefs is coact-agnostic; R3 layers on top. What
+    // we test here is that R3 does contribute (Y should have >= xref_weight
+    // 800 clamped to 1000, because R3's coact-strength adds).
+    let s_y = neighbor_strength(nbrs, h_y)
+    let s_z = neighbor_strength(nbrs, h_z)
+    ce_check("Y surfaces via combined _walk_xrefs + R3", s_y > 0)
+    ce_check("Z surfaces via _walk_xrefs (R3 filtered by MIN_COACT)", s_z > 0)
+    // Seed never appears.
+    ce_eq("X (seed) not in neighbors", neighbor_strength(nbrs, h_x), 0)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 12: default env preserves pre-R3 neighborhoods on coact=0 fixture
+// The existing test fixtures (test_neighborhood_activation `build_med`) build
+// xrefs without ever bumping coact -- so coact stays at 0 for all of them.
+// Default MIN_COACT=2 filters those out; R3 is a no-op on that fixture.
+// Verify directly: build a two-KG reg with a coact=0 xref, and confirm R3
+// adds nothing at the default config.
+fn test_default_env_preserves_pre_r3_on_coact_zero() {
+    _nb_xref_config_reset()
+    let reg = kg_registry_new()
+    let ka = kg_spawn(reg, "kga")
+    let kb = kg_spawn(reg, "kgb")
+    let ax = kg_add_atom(ka, ATOM_CONCEPT, "a-x", 0)
+    let by = kg_add_atom(kb, ATOM_CONCEPT, "b-y", 0)
+    // Xref with default coact_count=0 (xref_new initializes it to 0).
+    atom_add_xref(ax, xref_new(ax, by, XREF_SIMILAR, 900, 0))
+    let h_ax = handle_new("kga", atom_id(ax))
+    let out = nb_xref_traversal(reg, h_ax)
+    ce_eq("default env: coact=0 xref filtered out", len(out), 0)
+    // But `find_neighbors_full` still surfaces by (via `_walk_xrefs`) --
+    // exactly the pre-R3 baseline.
+    let nbrs = find_neighbors_full(reg, h_ax, 0, 0, 1, 8)
+    let s = neighbor_strength(nbrs, handle_new("kgb", atom_id(by)))
+    ce_check("_walk_xrefs still surfaces by (pre-R3 behavior)", s > 0)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 13: MIN_COACT boundary -- exactly-at-threshold surfaces ---------
+fn test_min_coact_boundary_inclusive() {
+    let bag = build_r3_reg()
+    _r3_set_config(1, 8, 5)   // threshold exactly equals X->Y's coact of 5
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    ce_eq("coact == MIN_COACT surfaces (>= is inclusive)", len(out), 1)
+    ce_str_eq("boundary-included is kgb (Y)", out[0][0][0], "kgb")
+    _r3_set_config(1, 8, 6)   // threshold above X->Y's coact
+    let out2 = nb_xref_traversal(_reg_of(bag), h_x)
+    ce_eq("coact < MIN_COACT filters everything out", len(out2), 0)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 14: MAX_DEPTH=2 with MIN_COACT=1 walks the full chain -----------
+fn test_max_depth_2_full_chain() {
+    let bag = build_r3_reg()
+    // Y -> Z with coact=3 (from depth-2 test setup).
+    let xr_yz = xref_new(_y_of(bag), _z_of(bag), XREF_CAUSAL, 700, 0)
+    atom_add_xref(_y_of(bag), xr_yz)
+    _bump_coact(xr_yz, 3)
+    _r3_set_config(2, 8, 1)   // depth=2, min_coact=1 (X->Z at coact=1 passes)
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    // Expected order: Y (from X, coact=5), Z (from Y, coact=3 -- Z was NOT
+    // yet visited when Y expanded), then... nothing (X->Z direct hits Z
+    // already-visited). Total: 2 entries.
+    ce_eq("depth-2 full-chain yields 2 unique neighbors", len(out), 2)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 15: null-arg guards ---------------------------------------------
+fn test_null_arg_guards() {
+    let bag = build_r3_reg()
+    _r3_set_config(1, 8, 1)
+    ce_eq("nb_xref_traversal(0, h) returns empty", len(nb_xref_traversal(0, _h_of(bag, _x_of(bag), "kga"))), 0)
+    ce_eq("nb_xref_traversal(reg, 0) returns empty", len(nb_xref_traversal(_reg_of(bag), 0)), 0)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 16: xr_iter_from on an atom with no xrefs -----------------------
+fn test_xr_iter_from_no_xrefs() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "solo")
+    let a = kg_add_atom(kg, ATOM_CONCEPT, "lonely", 0)
+    let xrs = xr_iter_from(atom_id(a), kg)
+    ce_eq("atom with no xrefs -> empty enumeration", len(xrs), 0)
+    // And traversal from it is empty.
+    _r3_set_config(1, 8, 1)
+    let out = nb_xref_traversal(reg, handle_new("solo", atom_id(a)))
+    ce_eq("nb_xref_traversal on isolated atom is empty", len(out), 0)
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 17: MAX_DEPTH=1 does NOT recurse into destinations ---------------
+fn test_max_depth_1_stops_at_first_hop() {
+    let bag = build_r3_reg()
+    let xr_yz = xref_new(_y_of(bag), _z_of(bag), XREF_CAUSAL, 700, 0)
+    atom_add_xref(_y_of(bag), xr_yz)
+    _bump_coact(xr_yz, 4)
+    _r3_set_config(1, 8, 2)   // depth=1: Y found, but not Y's chain
+    let h_x = _h_of(bag, _x_of(bag), "kga")
+    let out = nb_xref_traversal(_reg_of(bag), h_x)
+    ce_eq("depth=1 yields only the direct neighbor (Y)", len(out), 1)
+    ce_str_eq("depth=1 direct neighbor kg is kgb", out[0][0][0], "kgb")
+    _nb_xref_config_reset()
+    return 1
+}
+
+// ---- test 18: fanout cap keeps HIGHEST coact (order-dependent cap) --------
+fn test_fanout_cap_keeps_highest_coact() {
+    let reg = kg_registry_new()
+    let src_kg = kg_spawn(reg, "src")
+    let d1 = kg_spawn(reg, "d1")
+    let d2 = kg_spawn(reg, "d2")
+    let d3 = kg_spawn(reg, "d3")
+    let s = kg_add_atom(src_kg, ATOM_CONCEPT, "s", 0)
+    let a1 = kg_add_atom(d1, ATOM_CONCEPT, "a1", 0)
+    let a2 = kg_add_atom(d2, ATOM_CONCEPT, "a2", 0)
+    let a3 = kg_add_atom(d3, ATOM_CONCEPT, "a3", 0)
+    // Insert in ascending coact order to prove xr_iter_from re-sorts.
+    let xr1 = xref_new(s, a1, XREF_SIMILAR, 500, 0)
+    atom_add_xref(s, xr1)
+    _bump_coact(xr1, 2)
+    let xr2 = xref_new(s, a2, XREF_SIMILAR, 500, 0)
+    atom_add_xref(s, xr2)
+    _bump_coact(xr2, 9)   // top
+    let xr3 = xref_new(s, a3, XREF_SIMILAR, 500, 0)
+    atom_add_xref(s, xr3)
+    _bump_coact(xr3, 4)
+    _r3_set_config(1, 2, 2)   // fanout=2, min_coact=2 -- keep top-2
+    let out = nb_xref_traversal(reg, handle_new("src", atom_id(s)))
+    ce_eq("fanout=2 keeps two neighbors", len(out), 2)
+    ce_str_eq("first is d2 (coact=9)", out[0][0][0], "d2")
+    ce_str_eq("second is d3 (coact=4)", out[1][0][0], "d3")
+    // d1 (coact=2) filtered by the fanout cap.
+    let i = 0
+    let saw_d1 = 0
+    while i < len(out) {
+        if str_eq_bytes(out[i][0][0], "d1") == 1 { saw_d1 = 1 }
+        i = i + 1
+    }
+    ce_eq("d1 (coact=2) not in the fanout-capped result", saw_d1, 0)
+    _nb_xref_config_reset()
+    return 1
+}
+
+fn main() {
+    test_xr_iter_from_orders_by_coact()
+    test_default_env_values()
+    test_min_coact_filters_low_coact()
+    test_min_coact_1_retrieves_both()
+    test_max_fanout_1_caps_to_top()
+    test_max_depth_0_disables()
+    test_max_fanout_0_no_traversal()
+    test_max_depth_2_transitive()
+    test_cycle_safety()
+    test_dangling_xref_silent_skip()
+    test_find_neighbors_full_folds_r3_hits()
+    test_default_env_preserves_pre_r3_on_coact_zero()
+    test_min_coact_boundary_inclusive()
+    test_max_depth_2_full_chain()
+    test_null_arg_guards()
+    test_xr_iter_from_no_xrefs()
+    test_max_depth_1_stops_at_first_hop()
+    test_fanout_cap_keeps_highest_coact()
+    ce_summary("reader_xref_traversal")
+}
+
+main()

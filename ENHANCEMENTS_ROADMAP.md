@@ -357,8 +357,19 @@ Three focused rounds closing the open threads left by ADR-0072..0085:
   module-level default so the new `/gc-stats [kg=<label>]` chat command
   can read it back without an agent in scope. Existing GC callers stay
   unchanged (a `metrics_reg == 0` sentinel disables attribution).
-- **R3 -- Cross-KG xref query-time traversal (planned, ADR-0088).** Extend the
-  reader's neighborhood-expansion to follow xrefs across KGs.
+- **R3 -- Cross-KG xref query-time traversal (SHIPPED, ADR-0088).** The
+  reader's `find_neighbors_full` now folds in a bounded transitive walk over
+  persisted cross-KG xrefs via `nb_xref_traversal` /
+  `_nb_follow_xrefs` in `src/reader/neighborhood.nova`, layered on top of the
+  existing operator / xref / word-sense / cofire / slot walks. Ordered DESC
+  by `XR_COACT` so the fanout cap keeps the strongest edges;
+  `CROSSENGIN_READER_XREF_MAX_DEPTH` / `_MAX_FANOUT` / `_MIN_COACT` are the
+  three levers (defaults 1 / 8 / 2). Dangling xrefs are a silent skip; a
+  visited-handle set makes cycles safe. Closes the memory-lifecycle GC arc.
+
+**Phase L status: COMPLETE.** ADR-0074 (freelist) through ADR-0088
+(xref query-time traversal) now form a closed loop: reclaim -> sweep ->
+compact-remap -> observability -> query-side consumption.
 
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet

@@ -56,6 +56,7 @@
 
 import "lexical_anchor.nova"
 import "../parts/reasoning/reasoning_atoms.nova"
+import "../kg/cross_kg_references.nova"
 import "cofire_index.nova"
 import "slot_index.nova"
 
@@ -65,6 +66,85 @@ let NEIGH_HOP_DECAY = 500
 let NEIGH_WORD_SHARE = 500
 // Hard ceiling on neighbor entries collected before sort/trim (guards walk cost).
 let NEIGH_SCAN_CAP = 256
+
+// ---- ADR-0088 (R3): cross-KG xref query-time traversal config -------------
+// Persistence for xrefs shipped in ADRs 0077/0078; the compactor's remap in
+// ADR-0079 keeps them valid across compactions; ADR-0085 persists their
+// coactivation counter. Until this round the reader's neighborhood-expansion
+// walked in-atom `atom_xrefs` for a one-hop contribution (`_walk_xrefs`) but
+// never followed them transitively or filtered by coact_count. The R3 helper
+// `_nb_follow_xrefs` closes that loop, bounded by depth/fanout/min-coact so a
+// heavily-xref'd atom cannot blow up the neighborhood.
+//
+// Defaults are deliberately conservative:
+//   MAX_DEPTH  = 1 -- one hop of transitive xref walking, on by default so
+//                     high-coactivation cross-KG links ARE consumed at query
+//                     time. Set to 0 to disable the R3 traversal entirely
+//                     (byte-equivalent to pre-R3 reader behavior).
+//   MAX_FANOUT = 8 -- per-call cap on xrefs followed from a single atom.
+//                     Sorted descending by coact_count means the top-N
+//                     highest-corroboration links win.
+//   MIN_COACT  = 2 -- xrefs with coact_count < 2 are noise (a single chance
+//                     coactivation shouldn't drag a whole KG into the
+//                     neighborhood); the default filters them out.
+let _NB_XREF_DEFAULT_MAX_DEPTH  = 1
+let _NB_XREF_DEFAULT_MAX_FANOUT = 8
+let _NB_XREF_DEFAULT_MIN_COACT  = 2
+
+// Milli-per-coactivation scale for the R3 fold in `find_neighbors_full`.
+// coact * NEIGH_XREF_COACT_SCALE gives R3's contribution before clamp:
+// coact=2 -> 200 milli, coact=5 -> 500, coact=10 -> 1000 (saturated).
+let NEIGH_XREF_COACT_SCALE = 100
+
+let _nb_xref_cfg_loaded = 0
+let _nb_xref_max_depth  = 1
+let _nb_xref_max_fanout = 8
+let _nb_xref_min_coact  = 2
+
+// Canonical env-var guard. Distinguishes an intentional "0" from garbage that
+// parsed to 0 by checking that the env string was a single-byte "0". Unset,
+// empty, negative, or non-numeric all fall back to `def`. This is a superset
+// of `_ac_env_int` (which treats any `v <= 0` as garbage); MAX_DEPTH needs
+// literal 0 to mean "disable traversal" and must NOT collapse into the
+// default.
+fn _nb_env_int(name, def) {
+    let env = getenv(name)
+    if env == 0 { return def }
+    if len(env) == 0 { return def }
+    let v = str_to_int(env)
+    if v < 0 { return def }
+    if v > 0 { return v }
+    // v == 0: verify the raw env is exactly "0" (one byte). Everything else
+    // parsing to 0 is str_to_int's garbage-tolerance path.
+    if len(env) == 1 {
+        if str_eq_bytes(env, "0") == 1 { return 0 }
+    }
+    return def
+}
+
+fn _nb_xref_config_load() {
+    if _nb_xref_cfg_loaded != 0 { return 1 }
+    _nb_xref_max_depth  = _nb_env_int("CROSSENGIN_READER_XREF_MAX_DEPTH",
+                                       _NB_XREF_DEFAULT_MAX_DEPTH)
+    _nb_xref_max_fanout = _nb_env_int("CROSSENGIN_READER_XREF_MAX_FANOUT",
+                                       _NB_XREF_DEFAULT_MAX_FANOUT)
+    _nb_xref_min_coact  = _nb_env_int("CROSSENGIN_READER_XREF_MIN_COACT",
+                                       _NB_XREF_DEFAULT_MIN_COACT)
+    _nb_xref_cfg_loaded = 1
+    return 1
+}
+
+// Test-only: force the next config-load to re-read the env. Not invoked from
+// production paths; each test that pokes an env-var calls this to clear the
+// module-level cache so state does not leak across tests.
+fn _nb_xref_config_reset() {
+    _nb_xref_cfg_loaded = 0
+    return 1
+}
+
+fn _nb_xref_config_max_depth()  { _nb_xref_config_load(); return _nb_xref_max_depth }
+fn _nb_xref_config_max_fanout() { _nb_xref_config_load(); return _nb_xref_max_fanout }
+fn _nb_xref_config_min_coact()  { _nb_xref_config_load(); return _nb_xref_min_coact }
 
 // ---- accumulator helpers --------------------------------------------------
 // Entries are [handle, strength]. The accumulator is a plain list; lookup is a
@@ -259,6 +339,99 @@ fn _walk_slots(si, source_handle, acc, weight_scale) {
     return len(acc)
 }
 
+// ---- ADR-0088 (R3): cross-KG xref traversal --------------------------------
+// The R3 traversal is distinct from `_walk_xrefs` above: `_walk_xrefs` walks
+// the source atom's in-atom xref list ONCE (one-hop, no coact filter) and
+// contributes each destination's `xref_weight` to the accumulator. R3 walks
+// transitively (up to `MAX_DEPTH`), filters by `MIN_COACT` (so a single chance
+// coactivation cannot drag an unrelated KG into the neighborhood), and orders
+// by coact_count DESC so the fanout cap keeps the strongest links first.
+//
+// Visited tracking (a small list of source handles) prevents cycles:
+// X -> Y -> X does not loop, and X -> Y -> Z -> Y de-duplicates.
+
+fn _nb_visited_contains(visited, h) {
+    let i = 0
+    while i < len(visited) {
+        if handle_eq(visited[i], h) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Enumerate cross-KG xref-reachable neighbors from (kg, atom_id_arg), bounded
+// by depth/fanout/min-coact. Appends `[handle, coact_count]` entries into
+// `out_neighbors`; adds each newly-discovered destination handle into
+// `visited` so a later step (recursion or the caller's fold) cannot revisit
+// it. `reg` is the KG registry; `kg` is the SOURCE KG that owns `atom_id_arg`.
+//
+// Dangling xrefs (dst_kg_label not resolvable in reg) are skipped silently --
+// they are stale metadata (a KG unloaded across a snapshot boundary, a
+// wire-serialized xref pointing to a KG this reader wasn't told about) and
+// crashing on them would surface a benign-in-practice inconsistency as a
+// hard failure.
+fn _nb_follow_xrefs(atom_id_arg, kg, reg, depth_remaining, out_neighbors, visited) {
+    if depth_remaining < 1 { return 0 }
+    if kg == 0 { return 0 }
+    if reg == 0 { return 0 }
+    let min_coact  = _nb_xref_config_min_coact()
+    let max_fanout = _nb_xref_config_max_fanout()
+    if max_fanout <= 0 { return 0 }
+    let xrs = xr_iter_from(atom_id_arg, kg)
+    let count = 0
+    let i = 0
+    let n = len(xrs)
+    while i < n {
+        if count < max_fanout {
+            let entry = xrs[i]
+            let dst_kg_label = entry[0]
+            let dst_atom_id  = entry[1]
+            let coact        = entry[2]
+            if coact >= min_coact {
+                let dst_kg = kg_find(reg, dst_kg_label)
+                if dst_kg != 0 {
+                    let nh = handle_new(dst_kg_label, dst_atom_id)
+                    if _nb_visited_contains(visited, nh) == 0 {
+                        let e = list_new()
+                        push(e, nh)
+                        push(e, coact)
+                        push(out_neighbors, e)
+                        push(visited, nh)
+                        count = count + 1
+                        if depth_remaining > 1 {
+                            _nb_follow_xrefs(dst_atom_id, dst_kg, reg,
+                                             depth_remaining - 1,
+                                             out_neighbors, visited)
+                        }
+                    }
+                }
+                // dangling xref (dst_kg_label not in reg): silent skip.
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// Public: enumerate cross-KG xref-reachable neighbors from a handle. Reads
+// the module-level MAX_DEPTH config; a MAX_DEPTH of 0 short-circuits to an
+// empty list without touching `xr_iter_from`. Returns a list of
+// `[handle, coact_count]` sorted in traversal order (which is per-node
+// coact-DESC courtesy of `xr_iter_from`).
+fn nb_xref_traversal(reg, source_handle) {
+    let out = list_new()
+    if reg == 0 { return out }
+    if source_handle == 0 { return out }
+    let max_depth = _nb_xref_config_max_depth()
+    if max_depth <= 0 { return out }
+    let kg = kg_find(reg, handle_kg(source_handle))
+    if kg == 0 { return out }
+    let visited = list_new()
+    push(visited, source_handle)
+    _nb_follow_xrefs(handle_atom(source_handle), kg, reg, max_depth, out, visited)
+    return out
+}
+
 // ---- one-hop and frontier-driven multi-hop expansion -----------------------
 
 // Run one hop from a single source handle. Weight scale is FP_SCALE for the
@@ -379,6 +552,36 @@ fn find_neighbors_full(kg_reg, source_handle, ci, si, max_hops, max_results) {
                 _expand_one_full(kg_reg, next_src, acc, NEIGH_HOP_DECAY, ci, si)
             }
             i = i + 1
+        }
+    }
+
+    // ADR-0088 (R3): additive cross-KG xref traversal. Runs AFTER the hop-1
+    // and hop-2 frontier walks so R3-discovered handles are not chased as
+    // hop-2 seeds (avoiding an implicit doubling of R3's own depth). Guarded
+    // by MAX_DEPTH>0 so setting `CROSSENGIN_READER_XREF_MAX_DEPTH=0` reverts
+    // to pre-R3 behavior byte-for-byte. `nb_xref_traversal` returns
+    // `[handle, coact_count]` entries; we fold them into the accumulator via
+    // `_nh_add`, which clamps at 1000 and de-dupes with entries surfaced by
+    // the operator/xref/word/cofire/slot walks. Strength is derived from
+    // coact_count by a fixed linear scale (100 milli per coactivation,
+    // clamped at 1000): coact=2 -> 200 milli (just above the default
+    // MIN_COACT floor), coact=10 -> saturated at 1000. This gives R3 a
+    // distinct information channel from `xref_weight` (which _walk_xrefs
+    // already contributes) -- corroboration frequency, not one-shot
+    // similarity.
+    if _nb_xref_config_max_depth() > 0 {
+        let xr_hits = nb_xref_traversal(kg_reg, source_handle)
+        let x = 0
+        while x < len(xr_hits) {
+            let nh = xr_hits[x][0]
+            let coact = xr_hits[x][1]
+            if handle_eq(nh, source_handle) == 0 {
+                let s = coact * NEIGH_XREF_COACT_SCALE
+                if s < 0 { s = 0 }
+                if s > 1000 { s = 1000 }
+                _nh_add(acc, nh, fp_mul(s, FP_SCALE))
+            }
+            x = x + 1
         }
     }
 

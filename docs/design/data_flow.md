@@ -52,6 +52,22 @@ at tick 1, the `interior` node at tick 2).
 connected, co-active pairs in **both** directions, deepening stable assemblies
 (the `<=>` dynamic). This is the substrate basis for bound percepts (XSIG_BIND).
 
+## Cross-KG xref traversal on the read path (ADR-0088)
+
+When the reader's neighborhood-expansion runs (`find_neighbors_full` in
+`src/reader/neighborhood.nova`), it folds in a bounded transitive walk over
+persisted cross-KG xrefs after the hop-1/hop-2 frontier expansion completes.
+`xr_iter_from` (in `src/kg/cross_kg_references.nova`) enumerates each source
+atom's xrefs sorted DESC by `XR_COACT`; `_nb_follow_xrefs` walks them up to
+`CROSSENGIN_READER_XREF_MAX_DEPTH` (default 1), capped per call at
+`CROSSENGIN_READER_XREF_MAX_FANOUT` (default 8), skipping any xref whose
+`coact_count < CROSSENGIN_READER_XREF_MIN_COACT` (default 2). A visited-handle
+set makes cycles safe (X -> Y -> X emits Y once and stops), and a dangling
+xref (dst_kg_label not in the registry) is a silent skip rather than a
+crash -- so a reader configured with a subset of KGs stays best-effort. This
+is the query-side consumer for the persistence work in ADRs 0077/0078/0079/0085
+and closes the memory-lifecycle GC arc.
+
 ## Not yet in the path
 
 Predictive-coding error signals (the `error` term to `syn_plasticity_step` is
