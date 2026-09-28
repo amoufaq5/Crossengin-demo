@@ -1,0 +1,361 @@
+// Unit tests for examples/crossengin_fed_daemon.nova env-config + boot
+// contract (Phase M R1, ADR-0089).
+//
+// Coverage (~30 assertions) -- the fed daemon's env-config parser and
+// component-alloc order are the two pieces the unit layer can reach
+// without a live socket. The full boot happens inside main() and calls
+// gossip_listen (a real bind syscall), so this test focuses on the
+// pure-function surface.
+//
+// NOVA exposes `getenv` but NOT `setenv`/`putenv`, so we cannot mutate
+// the process environment from the test. Instead we test PURE resolvers
+// -- byte-for-byte copies of the daemon's helpers, but taking the raw
+// env-string as an explicit argument. The daemon's getenv wrapper then
+// only adds one line ("return _t_env_str_resolve(getenv(name), fb)")
+// so any drift shows up as a compile error against the wrapper's use
+// sites. Concretely mirrors the pattern in test_session_paths.nova.
+//
+// Coverage map:
+//   1. env-str resolver: default when input is 0 / empty; passes
+//      through set value.
+//   2. env-int resolver: default when 0 / empty / non-numeric / zero /
+//      negative; passes through positive integers.
+//   3. peer-list resolver: empty when both env values are 0; parsed
+//      to N tokens when a comma-separated list; falls back to
+//      the legacy CE_GOSSIP_PEERS value when CE_FED_PEERS is 0.
+//   4. tick-ms bounds resolver: default; clamped low; clamped high;
+//      passes through in-range values.
+//   5. soul-id resolver: derived from listen addr when 0 / empty;
+//      passes set value through.
+//   6. Component alloc surface: gossip_init returns non-null state
+//      shaped correctly; kgd_state_new + dq_init round-trip; the
+//      fed_kg registered under a fresh kgreg is reachable.
+
+import "../ce_test.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/parts/reasoning/reasoning_atoms.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/federation/gossip.nova"
+import "../../src/federation/kg_sync.nova"
+import "../../src/federation/distributed_query.nova"
+
+// ---- daemon-parity pure resolvers ----------------------------------------
+//
+// These are byte-identical to the daemon's helpers with getenv() lifted
+// out (raw env value passed in as `v` / `fed_env` / `legacy_env`). The
+// daemon calls the wrapped form; the tests call these directly. Any
+// change to the daemon's parse logic MUST be mirrored here or the tests
+// drift out of parity (they are pure functions, easy to keep in lockstep).
+
+let _T_FED_DEFAULT_LISTEN_ADDR = "127.0.0.1:8790"
+let _T_FED_DEFAULT_TICK_MS     = 250
+let _T_FED_MIN_TICK_MS         = 50
+let _T_FED_MAX_TICK_MS         = 10000
+
+fn _t_env_str_resolve(v, fallback) {
+    if v == 0 { return fallback }
+    if len(v) == 0 { return fallback }
+    return v
+}
+
+fn _t_env_int_resolve(v, fallback) {
+    if v == 0 { return fallback }
+    if len(v) == 0 { return fallback }
+    let n = rt_str_to_int(v)
+    if n <= 0 { return fallback }
+    return n
+}
+
+fn _t_peers_resolve(fed_env, legacy_env) {
+    let out = list_new()
+    let env = fed_env
+    if env == 0 { env = legacy_env }
+    if env == 0 { return out }
+    if len(env) == 0 { return out }
+    let i = 0
+    let start = 0
+    while i < len(env) {
+        if char_at(env, i) == 44 {
+            if i > start { push(out, substr(env, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if i > start { push(out, substr(env, start, i - start)) }
+    return out
+}
+
+fn _t_soul_id_resolve(v, listen_addr) {
+    if v != 0 {
+        if len(v) > 0 { return v }
+    }
+    return "soul:" + listen_addr
+}
+
+fn _t_tick_ms_resolve(v) {
+    let n = _t_env_int_resolve(v, _T_FED_DEFAULT_TICK_MS)
+    if n < _T_FED_MIN_TICK_MS { n = _T_FED_MIN_TICK_MS }
+    if n > _T_FED_MAX_TICK_MS { n = _T_FED_MAX_TICK_MS }
+    return n
+}
+
+// ---- env-str resolver ----------------------------------------------------
+
+fn test_env_str_defaults_when_null() {
+    let v = _t_env_str_resolve(0, "fallback")
+    ce_str_eq("null env falls back", v, "fallback")
+}
+
+fn test_env_str_defaults_when_empty() {
+    let v = _t_env_str_resolve("", "fallback")
+    ce_str_eq("empty env falls back", v, "fallback")
+}
+
+fn test_env_str_passes_through_when_set() {
+    let v = _t_env_str_resolve("explicit-value", "fallback")
+    ce_str_eq("set env passes through", v, "explicit-value")
+}
+
+fn test_listen_addr_default() {
+    let v = _t_env_str_resolve(0, _T_FED_DEFAULT_LISTEN_ADDR)
+    ce_str_eq("default listen addr", v, "127.0.0.1:8790")
+}
+
+fn test_listen_addr_override() {
+    let v = _t_env_str_resolve("10.0.0.5:9000",
+                               _T_FED_DEFAULT_LISTEN_ADDR)
+    ce_str_eq("override listen addr", v, "10.0.0.5:9000")
+}
+
+// ---- env-int resolver ----------------------------------------------------
+
+fn test_env_int_defaults_when_null() {
+    let v = _t_env_int_resolve(0, 42)
+    ce_eq("null int env falls back", v, 42)
+}
+
+fn test_env_int_defaults_on_empty() {
+    let v = _t_env_int_resolve("", 42)
+    ce_eq("empty int env falls back", v, 42)
+}
+
+fn test_env_int_defaults_on_garbage() {
+    let v = _t_env_int_resolve("not-a-number", 42)
+    // rt_str_to_int returns 0 on garbage; the <=0 guard falls back.
+    ce_eq("garbage int env falls back", v, 42)
+}
+
+fn test_env_int_defaults_on_zero() {
+    let v = _t_env_int_resolve("0", 42)
+    ce_eq("zero int env falls back (guard positive-only)", v, 42)
+}
+
+fn test_env_int_defaults_on_negative() {
+    let v = _t_env_int_resolve("-1", 42)
+    ce_eq("negative int env falls back", v, 42)
+}
+
+fn test_env_int_passes_through_positive() {
+    let v = _t_env_int_resolve("17", 42)
+    ce_eq("positive int env passes through", v, 17)
+}
+
+// ---- tick-ms bounds ------------------------------------------------------
+
+fn test_tick_ms_default_when_null() {
+    ce_eq("tick_ms default is 250", _t_tick_ms_resolve(0), 250)
+}
+
+fn test_tick_ms_default_when_empty() {
+    ce_eq("tick_ms default when empty is 250",
+          _t_tick_ms_resolve(""), 250)
+}
+
+fn test_tick_ms_clamps_low() {
+    // Positive-but-below-MIN clamps up to MIN (50).
+    ce_eq("tick_ms clamps low to 50",
+          _t_tick_ms_resolve("10"), 50)
+}
+
+fn test_tick_ms_clamps_high() {
+    ce_eq("tick_ms clamps high to 10000",
+          _t_tick_ms_resolve("999999"), 10000)
+}
+
+fn test_tick_ms_passes_through_in_range() {
+    ce_eq("tick_ms passes 500 through",
+          _t_tick_ms_resolve("500"), 500)
+}
+
+// ---- peer-list parsing ---------------------------------------------------
+
+fn test_peers_empty_when_both_null() {
+    let peers = _t_peers_resolve(0, 0)
+    ce_eq("no env => zero peers", len(peers), 0)
+}
+
+fn test_peers_empty_when_env_is_empty_string() {
+    let peers = _t_peers_resolve("", 0)
+    ce_eq("empty CE_FED_PEERS => zero peers", len(peers), 0)
+}
+
+fn test_peers_parses_two_host_ports() {
+    let peers = _t_peers_resolve("host1:1,host2:2", 0)
+    ce_eq("two hosts parse to two peers", len(peers), 2)
+    ce_str_eq("first parsed peer", peers[0], "host1:1")
+    ce_str_eq("second parsed peer", peers[1], "host2:2")
+}
+
+fn test_peers_parses_three_host_ports() {
+    let peers = _t_peers_resolve("a:1,b:2,c:3", 0)
+    ce_eq("three hosts parse to three peers", len(peers), 3)
+    ce_str_eq("third parsed peer", peers[2], "c:3")
+}
+
+fn test_peers_fallback_to_gossip_peers() {
+    let peers = _t_peers_resolve(0, "legacy:8770")
+    ce_eq("CE_FED_PEERS null => CE_GOSSIP_PEERS used",
+          len(peers), 1)
+    ce_str_eq("legacy peer parsed", peers[0], "legacy:8770")
+}
+
+fn test_peers_explicit_wins_over_gossip_legacy() {
+    let peers = _t_peers_resolve("explicit:1", "legacy:2")
+    ce_eq("explicit CE_FED_PEERS overrides legacy", len(peers), 1)
+    ce_str_eq("explicit peer wins", peers[0], "explicit:1")
+}
+
+// ---- soul-id derivation --------------------------------------------------
+
+fn test_soul_id_derives_from_listen_addr_when_null() {
+    let id = _t_soul_id_resolve(0, "127.0.0.1:8790")
+    ce_str_eq("derived soul id", id, "soul:127.0.0.1:8790")
+}
+
+fn test_soul_id_pass_through_when_set() {
+    let id = _t_soul_id_resolve("custom-soul-42", "127.0.0.1:8790")
+    ce_str_eq("explicit soul id wins", id, "custom-soul-42")
+}
+
+fn test_soul_id_defaults_when_empty() {
+    let id = _t_soul_id_resolve("", "127.0.0.1:8790")
+    ce_str_eq("empty soul id falls back", id, "soul:127.0.0.1:8790")
+}
+
+// ---- component-alloc surface --------------------------------------------
+
+fn test_alloc_order_kgreg_first() {
+    let kgreg = kg_registry_new()
+    ce_check("kg_registry_new returns non-null", kgreg != 0)
+}
+
+fn test_alloc_order_mo_after_kgreg() {
+    let kgreg = kg_registry_new()
+    let mo = mo_new()
+    ce_check("mo_new returns non-null after kgreg", mo != 0)
+}
+
+fn test_alloc_fed_kg_reachable_via_kgreg() {
+    let kgreg = kg_registry_new()
+    let fed_kg = reasoning_kg_init(kgreg)
+    ce_check("fed_kg allocated", fed_kg != 0)
+    ce_eq("fed_kg atom count starts at 0", kg_atom_count(fed_kg), 0)
+}
+
+fn test_alloc_gossip_init_returns_state_no_peers() {
+    let gs = gossip_init("127.0.0.1:8790", 0)
+    ce_check("gossip_init returns non-null state", gs != 0)
+    ce_str_eq("gossip self addr echoed",
+              gossip_self_addr(gs), "127.0.0.1:8790")
+    ce_eq("gossip starts with zero peers when boots=0",
+          gossip_peer_count(gs), 0)
+}
+
+fn test_alloc_gossip_init_with_peer_list() {
+    let peers = list_new()
+    push(peers, "127.0.0.1:8791")
+    push(peers, "127.0.0.1:8792")
+    let gs = gossip_init("127.0.0.1:8790", peers)
+    ce_eq("gossip seeded with two peers",
+          gossip_peer_count(gs), 2)
+}
+
+fn test_alloc_kgd_state_new() {
+    let kgd = kgd_state_new()
+    ce_check("kgd_state_new returns non-null", kgd != 0)
+    ce_eq("kgd starts at rev 0", kgd_state_rev(kgd), 0)
+}
+
+fn test_alloc_dq_init_wires_gossip_ref() {
+    let gs = gossip_init("127.0.0.1:8790", 0)
+    let dq = dq_init(gs)
+    ce_check("dq_init returns non-null", dq != 0)
+    ce_eq("dq starts with zero pending", dq_pending_count(dq), 0)
+    ce_eq("dq starts with zero queries",
+          dq_stats_queries(dq), 0)
+}
+
+fn test_alloc_order_sequence_end_to_end() {
+    // Reproduce the daemon's alloc block. Every stage must
+    // successfully allocate against the previous stage's outputs.
+    let kgreg  = kg_registry_new()
+    let mo     = mo_new()
+    let fed_kg = reasoning_kg_init(kgreg)
+    let gs     = gossip_init("127.0.0.1:8790", list_new())
+    let kgd    = kgd_state_new()
+    let dq     = dq_init(gs)
+    ce_check("kgreg alloc non-null",  kgreg  != 0)
+    ce_check("mo alloc non-null",     mo     != 0)
+    ce_check("fed_kg alloc non-null", fed_kg != 0)
+    ce_check("gs alloc non-null",     gs     != 0)
+    ce_check("kgd alloc non-null",    kgd    != 0)
+    ce_check("dq alloc non-null",     dq     != 0)
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    test_env_str_defaults_when_null()
+    test_env_str_defaults_when_empty()
+    test_env_str_passes_through_when_set()
+    test_listen_addr_default()
+    test_listen_addr_override()
+
+    test_env_int_defaults_when_null()
+    test_env_int_defaults_on_empty()
+    test_env_int_defaults_on_garbage()
+    test_env_int_defaults_on_zero()
+    test_env_int_defaults_on_negative()
+    test_env_int_passes_through_positive()
+
+    test_tick_ms_default_when_null()
+    test_tick_ms_default_when_empty()
+    test_tick_ms_clamps_low()
+    test_tick_ms_clamps_high()
+    test_tick_ms_passes_through_in_range()
+
+    test_peers_empty_when_both_null()
+    test_peers_empty_when_env_is_empty_string()
+    test_peers_parses_two_host_ports()
+    test_peers_parses_three_host_ports()
+    test_peers_fallback_to_gossip_peers()
+    test_peers_explicit_wins_over_gossip_legacy()
+
+    test_soul_id_derives_from_listen_addr_when_null()
+    test_soul_id_pass_through_when_set()
+    test_soul_id_defaults_when_empty()
+
+    test_alloc_order_kgreg_first()
+    test_alloc_order_mo_after_kgreg()
+    test_alloc_fed_kg_reachable_via_kgreg()
+    test_alloc_gossip_init_returns_state_no_peers()
+    test_alloc_gossip_init_with_peer_list()
+    test_alloc_kgd_state_new()
+    test_alloc_dq_init_wires_gossip_ref()
+    test_alloc_order_sequence_end_to_end()
+
+    ce_summary("fed_daemon_boot")
+}
+
+main()

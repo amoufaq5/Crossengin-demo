@@ -28,6 +28,7 @@ RPC_DAEMON  := examples/crossengin_rpc_daemon.nova
 KGSYNC_PUB  := examples/crossengin_kg_publisher.nova
 KGSYNC_SUB  := examples/crossengin_kg_subscriber.nova
 FED_COORD   := examples/crossengin_fed_coordinator.nova
+FED_DAEMON  := examples/crossengin_fed_daemon.nova
 
 .PHONY: all build test benchmark bench-nl bench-nl-compare bench-nl-baseline coverage lint-ints install integration clean check-nova help cross-windows smoke-windows-ce
 
@@ -53,6 +54,7 @@ NOVA_COMPILE = $(NOVA_ROOT)/bin/nova
 #   crossengin_kg_publisher.nova     -> crossengin-kg-publisher.exe
 #   crossengin_kg_subscriber.nova    -> crossengin-kg-subscriber.exe
 #   crossengin_fed_coordinator.nova  -> crossengin-fed-coordinator.exe
+#   crossengin_fed_daemon.nova       -> crossengin-fed-daemon.exe     (Phase M R1 MVP federation daemon)
 CROSS_WIN_PAIRS = \
 	$(SELFCHECK)::crossengin-selfcheck \
 	$(SPINE)::crossengin-spine \
@@ -61,7 +63,8 @@ CROSS_WIN_PAIRS = \
 	$(RPC_DAEMON)::crossengin-rpc-daemon \
 	$(KGSYNC_PUB)::crossengin-kg-publisher \
 	$(KGSYNC_SUB)::crossengin-kg-subscriber \
-	$(FED_COORD)::crossengin-fed-coordinator
+	$(FED_COORD)::crossengin-fed-coordinator \
+	$(FED_DAEMON)::crossengin-fed-daemon
 
 cross-windows: check-nova
 	@mkdir -p $(BIN)
@@ -304,6 +307,14 @@ install: build
 	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
 	  fi; \
 	fi
+	@if [ -f "$(FED_DAEMON)" ]; then \
+	  printf '  build %s ... ' "$(FED_DAEMON)"; \
+	  if "$(NOVA)" build "$(FED_DAEMON)" -o "$(BIN)/crossengin-fed-daemon" >/tmp/ce_install.log 2>&1; then \
+	    echo "OK -> $(BIN)/crossengin-fed-daemon"; \
+	  else \
+	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
+	  fi; \
+	fi
 
 integration: install
 	@scripts="$$(find tests/integration -maxdepth 1 -name '*.sh' ! -name '_*' 2>/dev/null | sort)"; \
@@ -335,7 +346,7 @@ help:
 	@echo "  bench-nl-baseline  run bench-nl and overwrite bench/latency_v1/baseline.json"
 	@echo "  coverage    report module-level unit-test coverage (static)"
 	@echo "  lint-ints   flag large-literal arithmetic at risk of codegen bug #11"
-	@echo "  install     build the self-check, companion-spine, unified daemon, kg-sync pub/sub, and fed-coordinator into ./bin/"
+	@echo "  install     build the self-check, companion-spine, unified daemon, kg-sync pub/sub, fed-coordinator, and fed-daemon into ./bin/"
 	@echo "  integration run every end-to-end scenario + admin-command script in tests/integration/"
 	@echo "  clean       remove build artifacts"
 	@echo "  check-nova  verify the NOVA toolchain is reachable"

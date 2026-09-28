@@ -1,0 +1,360 @@
+// CrossEngin federation daemon (Phase M R1, ADR-0089).
+//
+// Purpose
+//   The `src/federation/` tree ships 23 unit-tested modules -- gossip
+//   (R18E), kg_sync deltas (R6C/R7C v3), distributed query (R20E),
+//   distributed rules (R21B), leader election (R19E), snapshot
+//   attestation + replication (R20F/R23C), DTLS 1.2 (with R29B2 stubs),
+//   ICE/STUN/TURN/WebRTC, NAT traversal, gossip relays, Raft. Every
+//   one is unit-tested. None were wired into a runnable daemon.
+//
+//   This binary composes the R1 subset -- gossip + kg_sync + distributed
+//   query -- into a single event-driven mesh peer, mirroring the shape of
+//   examples/crossengin_daemon.nova:250-517 (env-config -> alloc ->
+//   session-register -> tick loop). Leader election and distributed
+//   rules land in R2 (ADR-0090); snapshot attestation and replication
+//   in R3 (ADR-0091). DTLS 1.2 stays out until the R29B2 cert-verify
+//   and SRTP EKM stubs at src/federation/dtls12.nova:137, 140 are
+//   filled in; the daemon runs plain TCP gossip until then.
+//
+//   Distinction from crossengin_daemon
+//   ----------------------------------
+//   crossengin_daemon runs the six cognitive loops over ONE soul; it
+//   does not need a mesh to be useful. This daemon runs the mesh over
+//   a soul-agnostic KG registry; it does not need the reasoning /
+//   emotion / goal loops to be useful. Two different concerns, two
+//   different lifecycles -- keeping them in separate binaries lets
+//   each shape its own tick loop and env-var namespace without
+//   colliding. A production deployment typically runs both, side by
+//   side, communicating over a Unix socket or via a shared snapshot
+//   directory (R3 wires the snapshot side).
+//
+//   Run with:  $NOVA_ROOT/nova run examples/crossengin_fed_daemon.nova
+//
+// Env-var contract (all optional; safe defaults for a local mesh):
+//   CE_FED_LISTEN_ADDR   default "127.0.0.1:8790"
+//                        The addr this daemon binds its gossip TCP
+//                        listener to. Format: HOST:PORT.
+//   CE_FED_PEERS         default "" -- falls back to CE_GOSSIP_PEERS
+//                        Comma-separated bootstrap peer addresses.
+//                        The daemon adds each to the gossip peer table
+//                        at boot; SWIM PINGs confirm / demote them.
+//   CE_FED_SOUL_ID       default: derived from listen addr
+//                        Stable identity for this node -- surfaced in
+//                        log lines and reserved for the leader-election
+//                        wiring in R2.
+//   CE_FED_TICK_MS       default 250
+//                        Milliseconds between gossip_step / accept /
+//                        input-poll ticks. Bounded [50, 10000].
+//
+// ADRs exercised: ADR-0089 (this daemon), ADR-0051 (Session shape),
+//   plus every federation-module ADR the composed primitives implement
+//   (ADR-0054 subset for the aggregator seam, R18E/R19E/R20E/R21B for
+//   the federation primitives).
+
+import "std/syscall"
+import "std/string"
+import "std/io"
+
+import "../src/kg/atom_store.nova"
+import "../src/kg/multi_kg_manager.nova"
+import "../src/parts/reasoning/reasoning_atoms.nova"
+import "../src/parts/meta/meta_observer.nova"
+import "../src/federation/gossip.nova"
+import "../src/federation/kg_sync.nova"
+import "../src/federation/distributed_query.nova"
+import "../src/session/session.nova"
+
+// ---- env-var config -------------------------------------------------------
+//
+// Each _cfg_* helper mirrors the canonical getenv guard used across the
+// rest of the tree: `env == 0 || len(env) == 0 -> default`. `str_to_int`
+// returns 0 for garbage, so int helpers additionally guard the fallback
+// via a positive-only check.
+
+let CE_FED_DEFAULT_LISTEN_ADDR = "127.0.0.1:8790"
+let CE_FED_DEFAULT_TICK_MS     = 250
+let CE_FED_MIN_TICK_MS         = 50
+let CE_FED_MAX_TICK_MS         = 10000
+
+fn _fed_env_str(name, fallback) {
+    let v = getenv(name)
+    if v == 0 { return fallback }
+    if len(v) == 0 { return fallback }
+    return v
+}
+
+fn _fed_env_int(name, fallback) {
+    let v = getenv(name)
+    if v == 0 { return fallback }
+    if len(v) == 0 { return fallback }
+    let n = rt_str_to_int(v)
+    if n <= 0 { return fallback }
+    return n
+}
+
+// Listener addr resolution. CE_FED_LISTEN_ADDR wins; otherwise the
+// documented default 127.0.0.1:8790.
+fn _fed_listen_addr_from_env() {
+    return _fed_env_str("CE_FED_LISTEN_ADDR", CE_FED_DEFAULT_LISTEN_ADDR)
+}
+
+// Bootstrap-peer resolution. CE_FED_PEERS wins; if unset (or empty),
+// fall back to CE_GOSSIP_PEERS so operators who already have a mesh
+// bootstrap block in their environment do not need to duplicate it.
+// Both are comma-separated "host:port" lists (empty tokens dropped).
+fn _fed_peers_from_env() {
+    let out = list_new()
+    let env = getenv("CE_FED_PEERS")
+    if env == 0 { env = getenv("CE_GOSSIP_PEERS") }
+    if env == 0 { return out }
+    if len(env) == 0 { return out }
+    let i = 0
+    let start = 0
+    while i < len(env) {
+        if char_at(env, i) == 44 {   // ','
+            if i > start { push(out, substr(env, start, i - start)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if i > start { push(out, substr(env, start, i - start)) }
+    return out
+}
+
+// Tick-interval resolution. CE_FED_TICK_MS wins; bounded to
+// [CE_FED_MIN_TICK_MS, CE_FED_MAX_TICK_MS] so a fat-fingered
+// `CE_FED_TICK_MS=0` cannot livelock the loop and a giant value
+// cannot silently freeze it.
+fn _fed_tick_ms_from_env() {
+    let n = _fed_env_int("CE_FED_TICK_MS", CE_FED_DEFAULT_TICK_MS)
+    if n < CE_FED_MIN_TICK_MS { n = CE_FED_MIN_TICK_MS }
+    if n > CE_FED_MAX_TICK_MS { n = CE_FED_MAX_TICK_MS }
+    return n
+}
+
+// Soul-id resolution. If CE_FED_SOUL_ID is set (non-empty), use it
+// verbatim; otherwise derive a stable, human-readable id from the
+// listen address so operators do not have to think about the
+// namespace until they run a multi-tenant setup. `soul:<addr>` is
+// the same shape leader_election.nova expects for peer IDs.
+fn _fed_soul_id_from_env(listen_addr) {
+    let v = getenv("CE_FED_SOUL_ID")
+    if v != 0 {
+        if len(v) > 0 { return v }
+    }
+    return "soul:" + listen_addr
+}
+
+// ---- main ------------------------------------------------------------------
+
+fn line() { println("------------------------------------------------------------") }
+
+fn main() {
+    println("=== CrossEngin federation daemon (Phase M R1) ===")
+    println("mesh peer: gossip + kg_sync + distributed_query (ADR-0089)")
+    line()
+
+    // 1. BOOT: resolve env-config. Keep the four inputs adjacent so the
+    // banner reads like a compact deployment sheet.
+    let listen_addr = _fed_listen_addr_from_env()
+    let peer_list   = _fed_peers_from_env()
+    let soul_id     = _fed_soul_id_from_env(listen_addr)
+    let tick_ms     = _fed_tick_ms_from_env()
+
+    println("config   : listen=" + listen_addr
+            + " peers=" + int_to_str(len(peer_list))
+            + " soul=" + soul_id
+            + " tick_ms=" + int_to_str(tick_ms))
+
+    // 2. COMPONENT ALLOC (order fixed by ADR-0089 sec "component alloc"):
+    //   kgreg      -- registry holding this node's shared KGs.
+    //   mo         -- meta-observer surface. R1 does not attribute
+    //                 mesh-received atoms yet (that lands with the
+    //                 R2 rule engine); constructed here so the
+    //                 Session shape holds it and R2 can wire it in
+    //                 without changing the boot.
+    //   fed_kg     -- one reasoning-shaped KG per node so kg_sync
+    //                 has a target for inbound ATOM lines. Named
+    //                 "reasoning" via reasoning_kg_init so the
+    //                 subscribe/publish path in gossip's DELTA
+    //                 branch (kg_sync.nova) can find it by label.
+    //   gs         -- gossip state, wired with self_addr + bootstrap
+    //                 peers. gossip_init takes (self_addr, peers)
+    //                 today; kgreg + mo are held on the Session and
+    //                 wired to gossip callbacks by R3 when the
+    //                 attestation store lands (see ADR-0091 preview).
+    //   listen_fd  -- server socket. gossip_listen binds the TCP
+    //                 listener and returns fd >= 0 on success.
+    //   kgd        -- kg-sync delta state. Not passed into gossip
+    //                 directly today (gossip's DELTA branch works
+    //                 off the raw KG), but constructed here so the
+    //                 Session carries it forward for R2's rule
+    //                 engine to consume.
+    //   dq         -- distributed-query state wired against gs so
+    //                 /gossip_dq (and the chat REPL wiring in
+    //                 examples/crossengin_chat.nova) can fan out
+    //                 SPARQL queries across the mesh.
+    let kgreg = kg_registry_new()
+    let mo    = mo_new()
+    let fed_kg = reasoning_kg_init(kgreg)
+    let gs = gossip_init(listen_addr, peer_list)
+    let listen_fd = gossip_listen(listen_addr)
+    let kgd = kgd_state_new()
+    let dq  = dq_init(gs)
+
+    if listen_fd < 0 {
+        println("gossip   : WARN -- listen bind failed on " + listen_addr
+                + " (port taken, or address unresolvable); running client-only")
+    } else {
+        println("gossip   : listening on " + listen_addr
+                + " fd=" + int_to_str(listen_fd))
+    }
+    println("kg       : one reasoning KG registered as 'reasoning' (atoms="
+            + int_to_str(kg_atom_count(fed_kg)) + ")")
+    println("dq       : distributed-query wired against gossip; peers seed="
+            + int_to_str(gossip_peer_count(gs)))
+    line()
+
+    // 3. Session tie-in. R1 does not need multi-tenant driving, but
+    // registering under a Session gives R3's snapshot / attestation
+    // wiring the seam it needs -- att_store_new + sr_init both live
+    // on the Session, and the chat REPL's `/save` path already speaks
+    // the Session contract. Cognitive slots (soul, lang, ikg, refl_kg,
+    // ctx, log, engine, hs) stay 0 -- this daemon carries the mesh
+    // half of the shape.
+    let sreg = sreg_new()
+    let sess = session_make(soul_id, soul_id, 0,
+                            0,       // sl
+                            kgreg,
+                            fed_kg,
+                            0,       // lang
+                            0,       // ikg
+                            0,       // refl_kg
+                            0,       // ctx
+                            0,       // log
+                            0,       // engine
+                            mo,
+                            0)       // hs
+    sreg_register(sreg, sess)
+    println("session  : registered '" + soul_id + "' in sreg (mesh half)")
+
+    // 4. INPUT SEAM: mirror crossengin_daemon.nova:470-480. A scripted
+    // driver writes one command per invocation to /tmp/crossengin_fed_input;
+    // the tick loop drains it as ONE command line. Recognized commands:
+    //   EXIT       -- clean shutdown
+    //   PEER <a>   -- register bootstrap peer at runtime
+    //   PING       -- force one gossip_step tick regardless of clock
+    // Anything else is logged and ignored.
+    let fed_input_path = "/tmp/crossengin_fed_input"
+
+    // 5. TICK LOOP. Advance one gossip step, drain any accept-pending
+    // conns, then poll the input file. Loop bound `CE_FED_MAXSTEP` for
+    // scripted tests; unset (or 0) -> run until EXIT / EOF. The default
+    // is unbounded so `nova run` sits at the mesh until interrupted.
+    let loop_cap = 0
+    let mx = getenv("CE_FED_MAXSTEP")
+    if mx != 0 {
+        if len(mx) > 0 {
+            let mv = rt_str_to_int(mx)
+            if mv > 0 { loop_cap = mv }
+        }
+    }
+    let step = 0
+    let keep_running = 1
+    let total_accepts = 0
+    let total_ticks = 0
+    while keep_running == 1 {
+        if loop_cap > 0 {
+            if step >= loop_cap { keep_running = 0 }
+        }
+        if keep_running == 1 {
+            // (a) Advance the SWIM clock. gossip_step runs one PING /
+            // DELTA tick against the registered KG (fed_kg). The
+            // return is state (mutated in place); the assignment is
+            // stylistic.
+            gs = gossip_step(gs, fed_kg)
+            total_ticks = total_ticks + 1
+
+            // (b) Drain accept-pending conns. gossip_try_accept
+            // returns -1 (EAGAIN) when the listen fd has nothing
+            // buffered, so this is a cheap poll. When a peer dials
+            // in, hand the conn to gossip_handle_conn_kg so the
+            // DELTA branch can serve ATOMs against fed_kg.
+            if listen_fd >= 0 {
+                let accepted = gossip_try_accept(listen_fd)
+                if accepted >= 0 {
+                    gs = gossip_handle_conn_kg(gs, accepted, fed_kg)
+                    total_accepts = total_accepts + 1
+                }
+            }
+
+            // (c) Scripted command drain. read_file returns 0 when
+            // the file is absent -- treat as "no command this tick".
+            // A single non-empty line is one command; multi-line files
+            // are handled one-per-tick (first line wins, driver
+            // rewrites for the next tick).
+            let input_text = read_file(fed_input_path)
+            if input_text != 0 {
+                if len(input_text) > 0 {
+                    let trimmed = str_trim(input_text)
+                    if len(trimmed) > 0 {
+                        if str_eq_bytes(trimmed, "EXIT") == 1 {
+                            println("input    : EXIT received; shutting down")
+                            keep_running = 0
+                        } else {
+                            if str_eq_bytes(trimmed, "PING") == 1 {
+                                println("input    : PING (extra gossip_step forced)")
+                                gs = gossip_step(gs, fed_kg)
+                            } else {
+                                // PEER <addr>
+                                let plen = len("PEER ")
+                                if len(trimmed) > plen {
+                                    let head = substr(trimmed, 0, plen)
+                                    if str_eq_bytes(head, "PEER ") == 1 {
+                                        let addr = substr(trimmed, plen,
+                                                          len(trimmed) - plen)
+                                        gossip_add_peer(gs, addr)
+                                        println("input    : PEER add "
+                                            + addr + " (peers="
+                                            + int_to_str(
+                                                gossip_peer_count(gs)) + ")")
+                                    } else {
+                                        println("input    : (ignored: "
+                                            + trimmed + ")")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            step = step + 1
+            // (d) Sleep to the next tick. sleep_ms is exposed by the
+            // gossip module's runtime (see src/federation/gossip.nova
+            // header). A 250ms default keeps the loop cheap while
+            // meeting SWIM's PING granularity.
+            sleep_ms(tick_ms)
+        }
+    }
+
+    // 6. SHUTDOWN SUMMARY. Print a one-line stats footer so a scripted
+    // integration harness can grep for it; mirrors the daemon's
+    // shutdown-summary shape (crossengin_daemon.nova:900+).
+    line()
+    println("fed-daemon summary:")
+    println("  ticks           = " + int_to_str(total_ticks))
+    println("  accepts         = " + int_to_str(total_accepts))
+    println("  peer_count      = " + int_to_str(gossip_peer_count(gs)))
+    println("  gossip_pings    = " + int_to_str(gossip_stats_pings(gs)))
+    println("  gossip_acks     = " + int_to_str(gossip_stats_acks(gs)))
+    println("  gossip_timeouts = " + int_to_str(gossip_stats_timeouts(gs)))
+    println("  gossip_deltas   = " + int_to_str(gossip_stats_deltas(gs)))
+    println("  dq_queries      = " + int_to_str(dq_stats_queries(dq)))
+    println("  session_ids     = " + int_to_str(sreg_count(sreg)))
+    println("crossengin-fed: OK")
+    return 0
+}
+
+main()

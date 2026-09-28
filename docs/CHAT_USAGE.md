@@ -210,9 +210,30 @@ detailed in their per-round audit docs (`AUDIO_AUDIT.md`, `IMAGE_AUDIT.md`,
 ### Federation / DP
 
 `/dp_status`, `/dp_query`, `/dp <subcommand>` (status / log / warn / reset),
-`/fed_join`, `/fed_stats`, `/fed_leave`, `/leader`, `/attest_log`, `/nat`,
+`/fed_join`, `/fed_stats`, `/fed_leave`, `/gossip_start`, `/gossip_peer`,
+`/gossip_peers`, `/gossip_dq`, `/leader`, `/attest_log`, `/nat`,
 `/snap_replicas`, `/relay`, `/relay_secure`, `/webrtc`. See
 `FEDERATED_AUDIT.md` and `DP_AUDIT.md` for the per-round detail.
+
+#### `/gossip_*` -- MVP mesh commands (Phase M R1, ADR-0089)
+
+Before Phase M R1 these were stubs that printed `"REPL has no gossip daemon"`.
+R1 wires the four base commands to a lazy-allocated gossip state; the
+recommended production entry point is `examples/crossengin_fed_daemon.nova`
+(`make install && ./bin/crossengin-fed-daemon`), which does the same thing
+as a standalone binary.
+
+| Command                    | Effect                                                                                                                               |
+|----------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `/gossip_start [ADDR]`     | Allocate a gossip state + `dq_init`, bind a TCP listener on `ADDR` (default `127.0.0.1:8790`). Repeated call reports the addr in use. |
+| `/gossip_peer add ADDR`    | Register a bootstrap peer at runtime; reports the new peer count.                                                                    |
+| `/gossip_peers`            | Enumerate the peer table (`<addr> <ALIVE\|SUSPECT\|DEAD> last_seen=<ns>`).                                                          |
+| `/gossip_dq QUERY`         | Fan out `QUERY` (SPARQL) across the mesh via R20E distributed_query; renders each row's peer + bindings.                             |
+
+R2 (ADR-0090) will wire `/leader elect|status` and `/drule_add|run|fixpoint`
+into the same state; R3 (ADR-0091) will wire `/attest_log`, `/attest_verify`,
+`/snap_fetch`, `/snap_serve`. Until then, those commands still print the
+"delegated to standalone driver" stubs.
 
 ### Diagnostics
 

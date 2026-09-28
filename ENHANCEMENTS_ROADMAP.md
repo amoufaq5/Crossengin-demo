@@ -371,6 +371,46 @@ Three focused rounds closing the open threads left by ADR-0072..0085:
 (xref query-time traversal) now form a closed loop: reclaim -> sweep ->
 compact-remap -> observability -> query-side consumption.
 
+## Phase M — Federation Daemon (in progress)
+
+`src/federation/` has 23 unit-tested modules (gossip, kg_sync, distributed
+query, distributed rules, leader election, snapshot attestation + replication,
+DTLS 1.2 with R29B2 stubs, ICE/STUN/TURN/WebRTC, NAT traversal, gossip relays,
+Raft). Every one is unit-tested. Until Phase M, none were wired into a
+runnable daemon; the chat REPL slash commands (`/gossip`, `/gossip_add_peer`,
+`/gossip_noise`, `/leader`, `/attest_log`, `/nat`, `/drule_add`, ...) were
+stubs that printed a link to the integration scenario and returned.
+
+Three focused rounds unify the mesh under a single binary
+(`examples/crossengin_fed_daemon.nova`) and lift the chat REPL stubs to real
+handlers:
+
+- **R1 -- MVP federation daemon (SHIPPED, ADR-0089).** New
+  `examples/crossengin_fed_daemon.nova` composes gossip + kg_sync +
+  distributed_query into one event-driven binary over plain TCP (DTLS 1.2
+  stubs at `src/federation/dtls12.nova:137, 140` block wire encryption
+  until the R29B2 unstub). Env-var contract: `CE_FED_LISTEN_ADDR`
+  (default `127.0.0.1:8790`), `CE_FED_PEERS` (falls back to
+  `CE_GOSSIP_PEERS`), `CE_FED_SOUL_ID`, `CE_FED_TICK_MS` (default 250,
+  clamped to [50, 10000]). Component alloc order: `kg_registry_new` ->
+  `mo_new` -> `reasoning_kg_init` -> `gossip_init` -> `gossip_listen` ->
+  `kgd_state_new` -> `dq_init`; wrapped in a Session for R3's snapshot
+  hooks. Chat REPL now grows four real handlers -- `/gossip_start [addr]`,
+  `/gossip_peer add <addr>`, `/gossip_peers`, `/gossip_dq <query>` --
+  replacing the R18E "this REPL has no gossip daemon" stubs. Argument
+  parsers + output formatters live in `src/chat/fed_slash.nova` for
+  testability. Cross-Windows build target and `install` seat under
+  `crossengin-fed-daemon`.
+- **R2 -- coordination + inference (pending, ADR-0090).** Wire
+  `leader_election` (Bully) + `distributed_rules` (mini-Datalog) into the
+  fed daemon; chat REPL grows `/leader status`, `/leader elect`,
+  `/drule_add`, `/drule_run`, `/drule_fixpoint`.
+- **R3 -- durability (pending, ADR-0091).** Wire `snapshot_attestation` +
+  `snapshot_replication` into the fed daemon; chat REPL grows
+  `/attest_log`, `/attest_verify`, `/snap_fetch`, `/snap_serve`. Closes
+  the federation-daemon arc for what can be built without unstubbing
+  DTLS 1.2.
+
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet
   *requires*; whether they compose into general intelligence is unproven and is
