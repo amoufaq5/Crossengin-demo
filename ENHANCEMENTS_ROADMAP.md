@@ -401,10 +401,28 @@ handlers:
   parsers + output formatters live in `src/chat/fed_slash.nova` for
   testability. Cross-Windows build target and `install` seat under
   `crossengin-fed-daemon`.
-- **R2 -- coordination + inference (pending, ADR-0090).** Wire
-  `leader_election` (Bully) + `distributed_rules` (mini-Datalog) into the
-  fed daemon; chat REPL grows `/leader status`, `/leader elect`,
-  `/drule_add`, `/drule_run`, `/drule_fixpoint`.
+- **R2 -- coordination + inference (SHIPPED, ADR-0090).** Extends the R1
+  fed daemon with `le_init(gs, self_id)` and `dr_init(gs, rule_engine_new())`
+  under two opt-out env flags (`CE_FED_LEADER_ELECTION_ENABLED`,
+  `CE_FED_DR_ENABLED`; default on, only `"0"` disables). Tick body adds
+  `le_step` alongside `gossip_step`; distributed-rules runs on explicit
+  operator invocation (rule evaluation is expensive; drift-free between
+  rounds). Chat REPL: R21B `/drule_add`, `/drule_run` stubs plus the
+  R19E `/leader` stub become real handlers; `/drule_fixpoint` and
+  `/leader elect` newly dispatched; `_chat_fed_le` / `_chat_fed_dr` /
+  `_chat_fed_dr_engine` module singletons allocated alongside the R1
+  gossip state inside `_admin_gossip_start`. Argument parsers + line
+  formatters in `src/chat/fed_slash.nova` (5 new helpers). `soul_id`
+  string maps to Bully's numeric `self_id` via a djb2 mixer masked to
+  24 bits (`_fed_soul_id_to_int`); the chat mirrors the same mixer so
+  chat + daemon at the same address agree on id. New ADR-0090 covers
+  Bully corner cases (split-brain during partition, deferred outbound
+  message queue, gossip-derived convergence shortcut), boundedness
+  (`DR_DEFAULT_MAX_ROUNDS=50` cap on fixpoint), and the R3 preview.
+  Two new test files (`test_fed_daemon_leader.nova`,
+  `test_fed_daemon_rules.nova`; ~30 checks each) exercise the env
+  resolver, mixer, le/dr bootstrap, message-handler flows, and the
+  env-disabled skip path.
 - **R3 -- durability (pending, ADR-0091).** Wire `snapshot_attestation` +
   `snapshot_replication` into the fed daemon; chat REPL grows
   `/attest_log`, `/attest_verify`, `/snap_fetch`, `/snap_serve`. Closes

@@ -100,6 +100,8 @@ import "../src/learning/federated_aggregator.nova"
 import "../src/learning/secure_aggregation.nova"
 import "../src/federation/gossip.nova"
 import "../src/federation/distributed_query.nova"
+import "../src/federation/leader_election.nova"
+import "../src/federation/distributed_rules.nova"
 import "../src/chat/helpers.nova"
 import "../src/chat/fed_slash.nova"
 import "../src/util/chat_cli_polish.nova"
@@ -265,6 +267,19 @@ let _fed_conn_fd = 0 - 1
 let _chat_fed_gs = 0
 let _chat_fed_dq = 0
 let _chat_fed_listen_addr = ""
+
+// Phase M R2 (ADR-0090) -- module-level lazy-init state for the R2
+// federation slash commands (`/leader`, `/leader elect`, `/drule_add`,
+// `/drule_run`, `/drule_fixpoint`). The leader-election + distributed-
+// rules state is allocated alongside `_chat_fed_gs` inside
+// `_admin_gossip_start` so a single `/gossip_start` boots the full R1+R2
+// mesh surface. `_chat_fed_dr_engine` holds the rule engine that the
+// dr_state wraps (dr_run_round takes an engine reference via the state).
+// The R3 stubs (`/attest_log`, `/snap_replicas`, ...) stay in place
+// until R3 lands.
+let _chat_fed_le = 0
+let _chat_fed_dr = 0
+let _chat_fed_dr_engine = 0
 
 // R112 CLI polish (Phase K part 3):
 //   _chat_json_mode -- 1 when the REPL should emit one JSON line per
@@ -2816,7 +2831,13 @@ fn _admin_help() {
     println("  /predict ID [K] [M] link prediction (M in {cn,jaccard,aa}; default jaccard); top-K candidate edges from ID (R18B)")
     println("  /temporal ID REL    Allen interval-algebra query (REL in {before,after,meets,overlaps,during,equals,...}); atoms in this relation to ID (R19C)")
     println("  /rule_add RULE h(?a,?b)<-b1(?a,?b),b2(?b,?c) ; /rule_run [MAX]    register a Datalog rule / forward-chain to fixpoint, reports (rules,derived,iterations) (R20B)")
-    println("  /drule_add <rule> ; /drule_run    distributed (federated) Datalog rule add + run-to-fixpoint; ships in src/federation/distributed_rules.nova (no in-REPL gossip; see scenario_eeee) (R21B)")
+    println("  /drule_add RULE     Phase M R2 (ADR-0090): register a mini-Datalog rule in the")
+    println("                      federated distributed_rules engine wired against gossip.")
+    println("                      Requires /gossip_start first. Broadcasts the rule to alive peers.")
+    println("  /drule_run          Phase M R2: run ONE round of federated rule inference against")
+    println("                      the chat's kg (drains inbound RULE + DERIVATION queues too).")
+    println("  /drule_fixpoint     Phase M R2: run distributed rule inference to a bounded fixpoint")
+    println("                      (max_rounds=DR_DEFAULT_MAX_ROUNDS=50); reports (derived, rounds).")
     println("  /explain ATOM_ID    recursive provenance walk over R20B's rule engine; prints indented proof tree with rule names, atom IDs, and ground facts (R22E)")
     println("  /recall member ID   episodic memories where atom ID is in the cluster (R8F)")
     println("  /recall window S E  episodic memories whose [first,last] overlaps [S,E]")
@@ -2853,7 +2874,9 @@ fn _admin_help() {
     println("                      <addr> <ALIVE|SUSPECT|DEAD> last_seen=<ns>")
     println("  /gossip_dq QUERY    fan out QUERY (SPARQL) across the mesh via R20E distributed")
     println("                      query; renders each returned binding annotated with peer addr")
-    println("  /leader             R19E Bully leader-election status (delegated to standalone driver, see scenario_zzz_leader.sh)")
+    println("  /leader [status|elect] Phase M R2 (ADR-0090): Bully leader-election on top of the gossip")
+    println("                      mesh. `/leader` or `/leader status` prints leader / self_id / phase;")
+    println("                      `/leader elect` kicks off a fresh election. Requires /gossip_start first.")
     println("  /attest_log PEER    R20F signed-snapshot attestation log for peer (delegated to standalone driver, see scenario_dddd_snapshot_attestation.sh)")
     println("  /lipsync DIR W.wav  R23B audio-vision lip sync detection: per-frame mouth-open intensity gradient correlated with VAD voicing; DIR contains frame_001.pgm, ...")
     println("  /nat status         R23E NAT traversal status (info-line; delegated to standalone driver, see scenario_oooo_nat_traversal.sh)")
@@ -5033,8 +5056,134 @@ fn _admin_gossip_start(arg) {
     let fd = gossip_listen(addr)
     _chat_fed_gs = gs
     _chat_fed_dq = dq_init(gs)
+    // R2 (ADR-0090): allocate leader-election + distributed-rules state
+    // as siblings of _chat_fed_dq so the /leader and /drule_* commands
+    // work off the same gossip mesh. self_id is derived from the listen
+    // addr the same way the fed daemon derives it (djb2 mask); this
+    // gives the chat and daemon the SAME numeric ID for the same
+    // addr so a mixed-mode test can bridge them.
+    _chat_fed_le = le_init(gs, _chat_soul_id_to_int(addr))
+    _chat_fed_dr_engine = rule_engine_new()
+    _chat_fed_dr = dr_init(gs, _chat_fed_dr_engine)
     _chat_fed_listen_addr = addr
     println(chat_fed_gossip_started_line(addr, fd))
+    return 1
+}
+
+// R2 (ADR-0090): tiny djb2-style mixer, byte-identical to
+// _fed_soul_id_to_int in examples/crossengin_fed_daemon.nova. Kept
+// local to the chat so we don't have to re-import the daemon binary;
+// the tests validate parity by feeding the same input to both.
+let _CHAT_FED_LE_ID_MASK = 16777215
+fn _chat_soul_id_to_int(s) {
+    if s == 0 { return 0 }
+    let n = len(s)
+    if n == 0 { return 0 }
+    let h = 5381
+    let i = 0
+    while i < n {
+        h = ((h * 33) + char_at(s, i)) & _CHAT_FED_LE_ID_MASK
+        i = i + 1
+    }
+    if h == 0 { return 1 }
+    return h
+}
+
+// ---- Phase M R2 (ADR-0090) -- /leader + /drule_* handlers ---------------
+//
+// These replace the R19E "REPL has no leader-election state" and R21B
+// "REPL has no gossip daemon" stubs. The module-level singletons are
+// allocated in _admin_gossip_start alongside gs+dq; a bare /leader
+// before /gossip_start prints the "no state" line and returns 1.
+//
+// Argument parsing + line formatting live in src/chat/fed_slash.nova
+// so the tests can validate the exact wire shape without spinning up
+// a live gossip listener.
+
+fn _admin_leader(arg) {
+    if _chat_fed_gs == 0 {
+        println(chat_fed_le_no_state_line())
+        return 1
+    }
+    if _chat_fed_le == 0 {
+        println(chat_fed_le_no_state_line())
+        return 1
+    }
+    let op = chat_fed_le_parse_arg(arg)
+    if str_eq_bytes(op, "status") == 1 {
+        println(chat_fed_le_status_line(_chat_fed_le))
+        return 1
+    }
+    if str_eq_bytes(op, "elect") == 1 {
+        le_start_election(_chat_fed_le)
+        println(chat_fed_le_elect_result_line(_chat_fed_le, 1))
+        return 1
+    }
+    println(chat_fed_le_usage_line())
+    return 1
+}
+
+fn _admin_drule_add(arg) {
+    if _chat_fed_gs == 0 {
+        println(chat_fed_drule_no_state_line())
+        return 1
+    }
+    if _chat_fed_dr == 0 {
+        println(chat_fed_drule_no_state_line())
+        return 1
+    }
+    let rule_text = chat_fed_drule_add_parse(arg)
+    if len(rule_text) == 0 {
+        println(chat_fed_drule_add_usage_line())
+        return 1
+    }
+    let r = dr_add_rule(_chat_fed_dr, rule_text)
+    if _rule_is_error(r) == 1 {
+        // Rule engine returns an error tuple; the second element is a
+        // short reason string suitable for surfacing to the operator.
+        let reason = "malformed"
+        if len(r) >= 2 { reason = r[1] }
+        println(chat_fed_drule_add_result_line(rule_text, 0, reason))
+        return 1
+    }
+    println(chat_fed_drule_add_result_line(rule_text, 1, ""))
+    return 1
+}
+
+fn _admin_drule_run(kg) {
+    if _chat_fed_gs == 0 {
+        println(chat_fed_drule_no_state_line())
+        return 1
+    }
+    if _chat_fed_dr == 0 {
+        println(chat_fed_drule_no_state_line())
+        return 1
+    }
+    let derived = dr_run_round(_chat_fed_dr, kg)
+    println(chat_fed_drule_run_line(derived))
+    return 1
+}
+
+fn _admin_drule_fixpoint(kg) {
+    if _chat_fed_gs == 0 {
+        println(chat_fed_drule_no_state_line())
+        return 1
+    }
+    if _chat_fed_dr == 0 {
+        println(chat_fed_drule_no_state_line())
+        return 1
+    }
+    // Pass 0 so dr_run_to_fixpoint falls back to its own
+    // DR_DEFAULT_MAX_ROUNDS (50) cap. The chat helper's status line
+    // surfaces that cap verbatim.
+    let r = dr_run_to_fixpoint(_chat_fed_dr, kg, 0)
+    let total  = 0
+    let rounds = 0
+    if len(r) >= 2 {
+        total  = r[0]
+        rounds = r[1]
+    }
+    println(chat_fed_drule_fixpoint_line(total, rounds))
     return 1
 }
 
@@ -5562,8 +5711,12 @@ fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, 
     if str_eq_bytes(cmd, "/rule_run")     == 1 { return rule_chat_run_cmd(kg, arg) }
     if str_eq_bytes(cmd, "/explain")      == 1 { return explain_chat_cmd(kg, arg) }
     if str_eq_bytes(cmd, "/rss")          == 1 { return rss_chat_cmd(kg, arg) }
-    if str_eq_bytes(cmd, "/drule_add")    == 1 { println("DRULE_ADD info=R21B distributed rule inference ships in src/federation/distributed_rules.nova; this REPL has no gossip daemon (see tests/integration/scenario_eeee_distributed_rules.sh for the 3-soul cross-soul derivation walkthrough)") return 1 }
-    if str_eq_bytes(cmd, "/drule_run")    == 1 { println("DRULE_RUN info=R21B distributed rule inference; this REPL has no gossip daemon (see tests/integration/scenario_eeee_distributed_rules.sh for the 3-soul fixpoint over partitioned parent-fact set)") return 1 }
+    // Phase M R2 (ADR-0090): /drule_add, /drule_run, /drule_fixpoint
+    // are live handlers. They require /gossip_start first (the same
+    // lazy allocation that owns _chat_fed_gs also owns _chat_fed_dr).
+    if str_eq_bytes(cmd, "/drule_add")     == 1 { return _admin_drule_add(arg) }
+    if str_eq_bytes(cmd, "/drule_run")     == 1 { return _admin_drule_run(kg) }
+    if str_eq_bytes(cmd, "/drule_fixpoint") == 1 { return _admin_drule_fixpoint(kg) }
     if str_eq_bytes(cmd, "/meta")    == 1 { return _admin_meta(mo, refl_kg, kg, now) }
     if str_eq_bytes(cmd, "/meta-feedback") == 1 { return _admin_meta_feedback(mo, sauth) }
     if str_eq_bytes(cmd, "/meta-apply")    == 1 { return _admin_meta_apply(mo, sauth) }
@@ -5586,7 +5739,11 @@ fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, 
     if str_eq_bytes(cmd, "/gossip_peers")    == 1 { return _admin_gossip_peers() }
     if str_eq_bytes(cmd, "/gossip_dq")       == 1 { return _admin_gossip_dq(kg, arg) }
     if str_eq_bytes(cmd, "/gossip_noise") == 1 { println("gossip_noise: R21E Noise-XK transport for gossip ships in src/federation/gossip.nova (gossip_set_noise_keys + gossip_register_peer_pubkey + CE_GOSSIP_REQUIRE_NOISE); REPL has no gossip state -- see tests/integration/scenario_hhhh_gossip_noise.sh") return 1 }
-    if str_eq_bytes(cmd, "/leader")      == 1 { println("leader: R19E Bully leader election module ships in src/federation/leader_election.nova; this REPL has no leader-election state (see tests/integration/scenario_zzz_leader.sh for the 3-soul highest-ID elects + leader-death re-election walkthrough)") return 1 }
+    // Phase M R2 (ADR-0090): /leader is a live handler wired against
+    // _chat_fed_le. `/leader` (no arg) or `/leader status` prints the
+    // status line; `/leader elect` kicks a Bully election on the local
+    // gossip peer table.
+    if str_eq_bytes(cmd, "/leader")      == 1 { return _admin_leader(arg) }
     if str_eq_bytes(cmd, "/attest_log")  == 1 { println("attest_log: R20F gossip-relayed signed snapshot attestation module ships in src/federation/snapshot_attestation.nova; this REPL has no gossip daemon (see tests/integration/scenario_dddd_snapshot_attestation.sh for the 2-soul mesh that broadcasts ATTESTATION tuples and verifies them against peer pubkeys)") return 1 }
     if str_eq_bytes(cmd, "/nat")         == 1 { println("nat: R23E NAT traversal -- STUN-like external addr discovery + gossip-piggyback advertisement ships in src/federation/nat_traversal.nova (nat_query_stun + nat_advertise + nat_detect_type + EXTADDR wire); UDP hole-punching deferred to R23E.2 pending NOVA sendto/recvfrom -- see tests/integration/scenario_oooo_nat_traversal.sh for the 2-soul mesh") return 1 }
     if str_eq_bytes(cmd, "/snap_replicas") == 1 { println("snap_replicas: R23C federation snapshot replication ships in src/federation/snapshot_replication.nova (sr_init + sr_observe_attestation + gossip_send_snap_fetch + sr_observe_snap_response); the REPL has no gossip daemon -- see tests/integration/scenario_mmmm_snap_replication.sh for the 2-soul walkthrough that broadcasts an attestation, drives SNAP_FETCH, verifies + stores the snapshot bytes against the signed Merkle root, and rejects tampered bytes") return 1 }

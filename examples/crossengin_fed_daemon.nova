@@ -1,4 +1,4 @@
-// CrossEngin federation daemon (Phase M R1, ADR-0089).
+// CrossEngin federation daemon (Phase M R1 + R2, ADR-0089 + ADR-0090).
 //
 // Purpose
 //   The `src/federation/` tree ships 23 unit-tested modules -- gossip
@@ -6,14 +6,16 @@
 //   distributed rules (R21B), leader election (R19E), snapshot
 //   attestation + replication (R20F/R23C), DTLS 1.2 (with R29B2 stubs),
 //   ICE/STUN/TURN/WebRTC, NAT traversal, gossip relays, Raft. Every
-//   one is unit-tested. None were wired into a runnable daemon.
+//   one is unit-tested. None were wired into a runnable daemon until
+//   Phase M.
 //
 //   This binary composes the R1 subset -- gossip + kg_sync + distributed
-//   query -- into a single event-driven mesh peer, mirroring the shape of
+//   query -- and the R2 additions -- leader election (Bully over gossip)
+//   and distributed rules (mini-Datalog over gossip) -- into a single
+//   event-driven mesh peer, mirroring the shape of
 //   examples/crossengin_daemon.nova:250-517 (env-config -> alloc ->
-//   session-register -> tick loop). Leader election and distributed
-//   rules land in R2 (ADR-0090); snapshot attestation and replication
-//   in R3 (ADR-0091). DTLS 1.2 stays out until the R29B2 cert-verify
+//   session-register -> tick loop). Snapshot attestation and replication
+//   land in R3 (ADR-0091). DTLS 1.2 stays out until the R29B2 cert-verify
 //   and SRTP EKM stubs at src/federation/dtls12.nova:137, 140 are
 //   filled in; the daemon runs plain TCP gossip until then.
 //
@@ -46,11 +48,21 @@
 //   CE_FED_TICK_MS       default 250
 //                        Milliseconds between gossip_step / accept /
 //                        input-poll ticks. Bounded [50, 10000].
+//   CE_FED_LEADER_ELECTION_ENABLED  default 1
+//                        Set to 0 to skip le_init at boot -- for hosts
+//                        that only want the gossip + kg_sync + dq slice
+//                        without paying the leader-election tick cost
+//                        or seeing /leader references in the shutdown
+//                        summary. Any non-"0" value is treated as
+//                        enabled.
+//   CE_FED_DR_ENABLED    default 1
+//                        Set to 0 to skip dr_init at boot. Same shape
+//                        as CE_FED_LEADER_ELECTION_ENABLED.
 //
-// ADRs exercised: ADR-0089 (this daemon), ADR-0051 (Session shape),
-//   plus every federation-module ADR the composed primitives implement
-//   (ADR-0054 subset for the aggregator seam, R18E/R19E/R20E/R21B for
-//   the federation primitives).
+// ADRs exercised: ADR-0089 (R1 subset), ADR-0090 (R2 coordination +
+//   inference), ADR-0051 (Session shape), plus every federation-module
+//   ADR the composed primitives implement (ADR-0054 subset for the
+//   aggregator seam, R18E/R19E/R20E/R21B for the federation primitives).
 
 import "std/syscall"
 import "std/string"
@@ -63,6 +75,9 @@ import "../src/parts/meta/meta_observer.nova"
 import "../src/federation/gossip.nova"
 import "../src/federation/kg_sync.nova"
 import "../src/federation/distributed_query.nova"
+import "../src/federation/leader_election.nova"
+import "../src/federation/distributed_rules.nova"
+import "../src/kg/rule_inference.nova"
 import "../src/session/session.nova"
 
 // ---- env-var config -------------------------------------------------------
@@ -146,6 +161,54 @@ fn _fed_soul_id_from_env(listen_addr) {
     return "soul:" + listen_addr
 }
 
+// R2 (ADR-0090) enable-flag resolution. `CE_FED_LEADER_ELECTION_ENABLED`
+// and `CE_FED_DR_ENABLED` are opt-OUT: default is on, "0" turns off. Any
+// other non-empty value is treated as enabled so operators are not
+// tripped up by "true" / "yes" / "1" variance. NOVA has no setenv, so
+// the raw env value is what the pure resolver takes.
+fn _fed_bool_from_env_value(v, default_on) {
+    if v == 0 { return default_on }
+    if len(v) == 0 { return default_on }
+    // Only literal "0" disables. Everything else enables.
+    if str_eq_bytes(v, "0") == 1 { return 0 }
+    return 1
+}
+
+fn _fed_le_enabled_from_env() {
+    return _fed_bool_from_env_value(getenv("CE_FED_LEADER_ELECTION_ENABLED"), 1)
+}
+
+fn _fed_dr_enabled_from_env() {
+    return _fed_bool_from_env_value(getenv("CE_FED_DR_ENABLED"), 1)
+}
+
+// Derive a small non-negative int from a soul-id string, stable across
+// runs of the same soul_id. Bully leader election compares self_id
+// against peer IDs, so any deterministic byte-mixer works; we use a
+// djb2-style rolling multiply on the string bytes and mask to a
+// 24-bit positive range so the shutdown-summary line stays readable
+// and there is no chance of a large-literal codegen (bug #11) drift
+// in downstream arithmetic. Empty input -> 0 (the sentinel; won't
+// collide with a real hash because the mask keeps zeros distinct
+// only when the input is non-empty).
+let _FED_LE_ID_MASK = 16777215   // (1 << 24) - 1; fits well under Bug-#11 limits
+fn _fed_soul_id_to_int(s) {
+    if s == 0 { return 0 }
+    let n = len(s)
+    if n == 0 { return 0 }
+    let h = 5381
+    let i = 0
+    while i < n {
+        // h * 33 + byte, masked each step so h stays bounded.
+        h = ((h * 33) + char_at(s, i)) & _FED_LE_ID_MASK
+        i = i + 1
+    }
+    // Ensure a non-empty string never produces 0 (0 is our "unset"
+    // sentinel in the /leader status line).
+    if h == 0 { return 1 }
+    return h
+}
+
 // ---- main ------------------------------------------------------------------
 
 fn line() { println("------------------------------------------------------------") }
@@ -203,6 +266,32 @@ fn main() {
     let kgd = kgd_state_new()
     let dq  = dq_init(gs)
 
+    // R2 (ADR-0090): leader election + distributed rules.
+    //   le  -- Bully leader-election state, self_id derived from
+    //          soul_id via _fed_soul_id_to_int (stable, small non-neg
+    //          int). Registered peers get their IDs the same way as the
+    //          daemon discovers them via gossip (deferred to the input
+    //          seam / operator wiring; R2 boots with self only). Skip
+    //          allocation when CE_FED_LEADER_ELECTION_ENABLED=0.
+    //   dr_engine, dr  -- distributed-rules state paired with a fresh
+    //          rule_engine. dr_init also installs itself on `gs` via
+    //          gossip_set_dr_state so inbound RULE / DERIVATION lines
+    //          route to this dr without a callback dance. Skip when
+    //          CE_FED_DR_ENABLED=0.
+    let le_enabled = _fed_le_enabled_from_env()
+    let dr_enabled = _fed_dr_enabled_from_env()
+    let self_id_int = _fed_soul_id_to_int(soul_id)
+    let le = 0
+    let dr_engine = 0
+    let dr = 0
+    if le_enabled == 1 {
+        le = le_init(gs, self_id_int)
+    }
+    if dr_enabled == 1 {
+        dr_engine = rule_engine_new()
+        dr = dr_init(gs, dr_engine)
+    }
+
     if listen_fd < 0 {
         println("gossip   : WARN -- listen bind failed on " + listen_addr
                 + " (port taken, or address unresolvable); running client-only")
@@ -214,6 +303,19 @@ fn main() {
             + int_to_str(kg_atom_count(fed_kg)) + ")")
     println("dq       : distributed-query wired against gossip; peers seed="
             + int_to_str(gossip_peer_count(gs)))
+    if le_enabled == 1 {
+        println("leader   : bully leader-election wired; self_id="
+                + int_to_str(self_id_int)
+                + " (CE_FED_LEADER_ELECTION_ENABLED=1)")
+    } else {
+        println("leader   : DISABLED (CE_FED_LEADER_ELECTION_ENABLED=0)")
+    }
+    if dr_enabled == 1 {
+        println("drules   : distributed-rules wired against gossip; rules=0"
+                + " (CE_FED_DR_ENABLED=1)")
+    } else {
+        println("drules   : DISABLED (CE_FED_DR_ENABLED=0)")
+    }
     line()
 
     // 3. Session tie-in. R1 does not need multi-tenant driving, but
@@ -275,6 +377,20 @@ fn main() {
             // stylistic.
             gs = gossip_step(gs, fed_kg)
             total_ticks = total_ticks + 1
+
+            // (a.1) R2 (ADR-0090): advance the leader-election tick.
+            // le_step (no `now` arg -- reads nanotime() internally)
+            // checks whether an in-flight election has timed out,
+            // whether the current leader is still gossip-alive, and
+            // whether a higher-ID non-dead peer has surfaced. It is
+            // cheap: a couple of list walks over the alive-peer set.
+            // Distributed rules (dr) do not tick continuously -- they
+            // run on explicit /drule_run + /drule_fixpoint invocation
+            // via the input seam / chat REPL -- so no per-tick call
+            // for dr here.
+            if le != 0 {
+                le_step(le)
+            }
 
             // (b) Drain accept-pending conns. gossip_try_accept
             // returns -1 (EAGAIN) when the listen fd has nothing
@@ -352,6 +468,28 @@ fn main() {
     println("  gossip_timeouts = " + int_to_str(gossip_stats_timeouts(gs)))
     println("  gossip_deltas   = " + int_to_str(gossip_stats_deltas(gs)))
     println("  dq_queries      = " + int_to_str(dq_stats_queries(dq)))
+    // R2 (ADR-0090) counters. Guarded on the enable-flag path so a
+    // daemon booted with the R2 primitives disabled still prints a
+    // recognisable footer (the disabled lines say so explicitly rather
+    // than printing 0s that look like "no activity").
+    if le != 0 {
+        println("  le_self_id      = " + int_to_str(self_id_int))
+        println("  le_leader       = " + int_to_str(le_current_leader(le)))
+        println("  le_elections    = " + int_to_str(le_stats_elections(le)))
+        println("  le_victories    = " + int_to_str(le_stats_victories(le)))
+        println("  le_deposed      = " + int_to_str(le_stats_deposed(le)))
+    } else {
+        println("  le_disabled     = 1")
+    }
+    if dr != 0 {
+        println("  dr_rules        = " + int_to_str(dr_rule_count(dr)))
+        println("  dr_derived      = " + int_to_str(dr_stats_derived(dr)))
+        println("  dr_rounds       = " + int_to_str(dr_stats_rounds(dr)))
+        println("  dr_rules_tx     = " + int_to_str(dr_stats_rules_tx(dr)))
+        println("  dr_derivs_tx    = " + int_to_str(dr_stats_derivs_tx(dr)))
+    } else {
+        println("  dr_disabled     = 1")
+    }
     println("  session_ids     = " + int_to_str(sreg_count(sreg)))
     println("crossengin-fed: OK")
     return 0

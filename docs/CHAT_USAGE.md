@@ -230,10 +230,38 @@ as a standalone binary.
 | `/gossip_peers`            | Enumerate the peer table (`<addr> <ALIVE\|SUSPECT\|DEAD> last_seen=<ns>`).                                                          |
 | `/gossip_dq QUERY`         | Fan out `QUERY` (SPARQL) across the mesh via R20E distributed_query; renders each row's peer + bindings.                             |
 
-R2 (ADR-0090) will wire `/leader elect|status` and `/drule_add|run|fixpoint`
-into the same state; R3 (ADR-0091) will wire `/attest_log`, `/attest_verify`,
-`/snap_fetch`, `/snap_serve`. Until then, those commands still print the
-"delegated to standalone driver" stubs.
+R2 (ADR-0090) wires `/leader elect|status` and `/drule_add|run|fixpoint`
+into the same state (see subsection below); R3 (ADR-0091) will wire
+`/attest_log`, `/attest_verify`, `/snap_fetch`, `/snap_serve`. Until R3
+lands, those commands still print the "delegated to standalone driver"
+stubs.
+
+#### `/leader` + `/drule_*` -- coordination + inference (Phase M R2, ADR-0090)
+
+R2 replaces the R19E `/leader` stub and the R21B `/drule_add`, `/drule_run`
+stubs with live handlers, and adds `/drule_fixpoint`. All five require
+`/gossip_start` first: the module-level lazy-init state
+(`_chat_fed_le`, `_chat_fed_dr`, `_chat_fed_dr_engine`) is allocated
+alongside the R1 gossip state so one `/gossip_start` boots the R1+R2 mesh
+surface. The recommended production entry point is the fed daemon
+(`nova run examples/crossengin_fed_daemon.nova`), which allocates the
+same state at boot; the chat REPL is for operators who want a live view
+without spawning a second process.
+
+| Command                    | Effect                                                                                                                               |
+|----------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `/leader` or `/leader status` | Print the current Bully leader-election status line -- `leader=<id> self_id=<n> is_leader=<yes\|no> state=<stable\|electing> peers=<n> elections=<n> victories=<n> deposed=<n>`. |
+| `/leader elect`            | Kick off a fresh Bully election on the local peer table. Prints `election started` with the new `elections` counter.               |
+| `/drule_add RULE`          | Register a mini-Datalog rule (e.g. `RULE ancestor(?a,?b) <- parent(?a,?b)`) with the federated engine and broadcast to alive peers. |
+| `/drule_run`               | Run ONE round of federated rule inference against the chat's KG (drains inbound RULE + DERIVATION queues too). Prints new-derivation count. |
+| `/drule_fixpoint`          | Run distributed rule inference to a bounded fixpoint (`DR_DEFAULT_MAX_ROUNDS=50`); reports `(derived, rounds)`.                    |
+
+Env vars added by R2 (both default on; only literal `"0"` disables):
+
+| Env var                              | Effect on `"0"`                                                       |
+|--------------------------------------|-----------------------------------------------------------------------|
+| `CE_FED_LEADER_ELECTION_ENABLED`     | Fed daemon skips `le_init`; `/leader` handler prints "no state".      |
+| `CE_FED_DR_ENABLED`                  | Fed daemon skips `dr_init`; `/drule_*` handlers print "no state".     |
 
 ### Diagnostics
 

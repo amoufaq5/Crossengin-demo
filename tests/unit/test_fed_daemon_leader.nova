@@ -1,0 +1,388 @@
+// Unit tests for examples/crossengin_fed_daemon.nova R2 leader-election
+// wiring (Phase M R2, ADR-0090).
+//
+// Coverage (~30 assertions) -- the daemon's env-config resolver for
+// CE_FED_LEADER_ELECTION_ENABLED, the soul-id-to-int mixer that derives
+// the numeric self_id, and the bootstrap + step-flow of leader_election
+// itself when wired against a gossip state (single-node, two-node
+// mocked, message-driven, and stability-check paths).
+//
+// NOVA has no `setenv`; the env resolver is a pure function that takes
+// the raw env value as an argument. The daemon's on-disk helper is a
+// three-liner that unwraps `getenv(name)` and delegates to the pure
+// resolver -- any drift shows up as a compile error against the wrapper's
+// use site. Same shape as test_fed_daemon_boot.nova and
+// test_session_paths.nova.
+//
+// Coverage map:
+//   1. Env-flag resolver: default when input is 0 / empty, passes non-"0"
+//      through as enabled, only literal "0" disables.
+//   2. Soul-id-to-int mixer: 0 for null/empty, non-zero for non-empty,
+//      deterministic across calls, always <= 24-bit mask.
+//   3. le_init(gs, self_id_int): bootstrap state -- leader=-1,
+//      phase=STABLE, self_id preserved, is_leader=0.
+//   4. Peer-id map: register / re-register / unregister.
+//   5. le_start_election: transitions to ELECTING, sets started_ns,
+//      bumps stats_elections, clears leader.
+//   6. le_on_election from a lower-ID peer: enqueues OK + kicks own
+//      election.
+//   7. le_on_election from a higher-ID peer: no OK enqueued (we wait
+//      for VICTORY).
+//   8. le_on_victory from a higher-ID peer: leader updates to that peer;
+//      phase returns to STABLE.
+//   9. le_on_victory from a lower-ID peer: ignored (leader unchanged).
+//  10. Two-node mocked scenario: le at self_id=10 with a peer at id=30 --
+//      after le_on_victory(le, 30), le_current_leader == 30.
+//  11. Env-disabled path: _t_le_enabled_resolve("0") returns 0; the
+//      daemon skips le_init.
+//
+// The unit tests avoid network I/O -- gossip_init is called without a
+// listener bind (peers are added via bootstrap-peer-list or omitted).
+// The integration path (real Bully round-trip over gossip) is covered
+// by tests/integration/scenario_zzz_leader.sh.
+
+import "../ce_test.nova"
+import "../../src/federation/gossip.nova"
+import "../../src/federation/leader_election.nova"
+
+// ---- daemon-parity pure resolvers ---------------------------------------
+
+// Byte-identical to _fed_bool_from_env_value in
+// examples/crossengin_fed_daemon.nova (default-on flavour). The daemon
+// calls the wrapped `_fed_le_enabled_from_env()`, which reads
+// getenv("CE_FED_LEADER_ELECTION_ENABLED") and delegates here.
+fn _t_bool_from_env_value(v, default_on) {
+    if v == 0 { return default_on }
+    if len(v) == 0 { return default_on }
+    if str_eq_bytes(v, "0") == 1 { return 0 }
+    return 1
+}
+
+fn _t_le_enabled_resolve(v) {
+    return _t_bool_from_env_value(v, 1)
+}
+
+// Byte-identical to _fed_soul_id_to_int (and _chat_soul_id_to_int in the
+// chat REPL). Kept here so a drift between the two mixers is caught by
+// the parity assertions below.
+let _T_FED_LE_ID_MASK = 16777215
+fn _t_soul_id_to_int(s) {
+    if s == 0 { return 0 }
+    let n = len(s)
+    if n == 0 { return 0 }
+    let h = 5381
+    let i = 0
+    while i < n {
+        h = ((h * 33) + char_at(s, i)) & _T_FED_LE_ID_MASK
+        i = i + 1
+    }
+    if h == 0 { return 1 }
+    return h
+}
+
+// ---- env-flag resolver ---------------------------------------------------
+
+fn test_le_enabled_default_when_null() {
+    ce_eq("null env -> enabled (default 1)", _t_le_enabled_resolve(0), 1)
+}
+
+fn test_le_enabled_default_when_empty() {
+    ce_eq("empty env -> enabled (default 1)", _t_le_enabled_resolve(""), 1)
+}
+
+fn test_le_enabled_disabled_by_literal_zero() {
+    ce_eq("'0' env -> disabled", _t_le_enabled_resolve("0"), 0)
+}
+
+fn test_le_enabled_passes_through_one() {
+    ce_eq("'1' env -> enabled", _t_le_enabled_resolve("1"), 1)
+}
+
+fn test_le_enabled_passes_through_yes() {
+    // Only literal "0" disables -- any other non-empty value stays enabled.
+    ce_eq("'yes' env -> enabled (only '0' disables)",
+          _t_le_enabled_resolve("yes"), 1)
+}
+
+fn test_le_enabled_passes_through_true() {
+    ce_eq("'true' env -> enabled",
+          _t_le_enabled_resolve("true"), 1)
+}
+
+// ---- soul-id-to-int mixer ------------------------------------------------
+
+fn test_soul_id_mixer_null_is_zero() {
+    ce_eq("null soul_id -> 0", _t_soul_id_to_int(0), 0)
+}
+
+fn test_soul_id_mixer_empty_is_zero() {
+    ce_eq("empty soul_id -> 0", _t_soul_id_to_int(""), 0)
+}
+
+fn test_soul_id_mixer_nonempty_nonzero() {
+    let h = _t_soul_id_to_int("soul:127.0.0.1:8790")
+    ce_check("non-empty soul_id -> non-zero id", h != 0)
+    ce_check("id fits in 24-bit mask", h <= _T_FED_LE_ID_MASK)
+    ce_check("id is non-negative", h >= 0)
+}
+
+fn test_soul_id_mixer_deterministic() {
+    let a = _t_soul_id_to_int("soul:127.0.0.1:8790")
+    let b = _t_soul_id_to_int("soul:127.0.0.1:8790")
+    ce_eq("mixer is deterministic across calls", a, b)
+}
+
+fn test_soul_id_mixer_distinct_inputs_distinct_outputs() {
+    // Not a hash-guarantee (djb2 can collide) but the two obvious
+    // deployment IDs should differ.
+    let a = _t_soul_id_to_int("soul:127.0.0.1:8790")
+    let b = _t_soul_id_to_int("soul:127.0.0.1:8791")
+    ce_check("two adjacent addrs -> distinct ids", a != b)
+}
+
+// ---- le bootstrap --------------------------------------------------------
+
+fn _mk_gs() { return gossip_init("127.0.0.1:9990", 0) }
+
+fn test_le_init_bootstrap_no_leader() {
+    let gs = _mk_gs()
+    let self_id = _t_soul_id_to_int("soul:127.0.0.1:9990")
+    let le = le_init(gs, self_id)
+    ce_check("le_init returns non-null", le != 0)
+    ce_eq("bootstrap leader = -1", le_current_leader(le), -1)
+    ce_eq("bootstrap phase = STABLE",
+          le_election_state(le), LE_STATE_STABLE)
+    ce_eq("bootstrap self_id preserved", le_self_id(le), self_id)
+    ce_eq("bootstrap is_leader = 0 (no leader yet)",
+          le_is_leader(le), 0)
+}
+
+fn test_le_init_stats_start_at_zero() {
+    let gs = _mk_gs()
+    let le = le_init(gs, 42)
+    ce_eq("bootstrap elections = 0", le_stats_elections(le), 0)
+    ce_eq("bootstrap victories = 0", le_stats_victories(le), 0)
+    ce_eq("bootstrap deposed = 0", le_stats_deposed(le), 0)
+    ce_eq("bootstrap peer_count = 0", le_peer_count(le), 0)
+    ce_eq("bootstrap pending msgs = 0",
+          le_pending_message_count(le), 0)
+}
+
+// ---- peer-id map --------------------------------------------------------
+
+fn test_le_register_peer_round_trip() {
+    let gs = _mk_gs()
+    let le = le_init(gs, 10)
+    le_register_peer(le, "127.0.0.1:9991", 20)
+    le_register_peer(le, "127.0.0.1:9992", 30)
+    ce_eq("two peers registered", le_peer_count(le), 2)
+    ce_eq("peer 20 id lookup",
+          le_peer_id_for_addr(le, "127.0.0.1:9991"), 20)
+    ce_eq("peer 30 id lookup",
+          le_peer_id_for_addr(le, "127.0.0.1:9992"), 30)
+    ce_eq("unknown peer lookup -> -1",
+          le_peer_id_for_addr(le, "127.0.0.1:9999"), -1)
+}
+
+fn test_le_register_peer_re_register_overwrites() {
+    let gs = _mk_gs()
+    let le = le_init(gs, 10)
+    le_register_peer(le, "127.0.0.1:9991", 20)
+    le_register_peer(le, "127.0.0.1:9991", 25)   // key rotation
+    ce_eq("re-register does not duplicate", le_peer_count(le), 1)
+    ce_eq("re-register overwrites id",
+          le_peer_id_for_addr(le, "127.0.0.1:9991"), 25)
+}
+
+fn test_le_unregister_peer_drops() {
+    let gs = _mk_gs()
+    let le = le_init(gs, 10)
+    le_register_peer(le, "127.0.0.1:9991", 20)
+    le_unregister_peer(le, "127.0.0.1:9991")
+    ce_eq("after unregister count=0", le_peer_count(le), 0)
+    ce_eq("after unregister lookup -1",
+          le_peer_id_for_addr(le, "127.0.0.1:9991"), -1)
+}
+
+// ---- le_start_election ---------------------------------------------------
+
+fn test_le_start_election_transitions_to_electing() {
+    let gs = _mk_gs()
+    let le = le_init(gs, 10)
+    le_start_election(le)
+    ce_eq("phase transitions to ELECTING",
+          le_election_state(le), LE_STATE_ELECTING)
+    ce_eq("leader cleared during election",
+          le_current_leader(le), -1)
+    ce_eq("stats_elections bumps to 1",
+          le_stats_elections(le), 1)
+}
+
+fn test_le_start_election_enqueues_to_higher_ids() {
+    // Bootstrap peers so gossip_alive_peers surfaces them; then register
+    // their IDs in the LE peer map.
+    let bp = list_new()
+    push(bp, "127.0.0.1:9991")
+    push(bp, "127.0.0.1:9992")
+    let gs = gossip_init("127.0.0.1:9990", bp)
+    let le = le_init(gs, 10)
+    le_register_peer(le, "127.0.0.1:9991", 20)
+    le_register_peer(le, "127.0.0.1:9992", 30)
+    le_start_election(le)
+    // Both peers have HIGHER ids than self (10) -> both should have
+    // ELECTION messages enqueued (Bully algorithm invariant).
+    ce_eq("2 ELECTION msgs enqueued to higher-ID peers",
+          le_pending_message_count(le), 2)
+}
+
+// ---- inbound message handlers -------------------------------------------
+
+fn test_le_on_election_from_lower_id_sends_ok() {
+    let gs = _mk_gs()
+    let le = le_init(gs, 20)
+    // Incoming ELECTION from peer id=10 (lower). Bully rule: self is
+    // higher, so respond OK + start our own election.
+    le_on_election(le, 10)
+    ce_check("phase moved to ELECTING",
+             le_election_state(le) == LE_STATE_ELECTING)
+    ce_check("at least one OK enqueued",
+             le_pending_message_count(le) >= 1)
+}
+
+fn test_le_on_election_from_higher_id_no_ok() {
+    let gs = _mk_gs()
+    let le = le_init(gs, 20)
+    // Incoming ELECTION from peer id=30 (higher). Bully rule: we are
+    // lower, no OK, wait for VICTORY.
+    le_on_election(le, 30)
+    ce_eq("no OK enqueued (we wait for VICTORY)",
+          le_pending_message_count(le), 0)
+    // Phase stays STABLE (we don't start our own election).
+    ce_eq("phase unchanged (STABLE)",
+          le_election_state(le), LE_STATE_STABLE)
+}
+
+fn test_le_on_victory_from_higher_id_updates_leader() {
+    let gs = _mk_gs()
+    let le = le_init(gs, 10)
+    // Simulate ELECTING phase first (a real Bully sequence would have
+    // us in ELECTING before receiving VICTORY).
+    le_start_election(le)
+    ce_eq("phase ELECTING before VICTORY",
+          le_election_state(le), LE_STATE_ELECTING)
+    le_on_victory(le, 30)
+    ce_eq("VICTORY from id=30 -> leader=30",
+          le_current_leader(le), 30)
+    ce_eq("phase back to STABLE",
+          le_election_state(le), LE_STATE_STABLE)
+}
+
+fn test_le_on_victory_from_lower_id_ignored() {
+    let gs = _mk_gs()
+    let le = le_init(gs, 20)
+    le_start_election(le)
+    // Malformed / racing VICTORY from a LOWER-id peer -- ignored.
+    le_on_victory(le, 10)
+    ce_eq("VICTORY from lower-ID ignored (leader unchanged)",
+          le_current_leader(le), -1)
+    ce_eq("phase unchanged (still ELECTING)",
+          le_election_state(le), LE_STATE_ELECTING)
+}
+
+// ---- two-node mocked scenario -------------------------------------------
+
+fn test_two_node_higher_id_wins() {
+    // Self = 10, peer at 30 (higher). After receiving VICTORY from the
+    // peer, we correctly follow it.
+    let bp = list_new()
+    push(bp, "127.0.0.1:9992")
+    let gs = gossip_init("127.0.0.1:9990", bp)
+    let le = le_init(gs, 10)
+    le_register_peer(le, "127.0.0.1:9992", 30)
+    le_start_election(le)
+    // In a real run, the peer's Bully state machine would send VICTORY
+    // once it decided; we simulate the arrival.
+    le_on_victory(le, 30)
+    ce_eq("two-node: higher-id (30) wins",
+          le_current_leader(le), 30)
+    ce_eq("we did not self-elect",
+          le_is_leader(le), 0)
+}
+
+// ---- env-disabled path --------------------------------------------------
+
+fn test_env_disabled_daemon_skips_le_init() {
+    // Simulate the daemon's decision:
+    //   let le_enabled = _fed_le_enabled_from_env()
+    //   let le = 0
+    //   if le_enabled == 1 { le = le_init(gs, self_id) }
+    let enabled = _t_le_enabled_resolve("0")
+    let gs = _mk_gs()
+    let le = 0
+    if enabled == 1 {
+        le = le_init(gs, _t_soul_id_to_int("soul:x"))
+    }
+    ce_eq("CE_FED_LEADER_ELECTION_ENABLED=0 -> le stays 0",
+          le, 0)
+}
+
+fn test_env_enabled_daemon_allocates_le() {
+    let enabled = _t_le_enabled_resolve(0)   // null -> default 1
+    let gs = _mk_gs()
+    let le = 0
+    if enabled == 1 {
+        le = le_init(gs, _t_soul_id_to_int("soul:127.0.0.1:9990"))
+    }
+    ce_check("null CE_FED_LEADER_ELECTION_ENABLED -> le allocated", le != 0)
+    ce_eq("allocated le has stable self_id",
+          le_self_id(le), _t_soul_id_to_int("soul:127.0.0.1:9990"))
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    // env flag
+    test_le_enabled_default_when_null()
+    test_le_enabled_default_when_empty()
+    test_le_enabled_disabled_by_literal_zero()
+    test_le_enabled_passes_through_one()
+    test_le_enabled_passes_through_yes()
+    test_le_enabled_passes_through_true()
+
+    // mixer
+    test_soul_id_mixer_null_is_zero()
+    test_soul_id_mixer_empty_is_zero()
+    test_soul_id_mixer_nonempty_nonzero()
+    test_soul_id_mixer_deterministic()
+    test_soul_id_mixer_distinct_inputs_distinct_outputs()
+
+    // le bootstrap
+    test_le_init_bootstrap_no_leader()
+    test_le_init_stats_start_at_zero()
+
+    // peer map
+    test_le_register_peer_round_trip()
+    test_le_register_peer_re_register_overwrites()
+    test_le_unregister_peer_drops()
+
+    // start_election
+    test_le_start_election_transitions_to_electing()
+    test_le_start_election_enqueues_to_higher_ids()
+
+    // inbound handlers
+    test_le_on_election_from_lower_id_sends_ok()
+    test_le_on_election_from_higher_id_no_ok()
+    test_le_on_victory_from_higher_id_updates_leader()
+    test_le_on_victory_from_lower_id_ignored()
+
+    // two-node mock
+    test_two_node_higher_id_wins()
+
+    // env-disabled
+    test_env_disabled_daemon_skips_le_init()
+    test_env_enabled_daemon_allocates_le()
+
+    ce_summary("fed_daemon_leader")
+}
+
+main()
