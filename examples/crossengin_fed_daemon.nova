@@ -1,4 +1,4 @@
-// CrossEngin federation daemon (Phase M R1 + R2, ADR-0089 + ADR-0090).
+// CrossEngin federation daemon (Phase M R1 + R2 + R3, ADR-0089 + ADR-0090 + ADR-0091).
 //
 // Purpose
 //   The `src/federation/` tree ships 23 unit-tested modules -- gossip
@@ -58,11 +58,42 @@
 //   CE_FED_DR_ENABLED    default 1
 //                        Set to 0 to skip dr_init at boot. Same shape
 //                        as CE_FED_LEADER_ELECTION_ENABLED.
+//   CE_FED_ATTEST_ENABLED  default 1
+//                        Set to 0 to skip att_store_new + the
+//                        merkle_signing keypair load at boot. When
+//                        enabled but the key files are missing, the
+//                        daemon logs a WARN and disables attestation
+//                        without crashing (mesh peer is still useful).
+//   CE_FED_ATTEST_KEY_DIR  default $HOME/.crossengin/fed_keys
+//                        Directory holding this node's Ed25519 signer
+//                        keypair (`signer.priv` + `signer.pub`, 32
+//                        bytes each). merkle_signing_keypair_load
+//                        appends the ".priv" / ".pub" suffixes; the
+//                        daemon passes the "<dir>/signer" base path.
+//                        Falls back to ./crossengin_fed_keys/signer
+//                        when HOME is unset (container default).
+//   CE_FED_SNAP_REPLICATION_ENABLED  default 1
+//                        Set to 0 to skip sr_init at boot; /snap_fetch
+//                        and gossip's SNAP_FETCH inbound handler both
+//                        become no-ops (bare SNAP_END on the wire).
+//   CE_FED_SNAP_SERVE     default 0 (opt-in)
+//                        When 1, `sr_set_serving(sr, 1)` is called at
+//                        boot so the daemon answers peers' SNAP_FETCH
+//                        requests with replica bytes; when 0 (default)
+//                        the serve path returns 0 and gossip answers
+//                        with a bare SNAP_END so peers see "miss".
+//                        The chat REPL /snap_serve on|off toggles the
+//                        same flag at runtime. Reuses CE_SNAP_PATH for
+//                        the local replica dir when set.
+//   CE_SNAP_PATH          reused for sr_init's local_snap_dir. If unset
+//                        the daemon falls back to $HOME/.crossengin/snap
+//                        with a final ./crossengin_snap safety net.
 //
 // ADRs exercised: ADR-0089 (R1 subset), ADR-0090 (R2 coordination +
-//   inference), ADR-0051 (Session shape), plus every federation-module
-//   ADR the composed primitives implement (ADR-0054 subset for the
-//   aggregator seam, R18E/R19E/R20E/R21B for the federation primitives).
+//   inference), ADR-0091 (R3 durability), ADR-0051 (Session shape),
+//   plus every federation-module ADR the composed primitives implement
+//   (ADR-0054 subset for the aggregator seam, R18E/R19E/R20E/R21B/R20F/R23C
+//   for the federation primitives).
 
 import "std/syscall"
 import "std/string"
@@ -77,6 +108,9 @@ import "../src/federation/kg_sync.nova"
 import "../src/federation/distributed_query.nova"
 import "../src/federation/leader_election.nova"
 import "../src/federation/distributed_rules.nova"
+import "../src/federation/snapshot_attestation.nova"
+import "../src/federation/snapshot_replication.nova"
+import "../src/persistence/merkle_signing.nova"
 import "../src/kg/rule_inference.nova"
 import "../src/session/session.nova"
 
@@ -180,6 +214,48 @@ fn _fed_le_enabled_from_env() {
 
 fn _fed_dr_enabled_from_env() {
     return _fed_bool_from_env_value(getenv("CE_FED_DR_ENABLED"), 1)
+}
+
+// R3 (ADR-0091) enable-flag resolvers. Attestation + replication default
+// on; only literal "0" disables. `/snap_serve` defaults OFF (opt-in per
+// ADR-0091 sec "Trust model") to avoid shipping local replica bytes to
+// peers before the operator has reviewed which roots would be served.
+fn _fed_att_enabled_from_env() {
+    return _fed_bool_from_env_value(getenv("CE_FED_ATTEST_ENABLED"), 1)
+}
+
+fn _fed_sr_enabled_from_env() {
+    return _fed_bool_from_env_value(getenv("CE_FED_SNAP_REPLICATION_ENABLED"), 1)
+}
+
+fn _fed_snap_serve_from_env() {
+    // Opposite default: OFF unless the operator explicitly opts in.
+    return _fed_bool_from_env_value(getenv("CE_FED_SNAP_SERVE"), 0)
+}
+
+// Signer-key directory resolution. CE_FED_ATTEST_KEY_DIR wins; else
+// $HOME/.crossengin/fed_keys; else ./crossengin_fed_keys (used when
+// HOME is unset, e.g. inside a container). The returned string is the
+// BASE PATH merkle_signing_keypair_load expects (it appends ".priv" +
+// ".pub"), so we return the base path WITHOUT trailing "/" plus the
+// filename stem "signer". The full on-disk layout is:
+//   <dir>/signer.priv  (32 bytes, mode 0600)
+//   <dir>/signer.pub   (32 bytes, mode 0644)
+fn _fed_attest_key_base_from_env() {
+    let v = getenv("CE_FED_ATTEST_KEY_DIR")
+    if v != 0 {
+        if len(v) > 0 { return v + "/signer" }
+    }
+    let home = getenv("HOME")
+    if home != 0 {
+        if len(home) > 0 { return home + "/.crossengin/fed_keys/signer" }
+    }
+    // NOVA has no `~` expansion; the container HOME can also be unset.
+    // Fall back to a project-relative default so the daemon still boots
+    // (the load then fails cleanly and R3 attestation is disabled with
+    // a warn, per the boot contract below -- we never crash for a
+    // missing key file).
+    return "./crossengin_fed_keys/signer"
 }
 
 // Derive a small non-negative int from a soul-id string, stable across
@@ -292,6 +368,77 @@ fn main() {
         dr = dr_init(gs, dr_engine)
     }
 
+    // R3 (ADR-0091): snapshot attestation + replication.
+    //   att -- per-peer attestation store (att_store_new(); the
+    //          low-level constructor takes NO args in this codebase --
+    //          soul_id is carried per-tuple via att_make). Wired into
+    //          gossip via gossip_set_att_store so the ATTESTATION
+    //          parser branch enqueues verified tuples on inbound.
+    //          Signer identity is a merkle_signing Ed25519 keypair
+    //          loaded from CE_FED_ATTEST_KEY_DIR (falls back to
+    //          $HOME/.crossengin/fed_keys, then ./crossengin_fed_keys).
+    //          Missing key files => WARN + disable attestation for
+    //          this run (mesh peer is still useful without it).
+    //          Own pubkey is registered under self's peer_id so a
+    //          same-node round-trip verifies the local signer.
+    //   sr  -- snapshot-replication state. sr_init(gs, local_dir)
+    //          per R23C's live signature. Wired via
+    //          gossip_set_sr_state so inbound SNAP_FETCH lands here.
+    //          Serving is opt-in: CE_FED_SNAP_SERVE=1 flips
+    //          sr_set_serving(sr, 1) at boot; default OFF so a fresh
+    //          node observes attestations + records known roots but
+    //          does NOT ship its own replicas to peers until the
+    //          operator has reviewed. The chat REPL /snap_serve
+    //          on|off toggles the same flag at runtime.
+    let att_enabled = _fed_att_enabled_from_env()
+    let sr_enabled  = _fed_sr_enabled_from_env()
+    let snap_serve  = _fed_snap_serve_from_env()
+    let att = 0
+    let att_key_loaded = 0
+    let att_key_base   = ""
+    if att_enabled == 1 {
+        att_key_base = _fed_attest_key_base_from_env()
+        let pair = merkle_signing_keypair_load(att_key_base)
+        if pair == 0 {
+            println("attest   : WARN -- keypair load failed at "
+                    + att_key_base + ".{priv,pub}; disabling attestation"
+                    + " for this run (generate with examples/snap_keygen.nova"
+                    + " or point CE_FED_ATTEST_KEY_DIR at an existing dir)")
+        } else {
+            att = att_store_new()
+            gossip_set_att_store(gs, att)
+            // Register OWN pubkey under own peer_id so a same-node
+            // round-trip verifies (integration scenarios then add
+            // other peers' pubkeys via gossip_register_att_pubkey
+            // out of band, same shape as R7C Noise XK auth).
+            gossip_register_att_pubkey(gs, self_id_int, pair[1])
+            att_key_loaded = 1
+        }
+    }
+    // Local snapshot directory. Reuse CE_SNAP_PATH if the daemon-shared
+    // env is set; otherwise a $HOME-rooted default; final container
+    // fallback is ./crossengin_snap. sys_open on /tmp aborts inside the
+    // container per the NOVA quirks doc, so we never fall back to /tmp.
+    let local_snap_dir = getenv("CE_SNAP_PATH")
+    if local_snap_dir == 0 { local_snap_dir = "" }
+    if len(local_snap_dir) == 0 {
+        let home2 = getenv("HOME")
+        if home2 != 0 {
+            if len(home2) > 0 {
+                local_snap_dir = home2 + "/.crossengin/snap"
+            }
+        }
+    }
+    if len(local_snap_dir) == 0 { local_snap_dir = "./crossengin_snap" }
+    let sr = 0
+    if sr_enabled == 1 {
+        sr = sr_init(gs, local_snap_dir)
+        gossip_set_sr_state(gs, sr)
+        if snap_serve == 1 {
+            sr_set_serving(sr, 1)
+        }
+    }
+
     if listen_fd < 0 {
         println("gossip   : WARN -- listen bind failed on " + listen_addr
                 + " (port taken, or address unresolvable); running client-only")
@@ -315,6 +462,28 @@ fn main() {
                 + " (CE_FED_DR_ENABLED=1)")
     } else {
         println("drules   : DISABLED (CE_FED_DR_ENABLED=0)")
+    }
+    // R3 (ADR-0091) attestation + replication banners.
+    if att_enabled == 1 {
+        if att_key_loaded == 1 {
+            println("attest   : signed-attestation store wired; key="
+                    + att_key_base + ".{priv,pub}"
+                    + " (CE_FED_ATTEST_ENABLED=1)")
+        } else {
+            println("attest   : DISABLED (keypair missing at "
+                    + att_key_base + ")")
+        }
+    } else {
+        println("attest   : DISABLED (CE_FED_ATTEST_ENABLED=0)")
+    }
+    if sr_enabled == 1 {
+        let serve_lbl = "off"
+        if snap_serve == 1 { serve_lbl = "on" }
+        println("snap_repl: sr_state wired; local_dir=" + local_snap_dir
+                + " serving=" + serve_lbl
+                + " (CE_FED_SNAP_REPLICATION_ENABLED=1)")
+    } else {
+        println("snap_repl: DISABLED (CE_FED_SNAP_REPLICATION_ENABLED=0)")
     }
     line()
 
@@ -489,6 +658,25 @@ fn main() {
         println("  dr_derivs_tx    = " + int_to_str(dr_stats_derivs_tx(dr)))
     } else {
         println("  dr_disabled     = 1")
+    }
+    // R3 (ADR-0091) counters. Guarded on att / sr allocation so an
+    // env-disabled or key-missing run still prints an explicit line.
+    if att != 0 {
+        println("  att_count       = " + int_to_str(att_store_count(att)))
+        println("  att_rx          = " + int_to_str(gossip_stats_att_rx(gs)))
+        println("  att_bad         = " + int_to_str(gossip_stats_att_bad(gs)))
+    } else {
+        println("  att_disabled    = 1")
+    }
+    if sr != 0 {
+        println("  sr_known        = " + int_to_str(sr_known_root_count(sr)))
+        println("  sr_replicas     = " + int_to_str(sr_replica_count(sr)))
+        println("  sr_fetched      = " + int_to_str(sr_stats_fetched(sr)))
+        println("  sr_verify_fail  = " + int_to_str(sr_stats_verify_fail(sr)))
+        println("  sr_observed     = " + int_to_str(sr_stats_observed(sr)))
+        println("  sr_serving      = " + int_to_str(sr_is_serving(sr)))
+    } else {
+        println("  sr_disabled     = 1")
     }
     println("  session_ids     = " + int_to_str(sreg_count(sreg)))
     println("crossengin-fed: OK")

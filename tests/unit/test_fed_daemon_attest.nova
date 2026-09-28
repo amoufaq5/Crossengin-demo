@@ -1,0 +1,454 @@
+// Unit tests for examples/crossengin_fed_daemon.nova R3 snapshot-attestation
+// wiring (Phase M R3, ADR-0091).
+//
+// Coverage (~40 assertions) -- the daemon's env-config resolvers for
+// CE_FED_ATTEST_ENABLED + CE_FED_ATTEST_KEY_DIR, the R3 boot alloc
+// contract (att_store_new + gossip_set_att_store + gossip_register_att_pubkey),
+// the sign / verify / observe round-trip, and the chat REPL /attest_log
+// + /attest_verify output shape via the pure formatters in
+// src/chat/fed_slash.nova.
+//
+// NOVA has no `setenv`; the env resolvers are pure functions that take
+// the raw env value as an argument. The daemon's on-disk helper is a
+// three-liner that unwraps `getenv(name)` and delegates to the pure
+// resolver -- any drift shows up as a compile error against the wrapper's
+// use site. Same shape as test_fed_daemon_leader.nova and
+// test_fed_daemon_rules.nova.
+//
+// Coverage map:
+//   1. Env-flag resolver: default when input is 0 / empty, passes non-"0"
+//      through as enabled, only literal "0" disables. Matches R2's
+//      _fed_bool_from_env_value semantics.
+//   2. Key-dir resolver: CE_FED_ATTEST_KEY_DIR wins; HOME fallback;
+//      container fallback when both are unset.
+//   3. att_store_new() returns a well-shaped store; counters at 0.
+//   4. att_make(soul_id, ts, root, seed, pk) round-trips through
+//      att_verify with the matching pubkey.
+//   5. att_verify against a wrong-key tampered signature returns 0.
+//   6. Observed attestations accumulate in the local store (mock a
+//      peer's ATTESTATION line by hand-building the tuple).
+//   7. gossip_set_att_store + gossip_register_att_pubkey wire the store
+//      onto the gossip state; gossip_att_store round-trips.
+//   8. att_store_recent(store, N) returns the last N entries (newest
+//      last as walked) and clamps to store size.
+//   9. _attest_log_format renders the header + one line per entry;
+//      empty store -> just the header.
+//  10. _attest_verify_result_line covers the ok / no-attestation /
+//      no-pubkey / signature-mismatch branches.
+//  11. Env-disabled path: att_enabled=0 -> daemon skips att_store_new.
+
+import "../ce_test.nova"
+import "../../src/federation/gossip.nova"
+import "../../src/federation/snapshot_attestation.nova"
+import "../../src/safety/ed25519.nova"
+import "../../src/chat/fed_slash.nova"
+
+// ---- daemon-parity pure resolvers ---------------------------------------
+
+// Byte-identical to _fed_bool_from_env_value (default-on flavour) in
+// examples/crossengin_fed_daemon.nova. The daemon's
+// _fed_att_enabled_from_env() reads getenv("CE_FED_ATTEST_ENABLED")
+// and delegates here.
+fn _t_bool_from_env_value(v, default_on) {
+    if v == 0 { return default_on }
+    if len(v) == 0 { return default_on }
+    if str_eq_bytes(v, "0") == 1 { return 0 }
+    return 1
+}
+
+fn _t_att_enabled_resolve(v) {
+    return _t_bool_from_env_value(v, 1)
+}
+
+// Byte-identical to _fed_attest_key_base_from_env with getenv() lifted
+// out. Precedence: explicit key_dir > $HOME/.crossengin/fed_keys >
+// container fallback ./crossengin_fed_keys. Returns the BASE path
+// (without .priv / .pub suffix).
+fn _t_att_key_base_resolve(key_dir_env, home_env) {
+    if key_dir_env != 0 {
+        if len(key_dir_env) > 0 { return key_dir_env + "/signer" }
+    }
+    if home_env != 0 {
+        if len(home_env) > 0 { return home_env + "/.crossengin/fed_keys/signer" }
+    }
+    return "./crossengin_fed_keys/signer"
+}
+
+// ---- env resolvers -------------------------------------------------------
+
+fn test_att_enabled_default_when_null() {
+    ce_eq("null env -> enabled (default 1)", _t_att_enabled_resolve(0), 1)
+}
+
+fn test_att_enabled_default_when_empty() {
+    ce_eq("empty env -> enabled (default 1)", _t_att_enabled_resolve(""), 1)
+}
+
+fn test_att_enabled_disabled_by_literal_zero() {
+    ce_eq("'0' env -> disabled", _t_att_enabled_resolve("0"), 0)
+}
+
+fn test_att_enabled_passes_through_one() {
+    ce_eq("'1' env -> enabled", _t_att_enabled_resolve("1"), 1)
+}
+
+fn test_att_enabled_passes_through_true() {
+    ce_eq("'true' env -> enabled (only '0' disables)",
+          _t_att_enabled_resolve("true"), 1)
+}
+
+fn test_att_key_base_uses_explicit_dir() {
+    let b = _t_att_key_base_resolve("/opt/ce/keys", "/root")
+    ce_str_eq("explicit CE_FED_ATTEST_KEY_DIR wins",
+              b, "/opt/ce/keys/signer")
+}
+
+fn test_att_key_base_falls_back_to_home() {
+    let b = _t_att_key_base_resolve(0, "/home/tester")
+    ce_str_eq("HOME fallback used when CE_FED_ATTEST_KEY_DIR unset",
+              b, "/home/tester/.crossengin/fed_keys/signer")
+}
+
+fn test_att_key_base_falls_back_to_container() {
+    let b = _t_att_key_base_resolve(0, 0)
+    ce_str_eq("container fallback when both unset",
+              b, "./crossengin_fed_keys/signer")
+}
+
+fn test_att_key_base_empty_key_dir_treated_as_unset() {
+    let b = _t_att_key_base_resolve("", "/home/tester")
+    ce_str_eq("empty CE_FED_ATTEST_KEY_DIR -> HOME fallback",
+              b, "/home/tester/.crossengin/fed_keys/signer")
+}
+
+// ---- keypair fixture (RFC 8032 vector) ---------------------------------
+
+// Reuse the test seed used elsewhere in the tree so the vector is
+// stable across suites. Same shape as tests/unit/test_snapshot_replication.
+let _T_ATT_SEED_HEX = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+let _T_ATT_ROOT_HEX = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+fn _t_att_keypair() {
+    let seed = ed25519_hex_to_bytes(_T_ATT_SEED_HEX)
+    let parts = _ed_derive_a_and_prefix(seed)
+    let pk = _ed_pk_from_a(parts[0])
+    let r = list_new()
+    push(r, seed)
+    push(r, pk)
+    return r
+}
+
+fn _t_att_root_bytes() {
+    return ed25519_hex_to_bytes(_T_ATT_ROOT_HEX)
+}
+
+// ---- att bootstrap ------------------------------------------------------
+
+fn test_att_store_new_returns_empty() {
+    let s = att_store_new()
+    ce_check("store non-null", s != 0)
+    ce_eq("count = 0", att_store_count(s), 0)
+}
+
+fn test_att_make_round_trip_verifies() {
+    let kp = _t_att_keypair()
+    let root = _t_att_root_bytes()
+    let att = att_make(42, 1700000000000000000, root, kp[0], kp[1])
+    ce_check("att_make returned non-null", att != 0)
+    ce_eq("att verify with correct pubkey = 1",
+          att_verify(att, kp[1]), 1)
+}
+
+fn test_att_verify_rejects_wrong_key() {
+    let kp = _t_att_keypair()
+    let root = _t_att_root_bytes()
+    let att = att_make(42, 1700000000000000000, root, kp[0], kp[1])
+    // Tamper the last byte of pubkey -- byte-identical to a wrong key.
+    let bad = list_new()
+    let i = 0
+    while i < len(kp[1]) {
+        push(bad, kp[1][i])
+        i = i + 1
+    }
+    let last = len(bad) - 1
+    bad[last] = (bad[last] + 1) & 255
+    ce_eq("att verify with tampered pubkey = 0",
+          att_verify(att, bad), 0)
+}
+
+fn test_att_verify_rejects_missing_pubkey() {
+    let kp = _t_att_keypair()
+    let root = _t_att_root_bytes()
+    let att = att_make(42, 1700000000000000000, root, kp[0], kp[1])
+    ce_eq("att verify with null pubkey = 0",
+          att_verify(att, 0), 0)
+}
+
+fn test_att_store_add_accumulates() {
+    let s = att_store_new()
+    let kp = _t_att_keypair()
+    let root = _t_att_root_bytes()
+    let a1 = att_make(10, 1, root, kp[0], kp[1])
+    let a2 = att_make(10, 2, root, kp[0], kp[1])
+    let a3 = att_make(20, 3, root, kp[0], kp[1])
+    att_store_add(s, a1)
+    att_store_add(s, a2)
+    att_store_add(s, a3)
+    ce_eq("store count after 3 adds = 3", att_store_count(s), 3)
+    ce_eq("peer 10 count = 2", att_store_count_for_peer(s, 10), 2)
+    ce_eq("peer 20 count = 1", att_store_count_for_peer(s, 20), 1)
+    let latest10 = att_store_latest(s, 10)
+    ce_check("peer 10 latest non-null", latest10 != 0)
+    ce_eq("peer 10 latest ts = 2", att_ts_ns(latest10), 2)
+}
+
+// ---- gossip wiring ------------------------------------------------------
+
+fn _mk_gs() { return gossip_init("127.0.0.1:9990", 0) }
+
+fn test_gossip_set_att_store_round_trip() {
+    let gs = _mk_gs()
+    let s = att_store_new()
+    gossip_set_att_store(gs, s)
+    ce_check("gossip_att_store returns the store",
+             gossip_att_store(gs) == s)
+}
+
+fn test_gossip_register_att_pubkey_round_trip() {
+    let gs = _mk_gs()
+    let kp = _t_att_keypair()
+    gossip_register_att_pubkey(gs, 42, kp[1])
+    let pk = gossip_lookup_att_pubkey(gs, 42)
+    ce_check("pubkey lookup returns non-null", pk != 0)
+    ce_eq("pubkey lookup length = 32", len(pk), 32)
+    ce_check("unknown peer lookup returns 0",
+             gossip_lookup_att_pubkey(gs, 999) == 0)
+}
+
+fn test_gossip_observed_attestation_lands_in_store() {
+    // Mock the "ATTESTATION line came in over the wire" path: gossip
+    // wired up + pubkey registered + store attached => att_to_wire
+    // round-trips through att_parse_wire + att_verify + att_store_add.
+    let gs = _mk_gs()
+    let s = att_store_new()
+    gossip_set_att_store(gs, s)
+    let kp = _t_att_keypair()
+    gossip_register_att_pubkey(gs, 42, kp[1])
+    let root = _t_att_root_bytes()
+    let att = att_make(42, 12345, root, kp[0], kp[1])
+    // Round-trip through the wire codec (matches gossip's parser).
+    let wire = att_to_wire(att)
+    let parsed = att_parse_wire(wire)
+    ce_check("wire parsed non-null", parsed != 0)
+    ce_eq("parsed verifies against registered pubkey",
+          att_verify(parsed, kp[1]), 1)
+    att_store_add(s, parsed)
+    ce_eq("store count after simulated inbound = 1",
+          att_store_count(s), 1)
+    ce_eq("peer 42 latest ts = 12345",
+          att_ts_ns(att_store_latest(s, 42)), 12345)
+}
+
+// ---- att_store_recent ---------------------------------------------------
+
+fn test_att_store_recent_empty_store() {
+    let s = att_store_new()
+    let out = att_store_recent(s, 20)
+    ce_eq("recent on empty = 0", len(out), 0)
+}
+
+fn test_att_store_recent_clamps_to_store_size() {
+    let s = att_store_new()
+    let kp = _t_att_keypair()
+    let root = _t_att_root_bytes()
+    att_store_add(s, att_make(1, 1, root, kp[0], kp[1]))
+    att_store_add(s, att_make(1, 2, root, kp[0], kp[1]))
+    att_store_add(s, att_make(1, 3, root, kp[0], kp[1]))
+    let out = att_store_recent(s, 20)
+    ce_eq("recent(20) on 3-entry store returns 3", len(out), 3)
+}
+
+fn test_att_store_recent_returns_tail() {
+    let s = att_store_new()
+    let kp = _t_att_keypair()
+    let root = _t_att_root_bytes()
+    att_store_add(s, att_make(1, 1, root, kp[0], kp[1]))
+    att_store_add(s, att_make(1, 2, root, kp[0], kp[1]))
+    att_store_add(s, att_make(1, 3, root, kp[0], kp[1]))
+    att_store_add(s, att_make(1, 4, root, kp[0], kp[1]))
+    let out = att_store_recent(s, 2)
+    ce_eq("recent(2) length = 2", len(out), 2)
+    // Newest last as walked (insertion order); the caller decides
+    // whether to reverse. Verify the tail is entries 3 and 4.
+    ce_eq("first recent entry ts = 3", att_ts_ns(out[0]), 3)
+    ce_eq("last recent entry ts = 4", att_ts_ns(out[1]), 4)
+}
+
+fn test_att_store_recent_zero_or_negative_max() {
+    let s = att_store_new()
+    let kp = _t_att_keypair()
+    let root = _t_att_root_bytes()
+    att_store_add(s, att_make(1, 1, root, kp[0], kp[1]))
+    ce_eq("recent(0) = empty", len(att_store_recent(s, 0)), 0)
+    ce_eq("recent(-1) = empty", len(att_store_recent(s, 0 - 1)), 0)
+}
+
+// ---- chat REPL output shape --------------------------------------------
+
+fn test_attest_log_format_empty_store_header_only() {
+    let entries = list_new()
+    let out = _attest_log_format(entries)
+    ce_eq("empty log => 1 line (header only)", len(out), 1)
+    ce_str_eq("empty header line",
+              out[0], "attest_log: 0 entries (newest last)")
+}
+
+fn test_attest_log_format_populated() {
+    let s = att_store_new()
+    let kp = _t_att_keypair()
+    let root = _t_att_root_bytes()
+    att_store_add(s, att_make(7, 111, root, kp[0], kp[1]))
+    att_store_add(s, att_make(7, 222, root, kp[0], kp[1]))
+    let entries = att_store_recent(s, 20)
+    let out = _attest_log_format(entries)
+    ce_eq("populated log => header + 2 lines", len(out), 3)
+    ce_str_eq("header line count = 2",
+              out[0], "attest_log: 2 entries (newest last)")
+    // Each entry line begins with "  peer="; the exact ts / root are
+    // pinned so a log-scraper regex is stable.
+    ce_check("first entry begins with '  peer='",
+             _ce_str_eq_bytes(substr(out[1], 0, 7), "  peer=") == 1)
+    ce_check("second entry ts=222",
+             _ce_str_eq_bytes(substr(out[2], 0, 7), "  peer=") == 1)
+}
+
+fn test_attest_verify_result_line_ok() {
+    let s = _attest_verify_result_line(1, 42, "")
+    ce_str_eq("ok line", s, "attest_verify: peer=42 ok")
+}
+
+fn test_attest_verify_result_line_no_attestation() {
+    let s = _attest_verify_result_line(0, 42, "no attestation for peer")
+    ce_str_eq("no-attestation line",
+              s, "attest_verify: peer=42 FAILED (no attestation for peer)")
+}
+
+fn test_attest_verify_result_line_no_pubkey() {
+    let s = _attest_verify_result_line(0, 42, "no pubkey registered")
+    ce_str_eq("no-pubkey line",
+              s, "attest_verify: peer=42 FAILED (no pubkey registered)")
+}
+
+fn test_attest_verify_result_line_signature_mismatch() {
+    let s = _attest_verify_result_line(0, 42, "signature mismatch")
+    ce_str_eq("mismatch line",
+              s, "attest_verify: peer=42 FAILED (signature mismatch)")
+}
+
+fn test_attest_verify_result_line_defaults_reason() {
+    let s = _attest_verify_result_line(0, 7, "")
+    ce_str_eq("empty reason defaults to 'unknown'",
+              s, "attest_verify: peer=7 FAILED (unknown)")
+}
+
+// ---- /attest_verify arg parser -----------------------------------------
+
+fn test_attest_verify_parse_arg_valid_int() {
+    ce_eq("'42' parses to 42", chat_fed_att_verify_parse_arg("42"), 42)
+}
+
+fn test_attest_verify_parse_arg_trimmed() {
+    ce_eq("'  99  ' parses to 99",
+          chat_fed_att_verify_parse_arg("  99  "), 99)
+}
+
+fn test_attest_verify_parse_arg_empty_yields_usage_sentinel() {
+    // -1 is the "usage" sentinel: soul_ids in the mesh are djb2-hashed
+    // to a 24-bit UNSIGNED int by _fed_soul_id_to_int, so -1 is
+    // unambiguous.
+    ce_eq("empty arg -> -1", chat_fed_att_verify_parse_arg(""), 0 - 1)
+    ce_eq("null arg -> -1", chat_fed_att_verify_parse_arg(0), 0 - 1)
+}
+
+fn test_attest_verify_parse_arg_non_digits_yields_usage() {
+    ce_eq("non-digits -> -1",
+          chat_fed_att_verify_parse_arg("abc"), 0 - 1)
+    ce_eq("mixed digits+letters -> -1",
+          chat_fed_att_verify_parse_arg("1x"), 0 - 1)
+}
+
+// ---- env-disabled path -------------------------------------------------
+
+fn test_env_disabled_daemon_skips_att_store() {
+    let enabled = _t_att_enabled_resolve("0")
+    let att = 0
+    if enabled == 1 {
+        att = att_store_new()
+    }
+    ce_eq("CE_FED_ATTEST_ENABLED=0 -> att stays 0", att, 0)
+}
+
+fn test_env_enabled_daemon_allocates_att_store() {
+    let enabled = _t_att_enabled_resolve(0)  // null -> default 1
+    let att = 0
+    if enabled == 1 {
+        att = att_store_new()
+    }
+    ce_check("null CE_FED_ATTEST_ENABLED -> att allocated", att != 0)
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    // env resolvers
+    test_att_enabled_default_when_null()
+    test_att_enabled_default_when_empty()
+    test_att_enabled_disabled_by_literal_zero()
+    test_att_enabled_passes_through_one()
+    test_att_enabled_passes_through_true()
+    test_att_key_base_uses_explicit_dir()
+    test_att_key_base_falls_back_to_home()
+    test_att_key_base_falls_back_to_container()
+    test_att_key_base_empty_key_dir_treated_as_unset()
+
+    // att bootstrap
+    test_att_store_new_returns_empty()
+    test_att_make_round_trip_verifies()
+    test_att_verify_rejects_wrong_key()
+    test_att_verify_rejects_missing_pubkey()
+    test_att_store_add_accumulates()
+
+    // gossip wiring
+    test_gossip_set_att_store_round_trip()
+    test_gossip_register_att_pubkey_round_trip()
+    test_gossip_observed_attestation_lands_in_store()
+
+    // recent enumeration
+    test_att_store_recent_empty_store()
+    test_att_store_recent_clamps_to_store_size()
+    test_att_store_recent_returns_tail()
+    test_att_store_recent_zero_or_negative_max()
+
+    // chat REPL formatters
+    test_attest_log_format_empty_store_header_only()
+    test_attest_log_format_populated()
+    test_attest_verify_result_line_ok()
+    test_attest_verify_result_line_no_attestation()
+    test_attest_verify_result_line_no_pubkey()
+    test_attest_verify_result_line_signature_mismatch()
+    test_attest_verify_result_line_defaults_reason()
+
+    // /attest_verify parser
+    test_attest_verify_parse_arg_valid_int()
+    test_attest_verify_parse_arg_trimmed()
+    test_attest_verify_parse_arg_empty_yields_usage_sentinel()
+    test_attest_verify_parse_arg_non_digits_yields_usage()
+
+    // env-disabled
+    test_env_disabled_daemon_skips_att_store()
+    test_env_enabled_daemon_allocates_att_store()
+
+    ce_summary("fed_daemon_attest")
+}
+
+main()

@@ -231,10 +231,9 @@ as a standalone binary.
 | `/gossip_dq QUERY`         | Fan out `QUERY` (SPARQL) across the mesh via R20E distributed_query; renders each row's peer + bindings.                             |
 
 R2 (ADR-0090) wires `/leader elect|status` and `/drule_add|run|fixpoint`
-into the same state (see subsection below); R3 (ADR-0091) will wire
-`/attest_log`, `/attest_verify`, `/snap_fetch`, `/snap_serve`. Until R3
-lands, those commands still print the "delegated to standalone driver"
-stubs.
+into the same state (see subsection below); R3 (ADR-0091) wires
+`/attest_log`, `/attest_verify`, `/snap_fetch`, and `/snap_serve` (see
+the R3 subsection below). All four require `/gossip_start` first.
 
 #### `/leader` + `/drule_*` -- coordination + inference (Phase M R2, ADR-0090)
 
@@ -262,6 +261,38 @@ Env vars added by R2 (both default on; only literal `"0"` disables):
 |--------------------------------------|-----------------------------------------------------------------------|
 | `CE_FED_LEADER_ELECTION_ENABLED`     | Fed daemon skips `le_init`; `/leader` handler prints "no state".      |
 | `CE_FED_DR_ENABLED`                  | Fed daemon skips `dr_init`; `/drule_*` handlers print "no state".     |
+
+#### `/attest_*` + `/snap_*` -- durability (Phase M R3, ADR-0091)
+
+R3 replaces the R20F `/attest_log` and R23C `/snap_replicas`-adjacent
+stubs with four live handlers (`/attest_log`, `/attest_verify`,
+`/snap_fetch`, `/snap_serve`). All four require `/gossip_start` first:
+the module-level lazy-init state (`_chat_fed_att`, `_chat_fed_sr`) is
+allocated alongside R1's `_chat_fed_gs` / R2's `_chat_fed_le` /
+`_chat_fed_dr` inside `_admin_gossip_start`, so one `/gossip_start`
+boots the R1+R2+R3 mesh surface. The recommended production entry point
+remains the fed daemon (`nova run examples/crossengin_fed_daemon.nova`),
+which additionally loads an Ed25519 signer keypair via
+`merkle_signing_keypair_load(CE_FED_ATTEST_KEY_DIR/signer)` for the
+sending half; the chat REPL is a viewer for the RECEIVED-from-peers
+half of the attestation store.
+
+| Command                    | Effect                                                                                                                               |
+|----------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `/attest_log`              | Dump up to 20 most-recent verified attestations across all peers (header + one line per entry). Empty store prints only the header. |
+| `/attest_verify <soul_id>` | Look up peer's most-recent attestation via `att_store_latest`, resolve pubkey via `gossip_lookup_att_pubkey`, re-verify. Prints `attest_verify: peer=<n> ok` or `... FAILED (<reason>)`. |
+| `/snap_fetch <root_hex>`   | Validate 64-char lowercase-hex root, walk `gossip_alive_peers`, dial each with `gossip_send_snap_fetch`; stop on first success. Verifies + stores via `sr_observe_snap_response`. |
+| `/snap_serve on|off`       | Toggle `sr_set_serving`. Off (default) means peers' SNAP_FETCH requests get bare SNAP_END back (miss); on means the sr_state's local replica table is served. |
+
+Env vars added by R3:
+
+| Env var                              | Default            | Effect                                                                    |
+|--------------------------------------|--------------------|---------------------------------------------------------------------------|
+| `CE_FED_ATTEST_ENABLED`              | `1` (only `"0"` disables) | Fed daemon skips `att_store_new` + keypair load; `/attest_log` prints "no state". |
+| `CE_FED_ATTEST_KEY_DIR`              | `$HOME/.crossengin/fed_keys` | Signer keypair location. Daemon reads `<dir>/signer.priv` + `<dir>/signer.pub`. Missing files -> WARN + attestation disabled (mesh peer still runs). Container fallback: `./crossengin_fed_keys`. |
+| `CE_FED_SNAP_REPLICATION_ENABLED`    | `1` (only `"0"` disables) | Fed daemon skips `sr_init`; `/snap_fetch` prints "no state"; gossip inbound SNAP_FETCH answered with bare SNAP_END. |
+| `CE_FED_SNAP_SERVE`                  | `0` (opt-in; `"1"` enables) | On `1`, fed daemon calls `sr_set_serving(sr, 1)` at boot; chat REPL surfaces same toggle via `/snap_serve on|off`. |
+| `CE_SNAP_PATH`                       | (reused)           | Local snapshot directory for `sr_init(gs, local_snap_dir)`. When unset: `$HOME/.crossengin/snap`, then `./crossengin_snap`. `/tmp` never used (container `sys_open` restriction). |
 
 ### Diagnostics
 

@@ -371,7 +371,7 @@ Three focused rounds closing the open threads left by ADR-0072..0085:
 (xref query-time traversal) now form a closed loop: reclaim -> sweep ->
 compact-remap -> observability -> query-side consumption.
 
-## Phase M — Federation Daemon (in progress)
+## Phase M — Federation Daemon (COMPLETE)
 
 `src/federation/` has 23 unit-tested modules (gossip, kg_sync, distributed
 query, distributed rules, leader election, snapshot attestation + replication,
@@ -423,11 +423,42 @@ handlers:
   `test_fed_daemon_rules.nova`; ~30 checks each) exercise the env
   resolver, mixer, le/dr bootstrap, message-handler flows, and the
   env-disabled skip path.
-- **R3 -- durability (pending, ADR-0091).** Wire `snapshot_attestation` +
-  `snapshot_replication` into the fed daemon; chat REPL grows
-  `/attest_log`, `/attest_verify`, `/snap_fetch`, `/snap_serve`. Closes
-  the federation-daemon arc for what can be built without unstubbing
-  DTLS 1.2.
+- **R3 -- durability (SHIPPED, ADR-0091).** Extends the R2 fed daemon
+  with `att_store_new()` + `sr_init(gs, local_snap_dir)` under three
+  new env flags (`CE_FED_ATTEST_ENABLED` and
+  `CE_FED_SNAP_REPLICATION_ENABLED` default-on; `CE_FED_SNAP_SERVE`
+  default-OFF -- opt-in per plan). Signer identity loads via
+  `merkle_signing_keypair_load(<CE_FED_ATTEST_KEY_DIR>/signer)`; a
+  missing key file WARN-disables attestation without crashing the mesh
+  peer. Own pubkey registered under own peer_id via
+  `gossip_register_att_pubkey` so same-node round-trips verify. New
+  `sr_set_serving(sr, on)` + `SR_S_SERVING` slot in
+  snapshot_replication.nova gate `sr_serve_snap_request` on the
+  opt-in flag; new `att_store_recent(store, N)` enumerates the tail
+  across all peers. Chat REPL: `/attest_log`, `/attest_verify <soul>`,
+  `/snap_fetch <root>`, `/snap_serve on|off` become live handlers;
+  `_chat_fed_att` / `_chat_fed_sr` module singletons allocated
+  alongside R1's `_chat_fed_gs` / R2's `_chat_fed_le` inside
+  `_admin_gossip_start`. Argument parsers + line formatters in
+  `src/chat/fed_slash.nova` (7 new helpers). Two new test files
+  (`test_fed_daemon_attest.nova` ~40 checks,
+  `test_fed_daemon_replication.nova` ~40 checks) exercise env
+  resolvers, keypair-path precedence, att/sr bootstrap, serve gating,
+  and the chat REPL formatters. **This closes the federation-daemon
+  arc for the plain-TCP era**: every one of the 23 modules under
+  `src/federation/` that CAN be wired without unstubbing DTLS 1.2 now
+  IS wired into the fed daemon and/or the chat REPL. Follow-up work
+  (DTLS 1.2 unstub at `src/federation/dtls12.nova:137, 140`, NAT
+  hole-punch R23E.2, WebRTC data plane, Raft wire integration,
+  auto-broadcast attestation on snapshot save) deferred to
+  post-Phase-M rounds.
+
+**Phase M COMPLETE.** R1+R2+R3 unify the mesh substrate under a single
+`examples/crossengin_fed_daemon.nova` binary and lift every R18E/R19E/
+R20E/R20F/R21B/R23C chat REPL stub to a real handler. Under-covered
+edges (DTLS 1.2 cert-verify, NAT UDP hole-punch, WebRTC data plane,
+Raft wire integration, auto-broadcast) are documented as post-Phase-M
+candidates below.
 
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet

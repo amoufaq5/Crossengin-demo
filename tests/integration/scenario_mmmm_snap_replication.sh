@@ -260,6 +260,12 @@ fn main() {
 
     let sr = sr_init(state, "/tmp/ce_mmmm_replicas_" + int_to_str(self_id))
     gossip_set_sr_state(state, sr)
+    // R3 (ADR-0091). Serving peer SNAP_FETCH requests is opt-in as of
+    // the R3 wiring; both souls in this scenario explicitly enable it
+    // so gossip_send_snap_fetch (driven by gossip_drive_snap_fetches
+    // below) can succeed. The chat REPL surfaces the same toggle via
+    // /snap_serve on|off.
+    sr_set_serving(sr, 1)
 
     let snap_text = _build_my_snap_text()
     let ts0 = 1700000000000000000 + self_id * 1000000
