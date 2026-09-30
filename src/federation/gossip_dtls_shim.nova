@@ -298,16 +298,213 @@ fn gds_handshake_client(conn_fd, dtls_state, priv_bn, pub_point,
     return out
 }
 
-// Server-side flight. Same shape as the client entry; same
-// "not-yet-wired" return today.
+// ---- Phase P R1 (ADR-0097): server-side handshake flight 1 ----------------
+//
+// `_gds_server_flight_1` drives the RFC 6347 server-side flight-1 quartet:
+//     recv ClientHello -> emit ServerHello + Certificate + ServerKeyExchange
+//                         + ServerHelloDone
+//
+// State-machine walk: INIT -> CLIENT_HELLO_RECVD -> SERVER_HELLO_SENT
+//                     -> CERT_SENT -> SKE_SENT -> SHD_SENT
+//
+// Transcript-accumulator walk: the incoming ClientHello HS message (the
+// 12-byte HS header + body) is absorbed BEFORE the state transitions;
+// each emitted server-flight message is absorbed after it is composed
+// but before it is sent, so a subsequent recv on the peer side sees the
+// same wire bytes and can absorb them into its own transcript with the
+// same layout. R2 finalizes the transcript twice (client Finished then
+// server Finished) via dtls_transcript_finalize which is non-destructive.
+//
+// Inputs:
+//   conn_fd     -- an already-connected TCP fd with the 2-byte framing shim.
+//   dtls_state  -- caller-supplied state (must be at DTLS_S_INIT).
+//   priv_bn     -- server long-term ECDSA-P-256 private scalar (bn256).
+//   pub_point   -- server ephemeral ECDH pub point (65B SEC1 uncompressed).
+//   cert_der    -- server cert chain as list of [buf, n] (leaf first).
+//
+// Returns [1, ""] on the full-flight-1 success path, [0, err_string] on
+// any parse-refuse / send-fail / state-transition-refuse condition. On
+// failure the state's LAST_ERR slot is stamped with the same string and
+// the state transitions to DTLS_S_FAILED.
+fn _gds_server_flight_1(conn_fd, dtls_state, priv_bn, pub_point, cert_der) {
+    // 1. Recv the first record off the wire; must be a handshake record
+    // carrying a ClientHello.
+    let rec = _gds_recv_record(conn_fd)
+    if rec[0] == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-recv-fail")
+    }
+    // The DTLS record has a 13-byte record header followed by the fragment.
+    // For flight-1 the ClientHello is plaintext (cipher not yet active).
+    let rec_buf = rec[1]
+    let rec_n = rec[2]
+    if rec_n < 13 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-short-record")
+    }
+    let ct = load8(rec_buf + 0)
+    if ct != DTLS_CT_HANDSHAKE {
+        return _gds_flight_fail(dtls_state, "dtls-hs-wrong-content-type")
+    }
+    let frag_off = 13
+    let frag_n = rec_n - 13
+    // Parse the 12-byte handshake header.
+    let hs = dtls_handshake_parse(rec_buf + frag_off, frag_n)
+    if hs == DTLS_ERR_BAD_HS {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-header")
+    }
+    if hs[0] != DTLS_HS_CLIENT_HELLO {
+        return _gds_flight_fail(dtls_state, "dtls-hs-not-client-hello")
+    }
+    let body_buf = hs[5]
+    let body_n = hs[6]
+    // Parse the ClientHello body.
+    let ch = _dtls_parse_client_hello_body(body_buf, body_n)
+    if ch[0] == 0 {
+        return _gds_flight_fail(dtls_state, ch[1])
+    }
+    // Populate client_random slot and absorb the whole HS message (header
+    // + body) into the transcript. The 12+body_n bytes at (rec_buf +
+    // frag_off) are exactly what the peer's transcript will see, so
+    // absorbing them here gives byte-for-byte matching transcripts.
+    dtls_state[DTLS_S_SLOT_CLIENT_RANDOM] = ch[2]
+    dtls_transcript_init(dtls_state)
+    dtls_transcript_absorb(dtls_state, rec_buf + frag_off, 12 + body_n)
+    // Transition INIT -> CLIENT_HELLO_RECVD.
+    if dtls_transition(dtls_state, DTLS_S_CLIENT_HELLO_RECVD) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-chr")
+    }
+    // 2. Generate server_random. Try secure_random first; fall back to
+    // the test-mode override slot if entropy is unavailable.
+    let sr_buf = _gds_generate_server_random(dtls_state)
+    if sr_buf == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-no-entropy")
+    }
+    dtls_state[DTLS_S_SLOT_SERVER_RANDOM] = sr_buf
+    // 3. Build and send ServerHello.
+    let sh_pair = _dtls_build_server_hello_body(dtls_state,
+                                                DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256,
+                                                sr_buf)
+    if sh_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-sh")
+    }
+    dtls_state[DTLS_S_SLOT_CIPHER_SUITE] = DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256
+    if _gds_send_hs(conn_fd, dtls_state, DTLS_HS_SERVER_HELLO,
+                    sh_pair[0], sh_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-sh")
+    }
+    if dtls_transition(dtls_state, DTLS_S_SERVER_HELLO_SENT) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-shs")
+    }
+    // 4. Build and send Certificate.
+    let cert_pair = _dtls_build_certificate_body(dtls_state, cert_der)
+    if cert_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-cert")
+    }
+    if _gds_send_hs(conn_fd, dtls_state, DTLS_HS_CERTIFICATE,
+                    cert_pair[0], cert_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-cert")
+    }
+    if dtls_transition(dtls_state, DTLS_S_CERT_SENT) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-cs")
+    }
+    // 5. Build and send ServerKeyExchange. `0x0017` = secp256r1 per
+    // RFC 4492 §5.1.1 NamedCurve registry.
+    let ske_pair = _dtls_build_ske_body(dtls_state, 23, pub_point, priv_bn)
+    if ske_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-ske")
+    }
+    if _gds_send_hs(conn_fd, dtls_state, DTLS_HS_SERVER_KEY_EXCHANGE,
+                    ske_pair[0], ske_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-ske")
+    }
+    if dtls_transition(dtls_state, DTLS_S_SKE_SENT) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-skes")
+    }
+    // 6. Build and send ServerHelloDone.
+    let shd_pair = _dtls_build_server_hello_done_body()
+    if _gds_send_hs(conn_fd, dtls_state, DTLS_HS_SERVER_HELLO_DONE,
+                    shd_pair[0], shd_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-shd")
+    }
+    if dtls_transition(dtls_state, DTLS_S_SHD_SENT) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-shds")
+    }
+    let out = list_new()
+    push(out, 1)
+    push(out, "")
+    return out
+}
+
+// Helper: wrap a body in an HS envelope, absorb into transcript, then wrap
+// in a plaintext DTLS record and push through the length-prefix framer.
+// Returns 1 on send success, 0 otherwise.
+fn _gds_send_hs(conn_fd, dtls_state, hs_type, body_buf, body_n) {
+    let msg_seq = dtls_msg_seq_next(dtls_state)
+    let hs_pair = dtls_handshake_serialize(hs_type, msg_seq, body_buf, body_n)
+    if hs_pair == 0 { return 0 }
+    let hs_buf = hs_pair[0]
+    let hs_n = hs_pair[1]
+    dtls_transcript_absorb(dtls_state, hs_buf, hs_n)
+    dtls_state[DTLS_S_SLOT_HS_OUT] = dtls_state[DTLS_S_SLOT_HS_OUT] + 1
+    let rec = dtls_record_emit(dtls_state, DTLS_CT_HANDSHAKE, hs_buf, hs_n)
+    if rec == 0 { return 0 }
+    // dtls_record_emit returns a [buf, total] pair (13B hdr + fragment).
+    return _gds_send_record(conn_fd, rec[0], rec[1])
+}
+
+// Helper: stamp the failure error tag and transition to FAILED. Returns
+// the [0, err] pair the flight driver hands back to its caller.
+fn _gds_flight_fail(dtls_state, err) {
+    dtls_state[DTLS_S_SLOT_LAST_ERR] = err
+    dtls_transition(dtls_state, DTLS_S_FAILED)
+    let out = list_new()
+    push(out, 0)
+    push(out, err)
+    return out
+}
+
+// Helper: produce a 32-byte server_random. Prefers secure_random(32);
+// falls back to the test-mode override slot (`DTLS_S_SLOT_SERVER_RANDOM_
+// OVERRIDE`) when entropy is unavailable so reproducible unit-test vectors
+// stay deterministic. Returns a fresh 33-byte buffer (32B + trailing NUL)
+// on success, 0 iff both paths are unavailable.
+fn _gds_generate_server_random(dtls_state) {
+    let buf = alloc(33)
+    let got = secure_random(buf, 32)
+    if got == 32 {
+        store8(buf + 32, 0)
+        return buf
+    }
+    let ov = dtls_state[DTLS_S_SLOT_SERVER_RANDOM_OVERRIDE]
+    if ov != 0 {
+        let out = alloc(33)
+        let i = 0
+        while i < 32 {
+            store8(out + i, load8(ov + i))
+            i = i + 1
+        }
+        store8(out + 32, 0)
+        return out
+    }
+    return 0
+}
+
+// Server-side flight entry. Phase P R1 wires flight-1 (ClientHello ->
+// ServerHello + Cert + SKE + SHD). Flight-2 (recv CKE + CCS + Finished,
+// send server CCS + Finished) lands in R2. On flight-1 success the state
+// sits at DTLS_S_SHD_SENT and the return is [1, dtls_state]; on failure
+// the state is at DTLS_S_FAILED with the reason in LAST_ERR and the
+// return is [0, dtls_state]. The client-side flight (gds_handshake_client)
+// continues to return "dtls-hs-flight-not-wired" until R2 lands the
+// client-side driver.
 fn gds_handshake_server(conn_fd, dtls_state, priv_bn, pub_point, cert_der) {
     let st = dtls_state
     if st == 0 { st = dtls_init() }
     st[DTLS_S_SLOT_PRIV_BN] = priv_bn
     st[DTLS_S_SLOT_LOCAL_PUB] = pub_point
-    st[DTLS_S_SLOT_LAST_ERR] = "dtls-hs-flight-not-wired"
+    st[DTLS_S_SLOT_IS_SERVER] = 1
+    let flight = _gds_server_flight_1(conn_fd, st, priv_bn, pub_point, cert_der)
     let out = list_new()
-    push(out, 0)
+    push(out, flight[0])
     push(out, st)
     return out
 }

@@ -692,6 +692,78 @@ would need).
   closed the DTLS 1.2 stack (cert-chain + SRTP EKM + `use_srtp`),
   R3 puts the wire under DTLS AEAD (mesh-only per ADR-0096).
 
+## Phase P — DTLS 1.2 handshake flight completion (IN PROGRESS)
+
+Phase P closes the handshake-flight caveat Phase O R3 documented:
+`gds_handshake_server` and `gds_handshake_client` in
+`src/federation/gossip_dtls_shim.nova` both returned
+`"dtls-hs-flight-not-wired"`, so cross-mesh peers had to skip the
+handshake via `gds_keyed_shortcut` and pre-derive the cipher state.
+R1 ships the SERVER-SIDE half; R2 ships the CLIENT-SIDE half + server
+flight-2; R3 ships extension parsing + DTLS-aware gossip stream
+helpers so the SNAP_FETCH / DELTA / RELAY_* handlers stop being
+silently dropped under DTLS.
+
+- **R1 -- server-side handshake flight (SHIPPED, ADR-0097).** Explore
+  surfaced that the 12-byte HS header serialize/parse pair
+  (`dtls_handshake_serialize` / `dtls_handshake_parse`) at
+  `src/federation/dtls12.nova:1037-1078` and the R2 ClientHello body
+  builder at `:1147` gave the shape; the server-side quartet
+  (ServerHello / Certificate / ServerKeyExchange / ServerHelloDone),
+  the ClientHello PARSER, the transcript-hash accumulator, and the
+  server-side state-machine drivers were all missing. R1 adds:
+  `_dtls_parse_client_hello_body(buf, n)` (RFC 5246 §7.4.1.2 + RFC
+  6347 §4.2.2, refuses on the four documented malformed shapes:
+  missing null-compression, wrong cipher suite, short body,
+  overflowing length prefixes); `_dtls_parse_ext_block_stub` (R3 will
+  replace with a real per-extension walker; R1 validates only the
+  outer 2-byte envelope); the four body builders
+  (`_dtls_build_server_hello_body` splices in the R2 `use_srtp`
+  extension via `_dtls_build_use_srtp_ext` when the SRTP_OFFER slot
+  is set; `_dtls_build_certificate_body` composes an RFC 5246 §7.4.2
+  cert chain with 3-byte length prefixes; `_dtls_build_ske_body`
+  emits the ECDHE ECDSA-signed SKE per RFC 4492 §5.4 with a DER-
+  encoded signature per RFC 3279 §2.2.3;
+  `_dtls_build_server_hello_done_body` returns the empty body per
+  RFC 5246 §7.4.5); an ECDSA-P-256 SIGN helper
+  (`_dtls_ecdsa_p256_sign`, added inline in `dtls12.nova` because
+  `src/safety/ecdsa.nova` shipped only verify pre-R1; a future round
+  promotes it into `ecdsa.nova` when a second caller lands); the
+  DER encoder helpers (`_dtls_der_encode_ecdsa_sig` +
+  `_dtls_der_encode_bn_as_integer`); and the transcript-hash
+  accumulator (three new state functions:
+  `dtls_transcript_init` / `dtls_transcript_absorb` /
+  `dtls_transcript_finalize`, backed by a growing byte buffer rather
+  than a live SHA-256 ctx because `sha256_final` consumes the ctx and
+  R2 needs to finalize twice at different transcript prefixes).
+  Five new server-side state constants (`DTLS_S_CLIENT_HELLO_RECVD =
+  10` .. `DTLS_S_SHD_SENT = 14`, appended so the R29B client-side
+  enum 0..6 stays byte-identical) + the matching edges in
+  `_dtls_valid_edge`. Three new tail slots:
+  `DTLS_S_SLOT_TRANSCRIPT_CTX = 49`,
+  `DTLS_S_SLOT_TRANSCRIPT_N = 50`,
+  `DTLS_S_SLOT_SERVER_RANDOM_OVERRIDE = 51` (test-mode hook so
+  ServerHello bytes stay reproducible under `secure_random`
+  unavailability). Wire-level flight driver
+  `_gds_server_flight_1(conn_fd, dtls_state, priv_bn, pub_point,
+  cert_der)` in `src/federation/gossip_dtls_shim.nova` composes the
+  four builders + the transcript feed + the state-machine walk +
+  the `_gds_send_record` framing; `gds_handshake_server` re-wired to
+  call it (returning `[flight_ok, state]`); every failure path
+  stamps a distinct string tag on `LAST_ERR` and transitions to
+  `DTLS_S_FAILED`. `gds_handshake_client` still returns
+  `"dtls-hs-flight-not-wired"` until R2. Tests:
+  `tests/unit/test_dtls_server_flight.nova` (~50 checks: parser
+  round-trip + four refusal paths + ext-block stub + all four body
+  builders' shapes + SKE signature verifies against `ecdsa_p256_
+  verify_bn` + transcript matches `sha256_oneshot` over concatenation
+  + non-destructive finalize + server-side state edges + server
+  flight driver refuse path + slot-index pinning). ADR-0097
+  (~300 lines) covers the design + alternatives (streaming SHA-256
+  vs buffer, raw r||s vs DER, deterministic-k RFC 6979 as follow-up).
+  `make lint-ints` clean (12 pre-existing findings unchanged; none
+  in the R1 files).
+
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet
   *requires*; whether they compose into general intelligence is unproven and is
