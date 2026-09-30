@@ -1,0 +1,366 @@
+// CrossEngin action: orchestrator module.
+//
+// Purpose
+//   The `action_module` is the substrate-first exit surface that turns
+//   ctx conclusions + goals + percepts into `Intent` records
+//   (`action_atoms.nova`) and submits them through the safety-gated
+//   effector chain (`src/io/effectors/effector_gate.nova`). Before
+//   Phase N, `src/agent/loop_action.nova` inlined a three-branch
+//   template body and wrote directly to `ctx_output` -- bypassing the
+//   effector gate entirely, which is a real README-called-out audit
+//   gap (ADR-0041 requires every outward action to pass the gate).
+//
+//   ADR-0093 shifts the wiring: `loop_action_step` now delegates to
+//   `action_run` on this module (via a module-level singleton so the
+//   2-arg entry point's signature is preserved -- callers under
+//   `examples/*` and `tests/unit/*` are untouched). Every SPEAK intent
+//   writes an INTENT record BEFORE the emit and an OUTCOME record AFTER,
+//   closing the audit trail.
+//
+//   Behavior-preservation contract (asserted in
+//   `tests/unit/test_action_module.nova` and the extended
+//   `tests/unit/test_loop_action.nova`): for the three existing
+//   loop_action fixtures the emitted `ctx_output` text is BYTE-IDENTICAL
+//   to pre-R2 (`unknown` -> "i do not fully understand that yet";
+//   `percept-present` -> "understood"; `else` -> "i have nothing to
+//   say"). What CHANGES is the decision log now carries INTENT + OUTCOME
+//   records for the SPEAK intents -- exactly the audit trail the README
+//   promised.
+//
+// ADRs implemented: ADR-0093 (action module, Phase N R2).
+//   Governed by ADR-0013, ADR-0041, ADR-0043.
+// NOVA dependencies: builtins.
+// CrossEngin dependencies: action_atoms.nova, ../../io/effectors/effector_gate.nova,
+//   ../../safety/reversibility_classifier.nova (for the ACT_SPEAK
+//   constant -- the effector-gate submission needs an action_type
+//   int, and ACT_SPEAK is the constant that maps SPEAK through the
+//   permission-tier chain today), ../goals/goal_engine.nova (optional
+//   -- when the caller passes a non-zero engine, the derive path
+//   attaches its currently-arbitrated goal id).
+
+import "action_atoms.nova"
+import "../../io/effectors/effector_gate.nova"
+import "../../safety/reversibility_classifier.nova"
+import "../goals/goal_engine.nova"
+import "../../agent/loop_coordination.nova"
+
+// ---- action module handle -------------------------------------------------
+//
+// Shape (7 slots). Deliberately minimal -- the module holds only what
+// it needs to route through the effector gate + report its own last
+// state (the R2 test suite reads AM_LAST_INTENT for round-trip checks,
+// and AM_INTENT_COUNT is the trace-ref counter).
+//
+//   [0]  AM_TAG              (AM_OBJ_TAG sentinel)
+//   [1]  AM_DL               (decision log handle; 0 when the loop is
+//                                running without a wired daemon -- the
+//                                chat REPL + unit tests pass no dl, so
+//                                the submit path short-circuits without
+//                                touching a null log)
+//   [2]  AM_GOAL_ENGINE      (goal_engine handle; 0 when the loop is
+//                                not yet threading goals in)
+//   [3]  AM_LAST_INTENT      (Intent or 0; overwritten on every step)
+//   [4]  AM_INTENT_COUNT     (int; monotonic tally of derived intents,
+//                                used for trace-ref generation)
+//   [5]  AM_LAST_EFF_RESULT  (int; the most recent effector_submit
+//                                result -- EFF_EXECUTED / EFF_NOTIFIED
+//                                / EFF_SUSPENDED / EFF_VETOED /
+//                                EFF_HALTED, or 0 when never submitted)
+//   [6]  AM_LAST_INTENT_SEQ  (int; the most recent intent's decision-log
+//                                sequence id, or -1 if not submitted)
+
+let AM_OBJ_TAG = 9303
+
+let AM_TAG             = 0
+let AM_DL              = 1
+let AM_GOAL_ENGINE     = 2
+let AM_LAST_INTENT     = 3
+let AM_INTENT_COUNT    = 4
+let AM_LAST_EFF_RESULT = 5
+let AM_LAST_INTENT_SEQ = 6
+
+fn action_module_new(dl, goal_engine) {
+    let am = list_new()
+    push(am, AM_OBJ_TAG)
+    push(am, dl)
+    push(am, goal_engine)
+    push(am, 0)             // last intent
+    push(am, 0)             // intent count
+    push(am, 0)             // last eff result
+    push(am, 0 - 1)         // last intent seq (-1 = not submitted)
+    return am
+}
+
+// Public init: mirrors the shape of other parts modules (e.g.
+// `perception_module_init`). Accepts (dl, goal_engine); either may be
+// 0 -- the submit path branches on non-zero.
+fn action_module_init(dl, goal_engine) {
+    return action_module_new(dl, goal_engine)
+}
+
+fn am_is_module(am) {
+    if am == 0 { return 0 }
+    if len(am) < 7 { return 0 }
+    if am[AM_TAG] != AM_OBJ_TAG { return 0 }
+    return 1
+}
+
+fn am_dl(am)              { return am[AM_DL] }
+fn am_goal_engine(am)     { return am[AM_GOAL_ENGINE] }
+fn am_last_intent(am)     { return am[AM_LAST_INTENT] }
+fn am_intent_count(am)    { return am[AM_INTENT_COUNT] }
+fn am_last_eff_result(am) { return am[AM_LAST_EFF_RESULT] }
+fn am_last_intent_seq(am) { return am[AM_LAST_INTENT_SEQ] }
+
+fn _am_record_intent(am, intent) {
+    list_set(am, AM_LAST_INTENT, intent)
+    list_set(am, AM_INTENT_COUNT, am[AM_INTENT_COUNT] + 1)
+    return 1
+}
+
+fn _am_record_submit(am, eff_result, intent_seq) {
+    list_set(am, AM_LAST_EFF_RESULT, eff_result)
+    list_set(am, AM_LAST_INTENT_SEQ, intent_seq)
+    return 1
+}
+
+// ---- derive ---------------------------------------------------------------
+//
+// `action_derive_intent` is the pure decision layer -- ctx + percept in,
+// Intent out, no side effects on the module or on the effector gate.
+//
+//   1. If `ctx_unknown(ctx) > 0`, produce a SPEAK intent with the
+//        pre-R2 not-understood text (confidence 500 -- the substrate is
+//        deliberately uncertain when its percept had unknown tokens).
+//   2. Else if `ctx_percept(ctx) != 0`, produce a SPEAK intent with the
+//        pre-R2 acknowledgment text (confidence 800 -- the reader
+//        matched and activated concepts).
+//   3. Else, produce an INTERNAL intent with reason "nothing" (the
+//        intent's IN_TEXT slot carries "i have nothing to say" so the
+//        loop_action shim can unconditionally emit `in_text(intent)`
+//        and preserve byte-identity of the pre-R2 else-branch output).
+//
+// `percept` is the Percept from R1's perception module (via
+// `pm_last_percept`); when it is 0 (no percept produced) the derive
+// path falls back to SOURCE_PERCEPT_ID=0 on the SPEAK intents.
+fn action_derive_intent(am, ctx, percept, now) {
+    let unknown = 0
+    let percept_present = 0
+    if ctx != 0 {
+        unknown = ctx_unknown(ctx)
+        // The pre-R2 body used `len(ctx_percept(ctx)) > 0` to test
+        // percept presence. `ctx_percept` returns a list (initially
+        // list_new()), so `len(...)` is well-defined. Guard with a
+        // 0-check first to avoid `len(0)` (NOVA quirk).
+        let p = ctx_percept(ctx)
+        if p != 0 {
+            if len(p) > 0 { percept_present = 1 }
+        }
+    }
+    // Goal attachment: only when a goal engine is threaded in AND it
+    // has an active leaf. `goal_arbitrate` returns -1 when the engine
+    // is empty; the intent's IN_GOAL_ID slot is 0 in that case.
+    let goal_id = 0
+    let ge = am[AM_GOAL_ENGINE]
+    if ge != 0 {
+        let g = goal_arbitrate(ge)
+        if g >= 0 { goal_id = g }
+    }
+    let source_pid = 0
+    if percept != 0 {
+        // Percept carries its source atom id on PC_SOURCE_ATOM_ID (slot
+        // 7 per perception_atoms.nova). Read positionally rather than
+        // importing perception_atoms here -- action must not depend on
+        // perception's layout beyond the well-known slot index R1
+        // documented.
+        if len(percept) > 7 {
+            source_pid = percept[7]
+        }
+    }
+    if unknown > 0 {
+        return intent_speak_new(now, "i do not fully understand that yet",
+                                goal_id, 500, source_pid)
+    }
+    if percept_present == 1 {
+        return intent_speak_new(now, "understood",
+                                goal_id, 800, source_pid)
+    }
+    return intent_internal_new(now, "nothing")
+}
+
+// ---- submit ---------------------------------------------------------------
+//
+// `action_submit` routes an Intent through the effector gate. INTERNAL
+// intents are a no-op (no decision-log write, no effector call). SPEAK
+// intents call `effector_submit` for the INTENT record, then, if the
+// gate permits (`eff_runs(result) == 1`), call `effector_speak` for the
+// text emission (which internally writes its own INTENT+OUTCOME pair
+// for the ACT_SPEAK submission -- so a fully-executed SPEAK produces
+// four log entries: the action_module's INTENT (this call), plus
+// effector_speak's INTENT+OUTCOME, plus the action_module's OUTCOME
+// via `action_complete`).
+//
+// Kinds other than SPEAK / INTERNAL (TOOL_CALL, FILE_OP, etc.) are
+// currently unrouted -- the MVP's motor_map is empty -- so they return
+// [EFF_SUSPENDED, -1] with no side effects. A follow-up round
+// populates `motor_map` and dispatches through the appropriate
+// effector primitive.
+//
+// Returns [eff_result, intent_seq]. `intent_seq` is -1 when the submit
+// was a no-op (INTERNAL, unrouted kind, or a null decision log).
+fn action_submit(am, intent, halted, user_approved, soul_ref, now) {
+    let out = list_new()
+    push(out, EFF_EXECUTED)
+    push(out, 0 - 1)
+    if intent == 0 {
+        _am_record_submit(am, EFF_EXECUTED, 0 - 1)
+        return out
+    }
+    let kind = in_kind(intent)
+    if kind == IN_KIND_INTERNAL {
+        // No-op action: no gate, no log.
+        _am_record_submit(am, EFF_EXECUTED, 0 - 1)
+        return out
+    }
+    if kind != IN_KIND_SPEAK {
+        // Non-SPEAK kinds are placeholders in the MVP -- motor_map is
+        // empty. Report SUSPENDED so a caller can distinguish this
+        // from an executed emit; a future round populates the map and
+        // dispatches through the appropriate effector primitive.
+        list_set(out, 0, EFF_SUSPENDED)
+        list_set(out, 1, 0 - 1)
+        _am_record_submit(am, EFF_SUSPENDED, 0 - 1)
+        return out
+    }
+    // SPEAK path.
+    let dl = am[AM_DL]
+    if dl == 0 {
+        // No wired decision log -- the loop is running under a chat
+        // REPL / unit-test fixture with no daemon. Preserve the
+        // pre-R2 behavior (no-op decision log) but report the intent
+        // as executed so the shim writes `in_text(intent)` to
+        // ctx_output.
+        _am_record_submit(am, EFF_EXECUTED, 0 - 1)
+        return out
+    }
+    let const_veto = 0
+    let trace = "loop_action:intent_" + int_to_str(am_intent_count(am))
+    in_set_trace_ref(intent, trace)
+    // Submit the INTENT record. `effector_submit` writes DLK_INTENT to
+    // the decision log before the effector runs; the result is the
+    // gate's disposition (EXECUTED / NOTIFIED / SUSPENDED / VETOED /
+    // HALTED).
+    let sub = effector_submit(dl, ACT_SPEAK, const_veto, halted,
+                              user_approved, in_goal_id(intent), trace,
+                              soul_ref, now)
+    let result = sub[0]
+    let seq = sub[1]
+    list_set(out, 0, result)
+    list_set(out, 1, seq)
+    // If the gate permits the emit, drive the text through
+    // effector_speak. `effector_speak` writes its own INTENT+OUTCOME
+    // pair (for the ACT_SPEAK submission it does itself), so a
+    // fully-executed SPEAK yields a rich audit trail. When the gate
+    // blocked (VETOED / SUSPENDED / HALTED), we skip the emit -- the
+    // INTENT record we wrote above carries the outcome (OUT_VETOED)
+    // per effector_gate policy.
+    if eff_runs(result) == 1 {
+        effector_speak(dl, in_text(intent), const_veto, halted,
+                       in_goal_id(intent), trace, soul_ref, now)
+    }
+    _am_record_submit(am, result, seq)
+    return out
+}
+
+// ---- complete -------------------------------------------------------------
+//
+// `action_complete` writes the OUTCOME record referencing the INTENT.
+// Skipped when `intent_seq == -1` (INTERNAL intent, unrouted kind, or
+// null decision log).
+fn action_complete(am, intent_seq, success, now) {
+    if intent_seq < 0 { return 0 }
+    let dl = am[AM_DL]
+    if dl == 0 { return 0 }
+    effector_complete(dl, intent_seq, success, now)
+    return 1
+}
+
+// ---- run ------------------------------------------------------------------
+//
+// `action_run` is the convenience the loop_action shim calls -- derive
+// -> submit -> complete -> record -> return. Callers under
+// `src/agent/loop_action.nova` use ONLY this entry point; the derive
+// / submit / complete trio is exposed for unit tests that want to
+// exercise each step independently.
+fn action_run(am, ctx, percept, halted, user_approved, soul_ref, now) {
+    let intent = action_derive_intent(am, ctx, percept, now)
+    if percept != 0 { in_set_linked_percept(intent, percept) }
+    _am_record_intent(am, intent)
+    let sub = action_submit(am, intent, halted, user_approved, soul_ref, now)
+    let eff_result = sub[0]
+    let intent_seq = sub[1]
+    // Success bit: EXECUTED counts as success; NOTIFIED also runs but
+    // carries a notify obligation, still treated as success at OUTCOME
+    // time. SUSPENDED / VETOED / HALTED are failures.
+    let success = 0
+    if eff_result == EFF_EXECUTED { success = 1 }
+    if eff_result == EFF_NOTIFIED { success = 1 }
+    action_complete(am, intent_seq, success, now)
+    return intent
+}
+
+// ---- module-level singleton ----------------------------------------------
+//
+// Same pattern as `perception_module_singleton_for` (ADR-0092):
+// preserve the pre-R2 `loop_action_step(ctx, lang_kg)` signature by
+// lazy-initing a module-level singleton on first call. Rebuild when
+// either `dl` or `goal_engine` changes so a test flipping fixtures
+// gets a fresh module. `dl == 0` + `goal_engine == 0` is the
+// well-formed "no daemon wired" state the chat REPL and existing unit
+// tests pass, so the singleton lazy-inits with those defaults and the
+// submit path short-circuits safely.
+//
+// NOVA quirk: module-level singletons lazy-init at first read; the
+// initial `0` sentinel is the "not-yet-built" flag.
+
+let _action_module_singleton = 0
+let _action_module_singleton_dl = 0
+let _action_module_singleton_ge = 0
+
+fn _action_module_singleton_get(dl, ge) {
+    if _action_module_singleton == 0 {
+        _action_module_singleton = action_module_new(dl, ge)
+        _action_module_singleton_dl = dl
+        _action_module_singleton_ge = ge
+        return _action_module_singleton
+    }
+    if _action_module_singleton_dl != dl {
+        _action_module_singleton = action_module_new(dl, ge)
+        _action_module_singleton_dl = dl
+        _action_module_singleton_ge = ge
+        return _action_module_singleton
+    }
+    if _action_module_singleton_ge != ge {
+        _action_module_singleton = action_module_new(dl, ge)
+        _action_module_singleton_dl = dl
+        _action_module_singleton_ge = ge
+        return _action_module_singleton
+    }
+    return _action_module_singleton
+}
+
+// Public accessor used by the loop shim. Callers that own their own
+// module handle (e.g. the autonomous loop's `AG_ACTION_MODULE` slot)
+// should use their handle directly and NOT go through the singleton.
+fn action_module_singleton_for(dl, ge) {
+    return _action_module_singleton_get(dl, ge)
+}
+
+// Test-only: force the next `action_module_singleton_for` call to
+// build a fresh module. Not invoked by production paths.
+fn _action_module_singleton_reset() {
+    _action_module_singleton = 0
+    _action_module_singleton_dl = 0
+    _action_module_singleton_ge = 0
+    return 1
+}

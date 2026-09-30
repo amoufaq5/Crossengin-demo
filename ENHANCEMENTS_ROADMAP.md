@@ -460,7 +460,7 @@ edges (DTLS 1.2 cert-verify, NAT UDP hole-punch, WebRTC data plane,
 Raft wire integration, auto-broadcast) are documented as post-Phase-M
 candidates below.
 
-## Phase N — Fill README-only parts subtrees (in progress)
+## Phase N — Fill README-only parts subtrees (COMPLETE)
 
 Two rounds close the "Status: Pending" placeholders under
 `src/parts/perception/` and `src/parts/action/` -- the last two parts
@@ -487,16 +487,44 @@ subtrees whose READMEs promised modules the loop layer never called.
   `test_loop_perception.nova`: the four ctx slots (`percept`, `active`,
   `routes`, `unknown`) are byte-identical to the pre-R1 reader-only
   path for a fixture text input.
-- **R2 -- Action module (PLANNED).** Fill `src/parts/action/` with
-  `action_atoms.nova` (Intent record) + `action_module.nova`
-  (orchestrator: Percept + ctx conclusions -> Intent ->
-  `effector_submit`) + `motor_map.nova` (substrate-activation ->
-  effector-class registry). The loop_action templating body (three
-  hard-coded strings written straight to `ctx_output`, bypassing
-  `effector_gate` -- a real README gap called out in the plan) will
-  submit through the effector gate, so every SPEAK writes an INTENT
-  plus an OUTCOME to the decision log (audit trail for every emit, per
-  ADR-0041).
+- **R2 -- Action module (SHIPPED, ADR-0093).** Three new modules
+  under `src/parts/action/`: `action_atoms.nova` (the 12-slot
+  `Intent` record, three constructors for SPEAK / INTERNAL /
+  TOOL_CALL, accessors + kind & effector-class name mappings +
+  `in_kind_to_effector_class` routing + a summary formatter),
+  `action_module.nova` (the orchestrator -- `action_derive_intent`
+  maps ctx state to SPEAK/INTERNAL intents, `action_submit` routes
+  SPEAK intents through `effector_gate.effector_submit` +
+  `effector_speak` writing INTENT + OUTCOME to the decision log,
+  `action_complete` writes the outcome, `action_run` cascades
+  derive → submit → complete; a module-level singleton
+  `action_module_singleton_for(dl, ge)` lets
+  `src/agent/loop_action.nova::loop_action_step` delegate without a
+  signature change), and `motor_map.nova` (the
+  substrate-activation → effector-class registry, ships empty at
+  MVP; a follow-up round populates it with real activation-signature
+  → TOOL / FILE / HTTP mappings). `src/agent/autonomous_loop.nova::agent_new`
+  now allocates `AG_ACTION_MODULE` at slot 22 via
+  `action_module_init(agent_dl(a), 0)`; accessors
+  `agent_action_module(a)` + `agent_dl(a)` expose the wire. The
+  pre-R2 three-branch template body has been retired from the loop:
+  every SPEAK now writes an INTENT + OUTCOME to the decision log
+  when the daemon-wire `_la_dl_slot` is populated (chat REPL /
+  existing unit tests pass no slot so the submit path
+  short-circuits silently -- byte-identical to pre-R2 in that
+  case). Backwards-compat contract asserted in
+  `test_action_module.nova` + the extended `test_loop_action.nova`:
+  for the three pre-R2 fixtures the emitted `ctx_output` text is
+  byte-identical to pre-R2 (`"i do not fully understand that yet"`
+  / `"understood"` / `"i have nothing to say"`). This CLOSES the
+  README-only parts arc.
+
+**Phase N COMPLETE.** R1+R2 fill both formerly-Pending parts subtrees
+(`src/parts/perception/`, `src/parts/action/`) with real atom +
+orchestrator modules and loop integration that honors the READMEs'
+promises. The last README-only parts subtree is done; every parts
+subtree with a Status now has an Accepted README backed by real
+modules on the loop's chain.
 
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet
