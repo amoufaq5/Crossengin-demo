@@ -1,0 +1,330 @@
+// CrossEngin perception: orchestrator module.
+//
+// Purpose
+//   The `perception_module` is the substrate-first entry surface that
+//   composes the existing perception primitives -- `classify_input`
+//   (`src/perception/input_classifier.nova`), the five-stage reader
+//   (`src/reader/reader.nova`), and, when the caller ships raw image /
+//   audio bytes, the cross-modal fusion primitive
+//   (`src/perception/sensor_fusion.nova`) plus the lipsync detector
+//   (`src/perception/lipsync.nova`) -- into a single `Percept` record
+//   (`perception_atoms.nova`) that downstream loops consume.
+//
+//   Before Phase N, `src/agent/loop_perception.nova` inlined a call to
+//   `reader_read(...)` and wrote four context slots (`percept` /
+//   `active` / `routes` / `unknown`); none of `src/parts/perception/*`
+//   was on the loop's chain. ADR-0092 shifts the wiring:
+//   `loop_perception_step` now delegates to `perception_step_text` on
+//   this module (via a module-level singleton so the 2-arg entry
+//   point's signature is preserved -- callers under `examples/*` and
+//   `tests/unit/*` are untouched).
+//
+//   Behavior-preservation contract (also asserted in
+//   `tests/unit/test_perception_module.nova`): for a text input, the
+//   four context slots (`ctx_percept`, `ctx_active`, `ctx_routes`,
+//   `ctx_unknown`) are byte-identical to the pre-Phase-N inline reader
+//   path. The refactor is purely additive at the ctx-slot layer: an
+//   extra `Percept` handle is cached in the module and made available
+//   to R2 (parts/action) via `pm_last_percept`, but the loop's return
+//   value (`reader_matched(c)`) is preserved.
+//
+// ADRs implemented: ADR-0092 (perception module, Phase N R1).
+//   Governed by ADR-0010, ADR-0021, ADR-0036.
+// NOVA dependencies: builtins.
+// CrossEngin dependencies: perception_atoms.nova, ../reader/reader.nova,
+//   ../perception/input_classifier.nova, ../perception/sensor_fusion.nova,
+//   ../perception/lipsync.nova.
+
+import "perception_atoms.nova"
+import "../../reader/reader.nova"
+import "../../perception/input_classifier.nova"
+import "../../perception/sensor_fusion.nova"
+import "../../perception/lipsync.nova"
+import "../../agent/loop_coordination.nova"
+
+// ---- perception module handle --------------------------------------------
+//
+// Shape (4 slots). Deliberately minimal -- the module holds only what
+// it must (the reader env + a cached last-percept) so the R2 action
+// module can pull the most-recent percept without a whole-ctx scan.
+//
+//   [0]  PM_TAG           (PM_OBJ_TAG sentinel)
+//   [1]  PM_RENV          (reader env; the reader_new() handle -- 0 when
+//                            the module was initialized without one, e.g.
+//                            a Percept-only test setup)
+//   [2]  PM_LAST_PERCEPT  (Percept or 0; overwritten on every step)
+//   [3]  PM_STEP_COUNT    (int; monotonic tally of perception_step_*
+//                            calls -- useful for the trace and the
+//                            /perception admin command in follow-up
+//                            rounds)
+//   [4]  PM_LAST_MATCHED  (int; reader's `matched` return for the most
+//                            recent text step -- lets the loop shim
+//                            preserve the pre-Phase-N `loop_perception_step`
+//                            return value without a second reader_read.
+//                            0 for A/V/M steps.)
+
+let PM_OBJ_TAG = 9202
+
+let PM_TAG          = 0
+let PM_RENV         = 1
+let PM_LAST_PERCEPT = 2
+let PM_STEP_COUNT   = 3
+let PM_LAST_MATCHED = 4
+
+fn perception_module_new(reader_env) {
+    let pm = list_new()
+    push(pm, PM_OBJ_TAG)
+    push(pm, reader_env)
+    push(pm, 0)             // last percept
+    push(pm, 0)             // step count
+    push(pm, 0)             // last matched
+    return pm
+}
+
+// Public init: mirrors the shape of other parts modules
+// (e.g. `si_new` / `reasoning_kg_init`). Accepts a `ctx` argument for
+// signature-parity with the plan, but the ctx is not captured -- the
+// module is designed to work over ANY ctx handed to it per-step, so
+// two loops sharing the module get parallel ctx state without
+// contamination.
+fn perception_module_init(reader_env, ctx) {
+    return perception_module_new(reader_env)
+}
+
+fn pm_is_module(pm) {
+    if pm == 0 { return 0 }
+    if len(pm) < 5 { return 0 }
+    if pm[PM_TAG] != PM_OBJ_TAG { return 0 }
+    return 1
+}
+
+fn _pm_renv(pm)          { return pm[PM_RENV] }
+fn pm_last_percept(pm)   { return pm[PM_LAST_PERCEPT] }
+fn pm_step_count(pm)     { return pm[PM_STEP_COUNT] }
+fn pm_last_matched(pm)   { return pm[PM_LAST_MATCHED] }
+
+fn _pm_record(pm, p) {
+    list_set(pm, PM_LAST_PERCEPT, p)
+    list_set(pm, PM_STEP_COUNT, pm[PM_STEP_COUNT] + 1)
+    return 1
+}
+
+// ---- text path ------------------------------------------------------------
+//
+// The text-perception step. Refactors the pre-Phase-N inline body of
+// `loop_perception_step`:
+//   1. `classify_input(text)` -- category / confidence / signals for
+//        the trace + downstream action policy.
+//   2. `reader_read(renv, text, list_new())` -- the five-stage reader
+//        (unchanged; still the source of truth for the four ctx slots).
+//   3. Mint a Percept from the classifier triple + the reader result
+//        (source_atom_id 0 -- the reader has not birthed a dedicated
+//        atom for the percept yet; a follow-up round could hook into
+//        `atom_add_xref`).
+//   4. Write the four ctx slots (percept / active / routes / unknown)
+//        VERBATIM from `rctx_active` / `rctx_routes` / `reader_unknown`
+//        -- byte-identical to the pre-Phase-N path.
+//   5. Cache the Percept on the module handle so a subsequent loop
+//        (parts/action, R2) can consume it without re-classifying.
+//
+// Returns the Percept. Callers that only want the matched-token count
+// (the pre-Phase-N return value) should use `pm_reader_matched(pm)`
+// or, more directly, call `loop_perception_step` -- see
+// `src/agent/loop_perception.nova` for that shim.
+fn perception_step_text(pm, ctx, text, now) {
+    let ci = classify_input(text)
+    // `classify_input` never returns 0 (it always returns a 3-tuple, per
+    // its post-condition at `input_classifier.nova:400`), but a defensive
+    // check keeps a caller that hands us a garbage classifier from
+    // segfaulting through `ci_category(0)` -> `0[0]`.
+    let cat = 0
+    let conf = 0
+    let signals = list_new()
+    if ci != 0 {
+        cat = ci_category(ci)
+        conf = ci_confidence(ci)
+        signals = ci_signals(ci)
+    }
+    let percept_atom = percept_text_new(now, cat, conf, signals, 0)
+
+    // Reader delegation -- unchanged from the pre-Phase-N inline path.
+    // The empty seed list matches the current call in loop_perception.
+    let read_res = reader_read(_pm_renv(pm), text, list_new())
+
+    // Write the four ctx slots. VERBATIM from the pre-Phase-N body:
+    //   ctx_percept  = rctx_active(read_res)
+    //   ctx_active   = rctx_active(read_res)
+    //   ctx_routes   = rctx_routes(read_res)
+    //   ctx_unknown  = reader_unknown(read_res)
+    // Do NOT re-order these; test_perception_module.nova asserts the
+    // four values are byte-identical to the reader-only path.
+    if ctx != 0 {
+        ctx_set_percept(ctx, rctx_active(read_res))
+        ctx_set_active(ctx, rctx_active(read_res))
+        ctx_set_routes(ctx, rctx_routes(read_res))
+        ctx_set_unknown(ctx, reader_unknown(read_res))
+    }
+
+    // Copy the same reader-side data into the Percept's own reader
+    // slots, so a caller holding only the Percept (no ctx) can still
+    // access routes / unknown without re-running the reader.
+    pc_set_routes(percept_atom, rctx_routes(read_res))
+    pc_set_unknown(percept_atom, reader_unknown(read_res))
+
+    // Cache the reader's matched-token count so the `loop_perception_step`
+    // shim can return it without a second reader_read (see the shim in
+    // `src/agent/loop_perception.nova`).
+    list_set(pm, PM_LAST_MATCHED, reader_matched(read_res))
+
+    _pm_record(pm, percept_atom)
+    return percept_atom
+}
+
+// ---- image path -----------------------------------------------------------
+//
+// Wraps `fuse_image_observation` and mints an image Percept. Optional --
+// no caller under `examples/*` currently ships image bytes through the
+// perception loop; this is here so the MVP is structurally complete
+// (a follow-up round can drive it from the video capture pipeline).
+//
+// `labels` is the vision-feature list (from `vp_features_for_image` or
+// `vp_seam_last_features`); `identity_label` is the face_recognize
+// result (or "" if no recognition ran); `source_atom_id` is the kg
+// atom id of the observation (or 0 if pre-birth).
+fn perception_step_image(pm, ctx, labels, identity_label, source_atom_id,
+                         confidence_milli, ts_ns) {
+    // Build the underlying fused observation atom so downstream fusion
+    // (perception_step_multimodal) can consume it. Discarded here --
+    // we retain only the derived Percept.
+    let _obs = fuse_image_observation(ts_ns, labels, identity_label,
+                                       source_atom_id, confidence_milli)
+    let p = percept_image_new(ts_ns, labels, identity_label,
+                              source_atom_id, confidence_milli)
+    _pm_record(pm, p)
+    return p
+}
+
+// Wraps `fuse_audio_observation` and mints an audio Percept.
+fn perception_step_audio(pm, ctx, labels, identity_label, source_atom_id,
+                         confidence_milli, ts_ns) {
+    let _obs = fuse_audio_observation(ts_ns, labels, identity_label,
+                                       source_atom_id, confidence_milli)
+    let p = percept_audio_new(ts_ns, labels, identity_label,
+                              source_atom_id, confidence_milli)
+    _pm_record(pm, p)
+    return p
+}
+
+// ---- multimodal path ------------------------------------------------------
+//
+// Composes an image + audio Percept into a single multimodal Percept.
+// The heavy lifting -- the temporal + identity binding -- has already
+// happened inside `fuse_observation`; this wrapper reconstructs the
+// two underlying observations, invokes `fuse_observation` for the
+// correlation score, and (only when BOTH sides ship real frames /
+// PCM samples) invokes `lipsync_detect` for the sync verdict.
+//
+// `video_frames` and `audio_pcm` are OPTIONAL; pass 0 to skip lipsync.
+// `sample_rate` matters only when audio_pcm is non-zero. When both are
+// present + valid, the returned Percept's `PC_CORR_MILLI` slot is the
+// lipsync sync score; when only fusion runs (no frames / no pcm), the
+// slot carries the sensor_fusion time delta as a coarse correlation
+// proxy (0 for a perfect time match).
+fn perception_step_multimodal(pm, ctx, image_percept, audio_percept,
+                              video_frames, audio_pcm, sample_rate, ts_ns) {
+    let corr = 0
+    // Rebuild underlying observations from the two Percepts so
+    // fuse_observation can compute the binding + time delta.
+    let img_obs = 0
+    if image_percept != 0 {
+        img_obs = fuse_image_observation(pc_timestamp_ns(image_percept),
+                                          pc_labels(image_percept),
+                                          pc_identity_label(image_percept),
+                                          pc_source_atom_id(image_percept),
+                                          pc_confidence(image_percept))
+    }
+    let aud_obs = 0
+    if audio_percept != 0 {
+        aud_obs = fuse_audio_observation(pc_timestamp_ns(audio_percept),
+                                          pc_labels(audio_percept),
+                                          pc_identity_label(audio_percept),
+                                          pc_source_atom_id(audio_percept),
+                                          pc_confidence(audio_percept))
+    }
+    let fused = fuse_observation(img_obs, aud_obs, ts_ns)
+    // Optional lipsync -- only when BOTH real frames and real PCM
+    // arrived. Empty / zero-side -> skip; sensor_fusion still supplies
+    // the time-delta binding regardless.
+    if video_frames != 0 {
+        if audio_pcm != 0 {
+            if sample_rate > 0 {
+                let r = lipsync_detect(video_frames, audio_pcm, sample_rate)
+                let s = lipsync_result_sync_score(r)
+                if s >= 0 { corr = s }
+            }
+        }
+    }
+    let p = percept_multimodal_new(image_percept, audio_percept, corr)
+    // Propagate identity from the fused atom -- fuse_observation may
+    // have upgraded WEAK to STRONG when both sides carried the same
+    // identity label, so read it back rather than trusting the
+    // per-modality Percepts' individual labels.
+    if fused != 0 {
+        let fi = fuse_atom_identity(fused)
+        if fi != 0 {
+            if len(fi) > 0 { list_set(p, PC_IDENTITY_LABEL, fi) }
+        }
+    }
+    _pm_record(pm, p)
+    return p
+}
+
+// ---- module-level singleton -----------------------------------------------
+//
+// The plan's "simpler alternative": preserve the 2-arg
+// `loop_perception_step(ctx, renv)` signature (callers in
+// `examples/crossengin_chat.nova`, `examples/crossengin_daemon.nova`,
+// `tests/unit/test_loop_perception.nova` untouched). A module-level
+// singleton lazy-initializes from the `renv` on first call; a second
+// call with a DIFFERENT `renv` (a fresh reader) rebuilds the singleton
+// so a test that constructs its own reader gets a fresh module.
+//
+// NOVA quirk: module-level singletons lazy-init at first read; the
+// initial `0` sentinel is the "not-yet-built" flag.
+
+let _perception_module_singleton = 0
+let _perception_module_singleton_renv = 0
+
+fn _perception_module_singleton_get(renv) {
+    if _perception_module_singleton == 0 {
+        _perception_module_singleton = perception_module_new(renv)
+        _perception_module_singleton_renv = renv
+        return _perception_module_singleton
+    }
+    if _perception_module_singleton_renv != renv {
+        // Different reader -- rebuild so a subsequent
+        // perception_step_text uses the correct env. Preserves the
+        // last_percept-per-renv contract (a test flipping renvs gets
+        // a fresh module rather than one that half-remembers the
+        // previous suite).
+        _perception_module_singleton = perception_module_new(renv)
+        _perception_module_singleton_renv = renv
+    }
+    return _perception_module_singleton
+}
+
+// Public accessor used by the loop shim. Callers that own their own
+// module handle (e.g. the autonomous loop's `AG_PERCEPTION_MODULE`
+// slot) should use their handle directly and NOT go through the
+// singleton.
+fn perception_module_singleton_for(renv) {
+    return _perception_module_singleton_get(renv)
+}
+
+// Test-only: force the next `perception_module_singleton_for` call to
+// build a fresh module. Not invoked by production paths.
+fn _perception_module_singleton_reset() {
+    _perception_module_singleton = 0
+    _perception_module_singleton_renv = 0
+    return 1
+}

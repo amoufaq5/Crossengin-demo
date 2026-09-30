@@ -460,6 +460,44 @@ edges (DTLS 1.2 cert-verify, NAT UDP hole-punch, WebRTC data plane,
 Raft wire integration, auto-broadcast) are documented as post-Phase-M
 candidates below.
 
+## Phase N — Fill README-only parts subtrees (in progress)
+
+Two rounds close the "Status: Pending" placeholders under
+`src/parts/perception/` and `src/parts/action/` -- the last two parts
+subtrees whose READMEs promised modules the loop layer never called.
+
+- **R1 -- Perception module (SHIPPED, ADR-0092).** Two new modules
+  under `src/parts/perception/`: `perception_atoms.nova` (the 14-slot
+  `Percept` record, four constructors for text / image / audio /
+  multimodal, accessors + name mappings + a summary formatter) and
+  `perception_module.nova` (the orchestrator -- composes
+  `classify_input` + the five-stage reader + optional
+  `fuse_image_observation` / `fuse_audio_observation` /
+  `fuse_observation` + optional `lipsync_detect` behind
+  `perception_step_text` / `_image` / `_audio` / `_multimodal`; caches
+  the most-recent Percept on `PM_LAST_PERCEPT` for R2 to consume; a
+  module-level singleton `perception_module_singleton_for(renv)` lets
+  `src/agent/loop_perception.nova::loop_perception_step` delegate
+  without a signature change, so `examples/crossengin_chat.nova`,
+  `examples/crossengin_daemon.nova`, and the existing unit test are
+  byte-untouched). `src/agent/autonomous_loop.nova::agent_new` now
+  allocates `AG_PERCEPTION_MODULE` at slot 21; the accessor
+  `agent_perception_module(a)` exposes it for R2. Behavior-preservation
+  contract asserted in `test_perception_module.nova` +
+  `test_loop_perception.nova`: the four ctx slots (`percept`, `active`,
+  `routes`, `unknown`) are byte-identical to the pre-R1 reader-only
+  path for a fixture text input.
+- **R2 -- Action module (PLANNED).** Fill `src/parts/action/` with
+  `action_atoms.nova` (Intent record) + `action_module.nova`
+  (orchestrator: Percept + ctx conclusions -> Intent ->
+  `effector_submit`) + `motor_map.nova` (substrate-activation ->
+  effector-class registry). The loop_action templating body (three
+  hard-coded strings written straight to `ctx_output`, bypassing
+  `effector_gate` -- a real README gap called out in the plan) will
+  submit through the effector gate, so every SPEAK writes an INTENT
+  plus an OUTCOME to the decision log (audit trail for every emit, per
+  ADR-0041).
+
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet
   *requires*; whether they compose into general intelligence is unproven and is
