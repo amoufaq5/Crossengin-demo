@@ -526,6 +526,65 @@ promises. The last README-only parts subtree is done; every parts
 subtree with a Status now has an Accepted README backed by real
 modules on the loop's chain.
 
+## Phase O — DTLS 1.2 completion + gossip transport wrap (in progress)
+
+Phase O closes the DTLS 1.2 work in `src/federation/dtls12.nova` and
+wraps gossip's TCP transport in DTLS records via a non-RFC-standard
+TCP shim (user-selected because gossip is line-oriented TCP today
+and NOVA lacks the UDP primitives an RFC-compliant DTLS transport
+would need).
+
+- **R1 -- DTLS cert-chain + truststore + hostname wire
+  (SHIPPED, ADR-0094).** Explore surfaced that the header comment at
+  `src/federation/dtls12.nova:137` mis-described `dtls_cert_verify` as
+  a "stub" -- R33B had already shipped the real single-cert path.
+  What was actually missing was chain walking, truststore
+  consultation, and SAN-based hostname matching. R1 adds a new
+  `dtls_cert_verify_chain(state, cert_der_list, hostname, anchors,
+  now)` entry that forwards to
+  `src/safety/x509_verify.nova::cert_chain_verify` and maps XV_* to
+  DTLS_* error codes (five failure classes, two of them new:
+  `DTLS_CERT_NOT_PINNED = "dtls-cert-not-pinned"` and
+  `DTLS_CERT_HOSTNAME_MISMATCH = "dtls-cert-hostname-mismatch"`, each
+  with its own tail-appended `STATS_CERT_*` counter). The legacy
+  single-cert `dtls_cert_verify(state, cert, n, fp)` signature is
+  untouched so existing test callers (including the R29B2 stub-forward
+  pinned in `tests/unit/test_dtls12.nova:677`) keep working
+  byte-identically. `src/safety/pem_truststore.nova` grows
+  `truststore_load_dir(dir_path)` -- since NOVA has no `sys_readdir`
+  primitive (documented at `src/nl/rpc_verbs.nova:3330`), R1 takes
+  the manifest-file fallback path: a `<dir>/manifest.txt` lists one
+  PEM filename per line (empty lines + `#` comments skipped) and
+  each is loaded via `truststore_load_file` and merged. Missing dir
+  or missing manifest -> empty anchors, no error (safe fail-closed:
+  every chain then rejects with XV_NOT_PINNED).
+  `examples/crossengin_fed_daemon.nova` adds two env vars:
+  `CE_FED_DTLS_TRUSTSTORE_PATH` (default
+  `$HOME/.crossengin/fed_truststore`, container fallback
+  `./crossengin_fed_truststore`) and `CE_FED_DTLS_HOSTNAME` (default:
+  `ce-<hash(SOUL_ID)>.fed` via a deterministic djb2 mixer over the
+  soul_id, so a self-signed test mesh where every peer's cert SAN
+  carries the derived hostname "just works"). R1 only ALLOCATES
+  anchors at boot and logs them in the banner + shutdown summary;
+  R3 wires the actual transport-time gating when the DTLS-over-TCP
+  shim lands. Tests: `tests/unit/test_dtls_cert_chain.nova` (~50
+  checks against the openssl-minted RSA + ECDSA chain fixtures
+  reused from `test_x509_verify.nova`; covers every XV -> DTLS
+  mapping, every counter bump, per-state isolation, error
+  accumulation, stats-line inclusion of the new counters, and
+  the two new tag spellings) and `tests/unit/test_truststore_dir.nova`
+  (~30 checks against fabricated per-test PEM + manifest fixtures
+  under `$HOME/.crossengin_ph_o_r1_*/`; covers non-existent dir,
+  null/empty path, missing manifest, single file, two files
+  merged, `#` comments + blank lines, missing/corrupt manifest
+  entries, CRLF endings, no trailing newline, empty and
+  all-comments manifests).
+- **R2 -- SRTP EKM forward + `use_srtp` extension** (queued;
+  ADR-0095).
+- **R3 -- non-standard DTLS-over-TCP shim for gossip** (queued;
+  ADR-0096; wraps `gossip_handle_conn` in DTLS records with a
+  length-prefixed framing since TCP has no datagram boundary).
+
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet
   *requires*; whether they compose into general intelligence is unproven and is

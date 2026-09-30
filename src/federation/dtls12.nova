@@ -134,7 +134,28 @@
 //                                         (the stub is retained as a
 //                                         regression guard against
 //                                         accidental rename).
-//     dtls_cert_verify_R29B2_STUB      -- still a stub; needs an X.509 parser.
+//     dtls_cert_verify_R29B2_STUB      -- HISTORICAL LABEL, no longer a
+//                                         stub. R33B replaced the body
+//                                         with a real single-cert path
+//                                         (x509_parse -> validity ->
+//                                         ECDSA-P256 verify -> optional
+//                                         fingerprint) and the SUFFIX is
+//                                         retained only for `grep`
+//                                         backwards-compat. Phase O R1
+//                                         (ADR-0094) then added the
+//                                         chain-aware entry
+//                                         `dtls_cert_verify_chain(state,
+//                                         cert_der_list, hostname,
+//                                         anchors, now)` which forwards
+//                                         to `cert_chain_verify` at
+//                                         `src/safety/x509_verify.nova`
+//                                         for full chain walking +
+//                                         truststore consultation +
+//                                         SAN matching. Legacy
+//                                         `dtls_cert_verify(state, cert,
+//                                         n, fp)` is kept untouched for
+//                                         backwards compatibility with
+//                                         existing test callers.
 //     dtls_seal_record_R29B2_STUB      -- REPLACED in R31B by dtls_seal_record.
 //     dtls_open_record_R29B2_STUB      -- REPLACED in R31B by dtls_open_record.
 //     dtls_extract_srtp_keys_R29B2_STUB -- still a stub; needs RFC 5705 EKM.
@@ -214,6 +235,13 @@ import "../safety/aes_gcm.nova"
 // `dtls_cert_verify` calls. `ecdsa_sha256` + `ecdsa_p256_verify_bn` are
 // re-exported through the same import chain.
 import "../safety/x509.nova"
+// Phase O R1 (ADR-0094): pull in the chain-aware verifier + typed anchor
+// key constants so `dtls_cert_verify_chain` can forward to
+// `cert_chain_verify(der_list, host, anchors, now)`. `x509_verify.nova`
+// is the RSA/EC chain path that already ships in the tree (it powers
+// the TLS 1.3 client's anchor pinning); this import wires the same
+// verifier into DTLS.
+import "../safety/x509_verify.nova"
 
 // ============================================================================
 //                              Error tags
@@ -259,6 +287,17 @@ let DTLS_CERT_EXPIRED         = "dtls: cert expired"
 let DTLS_CERT_NOT_YET_VALID   = "dtls: cert not yet valid"
 let DTLS_CERT_SIG_FAIL        = "dtls: cert sig fail"
 let DTLS_CERT_FP_MISMATCH     = "dtls: cert fingerprint mismatch"
+// Phase O R1 (ADR-0094) chain-aware cert-verify error tags. `_NOT_PINNED`
+// fires when `cert_chain_verify` walked the whole chain but the top
+// cert's public key did not match any anchor in the truststore.
+// `_HOSTNAME_MISMATCH` fires when the leaf cert's SAN list does not
+// cover the caller-supplied hostname (exact or wildcard). Both use the
+// same "dtls-<lowered-error-slug>" spelling the ADR-0094 error map
+// pins for cross-module consistency; they REMAIN distinct string tags
+// (unlike the AEAD path's collapsed DTLS_DECRYPT_FAIL) because
+// cert-verify is evaluated BEFORE any oracle-relevant state.
+let DTLS_CERT_NOT_PINNED         = "dtls-cert-not-pinned"
+let DTLS_CERT_HOSTNAME_MISMATCH  = "dtls-cert-hostname-mismatch"
 
 // ============================================================================
 //                              Protocol constants
@@ -602,6 +641,16 @@ let DTLS_S_SLOT_STATS_SRTP_KM_HITS  = 44  // int -- cache-hit count
 
 let DTLS_S_SLOT_STATS_REKEYS        = 45  // int -- key_block re-expand count
 
+// Phase O R1 (ADR-0094): chain-aware cert-verify telemetry. Two fresh
+// tail-appended stats slots so the R33B slot layout (0..45) stays
+// byte-identical. These mirror the R33B `STATS_CERT_*` pattern: every
+// `dtls_cert_verify_chain` outcome bumps exactly one counter. Existing
+// `STATS_CERT_OK` / `STATS_CERT_PARSE_FAIL` / `STATS_CERT_EXPIRED` /
+// `STATS_CERT_SIG_FAIL` are shared with the legacy single-cert path so
+// the counters stay unified across both entries.
+let DTLS_S_SLOT_STATS_CERT_NOT_PINNED        = 46  // int -- root not in anchors
+let DTLS_S_SLOT_STATS_CERT_HOSTNAME_MISMATCH = 47  // int -- SAN did not cover host
+
 fn dtls_init() {
     let st = list_new()
     push(st, DTLS_S_INIT)        // state
@@ -655,6 +704,9 @@ fn dtls_init() {
     push(st, 0)                  // stats_srtp_km_hits
     // R38B PRF-rekey counter on epoch advance.
     push(st, 0)                  // stats_rekeys
+    // Phase O R1 (ADR-0094) chain-aware cert-verify counters.
+    push(st, 0)                  // stats_cert_not_pinned
+    push(st, 0)                  // stats_cert_hostname_mismatch
     return st
 }
 
@@ -2168,6 +2220,136 @@ fn dtls_cert_verify(state, peer_cert_der, peer_cert_len,
 }
 
 // ============================================================================
+//         Phase O R1 (ADR-0094) chain-aware cert-verify
+// ============================================================================
+//
+// `dtls_cert_verify_chain(state, cert_der_list, hostname, anchors, now)`
+// is the chain-aware entry that Phase O R1 wires DTLS to. It forwards
+// to `cert_chain_verify(der_list, host, anchors, now)` at
+// `src/safety/x509_verify.nova:393`, which walks a full leaf-first cert
+// chain, verifies each signature under its parent's public key
+// (dispatching RSA / ECDSA per cert), matches the TOP cert's public
+// key against the caller-supplied truststore (`anchors`), enforces
+// SAN-based hostname coverage on the leaf (exact match or "*.suffix"),
+// and confirms the leaf's validity window brackets `now`.
+//
+// XV_* -> DTLS_* mapping (ADR-0094 error map):
+//   XV_OK          -> DTLS_OK (0)                bumps STATS_CERT_OK
+//   XV_PARSE       -> DTLS_CERT_PARSE_FAIL       bumps STATS_CERT_PARSE_FAIL
+//   XV_SIG         -> DTLS_CERT_SIG_FAIL         bumps STATS_CERT_SIG_FAIL
+//   XV_NOT_PINNED  -> DTLS_CERT_NOT_PINNED       bumps STATS_CERT_NOT_PINNED
+//   XV_HOSTNAME    -> DTLS_CERT_HOSTNAME_MISMATCH bumps STATS_CERT_HOSTNAME_MISMATCH
+//   XV_EXPIRED     -> DTLS_CERT_EXPIRED          bumps STATS_CERT_EXPIRED
+//
+// Note that `cert_chain_verify` folds both "not yet valid" and "expired"
+// into the single XV_EXPIRED tag (its validity check compares against
+// the same `now` bound on both sides); the DTLS mapping therefore
+// surfaces them as DTLS_CERT_EXPIRED. Callers that need to distinguish
+// the two must use the legacy single-cert `dtls_cert_verify` entry.
+//
+// Returns `[dtls_status, leaf_cert]`:
+//   * on DTLS_OK -- `leaf_cert` is the parsed leaf record from
+//     `cert_parse` (the SAME cert list `x509_verify.nova` returns on
+//     the XV_OK path). Callers that want to pin a fingerprint,
+//     extract the leaf public key for CertificateVerify, or read SANs
+//     read from this cert. Its lifetime is tied to `state`'s
+//     lifetime -- copy any bytes you need before the state is freed.
+//   * on any error -- `leaf_cert` is 0 (no valid leaf to hand out;
+//     the chain never fully verified).
+//
+// `state[DTLS_S_SLOT_LAST_ERR]` is stamped with the mapped tag on every
+// non-OK path so a caller inspecting `dtls_last_error(state)` sees the
+// exact rejection cause. The legacy single-cert `dtls_cert_verify`
+// signature is UNTOUCHED so existing test callers continue to work.
+//
+// Empty cert lists forward to `cert_chain_verify` unchanged, which
+// itself returns XV_PARSE for `len(certs) == 0` -- the DTLS surface
+// therefore reports DTLS_CERT_PARSE_FAIL (the safest bucket) for a
+// caller that hands us nothing to verify.
+//
+// This function does NOT take an `expected_fingerprint` -- fingerprint
+// binding is a WebRTC-DTLS-SDP-specific check (RFC 4572), not a chain-
+// path concern; callers that need it can call `dtls_cert_verify` on
+// the leaf separately after this returns DTLS_OK, or add their own
+// fingerprint comparison against the returned `leaf_cert`.
+// ----------------------------------------------------------------------------
+fn dtls_cert_verify_chain(state, cert_der_list, hostname, anchors, now) {
+    let r = cert_chain_verify(cert_der_list, hostname, anchors, now)
+    let xv = r[0]
+    let leaf = r[1]
+    if xv == XV_OK {
+        state[DTLS_S_SLOT_STATS_CERT_OK] =
+            state[DTLS_S_SLOT_STATS_CERT_OK] + 1
+        let out = list_new()
+        push(out, DTLS_OK)
+        push(out, leaf)
+        return out
+    }
+    if xv == XV_PARSE {
+        state[DTLS_S_SLOT_STATS_CERT_PARSE_FAIL] =
+            state[DTLS_S_SLOT_STATS_CERT_PARSE_FAIL] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_PARSE_FAIL
+        let out = list_new()
+        push(out, DTLS_CERT_PARSE_FAIL)
+        push(out, 0)
+        return out
+    }
+    if xv == XV_SIG {
+        state[DTLS_S_SLOT_STATS_CERT_SIG_FAIL] =
+            state[DTLS_S_SLOT_STATS_CERT_SIG_FAIL] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_SIG_FAIL
+        let out = list_new()
+        push(out, DTLS_CERT_SIG_FAIL)
+        push(out, 0)
+        return out
+    }
+    if xv == XV_NOT_PINNED {
+        state[DTLS_S_SLOT_STATS_CERT_NOT_PINNED] =
+            state[DTLS_S_SLOT_STATS_CERT_NOT_PINNED] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_NOT_PINNED
+        let out = list_new()
+        push(out, DTLS_CERT_NOT_PINNED)
+        push(out, 0)
+        return out
+    }
+    if xv == XV_HOSTNAME {
+        state[DTLS_S_SLOT_STATS_CERT_HOSTNAME_MISMATCH] =
+            state[DTLS_S_SLOT_STATS_CERT_HOSTNAME_MISMATCH] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_HOSTNAME_MISMATCH
+        let out = list_new()
+        push(out, DTLS_CERT_HOSTNAME_MISMATCH)
+        push(out, 0)
+        return out
+    }
+    if xv == XV_EXPIRED {
+        state[DTLS_S_SLOT_STATS_CERT_EXPIRED] =
+            state[DTLS_S_SLOT_STATS_CERT_EXPIRED] + 1
+        state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_EXPIRED
+        let out = list_new()
+        push(out, DTLS_CERT_EXPIRED)
+        push(out, 0)
+        return out
+    }
+    // Defensive: unknown XV_* -- treat as parse failure (the safest
+    // reject; the chain surfaced a code we do not recognise).
+    state[DTLS_S_SLOT_STATS_CERT_PARSE_FAIL] =
+        state[DTLS_S_SLOT_STATS_CERT_PARSE_FAIL] + 1
+    state[DTLS_S_SLOT_LAST_ERR] = DTLS_CERT_PARSE_FAIL
+    let out = list_new()
+    push(out, DTLS_CERT_PARSE_FAIL)
+    push(out, 0)
+    return out
+}
+
+// Accessors for the two new Phase O R1 counters.
+fn dtls_stats_cert_not_pinned(state) {
+    return state[DTLS_S_SLOT_STATS_CERT_NOT_PINNED]
+}
+fn dtls_stats_cert_hostname_mismatch(state) {
+    return state[DTLS_S_SLOT_STATS_CERT_HOSTNAME_MISMATCH]
+}
+
+// ============================================================================
 //                   R29B.2 STUBS  (deliberately incomplete)
 // ============================================================================
 //
@@ -2357,6 +2539,8 @@ fn dtls_stats_line(state) {
     s = s + " cert_expired=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_EXPIRED])
     s = s + " cert_sig_fail=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_SIG_FAIL])
     s = s + " cert_fp_mismatch=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_FP_MISMATCH])
+    s = s + " cert_not_pinned=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_NOT_PINNED])
+    s = s + " cert_hostname_mismatch=" + int_to_str(state[DTLS_S_SLOT_STATS_CERT_HOSTNAME_MISMATCH])
     s = s + " srtp_km_hits=" + int_to_str(state[DTLS_S_SLOT_STATS_SRTP_KM_HITS])
     s = s + " rekeys=" + int_to_str(state[DTLS_S_SLOT_STATS_REKEYS])
     return s
