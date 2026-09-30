@@ -911,6 +911,31 @@ fn _gossip_send_all(fd, s) {
     return 1
 }
 
+// Phase P R3 (ADR-0099): DTLS-aware wrapper around `_gossip_send_all`.
+// When `dtls_state == 0` this routes through the plaintext sender so
+// the wire bytes are byte-identical to pre-R3 (regression contract for
+// every plaintext caller). When `dtls_state != 0` this routes through
+// `gds_send_line`, which seals the plaintext under the AEAD and wraps
+// the sealed record in the shim's 2-byte length prefix so the receive
+// side (also going through `gds_recv_line`) can tear one DTLS record
+// off the stream at a time. `gds_send_line` adds a trailing '\n' if
+// the caller did not, and strips it on the receive side, so the line-
+// oriented protocol layers above remain oblivious to the transport
+// swap.
+//
+// Handlers that write ATOM / SNAP_* / DQ* / DR* / DELTA_END etc. to a
+// connection fd call this helper instead of `_gossip_send_all` so the
+// DTLS-variant dispatchers at gossip.nova:3215 / :3299 stop silently
+// dropping those verbs. See ADR-0099 for the full transport-neutral-
+// send contract.
+fn _gossip_send_all_maybe_dtls(fd, dtls_state, s) {
+    if dtls_state == 0 { return _gossip_send_all(fd, s) }
+    // gds_send_line strips a trailing '\n' from the plaintext-in and
+    // re-adds it on decrypt, so the DTLS receiver's line parser sees
+    // the same shape as the plaintext receiver.
+    return gds_send_line(fd, dtls_state, s)
+}
+
 fn _gossip_recv_line(fd) {
     let buf = alloc(GOSSIP_LINE_MAX)
     let n = 0
@@ -1442,6 +1467,15 @@ fn gossip_handle_conn_kg(state, conn_fd, kg) {
 // after. The originator detects the DQERR and bumps its bad_query
 // counter without aborting the rest of the fan-out.
 fn _gossip_serve_dquery(conn_fd, state, kg, line) {
+    return _gossip_serve_dquery_maybe_dtls(conn_fd, 0, state, kg, line)
+}
+
+// Phase P R3 (ADR-0099): DTLS-aware DQUERY server. Existing callers
+// pass dtls_state=0 (via the plaintext wrapper above) and get the
+// unchanged byte-for-byte plaintext behavior; the DTLS variant threads
+// dtls_state through so every response frame is sealed + framed via
+// `gds_send_line` and stays inside the AEAD envelope.
+fn _gossip_serve_dquery_maybe_dtls(conn_fd, dtls_state, state, kg, line) {
     let toks = _gossip_split_spaces(line)
     // Expected shape: ["DQUERY", "<id>", "<originator>", "<ts_ns>", "<rest...>"]
     if len(toks) < 5 { return 0 }
@@ -1462,8 +1496,9 @@ fn _gossip_serve_dquery(conn_fd, state, kg, line) {
     if _qry_is_error(parsed) == 1 {
         let err_msg = qry_error_message(parsed)
         let err_line = GOSSIP_DQERR_PREFIX + int_to_str(qid) + " " + err_msg + "\n"
-        _gossip_send_all(conn_fd, err_line)
-        _gossip_send_all(conn_fd, GOSSIP_DQEND_PREFIX + int_to_str(qid) + "\n")
+        _gossip_send_all_maybe_dtls(conn_fd, dtls_state, err_line)
+        _gossip_send_all_maybe_dtls(conn_fd, dtls_state,
+                                    GOSSIP_DQEND_PREFIX + int_to_str(qid) + "\n")
         return 0
     }
     let vars = kg_query_vars(parsed)
@@ -1471,7 +1506,7 @@ fn _gossip_serve_dquery(conn_fd, state, kg, line) {
     let n = len(bindings)
     let res_line = GOSSIP_DQRES_PREFIX + int_to_str(qid) + " " + self_addr
         + " " + int_to_str(n) + "\n"
-    if _gossip_send_all(conn_fd, res_line) == 0 { return -1 }
+    if _gossip_send_all_maybe_dtls(conn_fd, dtls_state, res_line) == 0 { return -1 }
     let k = 0
     while k < n {
         let row = GOSSIP_DQBIND_PREFIX + self_addr
@@ -1486,10 +1521,11 @@ fn _gossip_serve_dquery(conn_fd, state, kg, line) {
             }
             v = v + 1
         }
-        if _gossip_send_all(conn_fd, row + "\n") == 0 { return -1 }
+        if _gossip_send_all_maybe_dtls(conn_fd, dtls_state, row + "\n") == 0 { return -1 }
         k = k + 1
     }
-    _gossip_send_all(conn_fd, GOSSIP_DQEND_PREFIX + int_to_str(qid) + "\n")
+    _gossip_send_all_maybe_dtls(conn_fd, dtls_state,
+                                GOSSIP_DQEND_PREFIX + int_to_str(qid) + "\n")
     return n
 }
 
@@ -1497,6 +1533,15 @@ fn _gossip_serve_dquery(conn_fd, state, kg, line) {
 // The wire format mirrors kg_sync's ATOM line so the receiver can hand the
 // parsed payload straight to sync_apply_atom().
 fn _gossip_stream_atoms_since(conn_fd, kg, since_ns) {
+    return _gossip_stream_atoms_since_maybe_dtls(conn_fd, 0, kg, since_ns)
+}
+
+// Phase P R3 (ADR-0099): DTLS-aware ATOM streamer for DELTA responses.
+// dtls_state=0 keeps the plaintext byte-for-byte behavior; non-zero
+// routes every ATOM line through `gds_send_line` so each ATOM becomes
+// its own sealed length-prefixed DTLS record on the wire (matching the
+// per-line record boundary the recv side expects via `gds_recv_line`).
+fn _gossip_stream_atoms_since_maybe_dtls(conn_fd, dtls_state, kg, since_ns) {
     if kg == 0 { return 0 }
     let n = kg_atom_count(kg)
     let i = 0
@@ -1519,7 +1564,9 @@ fn _gossip_stream_atoms_since(conn_fd, kg, since_ns) {
                     + int_to_str(alpha) + " "
                     + int_to_str(beta) + " "
                     + label + "\n"
-                if _gossip_send_all(conn_fd, line) == 0 { return sent }
+                if _gossip_send_all_maybe_dtls(conn_fd, dtls_state, line) == 0 {
+                    return sent
+                }
                 sent = sent + 1
             }
         }
@@ -1941,13 +1988,21 @@ fn _gossip_serve_derivation(state, kg, line) {
 // matches the requested pred, as DRFACT lines tagged with our self_addr;
 // terminate with DREND.
 fn _gossip_serve_drfetch(conn_fd, state, kg, line) {
+    return _gossip_serve_drfetch_maybe_dtls(conn_fd, 0, state, kg, line)
+}
+
+// Phase P R3 (ADR-0099): DTLS-aware DRFETCH server. Same shape as the
+// plaintext original but with a `dtls_state` thread through every
+// DRFACT + DREND send. dtls_state=0 keeps the plaintext byte-shape;
+// non-zero routes every send through `gds_send_line`.
+fn _gossip_serve_drfetch_maybe_dtls(conn_fd, dtls_state, state, kg, line) {
     let toks = _gossip_split_spaces(line)
     if len(toks) < 2 { return 0 }
     let pred = toks[1]
     let self_addr = state[GOSSIP_S_SELF_ADDR]
     state[GOSSIP_S_STATS_DR_FETCHES_RX] = state[GOSSIP_S_STATS_DR_FETCHES_RX] + 1
     if kg == 0 {
-        _gossip_send_all(conn_fd, GOSSIP_DREND_LINE + "\n")
+        _gossip_send_all_maybe_dtls(conn_fd, dtls_state, GOSSIP_DREND_LINE + "\n")
         return 0
     }
     let atoms = kg_atoms(kg)
@@ -1966,7 +2021,7 @@ fn _gossip_serve_drfetch(conn_fd, state, kg, line) {
                             + " " + parts[1]
                             + " " + parts[2]
                             + " " + int_to_str(atom_id(a)) + "\n"
-                        if _gossip_send_all(conn_fd, fact_line) == 0 {
+                        if _gossip_send_all_maybe_dtls(conn_fd, dtls_state, fact_line) == 0 {
                             i = len(atoms)
                         } else {
                             sent = sent + 1
@@ -1977,7 +2032,7 @@ fn _gossip_serve_drfetch(conn_fd, state, kg, line) {
         }
         i = i + 1
     }
-    _gossip_send_all(conn_fd, GOSSIP_DREND_LINE + "\n")
+    _gossip_send_all_maybe_dtls(conn_fd, dtls_state, GOSSIP_DREND_LINE + "\n")
     return sent
 }
 
@@ -2751,6 +2806,12 @@ fn gossip_stats_sr_data_rx(state)  { return state[GOSSIP_S_STATS_SR_DATA_RX] }
 // Splits on '\n' (byte 10). Returns the number of SNAP_DATA frames
 // sent.
 fn _gossip_send_snap_body(conn_fd, bytes) {
+    return _gossip_send_snap_body_maybe_dtls(conn_fd, 0, bytes)
+}
+
+// Phase P R3 (ADR-0099): DTLS-aware SNAP_DATA streamer. See
+// `_gossip_send_all_maybe_dtls` for the dispatch contract.
+fn _gossip_send_snap_body_maybe_dtls(conn_fd, dtls_state, bytes) {
     let n = len(bytes)
     let pos = 0
     let sent = 0
@@ -2773,7 +2834,8 @@ fn _gossip_send_snap_body(conn_fd, bytes) {
             segment = substr(bytes, pos, n - pos)
             next_pos = n
         }
-        if _gossip_send_all(conn_fd, GOSSIP_SNAP_DATA_PREFIX + segment + "\n") == 0 {
+        if _gossip_send_all_maybe_dtls(conn_fd, dtls_state,
+                                       GOSSIP_SNAP_DATA_PREFIX + segment + "\n") == 0 {
             return sent
         }
         sent = sent + 1
@@ -2787,24 +2849,31 @@ fn _gossip_send_snap_body(conn_fd, bytes) {
 // each line of the snapshot text as SNAP_DATA <line>, then SNAP_END.
 // A miss (we don't have the root) is just SNAP_END alone.
 fn _gossip_serve_snap_fetch(conn_fd, state, line) {
+    return _gossip_serve_snap_fetch_maybe_dtls(conn_fd, 0, state, line)
+}
+
+// Phase P R3 (ADR-0099): DTLS-aware SNAP_FETCH server. dtls_state=0
+// keeps the plaintext byte-shape for existing callers; non-zero routes
+// every SNAP_DATA + SNAP_END frame through `gds_send_line`.
+fn _gossip_serve_snap_fetch_maybe_dtls(conn_fd, dtls_state, state, line) {
     let sr = state[GOSSIP_S_SR_STATE]
     state[GOSSIP_S_STATS_SR_FETCH_RX] = state[GOSSIP_S_STATS_SR_FETCH_RX] + 1
     if sr == 0 {
-        _gossip_send_all(conn_fd, GOSSIP_SNAP_END_LINE + "\n")
+        _gossip_send_all_maybe_dtls(conn_fd, dtls_state, GOSSIP_SNAP_END_LINE + "\n")
         return 0
     }
     let root_hex = sr_parse_fetch_line(line)
     if len(root_hex) == 0 {
-        _gossip_send_all(conn_fd, GOSSIP_SNAP_END_LINE + "\n")
+        _gossip_send_all_maybe_dtls(conn_fd, dtls_state, GOSSIP_SNAP_END_LINE + "\n")
         return 0
     }
     let bytes = sr_serve_snap_request(sr, root_hex)
     if bytes == 0 {
-        _gossip_send_all(conn_fd, GOSSIP_SNAP_END_LINE + "\n")
+        _gossip_send_all_maybe_dtls(conn_fd, dtls_state, GOSSIP_SNAP_END_LINE + "\n")
         return 0
     }
-    let sent = _gossip_send_snap_body(conn_fd, bytes)
-    _gossip_send_all(conn_fd, GOSSIP_SNAP_END_LINE + "\n")
+    let sent = _gossip_send_snap_body_maybe_dtls(conn_fd, dtls_state, bytes)
+    _gossip_send_all_maybe_dtls(conn_fd, dtls_state, GOSSIP_SNAP_END_LINE + "\n")
     return sent
 }
 
@@ -3253,7 +3322,14 @@ fn gossip_handle_conn_dtls(state, conn_fd, dtls_state) {
                         }
                     } else {
                         if _gossip_starts_with(line, GOSSIP_DELTA_PREFIX) == 1 {
-                            gds_send_line(conn_fd, dtls_state, GOSSIP_DELTA_END_LINE)
+                            // Phase P R3 (ADR-0099): DTLS DELTA in the
+                            // kg-less handler still has no KG to stream
+                            // from, so DELTA_END is the correct reply
+                            // per the plaintext handler's mirror at
+                            // line 1225 above. Now routed through the
+                            // sealed shim helper for consistency.
+                            _gossip_send_all_maybe_dtls(conn_fd, dtls_state,
+                                                       GOSSIP_DELTA_END_LINE + "\n")
                         }
                         if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
                             _gossip_serve_attestation(state, line)
@@ -3270,19 +3346,40 @@ fn gossip_handle_conn_dtls(state, conn_fd, dtls_state) {
                                 }
                             }
                         }
-                        // Note: SNAP_FETCH / EXTADDR / RELAY_* handlers
-                        // that write directly to `conn_fd` (rather than
-                        // via a shim-provided send helper) would leak
-                        // plaintext onto the DTLS wire and break the
-                        // AEAD framing. In R3 they are intentionally
-                        // NOT dispatched under the DTLS variant; a
-                        // follow-up round that adds DTLS-aware server-
-                        // side variants of those helpers wires them in
-                        // here. The line arrives via `gds_recv_line`
-                        // and is silently dropped -- protocol-level
-                        // "unknown verb" behavior, matching the plain
-                        // handler's fall-through on unrecognized
-                        // prefixes.
+                        // Phase P R3 (ADR-0099): SNAP_FETCH / EXTADDR /
+                        // RELAY_* now dispatched under DTLS through the
+                        // *_maybe_dtls handler variants (SNAP_FETCH
+                        // writes via `_gossip_send_all_maybe_dtls`;
+                        // EXTADDR / RELAY_REQ / RELAY_DATA / RELAY_ACK
+                        // do not write to conn_fd at all — they enqueue
+                        // for the drain helpers — so they are safe to
+                        // call as-is with no signature extension). The
+                        // silently-dropped fall-through comment R1
+                        // shipped is now retired; unknown verbs still
+                        // fall through the outer if-chain as before.
+                        if _gossip_starts_with(line, GOSSIP_SNAP_FETCH_PREFIX) == 1 {
+                            _gossip_serve_snap_fetch_maybe_dtls(conn_fd, dtls_state, state, line)
+                        }
+                        if _gossip_starts_with(line, GOSSIP_EXTADDR_PREFIX) == 1 {
+                            _gossip_serve_extaddr(state, line)
+                        }
+                        if _gossip_starts_with(line, GOSSIP_RELAY_REQ_PREFIX) == 1 {
+                            _gossip_serve_relay_req(state, line)
+                        }
+                        if _gossip_starts_with(line, GOSSIP_RELAY_DATA_PREFIX) == 1 {
+                            _gossip_serve_relay_data(state, line)
+                        }
+                        if _gossip_starts_with(line, GOSSIP_RELAY_ACK_PREFIX) == 1 {
+                            _gossip_serve_relay_ack(state, line)
+                        }
+                        // RELAY_BIN carries a raw binary tail read
+                        // directly off the fd via `_gnoise_recv_exact`.
+                        // Under DTLS the payload bytes ride sealed
+                        // records interleaved with header frames, which
+                        // this fd-oriented reader does not know how to
+                        // decrypt. R3 does NOT dispatch RELAY_BIN under
+                        // DTLS; a follow-up round that adds a
+                        // sealed-frame binary reader wires it in here.
                     }
                 }
             }
@@ -3332,38 +3429,79 @@ fn gossip_handle_conn_kg_dtls(state, conn_fd, dtls_state, kg) {
                         }
                     } else {
                         if _gossip_starts_with(line, GOSSIP_DELTA_PREFIX) == 1 {
-                            // DTLS DELTA path: we do NOT reuse
-                            // `_gossip_stream_atoms_since` because it
-                            // writes ATOM lines directly to `conn_fd`
-                            // (plaintext -> AEAD-framed wire would
-                            // corrupt the record stream). R3 answers
-                            // DELTA under DTLS with an immediate
-                            // DELTA_END; a follow-up round that adds a
-                            // gds-aware ATOM streamer plugs in here.
-                            gds_send_line(conn_fd, dtls_state, GOSSIP_DELTA_END_LINE)
-                        }
-                        if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
-                            _gossip_serve_attestation(state, line)
-                            let _srdk = state[GOSSIP_S_SR_STATE]
-                            if _srdk != 0 {
-                                let _attk = att_parse_wire(line)
-                                if _attk != 0 {
-                                    let _pkk = gossip_lookup_att_pubkey(state, att_soul_id(_attk))
-                                    if _pkk != 0 {
-                                        if att_verify(_attk, _pkk) == 1 {
-                                            sr_observe_attestation(_srdk, _attk)
+                            // Phase P R3 (ADR-0099): the DTLS DELTA
+                            // path now streams ATOM records through
+                            // `_gossip_stream_atoms_since_maybe_dtls`
+                            // so each ATOM line becomes its own sealed
+                            // length-prefixed DTLS record, followed by
+                            // a sealed DELTA_END. This mirrors the
+                            // plaintext handler at line 1325 above.
+                            let dtoksd = _gossip_split_spaces(line)
+                            if len(dtoksd) >= 3 {
+                                let since_sd = dtoksd[2]
+                                let since_nsd = 0
+                                if _gossip_is_digits(since_sd) == 1 {
+                                    since_nsd = str_to_int(since_sd)
+                                }
+                                _gossip_stream_atoms_since_maybe_dtls(conn_fd, dtls_state, kg, since_nsd)
+                            }
+                            _gossip_send_all_maybe_dtls(conn_fd, dtls_state,
+                                                       GOSSIP_DELTA_END_LINE + "\n")
+                        } else {
+                            // Phase P R3 (ADR-0099): DQUERY / RULE /
+                            // DRFETCH / DERIVATION / ATTESTATION /
+                            // SNAP_FETCH / EXTADDR / RELAY_* now
+                            // dispatched under DTLS through their
+                            // `_maybe_dtls` variants (or through their
+                            // existing helpers when they do not write
+                            // to conn_fd). R2's silently-dropped
+                            // fall-through comment is retired.
+                            if _gossip_starts_with(line, GOSSIP_DQUERY_PREFIX) == 1 {
+                                _gossip_serve_dquery_maybe_dtls(conn_fd, dtls_state, state, kg, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
+                                _gossip_serve_attestation(state, line)
+                                let _srdk = state[GOSSIP_S_SR_STATE]
+                                if _srdk != 0 {
+                                    let _attk = att_parse_wire(line)
+                                    if _attk != 0 {
+                                        let _pkk = gossip_lookup_att_pubkey(state, att_soul_id(_attk))
+                                        if _pkk != 0 {
+                                            if att_verify(_attk, _pkk) == 1 {
+                                                sr_observe_attestation(_srdk, _attk)
+                                            }
                                         }
                                     }
                                 }
                             }
+                            if _gossip_starts_with(line, GOSSIP_SNAP_FETCH_PREFIX) == 1 {
+                                _gossip_serve_snap_fetch_maybe_dtls(conn_fd, dtls_state, state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_RULE_PREFIX) == 1 {
+                                _gossip_serve_rule(state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_DRFETCH_PREFIX) == 1 {
+                                _gossip_serve_drfetch_maybe_dtls(conn_fd, dtls_state, state, kg, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_DERIVATION_PREFIX) == 1 {
+                                _gossip_serve_derivation(state, kg, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_EXTADDR_PREFIX) == 1 {
+                                _gossip_serve_extaddr(state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_RELAY_REQ_PREFIX) == 1 {
+                                _gossip_serve_relay_req(state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_RELAY_DATA_PREFIX) == 1 {
+                                _gossip_serve_relay_data(state, line)
+                            }
+                            if _gossip_starts_with(line, GOSSIP_RELAY_ACK_PREFIX) == 1 {
+                                _gossip_serve_relay_ack(state, line)
+                            }
+                            // RELAY_BIN's binary tail is not yet
+                            // sealed-record aware; see the kg-less
+                            // variant above for the rationale.
                         }
-                        // R20E / R21B / R23C / R23E / R26E parser
-                        // branches that write to `conn_fd` directly
-                        // are intentionally NOT dispatched under DTLS
-                        // in R3 (same reasoning as the kg-less variant
-                        // above). Follow-up: gds-aware variants of the
-                        // stream helpers wire them in here without
-                        // touching the plaintext handler.
                     }
                 }
             }

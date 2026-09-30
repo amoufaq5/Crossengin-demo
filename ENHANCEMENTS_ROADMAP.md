@@ -692,7 +692,7 @@ would need).
   closed the DTLS 1.2 stack (cert-chain + SRTP EKM + `use_srtp`),
   R3 puts the wire under DTLS AEAD (mesh-only per ADR-0096).
 
-## Phase P — DTLS 1.2 handshake flight completion (IN PROGRESS)
+## Phase P — DTLS 1.2 handshake flight completion (COMPLETE)
 
 Phase P closes the handshake-flight caveat Phase O R3 documented:
 `gds_handshake_server` and `gds_handshake_client` in
@@ -816,6 +816,67 @@ silently dropped under DTLS.
   gossip stream helpers so DELTA / SNAP_FETCH / EXTADDR /
   RELAY_* stop being silently dropped under DTLS. `make lint-ints`
   clean (pre-existing findings unchanged; none in the R2 files).
+- **R3 -- extension parse + DTLS-aware gossip stream helpers
+  (SHIPPED, ADR-0099).** Replaces R1's `_dtls_parse_ext_block_stub`
+  (kept as a back-compat alias for R1's pinned tests) with a real
+  extensions-block walker `_dtls_parse_ext_block(buf, n)` that
+  consumes the CONTENT bytes of an extensions block and returns
+  `[ok, extensions_list, total_bytes_consumed]` where each entry is
+  `[ext_type_u16, ext_data_buf, ext_data_len]`. Unknown extension
+  types are collected verbatim into the list; dispatch decides
+  whether to consume or drop (per RFC 5246 §7.4.1.4). Adds a
+  `_dtls_parse_use_srtp_ext(buf, n)` per-extension parser (RFC 5764
+  §4.1.1: 2B `profile_list_len` + N/2 profile IDs + 1B `mki_len` +
+  mki bytes; refuses odd / zero `profile_list_len` and any length
+  overflow) plus `_dtls_select_srtp_profile(offered_profiles)` server-
+  side selector (single supported profile:
+  `SRTP_PROFILE_AES128_CM_SHA1_80`). Wires the parse-side into
+  `_gds_server_flight_1` (`src/federation/gossip_dtls_shim.nova`):
+  after parsing the ClientHello + absorbing the HS message into the
+  transcript, walk the extensions block; for each `use_srtp` entry
+  dispatch to `_dtls_parse_use_srtp_ext` + `_dtls_select_srtp_profile`
+  + write the chosen profile to `DTLS_S_SLOT_SRTP_OFFER` so R1's
+  `_dtls_build_server_hello_body` echoes it back per RFC 5764 §4.1.3.
+  Adds `_gossip_send_all_maybe_dtls(fd, dtls_state, s)` transport-
+  neutral send helper in `src/federation/gossip.nova`: `dtls_state=0`
+  routes to `_gossip_send_all` (plaintext byte-identical to pre-R3);
+  non-zero routes to `gds_send_line` (sealed + length-prefixed under
+  the shim). Converts every write-to-conn_fd handler to a
+  `_maybe_dtls` variant that threads `dtls_state` through every send
+  (`_gossip_stream_atoms_since`, `_gossip_serve_dquery`,
+  `_gossip_serve_drfetch`, `_gossip_serve_snap_fetch`,
+  `_gossip_send_snap_body`); the existing plaintext-named functions
+  become one-line delegate wrappers with `dtls_state=0` so every
+  pre-R3 caller lands on the same wire bytes. Handlers that do NOT
+  write to conn_fd (`_gossip_serve_extaddr`, `_gossip_serve_relay_*`,
+  `_gossip_serve_rule`, `_gossip_serve_derivation`,
+  `_gossip_serve_attestation`) need no signature extension. Retires
+  the "silently drops" fall-through in `gossip_handle_conn_dtls`
+  (`gossip.nova:3215`) + `gossip_handle_conn_kg_dtls` (`:3299`): DELTA
+  under DTLS now streams ATOM records + a sealed DELTA_END; SNAP_FETCH
+  / DQUERY / DRFETCH route through their `_maybe_dtls` variants;
+  EXTADDR / RELAY_REQ / RELAY_DATA / RELAY_ACK route through their
+  as-is enqueue handlers. RELAY_BIN is explicitly deferred (binary
+  tail reader is not yet sealed-frame aware; documented follow-up).
+  Tests: `tests/unit/test_dtls_ext_parse.nova` (~32 checks — walker
+  empty + single + two entries + malformed inner ext_len + short TLV;
+  use_srtp parser single-profile + MKI bytes + odd list-len + zero
+  list-len + short buffer; selector picks + skips + empty; end-to-end
+  R2 builder -> walker -> use_srtp parser round-trip; stub back-compat
+  pins) + `tests/unit/test_gossip_dtls_streams.nova` (~24 checks —
+  `_gossip_send_all_maybe_dtls` both paths on bad fd; every
+  `_maybe_dtls` variant's plaintext + DTLS paths on the appropriate
+  guard-fires-first shape; enqueue-only handlers safe under DTLS;
+  DTLS dispatch refuses unready dtls_state). ADR-0099 covers the
+  design + alternatives (stub retained as alias vs replaced; signature-
+  extension vs wrapper decisions; RELAY_BIN deferral; profile-select
+  refuse policy on malformed use_srtp). `make lint-ints` clean (12
+  pre-existing findings unchanged; none in the R3 files). **Phase P
+  is now COMPLETE**: server-side flight (R1) + client-side flight +
+  Finished MAC + server flight-2 (R2) + extension parse + DTLS-aware
+  gossip stream helpers (R3) — the DTLS 1.2 handshake arc is closed
+  and ADR-0096 (Phase O R3, DTLS-over-TCP shim) is feature-complete
+  for the full gossip verb set.
 
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet

@@ -1,0 +1,300 @@
+// Unit tests for Phase P R3 (ADR-0099): the real extensions-block
+// walker (`_dtls_parse_ext_block`) and the `use_srtp` per-extension
+// parser (`_dtls_parse_use_srtp_ext`), plus the server-side profile
+// selector (`_dtls_select_srtp_profile`). Also verifies the R1 stub
+// (`_dtls_parse_ext_block_stub`) remains alive as an alias for the
+// R1 pinned tests.
+//
+// Coverage (~30 checks):
+//
+//   * Real walker: empty block -> empty list; single use_srtp extension
+//     -> one entry with correct type + body; two extensions where one
+//     is unknown -> both entries returned (dispatch decides what to do);
+//     malformed inner ext_len -> refused; short buffer -> refused.
+//   * `_dtls_parse_use_srtp_ext`: single-profile body extracts one
+//     offered profile + empty MKI; refuses odd profile_list_len;
+//     refuses zero profile_list_len; refuses short buffer.
+//   * `_dtls_select_srtp_profile`: matches AES128_CM_SHA1_80; returns
+//     0 when no supported profile is offered.
+//   * Round-trip: build a `use_srtp` extension via the R2 builder
+//     (`_dtls_build_use_srtp_ext`) + wrap in an outer 2B length block ->
+//     parse via `_dtls_parse_ext_block` + dispatch to
+//     `_dtls_parse_use_srtp_ext` -> the offered profile list contains
+//     `SRTP_PROFILE_AES128_CM_SHA1_80`, MKI is empty.
+//   * Stub compatibility: `_dtls_parse_ext_block_stub` still returns
+//     `[1, total_ext_len]` for R1's callers on the outer 2B envelope.
+//
+// Runtime caveat: NOVA compiler self-hosting bootstrap segfaults on
+// this bench (standing Phase L/M/N/O/P caveat); verification is
+// structural review + `make lint-ints`.
+
+import "../ce_test.nova"
+import "../../src/federation/dtls12.nova"
+
+// ---- helpers -------------------------------------------------------------
+
+// Build the CONTENT bytes of a use_srtp extension (RFC 5764 §4.1.1):
+//   2B profile_list_len (bytes) || N*2B profile IDs || 1B mki_len ||
+//   mki_len bytes.
+// For our tests we always emit mki_len = 0.
+fn _mk_use_srtp_content(profile) {
+    // 2B len + 2B profile + 1B mki = 5 bytes.
+    let n = 5
+    let buf = alloc(n + 1)
+    _dtls_put_u16(buf, 0, 2)              // profile_list_len = 2 bytes
+    _dtls_put_u16(buf, 2, profile)        // one profile ID
+    _dtls_put_u8(buf, 4, 0)               // mki_len = 0
+    store8(buf + n, 0)
+    return buf
+}
+
+// Build a use_srtp extension WITH mki bytes for MKI round-trip.
+fn _mk_use_srtp_content_with_mki(profile, mki_byte, mki_len) {
+    let n = 5 + mki_len
+    let buf = alloc(n + 1)
+    _dtls_put_u16(buf, 0, 2)
+    _dtls_put_u16(buf, 2, profile)
+    _dtls_put_u8(buf, 4, mki_len)
+    let i = 0
+    while i < mki_len { store8(buf + 5 + i, mki_byte); i = i + 1 }
+    store8(buf + n, 0)
+    return buf
+}
+
+// Wrap one extension body (type + body_bytes) as a 4B TLV inside a
+// content buffer. Returns [buf, n].
+fn _wrap_ext(ext_type, body_buf, body_n) {
+    let n = 4 + body_n
+    let buf = alloc(n + 1)
+    _dtls_put_u16(buf, 0, ext_type)
+    _dtls_put_u16(buf, 2, body_n)
+    let i = 0
+    while i < body_n { store8(buf + 4 + i, load8(body_buf + i)); i = i + 1 }
+    store8(buf + n, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, n)
+    return out
+}
+
+// ---- ext-block walker ------------------------------------------------------
+
+fn test_ext_block_empty_content() {
+    let buf = alloc(1)
+    store8(buf, 0)
+    let r = _dtls_parse_ext_block(buf, 0)
+    ce_eq("empty ext block accepted", r[0], 1)
+    ce_eq("empty ext block returns empty list", len(r[1]), 0)
+    ce_eq("empty ext block consumed 0 bytes", r[2], 0)
+}
+
+fn test_ext_block_single_use_srtp() {
+    let body = _mk_use_srtp_content(SRTP_PROFILE_AES128_CM_SHA1_80)
+    let wrap = _wrap_ext(DTLS_EXT_USE_SRTP, body, 5)
+    let r = _dtls_parse_ext_block(wrap[0], wrap[1])
+    ce_eq("single use_srtp accepted", r[0], 1)
+    ce_eq("single use_srtp yields one entry", len(r[1]), 1)
+    let entry = r[1][0]
+    ce_eq("entry type is 14 (use_srtp)", entry[0], DTLS_EXT_USE_SRTP)
+    ce_eq("entry body len is 5", entry[2], 5)
+    ce_eq("walker consumed the full block", r[2], wrap[1])
+}
+
+fn test_ext_block_two_entries_unknown_kept() {
+    // Build ext1 = unknown type 0x1234, body = [0xAA, 0xBB]
+    let body1 = alloc(3)
+    store8(body1, 170); store8(body1 + 1, 187); store8(body1 + 2, 0)
+    let w1 = _wrap_ext(4660, body1, 2)   // 0x1234 == 4660
+    // Build ext2 = use_srtp
+    let body2 = _mk_use_srtp_content(SRTP_PROFILE_AES128_CM_SHA1_80)
+    let w2 = _wrap_ext(DTLS_EXT_USE_SRTP, body2, 5)
+    // Concatenate: w1 || w2 into a fresh buffer.
+    let total = w1[1] + w2[1]
+    let buf = alloc(total + 1)
+    let i = 0
+    while i < w1[1] { store8(buf + i, load8(w1[0] + i)); i = i + 1 }
+    let j = 0
+    while j < w2[1] { store8(buf + w1[1] + j, load8(w2[0] + j)); j = j + 1 }
+    store8(buf + total, 0)
+    let r = _dtls_parse_ext_block(buf, total)
+    ce_eq("two-ext block accepted", r[0], 1)
+    ce_eq("two-ext block yields two entries", len(r[1]), 2)
+    ce_eq("first entry is unknown type 0x1234", r[1][0][0], 4660)
+    ce_eq("first entry body len is 2", r[1][0][2], 2)
+    ce_eq("second entry is use_srtp", r[1][1][0], DTLS_EXT_USE_SRTP)
+    ce_eq("second entry body len is 5", r[1][1][2], 5)
+    ce_eq("walker consumed the full block", r[2], total)
+}
+
+fn test_ext_block_bad_inner_ext_len() {
+    // ext_type = use_srtp, ext_len = 100 (way bigger than buffer)
+    let n = 4
+    let buf = alloc(n + 1)
+    _dtls_put_u16(buf, 0, DTLS_EXT_USE_SRTP)
+    _dtls_put_u16(buf, 2, 100)
+    store8(buf + n, 0)
+    let r = _dtls_parse_ext_block(buf, n)
+    ce_eq("overflowing inner ext_len refused", r[0], 0)
+    ce_eq("refusal tag is BAD_HS", r[1], DTLS_ERR_BAD_HS)
+}
+
+fn test_ext_block_short_header() {
+    // Only 3 bytes -- not enough for a TLV header (need 4).
+    let buf = alloc(4)
+    store8(buf, 0); store8(buf + 1, 14); store8(buf + 2, 0); store8(buf + 3, 0)
+    let r = _dtls_parse_ext_block(buf, 3)
+    ce_eq("short TLV refused", r[0], 0)
+}
+
+// ---- use_srtp per-extension parser --------------------------------------
+
+fn test_use_srtp_single_profile_empty_mki() {
+    let body = _mk_use_srtp_content(SRTP_PROFILE_AES128_CM_SHA1_80)
+    let r = _dtls_parse_use_srtp_ext(body, 5)
+    ce_eq("use_srtp parse accepted", r[0], 1)
+    ce_eq("offered profile list has one entry", len(r[1]), 1)
+    ce_eq("offered profile is AES128_CM_SHA1_80",
+          r[1][0], SRTP_PROFILE_AES128_CM_SHA1_80)
+    ce_eq("empty MKI len is 0", r[3], 0)
+}
+
+fn test_use_srtp_with_mki_bytes() {
+    let body = _mk_use_srtp_content_with_mki(SRTP_PROFILE_AES128_CM_SHA1_80,
+                                             222, 3)
+    let r = _dtls_parse_use_srtp_ext(body, 5 + 3)
+    ce_eq("use_srtp with MKI parse accepted", r[0], 1)
+    ce_eq("MKI len is 3", r[3], 3)
+    ce_eq("MKI byte 0 is 222", load8(r[2] + 0), 222)
+    ce_eq("MKI byte 1 is 222", load8(r[2] + 1), 222)
+    ce_eq("MKI byte 2 is 222", load8(r[2] + 2), 222)
+}
+
+fn test_use_srtp_odd_profile_list_len() {
+    // profile_list_len = 3 (odd) -- not a whole number of profiles.
+    let n = 6
+    let buf = alloc(n + 1)
+    _dtls_put_u16(buf, 0, 3)
+    store8(buf + 2, 0); store8(buf + 3, 1); store8(buf + 4, 2)
+    store8(buf + 5, 0)   // mki_len = 0
+    store8(buf + n, 0)
+    let r = _dtls_parse_use_srtp_ext(buf, n)
+    ce_eq("odd profile_list_len refused", r[0], 0)
+}
+
+fn test_use_srtp_zero_profile_list() {
+    // profile_list_len = 0 + mki_len = 0 -- "offered nothing".
+    let n = 3
+    let buf = alloc(n + 1)
+    _dtls_put_u16(buf, 0, 0)
+    store8(buf + 2, 0)
+    store8(buf + n, 0)
+    let r = _dtls_parse_use_srtp_ext(buf, n)
+    ce_eq("zero-profile use_srtp refused", r[0], 0)
+}
+
+fn test_use_srtp_short_buffer() {
+    // Only 2 bytes -- not enough for the mki_len byte.
+    let buf = alloc(3)
+    store8(buf, 0); store8(buf + 1, 2); store8(buf + 2, 0)
+    let r = _dtls_parse_use_srtp_ext(buf, 2)
+    ce_eq("short use_srtp buffer refused", r[0], 0)
+}
+
+// ---- profile selector ---------------------------------------------------
+
+fn test_selector_picks_supported_profile() {
+    let offered = list_new()
+    push(offered, SRTP_PROFILE_AES128_CM_SHA1_32)   // not supported by R3
+    push(offered, SRTP_PROFILE_AES128_CM_SHA1_80)   // supported
+    let sel = _dtls_select_srtp_profile(offered)
+    ce_eq("selector picks AES128_CM_SHA1_80",
+          sel, SRTP_PROFILE_AES128_CM_SHA1_80)
+}
+
+fn test_selector_none_supported() {
+    let offered = list_new()
+    push(offered, SRTP_PROFILE_AES128_CM_SHA1_32)
+    push(offered, SRTP_PROFILE_NULL_SHA1_80)
+    let sel = _dtls_select_srtp_profile(offered)
+    ce_eq("selector returns 0 when nothing matches", sel, 0)
+}
+
+fn test_selector_empty_list() {
+    let offered = list_new()
+    let sel = _dtls_select_srtp_profile(offered)
+    ce_eq("selector returns 0 on empty list", sel, 0)
+}
+
+// ---- end-to-end round-trip ---------------------------------------------
+
+fn test_r2_builder_roundtrips_through_r3_parser() {
+    // Build a use_srtp extension via the R2 emitter (9 bytes on the
+    // wire: 2B type + 2B ext_len + 5B body).
+    let pair = _dtls_build_use_srtp_ext(SRTP_PROFILE_AES128_CM_SHA1_80)
+    let ext_buf = pair[0]
+    let ext_n   = pair[1]
+    ce_eq("R2 builder emits 9 bytes", ext_n, 9)
+    // Feed the raw TLV directly to the walker -- it parses the outer
+    // TLV shape and hands us the body.
+    let walked = _dtls_parse_ext_block(ext_buf, ext_n)
+    ce_eq("walker accepts R2 wire bytes", walked[0], 1)
+    ce_eq("walker returns one entry", len(walked[1]), 1)
+    let entry = walked[1][0]
+    ce_eq("entry type is DTLS_EXT_USE_SRTP", entry[0], DTLS_EXT_USE_SRTP)
+    ce_eq("entry body len is 5", entry[2], 5)
+    // Dispatch the body to the use_srtp parser.
+    let inner = _dtls_parse_use_srtp_ext(entry[1], entry[2])
+    ce_eq("use_srtp parse accepted", inner[0], 1)
+    ce_eq("offered profile list has one entry", len(inner[1]), 1)
+    ce_eq("offered profile matches R2 builder input",
+          inner[1][0], SRTP_PROFILE_AES128_CM_SHA1_80)
+    ce_eq("MKI is empty per R2 builder", inner[3], 0)
+}
+
+// ---- stub compatibility (R1 pin) ----------------------------------------
+
+fn test_stub_still_returns_total_ext_len() {
+    // R1's shape: 2B length prefix + N bytes; stub returns [1, N].
+    let buf = alloc(6)
+    _dtls_put_u16(buf, 0, 3)
+    store8(buf + 2, 1); store8(buf + 3, 2); store8(buf + 4, 3)
+    store8(buf + 5, 0)
+    let r = _dtls_parse_ext_block_stub(buf, 5)
+    ce_eq("stub still returns ok=1", r[0], 1)
+    ce_eq("stub still returns total_ext_len=3", r[1], 3)
+}
+
+fn test_stub_still_refuses_short() {
+    let buf = alloc(2)
+    _dtls_put_u16(buf, 0, 100)
+    let r = _dtls_parse_ext_block_stub(buf, 2)
+    ce_eq("stub still refuses overflowing outer length", r[0], 0)
+}
+
+// ---- entry point ---------------------------------------------------------
+
+fn main() {
+    test_ext_block_empty_content()
+    test_ext_block_single_use_srtp()
+    test_ext_block_two_entries_unknown_kept()
+    test_ext_block_bad_inner_ext_len()
+    test_ext_block_short_header()
+
+    test_use_srtp_single_profile_empty_mki()
+    test_use_srtp_with_mki_bytes()
+    test_use_srtp_odd_profile_list_len()
+    test_use_srtp_zero_profile_list()
+    test_use_srtp_short_buffer()
+
+    test_selector_picks_supported_profile()
+    test_selector_none_supported()
+    test_selector_empty_list()
+
+    test_r2_builder_roundtrips_through_r3_parser()
+
+    test_stub_still_returns_total_ext_len()
+    test_stub_still_refuses_short()
+
+    ce_summary("test_dtls_ext_parse")
+    return 0
+}
