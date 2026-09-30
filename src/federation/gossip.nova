@@ -103,6 +103,13 @@ import "../kg/query.nova"
 import "../io/transducers/kg_sync.nova"
 import "./snapshot_attestation.nova"
 import "./snapshot_replication.nova"
+// Phase O R3 (ADR-0096): non-standard DTLS-1.2 shim over the gossip TCP
+// stream. Import is one-way (gossip_dtls_shim does NOT import gossip),
+// so no cycle. The DTLS-aware handler variants at the bottom of this
+// file thread `dtls_state` through `gds_send_line` / `gds_recv_line`
+// exactly the way the plaintext handlers thread `conn_fd` through
+// `_gossip_send_all` / `_gossip_recv_line`.
+import "./gossip_dtls_shim.nova"
 
 // ---- protocol constants ---------------------------------------------------
 
@@ -3171,4 +3178,243 @@ fn _gossip_serve_relay_bin(state, fd, line) {
     }
     state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
     return 0
+}
+
+// ============================================================================
+// Phase O R3 (ADR-0096) -- DTLS-1.2-over-TCP handler variants.
+// ============================================================================
+//
+// The three entries below are DTLS-aware counterparts to
+// `gossip_handle_conn`, `gossip_handle_conn_kg`, and `_gossip_dial`.
+// They read + write via `gds_recv_line` / `gds_send_line` (from
+// `src/federation/gossip_dtls_shim.nova`), which internally strip and
+// prepend a 2-byte big-endian length header around each DTLS record on
+// the wire. Everything else -- the line-oriented HELLO / PING / MEMBER /
+// DELTA / ATTESTATION / SNAP_* / EXTADDR / RELAY_* parser branches --
+// is identical to the plaintext variants above; they operate on
+// decrypted line strings, not raw TCP bytes.
+//
+// These entries are OPT-IN. The plaintext `gossip_handle_conn` /
+// `gossip_handle_conn_kg` / `_gossip_dial` above stay untouched so a
+// soul that never sets `CE_FED_TRANSPORT=dtls` keeps byte-identical
+// R18E behavior. The fed daemon (`examples/crossengin_fed_daemon.nova`)
+// selects the variant at boot based on the transport env var; a chat
+// REPL exposes the resolved transport via `/gossip_transport`.
+//
+// The `dtls_state` argument on both handlers MUST have `cipher_active
+// == 1` (handshake completed or `gds_keyed_shortcut` invoked) BEFORE
+// the caller enters the line loop. The daemon achieves this by calling
+// `gds_handshake_server` / `gds_handshake_client` on each newly-
+// accepted / newly-dialed fd; on failure it closes the fd + bumps the
+// STATS_DTLS_HANDSHAKE_FAILED counter (see fed-daemon boot flow) and
+// never enters these handler variants at all. If the caller somehow
+// hands a non-ready state to these entries, `gds_send_line` /
+// `gds_recv_line` return 0 on the first call and the handler exits
+// cleanly.
+
+fn gossip_handle_conn_dtls(state, conn_fd, dtls_state) {
+    if gds_is_ready(dtls_state) == 0 {
+        close_fd(conn_fd)
+        return state
+    }
+    // No HELLO / OK exchange on the DTLS wire -- the peers already
+    // authenticated each other via the DTLS certificate check during
+    // the handshake, and the wire is now encrypted. The line-oriented
+    // protocol starts directly with the payload verbs (PING / MEMBER /
+    // DELTA / ATTESTATION / SNAP_* / EXTADDR / RELAY_*).
+    let running = 1
+    while running == 1 {
+        let line = gds_recv_line(conn_fd, dtls_state)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_BYE_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_PING_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    if len(toks) >= 3 {
+                        let seq = toks[1]
+                        let sender_addr = toks[2]
+                        if str_eq(sender_addr, state[GOSSIP_S_SELF_ADDR]) == 0 {
+                            gossip_merge_member(state, sender_addr, GOSSIP_STATUS_ALIVE)
+                        }
+                        gds_send_line(conn_fd, dtls_state, GOSSIP_ACK_PREFIX + seq)
+                    }
+                } else {
+                    if _gossip_starts_with(line, GOSSIP_MEMBER_PREFIX) == 1 {
+                        let toks2 = _gossip_split_spaces(line)
+                        if len(toks2) >= 3 {
+                            let mb_addr = toks2[1]
+                            let mb_status_s = toks2[2]
+                            let mb_status = GOSSIP_STATUS_ALIVE
+                            if _gossip_is_digits(mb_status_s) == 1 {
+                                mb_status = str_to_int(mb_status_s)
+                            }
+                            gossip_merge_member(state, mb_addr, mb_status)
+                        }
+                    } else {
+                        if _gossip_starts_with(line, GOSSIP_DELTA_PREFIX) == 1 {
+                            gds_send_line(conn_fd, dtls_state, GOSSIP_DELTA_END_LINE)
+                        }
+                        if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
+                            _gossip_serve_attestation(state, line)
+                            let _srd = state[GOSSIP_S_SR_STATE]
+                            if _srd != 0 {
+                                let _attd = att_parse_wire(line)
+                                if _attd != 0 {
+                                    let _pkd = gossip_lookup_att_pubkey(state, att_soul_id(_attd))
+                                    if _pkd != 0 {
+                                        if att_verify(_attd, _pkd) == 1 {
+                                            sr_observe_attestation(_srd, _attd)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Note: SNAP_FETCH / EXTADDR / RELAY_* handlers
+                        // that write directly to `conn_fd` (rather than
+                        // via a shim-provided send helper) would leak
+                        // plaintext onto the DTLS wire and break the
+                        // AEAD framing. In R3 they are intentionally
+                        // NOT dispatched under the DTLS variant; a
+                        // follow-up round that adds DTLS-aware server-
+                        // side variants of those helpers wires them in
+                        // here. The line arrives via `gds_recv_line`
+                        // and is silently dropped -- protocol-level
+                        // "unknown verb" behavior, matching the plain
+                        // handler's fall-through on unrecognized
+                        // prefixes.
+                    }
+                }
+            }
+        }
+    }
+    gds_close(conn_fd, dtls_state)
+    return state
+}
+
+// KG-aware DTLS handler. Same dispatch as `gossip_handle_conn_kg` above
+// but reads/writes through `gds_recv_line` / `gds_send_line`. For the
+// DELTA path this handler streams ATOM lines via `gds_send_line` so
+// each ATOM record is its own length-prefixed DTLS record on the wire.
+fn gossip_handle_conn_kg_dtls(state, conn_fd, dtls_state, kg) {
+    if gds_is_ready(dtls_state) == 0 {
+        close_fd(conn_fd)
+        return state
+    }
+    let running = 1
+    while running == 1 {
+        let line = gds_recv_line(conn_fd, dtls_state)
+        if line == 0 { running = 0 } else {
+            if str_eq(line, GOSSIP_BYE_LINE) == 1 {
+                running = 0
+            } else {
+                if _gossip_starts_with(line, GOSSIP_PING_PREFIX) == 1 {
+                    let toks = _gossip_split_spaces(line)
+                    if len(toks) >= 3 {
+                        let seq = toks[1]
+                        let sender_addr = toks[2]
+                        if str_eq(sender_addr, state[GOSSIP_S_SELF_ADDR]) == 0 {
+                            gossip_merge_member(state, sender_addr, GOSSIP_STATUS_ALIVE)
+                        }
+                        gds_send_line(conn_fd, dtls_state, GOSSIP_ACK_PREFIX + seq)
+                    }
+                } else {
+                    if _gossip_starts_with(line, GOSSIP_MEMBER_PREFIX) == 1 {
+                        let toks2 = _gossip_split_spaces(line)
+                        if len(toks2) >= 3 {
+                            let mb_addr = toks2[1]
+                            let mb_status_s = toks2[2]
+                            let mb_status = GOSSIP_STATUS_ALIVE
+                            if _gossip_is_digits(mb_status_s) == 1 {
+                                mb_status = str_to_int(mb_status_s)
+                            }
+                            gossip_merge_member(state, mb_addr, mb_status)
+                        }
+                    } else {
+                        if _gossip_starts_with(line, GOSSIP_DELTA_PREFIX) == 1 {
+                            // DTLS DELTA path: we do NOT reuse
+                            // `_gossip_stream_atoms_since` because it
+                            // writes ATOM lines directly to `conn_fd`
+                            // (plaintext -> AEAD-framed wire would
+                            // corrupt the record stream). R3 answers
+                            // DELTA under DTLS with an immediate
+                            // DELTA_END; a follow-up round that adds a
+                            // gds-aware ATOM streamer plugs in here.
+                            gds_send_line(conn_fd, dtls_state, GOSSIP_DELTA_END_LINE)
+                        }
+                        if _gossip_starts_with(line, GOSSIP_ATTESTATION_PREFIX) == 1 {
+                            _gossip_serve_attestation(state, line)
+                            let _srdk = state[GOSSIP_S_SR_STATE]
+                            if _srdk != 0 {
+                                let _attk = att_parse_wire(line)
+                                if _attk != 0 {
+                                    let _pkk = gossip_lookup_att_pubkey(state, att_soul_id(_attk))
+                                    if _pkk != 0 {
+                                        if att_verify(_attk, _pkk) == 1 {
+                                            sr_observe_attestation(_srdk, _attk)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // R20E / R21B / R23C / R23E / R26E parser
+                        // branches that write to `conn_fd` directly
+                        // are intentionally NOT dispatched under DTLS
+                        // in R3 (same reasoning as the kg-less variant
+                        // above). Follow-up: gds-aware variants of the
+                        // stream helpers wire them in here without
+                        // touching the plaintext handler.
+                    }
+                }
+            }
+        }
+    }
+    gds_close(conn_fd, dtls_state)
+    return state
+}
+
+// DTLS-aware dial. Opens a TCP connection to `peer_addr`, allocates a
+// fresh dtls_state via `dtls_init`, drives the client-side handshake
+// via `gds_handshake_client`, and returns [conn_fd, dtls_state] on
+// success. On any failure (dial timeout, handshake refuse, cert
+// verify fail) returns 0. Callers that need to distinguish the
+// failure class inspect `dtls_last_error(dtls_state)` -- but must
+// pass a caller-owned state if they want to keep it after 0.
+//
+// The `anchors` / `hostname` / `now` arguments feed the R1 chain-
+// aware cert-verify inside the handshake driver.
+fn _gossip_dial_dtls(peer_addr, priv_bn, pub_point, hostname, anchors, now) {
+    let fd = _gossip_dial(peer_addr)
+    if fd < 0 { return 0 }
+    // Widen the socket RCVTIMEO for the handshake window (30s per
+    // ADR-0096 / GDS_HANDSHAKE_TIMEOUT_MS). After the handshake the
+    // caller may narrow it back to GOSSIP_PING_TIMEOUT_MS for the
+    // steady-state PING loop; the shim itself does not touch it.
+    _gossip_set_rcvtimeo_ms(fd, GDS_HANDSHAKE_TIMEOUT_MS)
+    let st = dtls_init()
+    let hs = gds_handshake_client(fd, st, priv_bn, pub_point,
+                                   hostname, anchors, now)
+    if hs[0] == 0 {
+        // Handshake refuse -- close cleanly (gds_close inspects
+        // cipher_active; not-yet-established states just close_fd).
+        gds_close(fd, hs[1])
+        return 0
+    }
+    let out = list_new()
+    push(out, fd)
+    push(out, hs[1])
+    return out
+}
+
+// Boot-time helper: given the operator-loaded P-256 keypair pair
+// (`p256_keypair_load` output shape: `[priv_bn, [X, Y]]`), return the
+// [priv_bn, pub_point] pair that `_gossip_dial_dtls` +
+// `gds_handshake_server` expect. Kept as a thin passthrough because
+// the fed daemon load path may (in a future round) switch to a
+// different loader (e.g. PEM-encoded X.509 cert-and-key blob) and this
+// entry gives it one adaptation seam.
+fn gossip_dtls_extract_keys(pair) {
+    if pair == 0 { return 0 }
+    if len(pair) != 2 { return 0 }
+    return pair
 }

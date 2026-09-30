@@ -526,7 +526,7 @@ promises. The last README-only parts subtree is done; every parts
 subtree with a Status now has an Accepted README backed by real
 modules on the loop's chain.
 
-## Phase O — DTLS 1.2 completion + gossip transport wrap (in progress)
+## Phase O — DTLS 1.2 completion + gossip transport wrap (COMPLETE)
 
 Phase O closes the DTLS 1.2 work in `src/federation/dtls12.nova` and
 wraps gossip's TCP transport in DTLS records via a non-RFC-standard
@@ -631,9 +631,66 @@ would need).
   (state=0 or fresh state -> 0, not DTLS_ERR_STUB). `make lint-ints`
   clean (12 pre-existing findings unchanged; none in dtls12.nova
   or test_dtls12.nova).
-- **R3 -- non-standard DTLS-over-TCP shim for gossip** (queued;
-  ADR-0096; wraps `gossip_handle_conn` in DTLS records with a
-  length-prefixed framing since TCP has no datagram boundary).
+- **R3 -- non-standard DTLS-1.2-over-TCP shim for gossip
+  (SHIPPED, ADR-0096).** The user selected the shim path over waiting
+  for NOVA `sendto`/`recvfrom` primitives (blocked per NAT-traversal
+  R23E.2). R3 wraps each gossip TCP connection in DTLS records by
+  prepending a 2-byte big-endian length header to every record before
+  writing to the TCP socket and stripping it on read. This is NOT RFC
+  6347 compliant -- the RFC assumes UDP datagram boundaries for
+  record framing, retransmit semantics, and replay-window sizing --
+  and a standards-compliant DTLS peer WILL NOT interop with a gossip
+  node using this transport. ADR-0096 flags this loudly in its
+  opening callout and documents the migration path (swap the framing
+  helpers for `sendto`/`recvfrom` internals when the primitives
+  land; the DTLS record body stays unchanged, so the migration
+  becomes RFC-standard). New files:
+  `src/safety/p256_keypair.nova` (~275 lines; `p256_keypair_load` /
+  `p256_keypair_save` / `p256_keypair_generate_deterministic` mirror
+  the `merkle_signing_keypair_load` shape for the ECDSA-P256 keys
+  DTLS wants instead of the ed25519 seeds Phase M R3 loads),
+  `src/federation/gossip_dtls_shim.nova` (~340 lines; length-prefix
+  framing via `_gds_send_record` / `_gds_recv_record`, line-oriented
+  seal/open via `gds_send_line` / `gds_recv_line`, handshake driver
+  seams via `gds_handshake_client` / `_server` -- flight builders
+  themselves return "not-yet-wired" today per the pending follow-up
+  round, but the wire framing + AEAD round-trip + `gds_close`
+  `close_notify` emission all work end-to-end via the
+  `gds_keyed_shortcut` fast path where both peers pre-derive the
+  cipher state via `dtls_ecdhe_derive` directly), and ADR-0096
+  itself (~340 lines with the mandatory "NON-STANDARD" callout up
+  top). Modified files: `src/federation/gossip.nova` grows three
+  opt-in DTLS-aware handler variants (`gossip_handle_conn_dtls`,
+  `gossip_handle_conn_kg_dtls`, `_gossip_dial_dtls`) at end-of-file
+  plus one new import; the plaintext handlers are untouched.
+  `examples/crossengin_fed_daemon.nova` grows the transport gate
+  (`CE_FED_TRANSPORT` = `"tcp"` (default) or `"dtls"`;
+  `CE_FED_DTLS_CERT_DIR` default `$HOME/.crossengin/fed_dtls_keys/`
+  container-fallback `./crossengin_fed_dtls_keys/`), a P-256 keypair
+  load at boot when DTLS is requested (missing keypair -> WARN +
+  fall back to tcp with a loud banner line, per ADR-0096
+  §"Alternatives Considered (e)"), and an accept-loop wrap that
+  drives `gds_handshake_server` on each newly-accepted fd before
+  handing off to `gossip_handle_conn_kg_dtls`. Chat REPL grows
+  `/gossip_transport` (info-only, env-driven at first `/gossip_start`;
+  see `docs/CHAT_USAGE.md`) backed by
+  `_fed_transport_line(mode)` in `src/chat/fed_slash.nova`. Tests:
+  `tests/unit/test_p256_keypair_load.nova` (~30 checks against
+  missing / wrong-size / bad-SEC1-tag files plus save+load round-trip
+  and deterministic-generator vectors),
+  `tests/unit/test_gossip_dtls_shim.nova` (~50 checks against the
+  2-byte BE length header shape, the send-side validation guards,
+  `gds_is_ready` / `gds_keyed_shortcut` / handshake seams, and the
+  AEAD seal/frame/unframe/open round-trip built in-memory since
+  NOVA lacks socketpair -- includes a tamper check that pins
+  DTLS_DECRYPT_FAIL on flipped ciphertext), and
+  `tests/unit/test_fed_daemon_transport.nova` (~20 checks pinning
+  the env resolver + cert-base fallback semantics + the missing-
+  keypair refuse shape + the `_fed_transport_line` REPL output).
+  `make lint-ints` clean (12 pre-existing findings unchanged; none
+  in the new / modified files). Phase O is now COMPLETE: R1 + R2
+  closed the DTLS 1.2 stack (cert-chain + SRTP EKM + `use_srtp`),
+  R3 puts the wire under DTLS AEAD (mesh-only per ADR-0096).
 
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet

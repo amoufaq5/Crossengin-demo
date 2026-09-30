@@ -141,6 +141,12 @@ import "../src/session/session.nova"
 // no connection is gated on the anchors yet (that lands in R3 when
 // the DTLS-over-TCP shim wraps gossip).
 import "../src/safety/pem_truststore.nova"
+// Phase O R3 (ADR-0096): non-standard DTLS-over-TCP shim + P-256
+// keypair loader. Both are conditionally exercised at boot when
+// CE_FED_TRANSPORT=dtls; a soul running with the (default) tcp
+// transport does not touch either.
+import "../src/safety/p256_keypair.nova"
+import "../src/federation/gossip_dtls_shim.nova"
 
 // ---- env-var config -------------------------------------------------------
 //
@@ -302,6 +308,44 @@ fn _fed_dtls_truststore_path_from_env() {
         if len(home) > 0 { return home + "/.crossengin/fed_truststore" }
     }
     return "./crossengin_fed_truststore"
+}
+
+// Phase O R3 (ADR-0096): transport selector. CE_FED_TRANSPORT defaults
+// to "tcp" (byte-identical R18E behavior); the literal (case-insensitive)
+// value "dtls" flips the accept loop + dial helpers over to the DTLS-
+// over-TCP shim. Garbage / unset / empty / any other value falls through
+// to "tcp" (safe default matching the getenv guard idiom used
+// throughout this file). NOVA has no `str_lower`, so the resolver
+// checks both "dtls" and "DTLS" explicitly. Any other spelling
+// (including whitespace-padded or mixed-case variants like "Dtls")
+// resolves to "tcp".
+fn _fed_transport_from_env() {
+    let v = getenv("CE_FED_TRANSPORT")
+    if v == 0 { return "tcp" }
+    if len(v) == 0 { return "tcp" }
+    if str_eq_bytes(v, "dtls") == 1 { return "dtls" }
+    if str_eq_bytes(v, "DTLS") == 1 { return "dtls" }
+    // "tcp", "TCP", and every unrecognized value fall through here.
+    return "tcp"
+}
+
+// Phase O R3 (ADR-0096): DTLS cert directory resolution. Mirrors the
+// `_fed_attest_key_base_from_env` shape:
+// CE_FED_DTLS_CERT_DIR wins; else $HOME/.crossengin/fed_dtls_keys/;
+// else the container-safe fallback `./crossengin_fed_dtls_keys/`.
+// Returns the BASE path (without .priv/.pub extension) plus the
+// filename stem "signer" so `p256_keypair_load` can append the two
+// suffixes directly, matching the merkle_signing convention.
+fn _fed_dtls_cert_base_from_env() {
+    let v = getenv("CE_FED_DTLS_CERT_DIR")
+    if v != 0 {
+        if len(v) > 0 { return v + "/signer" }
+    }
+    let home = getenv("HOME")
+    if home != 0 {
+        if len(home) > 0 { return home + "/.crossengin/fed_dtls_keys/signer" }
+    }
+    return "./crossengin_fed_dtls_keys/signer"
 }
 
 // Phase O R1 (ADR-0094): DTLS hostname resolution. CE_FED_DTLS_HOSTNAME
@@ -538,6 +582,55 @@ fn main() {
                 + " -- R1 tolerates empty anchors, R3 will fail closed")
     }
 
+    // Phase O R3 (ADR-0096): transport gate. Default "tcp" (byte-identical
+    // R18E gossip). "dtls" loads a P-256 keypair via `p256_keypair_load`
+    // and refuses to start when the keypair is missing (fail-closed: an
+    // operator who asked for DTLS but did not mint keys gets a clear
+    // error, not a silent fallback to plaintext). Truststore stays as
+    // R1 loaded it -- an empty anchors list means every peer chain is
+    // rejected (XV_NOT_PINNED via the R1 mapping), which is the SAFE
+    // default. `dtls_hs_ok` + `dtls_hs_failed` counters live on the
+    // fed daemon (module-local ints below); every handshake attempt
+    // in the accept loop / dial helper bumps exactly one.
+    let dtls_transport   = _fed_transport_from_env()
+    let dtls_cert_base   = ""
+    let dtls_priv_bn     = 0
+    let dtls_pub_point   = 0
+    let dtls_ready       = 0
+    let dtls_hs_ok       = 0
+    let dtls_hs_failed   = 0
+    if str_eq_bytes(dtls_transport, "dtls") == 1 {
+        dtls_cert_base = _fed_dtls_cert_base_from_env()
+        let dtls_pair = p256_keypair_load(dtls_cert_base)
+        if dtls_pair == 0 {
+            println("transport: ERROR -- CE_FED_TRANSPORT=dtls but P-256 keypair"
+                    + " load failed at " + dtls_cert_base + ".{priv,pub};"
+                    + " refusing to start DTLS (mint with"
+                    + " p256_keypair_save or point CE_FED_DTLS_CERT_DIR at"
+                    + " an existing dir). Falling back to tcp for this run.")
+            dtls_transport = "tcp"
+        } else {
+            dtls_priv_bn   = dtls_pair[0]
+            dtls_pub_point = dtls_pair[1]
+            dtls_ready     = 1
+        }
+    }
+    if str_eq_bytes(dtls_transport, "dtls") == 1 {
+        println("transport: DTLS 1.2 over TCP (ADR-0096 non-standard;"
+                + " NOT RFC-compliant, mesh-only). cert=" + dtls_cert_base
+                + ".{priv,pub}"
+                + " hostname=" + dtls_hostname
+                + " anchors=" + int_to_str(len(dtls_anchors)))
+        if len(dtls_anchors) == 0 {
+            println("transport: WARN -- empty truststore means every peer"
+                    + " chain fails XV_NOT_PINNED. Populate"
+                    + " " + dtls_truststore_path + "/manifest.txt to"
+                    + " accept peer certs.")
+        }
+    } else {
+        println("transport: tcp (unencrypted; CE_FED_TRANSPORT unset or 'tcp')")
+    }
+
     if listen_fd < 0 {
         println("gossip   : WARN -- listen bind failed on " + listen_addr
                 + " (port taken, or address unresolvable); running client-only")
@@ -668,7 +761,31 @@ fn main() {
             if listen_fd >= 0 {
                 let accepted = gossip_try_accept(listen_fd)
                 if accepted >= 0 {
-                    gs = gossip_handle_conn_kg(gs, accepted, fed_kg)
+                    // Phase O R3 (ADR-0096): when the transport gate is
+                    // "dtls" we run the server-side handshake before
+                    // handing the fd to the KG-aware handler. On
+                    // handshake failure we close the fd + bump the
+                    // module-local counter; on success we invoke the
+                    // DTLS variant (`gossip_handle_conn_kg_dtls`) so
+                    // the line loop reads + writes via the length-
+                    // prefixed record framing. Under "tcp" the call
+                    // stays byte-identical to R18E.
+                    if dtls_ready == 1 {
+                        let st_srv = dtls_init()
+                        let hs_srv = gds_handshake_server(accepted, st_srv,
+                                                          dtls_priv_bn,
+                                                          dtls_pub_point, 0)
+                        if hs_srv[0] == 1 {
+                            gs = gossip_handle_conn_kg_dtls(gs, accepted,
+                                                             hs_srv[1], fed_kg)
+                            dtls_hs_ok = dtls_hs_ok + 1
+                        } else {
+                            gds_close(accepted, hs_srv[1])
+                            dtls_hs_failed = dtls_hs_failed + 1
+                        }
+                    } else {
+                        gs = gossip_handle_conn_kg(gs, accepted, fed_kg)
+                    }
                     total_accepts = total_accepts + 1
                 }
             }
@@ -782,6 +899,10 @@ fn main() {
     // hostname without a separate log dive.
     println("  dtls_anchors    = " + int_to_str(len(dtls_anchors)))
     println("  dtls_hostname   = " + dtls_hostname)
+    // Phase O R3 (ADR-0096) transport counters.
+    println("  transport       = " + dtls_transport)
+    println("  dtls_hs_ok      = " + int_to_str(dtls_hs_ok))
+    println("  dtls_hs_failed  = " + int_to_str(dtls_hs_failed))
     println("  session_ids     = " + int_to_str(sreg_count(sreg)))
     println("crossengin-fed: OK")
     return 0

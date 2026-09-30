@@ -1,0 +1,308 @@
+// CrossEngin safety: on-disk P-256 keypair loader (Phase O R3, ADR-0096).
+//
+// Purpose
+//   Phase M R3 shipped `src/persistence/merkle_signing.nova`, whose
+//   `merkle_signing_keypair_load(base_path)` reads two raw byte files
+//   (`<base>.priv` + `<base>.pub`) into an Ed25519 seed + pubkey pair.
+//   Phase O R3 wraps gossip in DTLS 1.2 records; DTLS-cert authentication
+//   needs an ECDSA-P256 keypair (not the ed25519 signer identity Phase M
+//   R3 already loads). This module mirrors the merkle-signing loader
+//   shape verbatim for P-256:
+//
+//     <base>.priv  -- raw 32 bytes, priv scalar big-endian, mode 0600
+//     <base>.pub   -- raw 65 bytes, SEC1 uncompressed point (0x04 || X || Y),
+//                     mode 0644
+//
+//   The loader returns `[priv_bn, pub_point]` on success (both in the
+//   representation `src/safety/p256.nova` already uses -- bn256 for the
+//   scalar, [X, Y] bn256 pair for the point). Every failure path returns
+//   the sentinel `0`; the loader NEVER crashes on a missing file, a
+//   short read, an oversized read, a bad SEC1 tag byte, or an off-curve
+//   point. Callers (the DTLS shim in `src/federation/gossip_dtls_shim.nova`)
+//   treat `0` as "no keypair available, refuse to start DTLS" per the
+//   fed-daemon boot contract in ADR-0096 §"Env-flag gate".
+//
+// Deterministic generator (TEST USE ONLY)
+//   `p256_keypair_generate_deterministic(seed_32b)` derives a priv scalar
+//   via SHA-256(seed) mod (n-1) + 1, then computes pub via
+//   `p256_scalar_mult(priv, Gx, Gy)`. This is intentionally NOT for
+//   production DTLS certs -- a production keypair should come from
+//   `p256_keygen()` (which pulls entropy from the OS CSPRNG via
+//   `secure_random`). The deterministic entry point exists so
+//   `tests/unit/test_gossip_dtls_shim.nova` can bring up two peers with
+//   pinned keys and round-trip the handshake without shelling out to
+//   `openssl ecparam -genkey`.
+//
+// Save entry
+//   `p256_keypair_save(base, priv_bn, pub_point)` mirrors the merkle-
+//   signing shape: 32-byte big-endian scalar to `<base>.priv` at mode
+//   0600, 65-byte SEC1 uncompressed point to `<base>.pub` at mode 0644.
+//   Returns 1 on both-halves success, 0 on any write failure. The tmp-
+//   file + fsync + rename durability trick from merkle_signing is
+//   intentionally NOT duplicated here -- DTLS keypairs are minted once
+//   at operator bootstrap, not on every save cycle; the simpler direct
+//   sys_write path keeps the module small and matches how a shell
+//   pipeline (`openssl ...` piped to a file) would land the same bytes.
+//
+// ADRs implemented
+//   ADR-0096 (Phase O R3, non-standard DTLS-over-TCP shim for gossip).
+//   Domain-parameter reuse: the module is a thin layer over p256.nova's
+//   scalar-mult + bn256 primitives; no new curve arithmetic.
+//
+// NOVA dependencies
+//   sys_open / sys_read / sys_write / sys_close (via std/syscall). No
+//   dependency on `sys_readdir` (still absent per Phase O R1 notes) --
+//   the loader takes a base path, not a directory.
+//
+// CrossEngin dependencies
+//   src/safety/p256.nova   -- p256_base_point, p256_scalar_mult,
+//                             p256_encode_uncompressed, p256_decode_point.
+//   src/safety/bignum_256.nova -- bn256_from_int, bn256_mod, bn256_add,
+//                                 bn256_sub.
+//   src/safety/sha256.nova -- sha256_oneshot for the deterministic
+//                             generator only.
+//
+// Wire byte layouts
+//   priv file: 32 bytes = big-endian scalar. Byte 0 is the most
+//              significant. Matches the raw-scalar convention every
+//              other DTLS/TLS toolchain (OpenSSL / mbedTLS / Go
+//              crypto/ecdsa) writes when asked for a raw private key.
+//   pub  file: 65 bytes = 0x04 || X (32B BE) || Y (32B BE). Matches
+//              SEC1 §2.3.3 (Standards for Efficient Cryptography Group
+//              2010) uncompressed encoding. `openssl ec -pubout` in
+//              DER form contains this exact 65-byte sequence after the
+//              BIT STRING header.
+
+import "std/syscall"
+import "std/io"
+import "./p256.nova"
+import "./bignum_256.nova"
+import "./sha256.nova"
+
+// ---- constants ------------------------------------------------------------
+
+let _P256K_PRIV_LEN     = 32     // raw big-endian scalar
+let _P256K_PUB_LEN      = 65     // SEC1 uncompressed: 0x04 || X(32) || Y(32)
+let _P256K_MODE_PRIV    = 384    // 0600 -- operator-only
+let _P256K_MODE_PUB     = 420    // 0644 -- world-readable pubkey
+
+// ---- byte-list helpers ----------------------------------------------------
+
+// Read exactly `expect_len` bytes from `path`. Returns an alloc'd buffer
+// on success (with trailing NUL), 0 if the file cannot be opened OR if
+// its length is not EXACTLY `expect_len`. Strict shape mirrors
+// `_ms_read_bytes_strict` in merkle_signing.nova -- a padded/short file
+// is a security smell, not a soft error.
+fn _p256k_read_exact(path, expect_len) {
+    if path == 0 { return 0 }
+    if len(path) == 0 { return 0 }
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return 0 }
+    // Read one byte MORE than expected so we can detect an overlong file
+    // (Linux's read(2) always returns the whole small file in one call
+    // when the buffer is large enough, so a return < expect_len OR
+    // > expect_len is a shape violation).
+    let buf = alloc(expect_len + 16 + 1)
+    let m = sys_read(fd, buf, expect_len + 1)
+    sys_close(fd)
+    if m != expect_len { return 0 }
+    store8(buf + expect_len, 0)
+    return buf
+}
+
+// Convert a 32-byte big-endian buffer into a bn256 scalar. Delegates to
+// p256.nova's internal `_p256_bytes_to_bn` via the seeded-keygen path so
+// we do not duplicate the byte-order conversion.
+fn _p256k_bytes_to_priv_bn(buf) {
+    // p256.nova's _p256_bytes_to_bn is module-private; we replicate the
+    // eight 32-bit big-endian limbs shape here directly. bn256 is an
+    // 8-limb 32-bit little-endian array; byte 0 of the buffer is the
+    // most-significant byte of the scalar, so the highest limb takes
+    // bytes 0..3.
+    let bn = bn256_from_int(0)
+    let limb_i = 0
+    while limb_i < 8 {
+        // bytes 0..3 -> limb 7 (most significant); bytes 28..31 -> limb 0.
+        let byte_off = limb_i * 4
+        let b0 = load8(buf + byte_off + 0)
+        let b1 = load8(buf + byte_off + 1)
+        let b2 = load8(buf + byte_off + 2)
+        let b3 = load8(buf + byte_off + 3)
+        // v = b0*2^24 | b1*2^16 | b2*2^8 | b3.  int_shl keeps large-
+        // literal arithmetic away from raw `*` (bug #11).
+        let v = int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                              int_shl(b2, 8)), b3)
+        let limb_dst = 7 - limb_i
+        bn[limb_dst] = v
+        limb_i = limb_i + 1
+    }
+    return bn
+}
+
+// Serialize a bn256 scalar back to a 32-byte big-endian buffer.
+fn _p256k_priv_bn_to_bytes(bn) {
+    let buf = alloc(_P256K_PRIV_LEN + 1)
+    let limb_i = 0
+    while limb_i < 8 {
+        // limb 7 -> bytes 0..3 (most significant).
+        let limb_src = 7 - limb_i
+        let v = bn[limb_src]
+        let byte_off = limb_i * 4
+        store8(buf + byte_off + 0, int_and(int_shr(v, 24), 255))
+        store8(buf + byte_off + 1, int_and(int_shr(v, 16), 255))
+        store8(buf + byte_off + 2, int_and(int_shr(v, 8),  255))
+        store8(buf + byte_off + 3, int_and(v, 255))
+        limb_i = limb_i + 1
+    }
+    store8(buf + _P256K_PRIV_LEN, 0)
+    return buf
+}
+
+// ---- loader ---------------------------------------------------------------
+
+// Load a P-256 keypair from disk. Returns [priv_bn, pub_point] on
+// success, 0 on any failure (missing file, wrong length, bad SEC1
+// encoding, off-curve point). `pub_point` is a two-element list
+// [X_bn, Y_bn] -- the same shape `p256_decode_point` and
+// `p256_scalar_mult` produce/consume.
+//
+// The loader is intentionally NOT strict about the priv scalar being
+// in [1, n-1]. p256_scalar_mult is total (returns 0 sentinel on
+// identity); DTLS operations that would multiply by a zero or oversized
+// scalar fail cleanly at the ecdhe-derive step. A separate
+// `p256_keypair_valid(pair)` entry (below) sanity-checks the scalar
+// against the curve order for callers that want the tighter contract.
+fn p256_keypair_load(base_path) {
+    if base_path == 0 { return 0 }
+    if len(base_path) == 0 { return 0 }
+    let priv_path = base_path + ".priv"
+    let pub_path  = base_path + ".pub"
+    let priv_buf = _p256k_read_exact(priv_path, _P256K_PRIV_LEN)
+    if priv_buf == 0 { return 0 }
+    let pub_buf = _p256k_read_exact(pub_path, _P256K_PUB_LEN)
+    if pub_buf == 0 { return 0 }
+    // First byte of the pub buffer must be the SEC1 uncompressed tag.
+    if load8(pub_buf) != 4 { return 0 }
+    let priv_bn = _p256k_bytes_to_priv_bn(priv_buf)
+    let point = p256_decode_point(pub_buf, _P256K_PUB_LEN)
+    if point == 0 { return 0 }
+    let pair = list_new()
+    push(pair, priv_bn)
+    push(pair, point)
+    return pair
+}
+
+// Sanity check: priv scalar must be in [1, n-1]; pub point must be
+// on-curve. `p256_decode_point` already enforces on-curve for the pub
+// half; this entry adds the priv range check for callers who want the
+// tighter contract before handing the pair to `dtls_ecdhe_derive`.
+// Returns 1 on OK, 0 on rejection. Leaves the pair unchanged either way.
+fn p256_keypair_valid(pair) {
+    if pair == 0 { return 0 }
+    if len(pair) != 2 { return 0 }
+    let priv = pair[0]
+    let point = pair[1]
+    if priv == 0 { return 0 }
+    if point == 0 { return 0 }
+    if len(point) != 2 { return 0 }
+    // priv must be non-zero and less than n.
+    let n = p256_curve_n()
+    let zero = bn256_from_int(0)
+    if bn256_cmp(priv, zero) == 0 { return 0 }
+    if bn256_cmp(priv, n) >= 0 { return 0 }
+    return 1
+}
+
+// ---- deterministic generator (TEST USE ONLY) ------------------------------
+//
+// TEST USE ONLY. Callers producing REAL DTLS keys must use `p256_keygen`
+// (which pulls entropy from `secure_random`). This entry exists so tests
+// can pin two peers to a fixed known keypair without shelling out to
+// external tooling; do not use it to mint a production cert.
+//
+// Derivation:
+//   1. h = SHA-256(seed_32b || "p256-test-gen")   (33-byte buffer trailing NUL)
+//   2. r = _p256k_bytes_to_priv_bn(h[0..32])
+//   3. priv = (r mod (n - 1)) + 1
+//   4. (X, Y) = priv * G                          (via p256_scalar_mult)
+fn p256_keypair_generate_deterministic(seed_32b) {
+    if seed_32b == 0 { return 0 }
+    // Build the SHA-256 input: seed (32B) || "p256-test-gen" (13B) = 45B.
+    let label = "p256-test-gen"
+    let lbl_n = len(label)
+    let total = _P256K_PRIV_LEN + lbl_n
+    let input = alloc(total + 1)
+    let i = 0
+    while i < _P256K_PRIV_LEN {
+        store8(input + i, load8(seed_32b + i))
+        i = i + 1
+    }
+    let j = 0
+    while j < lbl_n {
+        store8(input + _P256K_PRIV_LEN + j, char_at(label, j))
+        j = j + 1
+    }
+    store8(input + total, 0)
+    let h = sha256_oneshot(input, total)
+    let raw_bn = _p256k_bytes_to_priv_bn(h)
+    let n = p256_curve_n()
+    let one = bn256_from_int(1)
+    let n_minus_one = bn256_sub(n, one)
+    let reduced = bn256_mod(raw_bn, n_minus_one)
+    let priv = bn256_add(reduced, one)
+    let G = p256_base_point()
+    let pub_aff = p256_scalar_mult(priv, G[0], G[1])
+    if pub_aff == 0 { return 0 }
+    let pair = list_new()
+    push(pair, priv)
+    push(pair, pub_aff)
+    return pair
+}
+
+// ---- save -----------------------------------------------------------------
+
+// Write `bytes` (a raw byte buffer of `n` bytes; NOT a NOVA byte list)
+// to `path` in one open+write+close cycle with the given file mode.
+// Returns 1 on complete write, 0 on any failure. This is the simpler
+// (non-durable) counterpart to `_ms_write_bytes_durable` in
+// merkle_signing.nova -- DTLS keypairs are minted once at bootstrap so
+// the tmp+fsync+rename dance is not required.
+fn _p256k_write_bytes(path, buf, n, mode) {
+    if path == 0 { return 0 }
+    if len(path) == 0 { return 0 }
+    if buf == 0 { return 0 }
+    if n <= 0 { return 0 }
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(path, flags, mode)
+    if fd < 0 { return 0 }
+    let written = sys_write(fd, buf, n)
+    sys_close(fd)
+    if written != n { return 0 }
+    return 1
+}
+
+// Save a P-256 keypair to disk under `base_path`:
+//   <base>.priv  (32 bytes = raw big-endian scalar; mode 0600)
+//   <base>.pub   (65 bytes = SEC1 uncompressed 0x04||X||Y; mode 0644)
+// Returns 1 on both-halves success, 0 if either half fails.
+fn p256_keypair_save(base_path, priv_bn, pub_point) {
+    if base_path == 0 { return 0 }
+    if len(base_path) == 0 { return 0 }
+    if priv_bn == 0 { return 0 }
+    if pub_point == 0 { return 0 }
+    if len(pub_point) != 2 { return 0 }
+    let priv_buf = _p256k_priv_bn_to_bytes(priv_bn)
+    let pub_buf = p256_encode_uncompressed(pub_point[0], pub_point[1])
+    if pub_buf == 0 { return 0 }
+    let priv_path = base_path + ".priv"
+    let pub_path  = base_path + ".pub"
+    if _p256k_write_bytes(priv_path, priv_buf, _P256K_PRIV_LEN,
+                          _P256K_MODE_PRIV) == 0 {
+        return 0
+    }
+    if _p256k_write_bytes(pub_path, pub_buf, _P256K_PUB_LEN,
+                          _P256K_MODE_PUB) == 0 {
+        return 0
+    }
+    return 1
+}

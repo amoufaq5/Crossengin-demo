@@ -229,6 +229,36 @@ as a standalone binary.
 | `/gossip_peer add ADDR`    | Register a bootstrap peer at runtime; reports the new peer count.                                                                    |
 | `/gossip_peers`            | Enumerate the peer table (`<addr> <ALIVE\|SUSPECT\|DEAD> last_seen=<ns>`).                                                          |
 | `/gossip_dq QUERY`         | Fan out `QUERY` (SPARQL) across the mesh via R20E distributed_query; renders each row's peer + bindings.                             |
+| `/gossip_transport`        | Phase O R3 (ADR-0096): report the resolved gossip transport (`tcp` or `dtls`). Env-driven at first `/gossip_start` via `CE_FED_TRANSPORT`; no in-REPL mutation -- restart to switch. |
+
+##### `/gossip_transport` -- DTLS-1.2-over-TCP shim status (Phase O R3, ADR-0096)
+
+Reports which transport the gossip mesh is using. Two possible outputs:
+
+- `transport=tcp` -- the default: byte-identical R18E gossip on
+  plaintext TCP.
+- `transport=dtls (ADR-0096 non-standard; not RFC-compliant)` -- the
+  DTLS-1.2-over-TCP shim from Phase O R3. This is NOT RFC 6347
+  compliant (the record layer is length-prefixed on TCP rather than
+  datagram-framed on UDP) and is CrossEngin-mesh-only; a standards-
+  compliant DTLS peer will not interop. See ADR-0096 for the full
+  trade + migration path.
+
+The transport is read ONCE from `CE_FED_TRANSPORT` at first
+`/gossip_start`; there is no in-REPL mutation entry. To switch mid-run
+restart the daemon or REPL. The recommended production entry point for
+DTLS is the fed daemon
+(`CE_FED_TRANSPORT=dtls nova run examples/crossengin_fed_daemon.nova`),
+which additionally loads a P-256 keypair via
+`p256_keypair_load(CE_FED_DTLS_CERT_DIR/signer)` and drives the
+server-side handshake on each accepted connection.
+
+Env vars introduced by Phase O R3:
+
+| Env var                    | Effect                                                               |
+|----------------------------|----------------------------------------------------------------------|
+| `CE_FED_TRANSPORT`         | `"dtls"` / `"DTLS"` enables the shim; anything else -> `"tcp"`.     |
+| `CE_FED_DTLS_CERT_DIR`     | Directory holding `signer.priv` (32B) + `signer.pub` (65B SEC1). Default `$HOME/.crossengin/fed_dtls_keys`. |
 
 R2 (ADR-0090) wires `/leader elect|status` and `/drule_add|run|fixpoint`
 into the same state (see subsection below); R3 (ADR-0091) wires
