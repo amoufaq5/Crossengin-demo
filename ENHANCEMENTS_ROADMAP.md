@@ -763,6 +763,59 @@ silently dropped under DTLS.
   vs buffer, raw r||s vs DER, deterministic-k RFC 6979 as follow-up).
   `make lint-ints` clean (12 pre-existing findings unchanged; none
   in the R1 files).
+- **R2 -- client-side flight + Finished MAC + server-side R2 flight
+  (SHIPPED, ADR-0098).** Closes the ClientHello Random placeholder
+  (`_dtls_build_client_hello_body` at `src/federation/dtls12.nova`
+  now pulls 32 bytes from `secure_random(buf, 32)`; falls back to
+  `DTLS_S_SLOT_CLIENT_RANDOM_OVERRIDE = 52` when entropy is
+  unavailable; writes the SAME bytes to both the wire body and
+  `DTLS_S_SLOT_CLIENT_RANDOM` so `dtls_ecdhe_derive` sees exactly
+  what went on the wire). Adds four server-flight parsers
+  (`_dtls_parse_server_hello_body`, `_dtls_parse_certificate_body`,
+  `_dtls_parse_ske_body`, `_dtls_parse_server_hello_done_body`,
+  each mirroring R1's `[ok | 0, ...]` return shape) plus
+  `_dtls_parse_client_key_exchange_body` for the server-flight-2
+  inverse. Adds three body builders (`_dtls_build_client_key_
+  exchange_body` = 1 + 65 point; `_dtls_build_change_cipher_spec_
+  record` = the 14-byte record_type=20 CCS record; `_dtls_build_
+  finished_body` = 12-byte PRF verify_data over the transcript
+  snapshot). Adds `_dtls_der_decode_ecdsa_sig` (+ helpers), the DER
+  inverse of R1's encoder, used by the SKE-sig verify path. Two
+  tail slots `DTLS_S_SLOT_HOSTNAME = 53` +
+  `DTLS_S_SLOT_ANCHORS = 54` carry the cert-verify plumbing from
+  `gds_handshake_client` into the flight driver. Wire drivers
+  `_gds_client_flight` (in `src/federation/gossip_dtls_shim.nova`)
+  and `_gds_server_flight_2` compose the full RFC 6347 handshake:
+  ClientHello -> SH/Cert/SKE/SHD -> cert-verify hook (via
+  `dtls_cert_verify_chain` from Phase O R1) + SKE-sig verify (via
+  `ecdsa_p256_verify_bn` against the leaf cert's EC pubkey) ->
+  ECDH-derive -> CKE + CCS + client Finished -> server CCS +
+  server Finished. Transcript-snapshot ordering follows RFC 5246
+  §7.4.9 exactly (client Finished covers CH..CKE; server Finished
+  covers CH..client Finished; the non-destructive `dtls_transcript_
+  finalize` from R1 makes this work without back-patching).
+  `gds_handshake_client` re-wired to call `_gds_client_flight`;
+  `gds_handshake_server` extended to call `_gds_server_flight_2`
+  after R1's flight-1. On the full success path both sides reach
+  `DTLS_S_ESTABLISHED`. On any refuse `LAST_ERR` carries a distinct
+  diagnostic tag and the state transitions to `DTLS_S_FAILED`.
+  Tests: `tests/unit/test_dtls_client_flight.nova` (~35 tests /
+  ~60 checks: CH Random slot populated + wire matches slot; all
+  four SH/Cert/SKE/SHD parsers round-trip against R1's builders;
+  CKE round-trip; CCS 14-byte record; Finished body matches PRF
+  for known transcript + master_secret + labels differ per side;
+  DER encode + decode round-trip; SKE sig verifies via
+  parser-recovered DER; client-flight refuse path with bogus fd;
+  hostname/anchors slots populated; slot-index pinning; client
+  state chain still valid). ADR-0098 covers the design +
+  alternatives (state-slot vs args for hostname/anchors,
+  epoch-advance timing on server side after client CCS, direct
+  state write for the server-side ESTABLISHED transition to avoid
+  extending `_dtls_valid_edge` and breaking pinned tests). Deferred
+  to R3: full extension parsing (replacing R1's stub) + DTLS-aware
+  gossip stream helpers so DELTA / SNAP_FETCH / EXTADDR /
+  RELAY_* stop being silently dropped under DTLS. `make lint-ints`
+  clean (pre-existing findings unchanged; none in the R2 files).
 
 ## What this roadmap does NOT claim
 - It does not claim AGI. It builds the mechanisms a moment-signal AGI bet

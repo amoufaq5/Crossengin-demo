@@ -760,6 +760,32 @@ let DTLS_S_SLOT_TRANSCRIPT_N   = 50  // int    -- valid byte count in the buffer
 let DTLS_S_SLOT_SERVER_RANDOM_OVERRIDE = 51  // buf | 0 -- 32B override for tests
 
 // ----------------------------------------------------------------------------
+// Phase P R2 (ADR-0098): client-side handshake flight tail slots.
+//
+// `DTLS_S_SLOT_CLIENT_RANDOM_OVERRIDE` mirrors the R1 server-side override:
+// when the client's ClientHello builder cannot pull 32 bytes from
+// secure_random (entropy unavailable in the test harness), it falls back
+// to whatever 32-byte buffer this slot points at. Prod paths leave it at 0
+// so the fallback path is a no-op; unit tests populate it so ClientHello
+// bytes stay reproducible across runs.
+//
+// `DTLS_S_SLOT_HOSTNAME` + `DTLS_S_SLOT_ANCHORS` carry the values
+// `gds_handshake_client` supplies (per Phase O R3's plumbing) so the
+// client-flight driver can hand them to `dtls_cert_verify_chain` when the
+// server's Certificate arrives. Kept on the state (rather than passed as
+// function args threaded through every internal helper) because the
+// verify call happens deep in the flight driver after several records
+// have been read; a state slot is the cleanest cross-call carrier.
+//
+// Tail-appended at 52/53/54 so slots 0..51 stay byte-identical -- any
+// caller that indexes into state by slot number continues to work.
+// ----------------------------------------------------------------------------
+
+let DTLS_S_SLOT_CLIENT_RANDOM_OVERRIDE = 52  // buf | 0 -- 32B override for tests
+let DTLS_S_SLOT_HOSTNAME               = 53  // string | 0 -- verify target host
+let DTLS_S_SLOT_ANCHORS                = 54  // list | 0 -- trust anchors
+
+// ----------------------------------------------------------------------------
 // RFC 5764 §4.1 `use_srtp` extension type + §4.1.2 SRTP protection
 // profile IDs. R2 exposes the four profiles the RFC's initial registry
 // enumerates; only AES128_CM_SHA1_80 is exercised in the ClientHello
@@ -835,6 +861,10 @@ fn dtls_init() {
     push(st, 0)                  // transcript_ctx (0 = not initialized)
     push(st, 0)                  // transcript_n
     push(st, 0)                  // server_random_override (test-mode only)
+    // Phase P R2 (ADR-0098) client-side handshake flight tail slots.
+    push(st, 0)                  // client_random_override (test-mode only)
+    push(st, 0)                  // hostname (client-flight verify target)
+    push(st, 0)                  // anchors (client-flight trust store)
     return st
 }
 
@@ -1225,6 +1255,30 @@ fn _dtls_build_client_hello_body(state) {
         // extensions block = 2B length prefix + concatenated ext bytes
         ext_block_n = 2 + ext_n
     }
+    // Phase P R2 (ADR-0098): populate the 32-byte Random from
+    // secure_random(32). On entropy-unavailable (test harness), fall back
+    // to the test-mode override slot -- deterministic bytes for wire-byte
+    // pins. Write the SAME bytes to both the wire body AND
+    // DTLS_S_SLOT_CLIENT_RANDOM so `dtls_ecdhe_derive` (which reads slot
+    // 17) sees exactly what went on the wire.
+    let cr_buf = alloc(33)
+    let cr_got = secure_random(cr_buf, 32)
+    if cr_got != 32 {
+        let ov = state[DTLS_S_SLOT_CLIENT_RANDOM_OVERRIDE]
+        if ov == 0 {
+            // Neither path available -- zero-fill (pre-R2 skeleton
+            // behavior). A caller that requires real randomness on a
+            // no-entropy platform can populate the override slot before
+            // calling; the zero-fill fallback keeps the function total.
+            let z = 0
+            while z < 32 { store8(cr_buf + z, 0); z = z + 1 }
+        } else {
+            let m = 0
+            while m < 32 { store8(cr_buf + m, load8(ov + m)); m = m + 1 }
+        }
+    }
+    store8(cr_buf + 32, 0)
+    state[DTLS_S_SLOT_CLIENT_RANDOM] = cr_buf
     // 2 (ver) + 32 (random) + 1 (sid len=0) + 1 (cookie len=0) +
     // 2 (suites len) + 2 (one suite) + 1 (compr len=1) + 1 (null compr) = 42
     // + ext_block_n (0 when no offer; 2 + 9 = 11 when use_srtp set)
@@ -1232,10 +1286,10 @@ fn _dtls_build_client_hello_body(state) {
     let body = alloc(body_n + 1)
     let off = 0
     _dtls_put_u16(body, off, DTLS_VERSION_WORD); off = off + 2
-    // 32-byte zero Random (R29B placeholder; secure_random in R29B.2).
+    // Copy the 32B client_random into the wire body.
     let i = 0
     while i < 32 {
-        store8(body + off + i, 0)
+        store8(body + off + i, load8(cr_buf + i))
         i = i + 1
     }
     off = off + 32
@@ -1983,6 +2037,506 @@ fn dtls_transcript_len(state) {
     return state[DTLS_S_SLOT_TRANSCRIPT_N]
 }
 
+// ============================================================================
+//         Phase P R2 (ADR-0098) -- client-side handshake flight parsers
+// ============================================================================
+//
+// Mirror the R1 server-side parser shape: return a fixed-shape list whose
+// first slot is `1` on accept and `0` on refuse (with the second slot
+// carrying the diagnostic tag). No exceptions, no negative sentinels --
+// callers discriminate on the first slot.
+
+// ----------------------------------------------------------------------------
+// ServerHello parser (RFC 5246 §7.4.1.3)
+//
+// Layout:
+//   2B version || 32B random || 1B sid_len + sid || 2B suite || 1B compr ||
+//   optional 2B ext_block_len + ext bytes.
+//
+// Returns [1, version_u16, random_buf_32B, sid_pair, negotiated_suite_u16,
+//          compr_u8, ext_pair_or_0]. On refuse: [0, DTLS_ERR_*].
+//
+// Refuses:
+//   * body shorter than 38 bytes (the minimum: 2+32+1+2+1 = 38).
+//   * negotiated_suite != 0xC02B (single-suite policy).
+//   * compression method != 0 (null compression required).
+//   * length prefixes that overflow the buffer.
+// ----------------------------------------------------------------------------
+fn _dtls_parse_server_hello_body(buf, n) {
+    if n < 38 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let off = 0
+    let version = _dtls_get_u16(buf, off); off = off + 2
+    let random_buf = alloc(33)
+    let i = 0
+    while i < 32 {
+        store8(random_buf + i, load8(buf + off + i))
+        i = i + 1
+    }
+    store8(random_buf + 32, 0)
+    off = off + 32
+    let sid_len = _dtls_get_u8(buf, off); off = off + 1
+    if off + sid_len > n {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let sid_pair = 0
+    if sid_len > 0 {
+        let sid_buf = alloc(sid_len + 1)
+        let j = 0
+        while j < sid_len {
+            store8(sid_buf + j, load8(buf + off + j))
+            j = j + 1
+        }
+        store8(sid_buf + sid_len, 0)
+        sid_pair = list_new()
+        push(sid_pair, sid_buf)
+        push(sid_pair, sid_len)
+    }
+    off = off + sid_len
+    if off + 3 > n {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let suite = _dtls_get_u16(buf, off); off = off + 2
+    if suite != DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_NO_CIPHER)
+        return bad
+    }
+    let compr = _dtls_get_u8(buf, off); off = off + 1
+    if compr != 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let ext_pair = 0
+    if off < n {
+        if off + 2 > n {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_ERR_BAD_HS)
+            return bad
+        }
+        let ext_block_len = _dtls_get_u16(buf, off); off = off + 2
+        if off + ext_block_len > n {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_ERR_BAD_HS)
+            return bad
+        }
+        let ext_buf = 0
+        if ext_block_len > 0 {
+            ext_buf = alloc(ext_block_len + 1)
+            let e = 0
+            while e < ext_block_len {
+                store8(ext_buf + e, load8(buf + off + e))
+                e = e + 1
+            }
+            store8(ext_buf + ext_block_len, 0)
+        }
+        ext_pair = list_new()
+        push(ext_pair, ext_buf)
+        push(ext_pair, ext_block_len)
+        off = off + ext_block_len
+    }
+    let out = list_new()
+    push(out, 1)
+    push(out, version)
+    push(out, random_buf)
+    push(out, sid_pair)
+    push(out, suite)
+    push(out, compr)
+    push(out, ext_pair)
+    return out
+}
+
+// ----------------------------------------------------------------------------
+// Certificate parser (RFC 5246 §7.4.2)
+//
+// Layout: 3B total inner length || per cert: 3B len + cert DER bytes.
+//
+// Returns [1, cert_der_list] where cert_der_list is a NOVA list of
+// [buf, n] pairs (leaf first per §7.4.2). On refuse: [0, DTLS_ERR_BAD_HS].
+// ----------------------------------------------------------------------------
+fn _dtls_parse_certificate_body(buf, n) {
+    if n < 3 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let total = _dtls_get_u24(buf, 0)
+    if 3 + total > n {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let cert_list = list_new()
+    let off = 3
+    let end = 3 + total
+    while off < end {
+        if off + 3 > end {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_ERR_BAD_HS)
+            return bad
+        }
+        let cert_n = _dtls_get_u24(buf, off); off = off + 3
+        if off + cert_n > end {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_ERR_BAD_HS)
+            return bad
+        }
+        let cbuf = alloc(cert_n + 1)
+        let i = 0
+        while i < cert_n {
+            store8(cbuf + i, load8(buf + off + i))
+            i = i + 1
+        }
+        store8(cbuf + cert_n, 0)
+        let entry = list_new()
+        push(entry, cbuf)
+        push(entry, cert_n)
+        push(cert_list, entry)
+        off = off + cert_n
+    }
+    let out = list_new()
+    push(out, 1)
+    push(out, cert_list)
+    return out
+}
+
+// ----------------------------------------------------------------------------
+// ServerKeyExchange parser (RFC 4492 §5.4 + RFC 5246 §7.4.3)
+//
+// Layout:
+//   1B curve_type=3 || 2B curve_id || 1B point_len=65 || 65B point ||
+//   2B sig_alg || 2B sig_len || N sig bytes (DER).
+//
+// Returns [1, curve_type, curve_id, pub_point_65B, sig_alg,
+//          sig_pair (=[buf, n])] on accept. Refuses on wrong curve_type
+// (must be 3 = named_curve), wrong curve_id (must be 23 = secp256r1),
+// wrong point_len (must be 65), or any length overflow. Signature bytes
+// are returned raw; DER decoding happens at verify time via
+// _dtls_der_decode_ecdsa_sig.
+// ----------------------------------------------------------------------------
+fn _dtls_parse_ske_body(buf, n) {
+    if n < 4 + 65 + 4 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let curve_type = _dtls_get_u8(buf, 0)
+    if curve_type != 3 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let curve_id = _dtls_get_u16(buf, 1)
+    if curve_id != 23 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let point_len = _dtls_get_u8(buf, 3)
+    if point_len != 65 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let pub_point = alloc(66)
+    let i = 0
+    while i < 65 {
+        store8(pub_point + i, load8(buf + 4 + i))
+        i = i + 1
+    }
+    store8(pub_point + 65, 0)
+    let off = 4 + 65
+    if off + 4 > n {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let sig_alg = _dtls_get_u16(buf, off); off = off + 2
+    let sig_len = _dtls_get_u16(buf, off); off = off + 2
+    if off + sig_len > n {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let sig_buf = alloc(sig_len + 1)
+    let j = 0
+    while j < sig_len {
+        store8(sig_buf + j, load8(buf + off + j))
+        j = j + 1
+    }
+    store8(sig_buf + sig_len, 0)
+    let sig_pair = list_new()
+    push(sig_pair, sig_buf)
+    push(sig_pair, sig_len)
+    let out = list_new()
+    push(out, 1)
+    push(out, curve_type)
+    push(out, curve_id)
+    push(out, pub_point)
+    push(out, sig_alg)
+    push(out, sig_pair)
+    return out
+}
+
+// ----------------------------------------------------------------------------
+// ServerHelloDone parser (RFC 5246 §7.4.5)
+//
+// Body MUST be empty (0 bytes). Returns [1] on accept, [0, DTLS_ERR_BAD_HS]
+// on any non-empty body.
+// ----------------------------------------------------------------------------
+fn _dtls_parse_server_hello_done_body(buf, n) {
+    if n != 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let out = list_new()
+    push(out, 1)
+    return out
+}
+
+// ----------------------------------------------------------------------------
+// ClientKeyExchange parser (RFC 4492 §5.7)
+//
+// For the ECDHE_ECDSA suite the body is:
+//   1B point_len=65 || 65B uncompressed EC point.
+//
+// Returns [1, client_pub_point_65B] on accept, [0, DTLS_ERR_BAD_HS] on
+// any length mismatch. This is the mirror of _dtls_build_client_key_
+// exchange_body.
+// ----------------------------------------------------------------------------
+fn _dtls_parse_client_key_exchange_body(buf, n) {
+    if n < 1 + 65 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let point_len = _dtls_get_u8(buf, 0)
+    if point_len != 65 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    if 1 + 65 > n {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, DTLS_ERR_BAD_HS)
+        return bad
+    }
+    let pub_point = alloc(66)
+    let i = 0
+    while i < 65 {
+        store8(pub_point + i, load8(buf + 1 + i))
+        i = i + 1
+    }
+    store8(pub_point + 65, 0)
+    let out = list_new()
+    push(out, 1)
+    push(out, pub_point)
+    return out
+}
+
+// ============================================================================
+//         Phase P R2 (ADR-0098) -- client-side handshake flight builders
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// ClientKeyExchange body builder (RFC 4492 §5.7 -- ECDHE variant)
+//
+// Layout: 1B point_len=65 || 65B uncompressed SEC1 point.
+// Returns [buf, 66].
+// ----------------------------------------------------------------------------
+fn _dtls_build_client_key_exchange_body(state, client_pub_point_65b) {
+    let body_n = 1 + 65
+    let body = alloc(body_n + 1)
+    _dtls_put_u8(body, 0, 65)
+    let i = 0
+    while i < 65 {
+        store8(body + 1 + i, load8(client_pub_point_65b + i))
+        i = i + 1
+    }
+    store8(body + body_n, 0)
+    let out = list_new()
+    push(out, body)
+    push(out, body_n)
+    return out
+}
+
+// ----------------------------------------------------------------------------
+// ChangeCipherSpec record builder (RFC 5246 §7.1)
+//
+// CCS is NOT a handshake message. It rides in its OWN record with
+// content_type=20 and a 1-byte body containing the constant value 0x01.
+//
+// Returns [record_buf, record_n] ready for `_gds_send_record` (i.e.
+// includes the 13-byte DTLS record header). It is emitted with the
+// CURRENT epoch + record_seq (pre-advance); the caller advances the
+// epoch AFTER sending, which is what the CCS semantically signals to
+// the peer ("everything from now on runs under the new keys").
+// ----------------------------------------------------------------------------
+fn _dtls_build_change_cipher_spec_record(state) {
+    let body = alloc(2)
+    store8(body + 0, 1)
+    store8(body + 1, 0)
+    // Emit at the CURRENT epoch (pre-CCS). dtls_record_emit bumps
+    // rec_seq + records_out counters.
+    let rec = dtls_record_emit(state, DTLS_CT_CCS, body, 1)
+    return rec
+}
+
+// ----------------------------------------------------------------------------
+// Finished body builder (RFC 5246 §7.4.9)
+//
+// verify_data = PRF(master_secret, label, SHA-256(handshake_messages), 12)
+// where label is "client finished" if is_client else "server finished".
+//
+// The transcript-hash snapshot is taken via `dtls_transcript_finalize`
+// (non-destructive). Returns [body_buf, 12] on success, 0 iff
+// master_secret is not yet populated (a state bug).
+//
+// NOTE: this DOES NOT absorb the Finished message into the transcript.
+// The caller is responsible for absorbing AFTER computing verify_data so
+// the transcript-snapshot moment matches RFC 5246 §7.4.9's contract
+// (Finished MAC does not cover the Finished message itself, but the
+// peer's Finished MAC DOES cover ours). See _gds_client_flight for the
+// full ordering.
+// ----------------------------------------------------------------------------
+fn _dtls_build_finished_body(state, is_client) {
+    let ms = state[DTLS_S_SLOT_MASTER_SECRET]
+    if ms == 0 { return 0 }
+    let transcript_hash = dtls_transcript_finalize(state)
+    if transcript_hash == 0 { return 0 }
+    let label = "server finished"
+    if is_client == 1 { label = "client finished" }
+    // dtls_prf_sha256(secret_buf, sec_n, label, seed_buf, seed_n, nbytes).
+    // master_secret is 48 bytes (RFC 5246 §8.1). transcript hash is
+    // exactly 32 bytes (FIPS 180-4 SHA-256 output).
+    let verify_data = dtls_prf_sha256(ms, 48, label, transcript_hash, 32, 12)
+    if verify_data == 0 { return 0 }
+    let out = list_new()
+    push(out, verify_data)
+    push(out, 12)
+    return out
+}
+
+// ----------------------------------------------------------------------------
+// DER-decode an ECDSA signature (RFC 3279 §2.2.3 / X9.62).
+//
+//   Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }
+//
+// Returns [r_bn, s_bn] on accept, 0 on any malformed input. Accepts
+// short-form outer length (top bit of length byte = 0); the outputs from
+// R1's _dtls_der_encode_ecdsa_sig always fit in <128 bytes (~72 bytes
+// max for two 32B scalars) so short-form is the only case we need to
+// support. Rejects long-form to keep the decoder minimal and total.
+//
+// Each INTEGER is decoded by parsing the 0x02 tag + short-form length +
+// content bytes. A leading 0x00 (added by the encoder to keep the
+// integer positive under two's complement) is stripped. The remaining
+// bytes are interpreted as a big-endian bn256 via _p256_bytes_to_bn on a
+// 32-byte staging buffer (left-padded with zeros).
+// ----------------------------------------------------------------------------
+fn _dtls_der_decode_ecdsa_sig(buf, n) {
+    if n < 2 { return 0 }
+    // Outer SEQUENCE (0x30) + short-form length.
+    if load8(buf + 0) != 48 { return 0 }
+    let outer_len = load8(buf + 1)
+    if int_and(outer_len, 128) != 0 { return 0 }   // long-form: reject.
+    if 2 + outer_len > n { return 0 }
+    let off = 2
+    let end = 2 + outer_len
+    // r INTEGER.
+    let r_bn = _dtls_der_decode_integer(buf, off, end)
+    if r_bn == 0 { return 0 }
+    let r_consumed = _dtls_der_decode_integer_consumed(buf, off, end)
+    if r_consumed <= 0 { return 0 }
+    off = off + r_consumed
+    // s INTEGER.
+    let s_bn = _dtls_der_decode_integer(buf, off, end)
+    if s_bn == 0 { return 0 }
+    let out = list_new()
+    push(out, r_bn)
+    push(out, s_bn)
+    return out
+}
+
+// Helper: decode one INTEGER at buf[off..end] and return the bn256.
+// Returns 0 on any malformed input (tag mismatch, length overflow,
+// zero-length content, > 33 bytes of content).
+fn _dtls_der_decode_integer(buf, off, end) {
+    if off + 2 > end { return 0 }
+    if load8(buf + off) != 2 { return 0 }
+    let val_n = load8(buf + off + 1)
+    if int_and(val_n, 128) != 0 { return 0 }   // long-form: reject.
+    if off + 2 + val_n > end { return 0 }
+    if val_n < 1 { return 0 }
+    if val_n > 33 { return 0 }
+    let content_off = off + 2
+    let content_n = val_n
+    // Strip the leading 0x00 sign byte if present + the top bit of the
+    // NEXT byte is set (i.e. the 0x00 was appended by the encoder to
+    // keep the integer positive).
+    if content_n > 1 {
+        if load8(buf + content_off) == 0 {
+            content_off = content_off + 1
+            content_n = content_n - 1
+        }
+    }
+    if content_n > 32 { return 0 }
+    // Right-align the content into a 32-byte buffer for _p256_bytes_to_bn.
+    let raw = alloc(33)
+    let pad = 32 - content_n
+    let z = 0
+    while z < pad { store8(raw + z, 0); z = z + 1 }
+    let i = 0
+    while i < content_n {
+        store8(raw + pad + i, load8(buf + content_off + i))
+        i = i + 1
+    }
+    store8(raw + 32, 0)
+    return _p256_bytes_to_bn(raw, 0)
+}
+
+// Helper: return the byte count consumed by the INTEGER at buf[off..end],
+// or -1 on malformed input. Used by _dtls_der_decode_ecdsa_sig to advance
+// past the r INTEGER before parsing the s INTEGER.
+fn _dtls_der_decode_integer_consumed(buf, off, end) {
+    if off + 2 > end { return 0 - 1 }
+    if load8(buf + off) != 2 { return 0 - 1 }
+    let val_n = load8(buf + off + 1)
+    if int_and(val_n, 128) != 0 { return 0 - 1 }
+    if off + 2 + val_n > end { return 0 - 1 }
+    return 2 + val_n
+}
+
 // dtls_client_init: build a ClientHello, wrap it in a Handshake envelope,
 // wrap that in a record, and advance state to CLIENT_HELLO_SENT.
 // `server_name` is recorded for SNI -- the SNI extension itself is a
@@ -2368,6 +2922,17 @@ fn dtls_offer_srtp(state, profile) {
 
 // Read-only accessor for the currently offered SRTP profile (0 = none).
 fn dtls_srtp_offer(state)       { return state[DTLS_S_SLOT_SRTP_OFFER] }
+
+// Phase P R2 (ADR-0098): accessors for the client-side verify plumbing.
+// `hostname` is the SAN target the client-flight driver hands to
+// `dtls_cert_verify_chain`; `anchors` is the trust-anchor list. Both are
+// stored on the state by `gds_handshake_client` so the flight driver can
+// pull them out when the peer's Certificate arrives without threading
+// them through every internal helper. 0 means "not set" (the driver will
+// return DTLS_CERT_HOSTNAME_MISMATCH / DTLS_CERT_NOT_PINNED per the
+// x509_verify.nova defaults on empty inputs).
+fn dtls_hostname(state)         { return state[DTLS_S_SLOT_HOSTNAME] }
+fn dtls_anchors(state)          { return state[DTLS_S_SLOT_ANCHORS] }
 
 // Convenience: snapshot the four 16/4-byte cipher slots so a test can
 // compare two sides' key blocks byte-identical without poking at slots.
