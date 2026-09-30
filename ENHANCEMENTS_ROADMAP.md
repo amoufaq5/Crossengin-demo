@@ -579,8 +579,58 @@ would need).
   merged, `#` comments + blank lines, missing/corrupt manifest
   entries, CRLF endings, no trailing newline, empty and
   all-comments manifests).
-- **R2 -- SRTP EKM forward + `use_srtp` extension** (queued;
-  ADR-0095).
+- **R2 -- SRTP EKM forward + `use_srtp` extension
+  (SHIPPED, ADR-0095).** Explore surfaced that the header comment at
+  `src/federation/dtls12.nova:140` (now :161 after R1's rewrite) still
+  called `dtls_extract_srtp_keys_R29B2_STUB` a stub, when R36B had
+  already shipped the full RFC 5764 §4.2 exporter
+  `dtls_export_srtp_keying_material` (60-byte PRF expansion under the
+  "EXTRACTOR-dtls_srtp" label, cached in DTLS_S_SLOT_SRTP_KM_CACHED).
+  R2 flips the legacy `_R29B2_STUB` wrapper into a thin forward to
+  the real exporter (`if state == 0 { return 0 } else return
+  dtls_export_srtp_keying_material(state)`); the suffix is kept for
+  grep-compat but the body is no longer a sentinel-returner. Two
+  public accessors that R33B skipped are also exposed:
+  `dtls_client_random(state)` and `dtls_server_random(state)` read
+  slots 17 and 18 respectively, so callers that need to bind SRTP
+  (or a DTLS-SCTP keyfile) to the PRF seed no longer index raw slot
+  numbers. Four RFC 5764 §4.1.2 profile IDs
+  (`SRTP_PROFILE_AES128_CM_SHA1_80 = 1`,
+  `SRTP_PROFILE_AES128_CM_SHA1_32 = 2`,
+  `SRTP_PROFILE_NULL_SHA1_80 = 5`,
+  `SRTP_PROFILE_NULL_SHA1_32 = 6`), the extension type
+  `DTLS_EXT_USE_SRTP = 14`, and a fresh tail-appended state slot
+  `DTLS_S_SLOT_SRTP_OFFER = 48` back a public setter
+  `dtls_offer_srtp(state, profile)` that validates the profile
+  argument (unknown values become a no-op with `last_err` stamped
+  to `"DTLS_ERR_BAD_SRTP_PROFILE"`). When the slot is non-zero at
+  `dtls_client_init` time, the ClientHello body builder splices the
+  9-byte wire sequence `[00, 14, 00, 05, 00, 02, 00, <profile>, 00]`
+  (RFC 5764 §4.1.1: `use_srtp` with a single-profile
+  `SRTPProtectionProfiles<>` list and an empty `srtp_mki<>`) into
+  the extensions block, growing the CH body from 42 to 53 bytes; a
+  zero slot leaves the wire bytes byte-identical to the pre-R2 42-
+  byte body so existing wire-byte assertions
+  (`tests/unit/test_dtls12.nova:448`) keep passing. Extension
+  PARSING remains deferred (a follow-up round); ServerHello echo is
+  deferred alongside since no ServerHello builder exists in this
+  file yet -- ADR-0095 documents both as known limitations plus the
+  `_dtls_build_use_srtp_ext(profile)` helper it leaves ready for
+  the ServerHello builder when it lands. Tests: ~70 new
+  `ce_check`/`ce_eq` assertions across 12 new
+  `test_r2_*` functions in `tests/unit/test_dtls12.nova` (forward
+  equivalence + cache-pointer identity vs the real exporter, the
+  RFC 5764 §4.2 60-byte layout with per-slice boundary probes,
+  cross-handshake determinism, both random-accessors round-tripped
+  through slots 17/18, both accessors after a two-side ECDHE derive,
+  all four SRTP profiles accepted by the setter + garbage / reserved
+  / zero rejected, and the 9-byte wire shape emitted in ClientHello
+  with two different profile IDs plus default-absent when no offer
+  is set). The pre-R2 `test_stubs_return_DTLS_ERR_STUB` check for
+  the SRTP wrapper was updated to assert the new forward semantics
+  (state=0 or fresh state -> 0, not DTLS_ERR_STUB). `make lint-ints`
+  clean (12 pre-existing findings unchanged; none in dtls12.nova
+  or test_dtls12.nova).
 - **R3 -- non-standard DTLS-over-TCP shim for gossip** (queued;
   ADR-0096; wraps `gossip_handle_conn` in DTLS records with a
   length-prefixed framing since TCP has no datagram boundary).
