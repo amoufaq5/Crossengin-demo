@@ -647,15 +647,81 @@ the same subtests as pre-R3c (no new failures). Spot-check
 `test_stereo_u8_simd` STILL SEGVs — same `memcpy_raw` bug, same
 fix pattern applies, out of R3c scope; folded into R3d.
 
-### R3d — follow-ups (NEXT)
+### Q.R3d — Cluster A/B/C SEGVs fixed (SHIPPED, ADR-0103)
 
-- Fix NOVA's `memcpy_raw` codegen label (`codegen.nova:22248`) to
-  `sar rdi,1; sar rsi,1; sar rdx,1` before `rep movsb`. Flips
-  `test_stereo_u8_simd` to PASS and lets us revert `_lk_byte_copy`
-  back to `memcpy_raw` for the speed. Operator action required
-  (NOVA compiler edit).
-- 15 non-str_eq SEGVs reclassified by R3b (parser / chunked-decode
-  / alloc-buffer bugs) still await per-test diagnosis.
+Phase Q R3d resolves 7 of the 15 R3b-residual SEGVs plus
+`test_stereo_u8_simd` (R3c fallout). Scope split into 5 clusters;
+A+B+C close here, D rolls to R3e.
+
+Diagnoses (per-cluster, instrumentation stripped before commit):
+
+1. **Cluster A (1 test)** — `test_stereo_u8_simd` hit the same bare
+   `rep movsb` codegen bug R3c diagnosed; fixed by extracting R3c's
+   `_lk_byte_copy` into the new shared `src/util/mem_safe.nova`
+   module as `byte_copy(dst, src, n)` and swapping the one direct
+   `memcpy_raw` call site (`image_stereo.nova:406`).
+2. **Cluster B (2 tests)** — `test_http_client`, `test_kg_rss_ingest`
+   reached the same `rep movsb` through runtime `substr(raw_alloc,
+   0, n)`. Fixed by adding `buf_to_str(buf, n)` to `mem_safe.nova`
+   (byte-wise `load8 + chr`, routes around `memcpy_raw`) and
+   swapping the two call sites (`http_client.nova:770`,
+   `kg_rss_ingest.nova:373`).
+3. **Cluster C (4 tests)** — `test_kg_query{,_agg,_ext}` +
+   `test_fed_daemon_boot`. The plan hypothesis (`str_concat` on
+   `+` with `_tok_text`) was wrong; instrumentation showed the
+   SEGV lives in `rt_str_to_int` (runtime
+   `src/runtime/string.nova:226`), which iterates with `load8(s + i)`
+   on string handles returned from `substr(tagged_string, …)`.
+   `load8` does not untag string-handle operands, so the second-byte
+   read faults. Fixed by migrating every reachable call site to the
+   `str_to_int` builtin (walks via `char_at`, unaffected).
+   Sites: `src/kg/query.nova` (9), `examples/crossengin_fed_daemon.nova`
+   (2), `tests/unit/test_fed_daemon_boot.nova` (1), plus pre-emptive
+   migration in `src/kg/{episodic,temporal,rule_inference,
+   link_prediction}.nova` (grep-caught, pattern-matched).
+
+The R3c SIMD canaries (`test_lk_u8_simd`, `test_lk_mulacc_simd`,
+`test_image_ocr`) still PASS after rewiring `image_optical_flow.nova`
+to the shared `byte_copy` helper (local `_lk_byte_copy` body deleted).
+
+Post-R3d exit tally for the targeted 16:
+- Cluster A: `test_stereo_u8_simd` → PASS.
+- Cluster B: `test_http_client`, `test_kg_rss_ingest` → PASS.
+- Cluster C: `test_fed_daemon_boot` → PASS; `test_kg_query{,_agg,_ext}`
+  → clean exit-3 FAIL (SEGV gone; residual behavioural FAILs trace
+  to a `type_of` runtime regression where strings AND lists both
+  now read `1`, breaking `_qry_is_error`'s `type_of(x) != 3` guard;
+  rolled to R3e).
+- Cluster D (7 tests): all still SEGV on indexing a null returned
+  by a `save`/`serve`; the "downstream of C" hypothesis was wrong,
+  roots are per-test module failures (sr/dq/replication paths use
+  flaky `str_eq` + hit the `type_of` regression). Rolled to R3e.
+- Cluster E (1 test): `test_ingest_file_multimodal` stack corruption,
+  rolled to R3e.
+
+### R3e — follow-ups (NEXT)
+
+- `test_ingest_file_multimodal` (Cluster E stack corruption; needs
+  standalone bisect).
+- `test_fed_daemon_transport` (R3b reclass: exit 3 behavioural, not
+  a SEGV; rolled per R3d non-goal).
+- 7 Cluster D tests: `test_audio_wakeword`,
+  `test_chat_state_persistence`, `test_decision_log_durable`,
+  `test_distributed_rules`, `test_fed_daemon_replication`,
+  `test_federated_aggregator`, `test_gossip_dtls_shim`.
+  Per-test save/serve failure diagnosis needed; the current
+  symptom (test SEGVs on null-index of a save/serve result) is a
+  downstream-of-module-bug pattern, not the tagged-pointer family.
+- `type_of` runtime regression audit: strings and lists both read
+  `1` instead of the historical `2`/`3`. Caller code assumes the old
+  values in `_qry_is_error` and several other guards. Either restore
+  the runtime values or migrate every reader.
+- **Upstream NOVA** (operator action; closes the whole workaround
+  family): fix `memcpy_raw` codegen (`codegen.nova:22248`) to
+  `sar rdi,1; sar rsi,1; sar rdx,1` before `rep movsb`; and add the
+  same SAR to `rt_str_to_int`'s `load8(s+i)` (or rewrite it over
+  `char_at`). Lets us revert `src/util/mem_safe.nova` + the
+  `str_to_int` migration.
 
 ### Migration-out criteria (when to delete Phase Q scaffolding)
 
