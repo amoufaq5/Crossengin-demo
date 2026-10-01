@@ -406,6 +406,85 @@ Optional stretch for R2 if time allows: a `make test` wall-time run
 against the full 273-test unit suite under the setarch-built compiler
 to catch any other latent failures the Phase P sample missed.
 
+#### Q.R2 SHIPPED (2026-10-01)
+
+**Root cause (deeper than R1 suspected)**: NOVA's `==` / `!=` on list
+values is neither reference-identity nor structural-content — empirically
+both comparators treat any two list handles as EQUAL regardless of
+content (probe: two lists with completely different content still
+compare `==` true). Both failing subtests asserted "handle distinctness"
+(`s1 != pm`, `s3 != s1`), which can never succeed under NOVA's list
+equality.
+
+**Secondary finding**: the module's own rebuild-on-key-change guards
+(`_perception_module_singleton_renv != renv2`,
+`_action_module_singleton_dl != dl`) are DEAD CODE under current NOVA
+semantics — `!=` on list-valued renv / dl is always false, so the
+rebuild branches never fire. `_perception_module_singleton_reset()` /
+`_action_module_singleton_reset()` are the only portable ways to force
+a fresh module. (Future round could migrate the guards to numeric
+monotonic ids; captured as a follow-up in ADR-0092 / ADR-0093 §"NOVA
+language quirks".)
+
+**Fixes shipped**:
+- `tests/unit/test_perception_module.nova` `test_module_init_and_singleton`:
+  rewrote both assertions to use behavioral side-effects
+  (`pm_step_count` mutation via `perception_step_text`) + reset-based
+  rebuild check. 45/45 checks pass.
+- `tests/unit/test_action_module.nova` `test_singleton` (parallel bug
+  found): same rewrite via `am_intent_count` mutation + reset-based
+  rebuild. Singleton test now passes.
+- `docs/adr/0092-perception-module.md` + `docs/adr/0093-action-module.md`:
+  appended `## NOVA language quirks` sections documenting the real
+  NOVA list-equality semantics + behavioral-assertion convention.
+- Top-of-file comment added to both test files restating the gotcha.
+
+**Full-suite regression sweep (`./scripts/test.sh tests/unit/*.nova`)**:
+TIMED OUT at the 10-minute wall-clock budget while running
+`test_merkle_signing.nova`. Partial results through merkle:
+- **172 PASS**, **67 FAIL** (plus `test_merkle_signing.nova` hung).
+- Failures catalogued below for R3+ triage. **R2 does not fix any of
+  these** — they are pre-existing latent failures (several segfault
+  with exit 139) unrelated to the singleton-cache work.
+
+Additional failing tests catalogued (partial, pre-timeout, R3+ triage):
+`test_action_module` (2 remaining pre-existing EFF_EXECUTED=1 vs got=2
+failures in `test_submit_speak_wired_dl` + `test_run_unknown_end_to_end`
+— NOT the singleton bug R2 fixed),
+`test_admin_bake_child_verb`, `test_admin_emit_delta_verb`,
+`test_atom_birth_monitor` (SEGV), `test_atom_death_monitor`,
+`test_audio_capture`, `test_audio_synth`, `test_audio_tts`,
+`test_audio_wakeword` (SEGV), `test_autocompact_trigger`,
+`test_autonomous_loop`, `test_autonomous_research`, `test_bignum_2048`,
+`test_bignum_256`, `test_byzantine_aggregation`,
+`test_chat_fed_slash_commands`, `test_chat_state_persistence` (SEGV),
+`test_cognitive_router`, `test_competence_tracker` (SEGV),
+`test_consolidation`, `test_constitutional_filter`,
+`test_decision_log_durable` (SEGV), `test_distributed_query`,
+`test_distributed_rules` (SEGV), `test_dp_budget_ui`,
+`test_dr_async_fetch`, `test_dtls12`, `test_ed25519`,
+`test_entity_resolve` (SEGV), `test_episodic` (SEGV),
+`test_episodic_retrieval`, `test_face_recognize`,
+`test_fed_daemon_attest` (SEGV), `test_fed_daemon_boot` (SEGV),
+`test_fed_daemon_leader`, `test_fed_daemon_replication` (SEGV),
+`test_fed_daemon_rules`, `test_fed_daemon_transport` (SEGV),
+`test_federated_aggregator` (SEGV), `test_gc_metrics`,
+`test_gossip` (SEGV), `test_gossip_dtls_shim` (SEGV),
+`test_gossip_noise` (SEGV), `test_gossip_relay` (SEGV),
+`test_graph_clustering`, `test_http_client` (SEGV), `test_ice`,
+`test_ice_turn`, `test_identity`, `test_image_harris`,
+`test_image_ocr` (SEGV), `test_image_tracker`,
+`test_ingest_file_multimodal` (SEGV), `test_internet_fetch` (SEGV),
+`test_kg_query` (SEGV), `test_kg_query_agg` (SEGV),
+`test_kg_query_ext` (SEGV), `test_kg_rss_ingest` (SEGV),
+`test_kg_sync` (SEGV), `test_kg_sync_delta` (SEGV),
+`test_leader_election`, `test_learn_pipeline`, `test_link_prediction`,
+`test_lk_mulacc_simd` (SEGV), `test_lk_u8_simd` (SEGV),
+`test_louvain`, `test_loyalty`, `test_merkle`, `test_merkle_signing`
+(timeout — hung the suite). Many SEGVs cluster around KG / gossip /
+federated code — strong signal of a shared substrate regression,
+likely a Phase P / Phase O side-effect worth a dedicated R3 round.
+
 ### Migration-out criteria (when to delete Phase Q scaffolding)
 
 Phase Q goes away — Makefile wrappers deleted, ADR-0100 marked

@@ -292,3 +292,35 @@ This round CLOSES Phase N -- the "README-only parts" arc is done. Both
 `src/parts/perception/` (R1, ADR-0092) and `src/parts/action/` (R2,
 this ADR) now have real atom + orchestrator modules and loop
 integration that honors their README-called-out promises.
+
+## NOVA language quirks
+
+Phase Q R2 surfaced the same two coupled issues as ADR-0092 §"NOVA
+language quirks" in the action-module singleton tests:
+
+1. **NOVA list equality is neither reference nor structural**. Empirically,
+   `==` / `!=` on any two list values -- even with completely different
+   content -- always evaluate as EQUAL. The initial `test_singleton`
+   subtest asserted `s1 != s3` where both are list-valued AM handles,
+   so the `!=` always evaluated false.
+
+2. **The module's own rebuild guard cannot fire**. The singleton's
+   `_action_module_singleton_dl != dl` and `_action_module_singleton_ge != ge`
+   checks at `action_module.nova:337` / `:343` are subject to the same
+   NOVA list-equality quirk: `!=` on two list-valued dl or ge handles
+   is always false, so the rebuild branches are dead code under current
+   NOVA semantics. The `_action_module_singleton_reset()` test helper
+   is the only portable way to force a fresh module.
+
+**Convention for tests**: assert `s1`/`s2` state separation via
+`am_intent_count` / `am_last_intent` mutation side-effects after one
+`action_run`; assert rebuild via the explicit
+`_action_module_singleton_reset()` helper rather than hoping the
+module's dl-change guard will fire. See the top-of-file comment in
+`tests/unit/test_action_module.nova`.
+
+**Follow-up (not blocking R2)**: the ADR-0093 contract "singleton
+rebuilds when the dl or goal_engine changes" is aspirational under
+current NOVA semantics -- a future round could tag `dl_new()` and
+`goal_engine_new()` with a monotonic integer id so `!=` compares
+integers, which NOVA does distinguish.

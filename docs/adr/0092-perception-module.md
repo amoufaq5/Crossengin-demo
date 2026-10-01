@@ -234,3 +234,38 @@ ADR-0041). The perception Percept minted here is what R2's
 `action_derive_intent` reads to set the Intent's confidence and category
 signal. See the plan file at `/root/.claude/plans/gentle-toasting-zephyr.md`
 §R2 for the full spec.
+
+## NOVA language quirks
+
+Phase Q R2 surfaced two coupled issues worth recording with the module
+contract:
+
+1. **NOVA list equality is neither reference nor structural**. Empirically
+   (verified by probe), `==` / `!=` on any two list values -- even lists
+   with completely different content -- always evaluate as EQUAL. The
+   initial `test_module_init_and_singleton` subtest asserted `s1 != pm`
+   where both `s1` (singleton-built via `perception_module_singleton_for(renv)`)
+   and `pm` (explicit via `perception_module_init(renv, 0)`) were lists --
+   so the `!=` evaluated false, failing the assertion.
+
+2. **The module's own rebuild guard cannot fire**. The singleton's
+   `_perception_module_singleton_renv != renv2` check at
+   `perception_module.nova:304` is subject to the same NOVA list-equality
+   quirk: `!=` on two list-valued renvs is always false, so the rebuild
+   branch is dead code under current NOVA semantics. The module's
+   `_perception_module_singleton_reset()` test helper is the only
+   portable way to force a fresh module.
+
+**Convention for tests**: assert singleton-vs-explicit distinctness
+BEHAVIORALLY -- step one handle and confirm the other's state did NOT
+advance (compare `pm_step_count` / `pm_last_percept` after a
+`perception_step_text` call). Assert rebuild via the explicit
+`_perception_module_singleton_reset()` helper rather than hoping the
+module's renv-change guard will fire. See the top-of-file comment in
+`tests/unit/test_perception_module.nova`.
+
+**Follow-up (not blocking R2)**: the ADR-0092 contract "singleton
+rebuilds when renv identity changes" is aspirational under current NOVA
+semantics -- a future round could switch the guard to a numeric
+monotonic renv-id (set on `reader_new`) so `!=` compares integers,
+which NOVA does distinguish.
