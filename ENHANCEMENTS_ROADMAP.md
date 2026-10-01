@@ -485,6 +485,125 @@ failures in `test_submit_speak_wired_dl` + `test_run_unknown_end_to_end`
 federated code — strong signal of a shared substrate regression,
 likely a Phase P / Phase O side-effect worth a dedicated R3 round.
 
+### Q.R3a — SEGV cluster diagnosis (SHIPPED, no fix landed)
+
+Diagnosis-only round, commit `6b746e7`. Catalogued the 29 exit-139
+segfaults R2 observed, clustered them by proximate failure mechanism,
+dmesg-decoded a representative crash (`test_atom_birth_monitor`), and
+identified a single documented NOVA runtime quirk (`str_eq` flaky on
+short-literal pairs; `src/util/str_safe.nova:3-14`) that explains ~22-26
+of them. 3 segfaults (`test_lk_u8_simd`, `test_lk_mulacc_simd`,
+`test_image_ocr`) classified as a separate SIMD / pointer-arithmetic
+bug class deferred to R3c. Full write-up: `docs/SEGFAULT_TRIAGE_R3A.md`
+(431 lines; §1-10). No code fix; R3b lands the mechanical migration.
+
+### Q.R3b — `str_eq` → `str_eq_bytes` call-site migration (SHIPPED, ADR-0101)
+
+Mechanical migration pass on the vulnerable call-site cluster. ADR
+`docs/adr/0101-str-eq-migration.md` (co-numbered with the existing
+`0101-data-acquisition-pipeline.md`, matching the two-ADR-0100
+precedent) documents the shape of the migration + the four sites
+intentionally left on raw `str_eq`.
+
+**Files touched (33, superset of R3a's 24-file §4 table — expanded in
+flight after smoke runs showed deeper transitive deps also carried
+vulnerable sites)**:
+`src/federation/distributed_query.nova`,
+`src/federation/gossip.nova`,
+`src/federation/gossip_dtls_shim.nova`,
+`src/federation/gossip_relay.nova`,
+`src/federation/gossip_relay_secure.nova`,
+`src/federation/kg_sync.nova`,
+`src/federation/leader_election.nova`,
+`src/federation/nat_traversal.nova`,
+`src/federation/snapshot_attestation.nova`,
+`src/federation/snapshot_replication.nova`,
+`src/federation/turn_server.nova`,
+`src/io/transducers/audio_wakeword.nova`,
+`src/io/transducers/http_client.nova`,
+`src/io/transducers/kg_rss_ingest.nova`,
+`src/io/transducers/kg_sync.nova`,
+`src/kg/competence_tracker.nova`,
+`src/kg/episodic.nova`,
+`src/kg/link_prediction.nova`,
+`src/kg/pagerank.nova`,
+`src/learning/atom_birth_monitor.nova`,
+`src/learning/autonomous_research.nova`,
+`src/learning/byzantine_aggregation.nova`,
+`src/learning/entity_resolve.nova`,
+`src/learning/federated_aggregator.nova`,
+`src/learning/internet_fetch.nova`,
+`src/learning/secure_aggregation.nova`,
+`src/parts/soul/identity.nova`,
+`src/persistence/chat_state.nova`,
+`src/persistence/merkle.nova`,
+`src/persistence/merkle_signing.nova`,
+`src/persistence/schema_migration.nova`,
+`src/persistence/snapshot_delta.nova`,
+`src/persistence/snapshot_disk.nova`.
+
+**Call sites migrated: 367 `str_eq_bytes` call sites introduced**
+across the 33 files (4 raw sites intentionally retained for
+long-dynamic-string compares: `internet_fetch.nova:74` URL cache,
+`snapshot_replication.nova:339/349/488` ROOT_HEX).
+
+**Regression gate on the 26 class-A SEGV tests from R3a §2
+(setarch-R NOVA, per-test isolation)**:
+
+- **PASS (6/26)**: `test_atom_birth_monitor`, `test_competence_tracker`,
+  `test_entity_resolve`, `test_gossip_noise`, `test_kg_sync`,
+  `test_kg_sync_delta`.
+- **SEGV → clean non-crash FAIL (5/26, recovered test signal)**:
+  `test_episodic` (78/1), `test_fed_daemon_attest`, `test_gossip`,
+  `test_gossip_relay`, `test_internet_fetch`.
+- **Still SEGV after R3b (15/26)**: `test_audio_wakeword`,
+  `test_chat_state_persistence`, `test_decision_log_durable`,
+  `test_distributed_rules`, `test_fed_daemon_boot`,
+  `test_fed_daemon_replication`, `test_fed_daemon_transport`,
+  `test_federated_aggregator`, `test_gossip_dtls_shim`,
+  `test_http_client`, `test_ingest_file_multimodal`, `test_kg_query`,
+  `test_kg_query_agg`, `test_kg_query_ext`, `test_kg_rss_ingest`.
+  Spot-checked — these are **not** str_eq SEGVs. Representative traces:
+  `test_kg_query` dies inside `_qry_parse_limit` on `"LIMIT 3"` with no
+  str_eq on the fault path; `test_http_client` dies inside
+  `_hc_chunked_decode` (alloc-byte-buffer handling, same shape as the
+  `_hc_str_lower` bug fixed inline in this round); and
+  `test_federated_aggregator` dies after `test_fed_agg_join_leave_flags`
+  in the DP/meta-observer path. Tracked for Q.R3d.
+
+So vs R3a's prediction of "~22-26 of 29 flip to PASS or clean FAIL",
+R3b achieved **11/26 recovered** (6 PASS + 5 SEGV→FAIL) and surfaced
+that the dmesg-sampled cluster overstated the str_eq share — several
+tests have a different, non-str_eq SEGV upstream.
+
+**Side-benefit (non-regression spot-check)**: three previously-failing
+non-SEGV tests saw fail-count drops as transitive deps got migrated:
+
+- `test_merkle`: 48 pass / 12 fail → **57 pass / 3 fail**.
+- `test_byzantine_aggregation`: 55 pass / 15 fail → **68 pass / 2 fail**.
+- `test_leader_election`: 26 pass / 14 fail → **31 pass / 9 fail**.
+
+No regressions on spot-checked non-SEGV tests (`test_arithmetic`,
+`test_perception_module`, `test_episodic_retrieval`, `test_identity`,
+`test_atom_birth_monitor`).
+
+**One ancillary bug fixed inline** (ADR-0101 "Decision"):
+`src/io/transducers/http_client.nova:_hc_str_lower` was returning a raw
+`alloc`'d NUL-terminated byte buffer that only the strcmp-shaped
+`str_eq` builtin could consume. `str_eq_bytes` uses `len`+`char_at`,
+which SEGV on a raw buffer. Rewired to delegate to NOVA's `str_lower`
+builtin, matching `src/chat/helpers.nova:417`.
+
+Follow-ups: **R3c** (SIMD / pointer-arithmetic, still open — the 3
+Class B tests), **R3d** (the 15 non-str_eq SEGVs this round surfaced;
+needs per-test triage, with the `alloc`-buffer sweep as a strong
+starting hypothesis). The ~124 raw `str_eq` sites still outside this
+migration (image / video / audio / stream transducers, dp_budget_ui,
+sensor_fusion, cognitive_router, …) are not in the import graph of any
+of the 26 class-A tests and are left for a later low-priority round.
+
+See ADR-0101 for the per-site rationale.
+
 ### Migration-out criteria (when to delete Phase Q scaffolding)
 
 Phase Q goes away — Makefile wrappers deleted, ADR-0100 marked
