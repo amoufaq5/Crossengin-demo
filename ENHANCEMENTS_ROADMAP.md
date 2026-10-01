@@ -604,6 +604,59 @@ of the 26 class-A tests and are left for a later low-priority round.
 
 See ADR-0101 for the per-site rationale.
 
+### Q.R3c — class-B SEGV outliers fixed (SHIPPED, ADR-0102)
+
+Phase Q R3c closes the three class-B SEGV outliers R3b deferred.
+Scope: `test_lk_u8_simd`, `test_lk_mulacc_simd`, `test_image_ocr`.
+All three were SEGV at `b64b382`; all three exit 0 after R3c
+(34 + 28 + 40 = 102 checks pass across 13+11+12 = 36 subtests).
+
+Diagnoses (per-test instrumentation + dmesg disassembly, stripped
+before commit):
+
+1. **LK pair** — NOVA's `memcpy_raw` builtin at
+   `/home/user/NOVA/src/compiler/codegen.nova:22248` is a bare
+   `rep movsb` that does NOT untag its (rdi, rsi, rdx) args. Since
+   NOVA ints and pointers are tagged `2x+1`, `rep movsb` runs on
+   `actual*2+1` addresses and faults. R3a's "pointer-arithmetic
+   drift" hypothesis was wrong; the pack helpers are correct, the
+   compiler's `memcpy_raw` label is the bug.
+
+2. **OCR** — `image_ocr.nova:504` did `s = s + buf` where `buf =
+   alloc(2); store8(buf+0, char); store8(buf+1, 0)`. NOVA's `+`
+   dispatches through `_nova_add` → `_nova_check_rdi` which probes
+   `[rdi]` for a type header; a raw byte buffer has no header, so
+   the probe faults.
+
+Fixes (minimum necessary, per-caller, no NOVA edits):
+
+1. **LK pair** — new `_lk_byte_copy(dst, src, n)` helper in
+   `image_optical_flow.nova` that uses `store8(load8)` (both
+   properly untag). Replaces 5 `memcpy_raw` calls in the LK pack
+   paths (1 SAD + 4 mulacc). Perf: scalar byte-at-a-time vs `rep
+   movsb`; slower but correct.
+
+2. **OCR** — replace `alloc + store8 + s + buf` with a `substr`
+   lookup into a static
+   `"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"`. `substr` returns a
+   proper NOVA string that `_nova_add`'s probe accepts. Covers all
+   emittable chars from the default 8x8 ASCII gallery.
+
+Regression check: `test_image_harris`, `test_image_tracker` fail
+the same subtests as pre-R3c (no new failures). Spot-check
+`test_stereo_u8_simd` STILL SEGVs — same `memcpy_raw` bug, same
+fix pattern applies, out of R3c scope; folded into R3d.
+
+### R3d — follow-ups (NEXT)
+
+- Fix NOVA's `memcpy_raw` codegen label (`codegen.nova:22248`) to
+  `sar rdi,1; sar rsi,1; sar rdx,1` before `rep movsb`. Flips
+  `test_stereo_u8_simd` to PASS and lets us revert `_lk_byte_copy`
+  back to `memcpy_raw` for the speed. Operator action required
+  (NOVA compiler edit).
+- 15 non-str_eq SEGVs reclassified by R3b (parser / chunked-decode
+  / alloc-buffer bugs) still await per-test diagnosis.
+
 ### Migration-out criteria (when to delete Phase Q scaffolding)
 
 Phase Q goes away — Makefile wrappers deleted, ADR-0100 marked
