@@ -799,6 +799,72 @@ Follow-ups:
   `src/util/mem_safe.nova`, `src/util/str_safe.nova`,
   `src/util/type_safe.nova`, and the 7 migrated call sites.
 
+### Q.R3f -- bug-#11 sentinel equality + rebuild-guard sweep (SHIPPED, ADR-0105)
+
+Phase Q R3f closes the segfault-arc tail opened by R3a. Five sub-passes,
+one commit:
+
+1. **R3f.1 -- `test_distributed_rules` (io_println broader bug class).**
+   Phase-1 inferred "long literal only"; the real class also includes
+   dynamically-concatenated string arguments (`str_data`/`str_len`
+   codegen assumes a flat literal, dereferences a concat-node operand).
+   Migrated `drule_chat_add_cmd` / `drule_chat_run_cmd` to the `println`
+   NOVA builtin (handles both) + chunk-split <=128 B. SEGV -> OK
+   (42 checks).
+2. **R3f.2 -- `test_federated_aggregator` (DP_REFUSED equality).**
+   `dp_is_refused` compared against a sentinel at `-(2^31-1)`; two
+   large-magnitude operands with tags set reach NOVA bug-#11's
+   sentinel-equality (pointer-deref) path. Replaced with a magnitude
+   probe `v < 0 - 2000000000`. Fix is correct for its class, but a
+   secondary SEGV earlier in the module-init path remains -- partial
+   defer to R3g.
+3. **R3f.3 -- `test_gossip_dtls_shim` (test-side ABI mismatch).**
+   Phase-1 hypothesis "same class as R3f.2" was wrong. Real root: the
+   test built private scalars as 32-byte buffers, but
+   `dtls_ecdhe_keygen_seeded` forwards to `p256_keygen_seeded` which
+   expects a bn256 limb list. Switched both helpers to `bn256_from_hex`
+   (test-side only). Crash boundary moved past `_setup_ready_pair`;
+   second unrelated crash at `test_extract_keys_null` (test 26/31) --
+   partial defer to R3g.
+4. **R3f.4 -- `test_ingest_file_multimodal` (tag-strip + ABI fix).**
+   `perceptual_capsule.nova` wrote `store8(buf+i, byte_list[i])`
+   without masking; `byte_list[i]` returns tagged small-ints whose tag
+   bits corrupt the stored byte and cause OOB writes. Added
+   `int_and(x, 255)` in both `perc_hash_from_bytes` and
+   `perc_hash_full_from_bytes`; rewired the test's `_presented_holder`
+   call (non-existent helper) through `capability_registry` +
+   `rpc_ctx_set_presented_token`. SEGV -> OK (28 checks).
+5. **R3f.5 -- dead-code rebuild-guard sweep.** The singleton guards in
+   `perception_module.nova:304` and `action_module.nova:337,343` used
+   list-identity `!=` on `renv` / `dl` / `ge` -- same bug-#11 class, so
+   the guards never rebuilt. Added `src/util/gen_id.nova` (monotonic
+   counter + stamp/matches helpers); tail-appended `REN_GEN`, `DL_GEN`,
+   `GE_GEN` slots to the three constructors; rewired the three guard
+   sites to compare on the stamped int. `test_perception_module` and
+   `test_action_module` unchanged (behavioral assertions, not
+   identity).
+
+Post-R3f exit tally (R3f-targeted 4 tests):
+- PASS: `test_distributed_rules`, `test_ingest_file_multimodal`.
+  **2 wins.**
+- IMPROVED: `test_gossip_dtls_shim` (crash boundary moved 25 tests
+  forward, now at test 26/31).
+- DEFERRED to R3g: `test_federated_aggregator`,
+  `test_gossip_dtls_shim` (tail only).
+
+Regression canaries from R3b/R3c/R3d/R3e (`test_perception_module`,
+`test_action_module`, `test_fed_daemon_replication`, `test_kg_query`
+/`_agg`/`_ext`, `test_arithmetic`) all unchanged. Known non-SEGV
+neighbors (`test_merkle`, `test_merkle_signing`) unchanged.
+
+Follow-ups:
+- **R3g**: `test_federated_aggregator` (secondary SEGV earlier than
+  `dp_is_refused`), `test_gossip_dtls_shim` tail (crash at
+  `test_extract_keys_null`, likely a separate class).
+- **Upstream NOVA**: see `docs/UPSTREAM_NOVA_BUGS.md` -- six-entry
+  manifest (bug-#11 sentinel equality, `io_println`, memcpy_raw,
+  `rt_str_to_int`, type_of regression, sandbox O_CREAT policy).
+
 ### Migration-out criteria (when to delete Phase Q scaffolding)
 
 Phase Q goes away — Makefile wrappers deleted, ADR-0100 marked
