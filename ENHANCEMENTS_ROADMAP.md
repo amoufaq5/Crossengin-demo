@@ -865,6 +865,55 @@ Follow-ups:
   manifest (bug-#11 sentinel equality, `io_println`, memcpy_raw,
   `rt_str_to_int`, type_of regression, sandbox O_CREAT policy).
 
+### Q.R3g -- segfault-arc close-out (SHIPPED, ADR-0106)
+
+Phase Q R3g retires the two R3f-deferred residuals. Two sub-passes,
+one commit:
+
+1. **R3g.1 -- `test_federated_aggregator` (raw-nanotime-untagged).**
+   SEGV at `s * _LCG_MUL` in `_lcg_step` on first noise call. New bug
+   class (NOT ADR-0105 bug-#11): `nanotime() & _LCG_MASK` leaves the
+   result UNTAGGED and the subsequent `*` dispatches through the
+   pointer-threshold path. User-level fix in
+   `src/safety/differential_privacy.nova:dp_new`: seed from
+   `epsilon_budget_milli + 7919` (already-tagged); deterministic seed
+   is acceptable for Minimum Viable DP, `dp_new_seeded` remains for
+   stream-pinning callers. Also migrates two residual `str_eq` call
+   sites in the test to `str_eq_bytes` (ADR-0101 cleanup, previously
+   masked by the SEGV).
+2. **R3g.2 -- `test_gossip_dtls_shim` (unresolved-callee SEGV).** SEGV
+   at the call site of `gossip_dtls_extract_keys(0)` BEFORE the
+   function body executes (instrumented entry print never fires).
+   Root: the function lives in `src/federation/gossip.nova`, which
+   the test does not import. NOVA lowers the unresolved call to a
+   null callee that SEGVs on entry. Fix: add a shim-local
+   `gds_extract_keys` to `src/federation/gossip_dtls_shim.nova` and
+   switch the three callers.
+
+Post-R3g exit tally (R3g-targeted 2 tests):
+- PASS: `test_federated_aggregator` (OK, 91 checks). **1 win.**
+- CLEAN NON-SEGV: `test_gossip_dtls_shim` (56 passed, 1 pre-existing
+  FAIL `client hs last_err = flight-not-wired` carried from R3f.3; no
+  SEGV). **1 win on SEGV front; a pre-existing clean FAIL remains.**
+
+**Segfault-arc close-out**: all 29 tests catalogued under R3a are
+resolved. The remaining non-SEGV FAILs are
+`test_gossip_dtls_shim:client hs last_err` (1) and
+`test_action_module` (2 pre-existing). No test currently SEGVs on
+tip.
+
+Regression canaries from R3b/R3c/R3d/R3e/R3f
+(`test_distributed_rules`, `test_ingest_file_multimodal`,
+`test_fed_daemon_replication`, `test_kg_query`, `test_arithmetic`,
+`test_perception_module`, `test_type_of_probe`): all still OK.
+`test_action_module`: 53 passed / 2 FAIL (unchanged).
+
+Follow-ups:
+- **R3h**: none queued -- segfault-arc closed.
+- **Upstream NOVA**: `docs/UPSTREAM_NOVA_BUGS.md` extended with
+  entries 7 (raw-nanotime-untagged on `&`) and 8 (unresolved-callee
+  SEGV).
+
 ### Migration-out criteria (when to delete Phase Q scaffolding)
 
 Phase Q goes away — Makefile wrappers deleted, ADR-0100 marked

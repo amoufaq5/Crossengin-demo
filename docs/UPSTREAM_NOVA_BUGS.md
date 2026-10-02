@@ -54,8 +54,9 @@ location.
   `src/safety/differential_privacy.nova:dp_is_refused` (replaces
   `v == DP_REFUSED` with `v < 0 - 2000000000`); test-side bn256 fix in
   `tests/unit/test_gossip_dtls_shim.nova`.
-- **Tests**: `test_federated_aggregator` (partial; R3f.2 fix is correct
-  for its own class but a secondary SEGV remains -- queued for R3g).
+- **Tests**: `test_federated_aggregator` (R3f.2 fix retires one class;
+  R3g.1 retires a second, independent class in the same test -- see
+  entry 7 below).
 - **Suggested fix**: in codegen's integer-equality lowering, when both
   operands have tags set, lower as a plain int compare rather than
   routing through the sentinel-equality (pointer-dereference) path.
@@ -72,6 +73,33 @@ location.
   walker's bounds check in `io_println`, and extend the `str_data` /
   `str_len` codegen on `io_println` to handle `concat` AST nodes (not
   only flat literals).
+
+## 7. raw-nanotime-untagged on `&` -- subsequent `*` SEGVs
+
+- **ADR**: 0106
+- **Workaround**: `src/safety/differential_privacy.nova:dp_new`
+  derives the LCG seed from `epsilon_budget_milli + 7919` (an
+  already-tagged caller-supplied int) instead of
+  `nanotime() & _LCG_MASK`. Deterministic seed is acceptable for the
+  Minimum Viable DP; `dp_new_seeded` remains for callers that need
+  to pin the stream.
+- **Tests**: `test_federated_aggregator` (R3g.1).
+- **Suggested fix**: `/home/user/NOVA/src/compiler/codegen.nova` --
+  re-tag the result of `&` (and other bitwise ops) when either operand
+  is a raw int from `nanotime()` / other asm-returning builtins, OR
+  tag `nanotime()`'s return value itself.
+
+## 8. unresolved-callee SEGV on import-graph miss
+
+- **ADR**: 0106
+- **Workaround**: `src/federation/gossip_dtls_shim.nova` defines a
+  shim-local `gds_extract_keys`; `tests/unit/test_gossip_dtls_shim.nova`
+  switches to it (`gossip_dtls_extract_keys` lived in `gossip.nova`,
+  which the test does not import).
+- **Tests**: `test_gossip_dtls_shim` (R3g.2).
+- **Suggested fix**: NOVA's whole-program link should FAIL compilation
+  on an unresolved call rather than lower it to a null callee that
+  SEGVs on entry.
 
 ## 6. Sandbox O_CREAT policy (container, not NOVA)
 
