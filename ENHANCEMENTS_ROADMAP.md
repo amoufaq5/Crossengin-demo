@@ -787,10 +787,11 @@ Follow-ups:
 - **R3f**: 4 R3e-deferred tests (above) + dead-code rebuild-guard
   sweep (R2 flag).
 - **R3-arc post-queue (unchanged from R3d)**: RELAY_BIN sealed-frame
-  (P R3 defer), motor_map population (N R2 shell), auto-broadcast-
-  on-snapshot-save (M R3 defer), split 924KB NEXT_SESSION.md, NOVA
-  Makefile push (`ef4c3c6` local-only — operator action), UDP rewrite
-  of gossip (blocked on NOVA sendto/recvfrom).
+  (P R3 defer), motor_map population (N R2 shell) -- **CLOSED by Phase
+  R1 (ADR-0107)**, auto-broadcast-on-snapshot-save (M R3 defer), split
+  924KB NEXT_SESSION.md, NOVA Makefile push (`ef4c3c6` local-only —
+  operator action), UDP rewrite of gossip (blocked on NOVA sendto/
+  recvfrom).
 - **Upstream NOVA (operator action; closes the whole workaround family):**
   fix `memcpy_raw` codegen + `type_of()` regression in
   `codegen.nova`. The current `type_of()` renders strings as a
@@ -923,6 +924,61 @@ Superseded — when all three hold:
 2. `make self-host` passes without `setarch -R`.
 3. `/home/user/NOVA/docs/PTR_TAGGING_PLAN.md` reports 177/177 and the
    `boot/nova_boot.s` classifier is tagged-int-aware.
+
+---
+
+## Phase R — action-module effector arc *(post-Q feature work)*
+
+Phase R picks up the Phase N R2 motor_map arc that ADR-0093 explicitly
+deferred to its own R3 preview section.
+
+### R.R1 -- motor_map population + action_module wiring (SHIPPED, ADR-0107)
+
+Phase R1 fills in the three missing pieces around the already-complete
+`motor_map.nova` public API:
+
+1. **`motor_map_default()`** -- seeded registry with canonical
+   `EFF_CLASS_*` vocabulary (`search_the_web`/`fetch_url` -> HTTP;
+   `write_a_note`/`read_file` -> FILE; `call_tool` -> TOOL;
+   `run_code` -> CODE; `play_audio`/`synth_audio` -> AUDIO;
+   `invoke_mcp` -> MCP).  Non-exhaustive on purpose -- expanded by R2
+   alongside effector primitives.
+2. **`mm_activation_signature(ctx, goal_id)`** -- deterministic key
+   builder.  Shape `"g<gid>:a<act0>:a<act1>:..."` with a `len(0)`
+   guard; degrades to `"g<gid>"` on null/active-less ctx.  Reads
+   `ctx[5]` positionally (motor_map is a leaf).
+3. **`AM_MOTOR_MAP` slot** -- tail-appended at index 7 to preserve the
+   seven pre-R1 slot offsets (ADR-0093 byte-identity contract).  Seeded
+   with `motor_map_default()` at init; `action_derive_intent` consults
+   it BEFORE the pre-R2 SPEAK/INTERNAL fallthrough.  On a TOOL/FILE/
+   HTTP/CODE/AUDIO/MCP hit, mint the matching kind; on a miss, fall
+   through unchanged (byte-identity preserved).
+4. **Intent constructors** -- added `intent_file_new`, `intent_http_new`,
+   `intent_code_new`, `intent_audio_new`, `intent_mcp_new` to
+   `action_atoms.nova`, parallel to the pre-R1 `intent_tool_new`.
+
+**Non-goal (deferred to R2)**: `action_submit`'s SUSPENDED-fallback is
+UNCHANGED.  Non-SPEAK intents mint and are visible in the decision log
+but return `[EFF_SUSPENDED, -1]` at the gate until effector primitives
+ship.
+
+Exit tally:
+- `test_motor_map`: 8 subtests, 52 checks, OK (was 36).
+- `test_action_module`: 61 passed / 2 pre-existing FAIL (was 53/2;
+  the 2 FAILs -- `submit result EXECUTED` + `run unknown eff
+  EXECUTED` -- are carried unchanged from R3e).
+- Spot-check canaries: `test_perception_module`, `test_arithmetic`,
+  `test_type_of_probe`, `test_distributed_rules`, `test_fed_daemon_boot`
+  all OK.
+
+Follow-ups:
+- **R2** -- ship `src/io/effectors/{tool,file,http,code,audio,mcp}.nova`
+  and rewrite `action_submit` to dispatch per-class instead of the
+  SUSPENDED fallback.  Expands `motor_map_default` vocabulary alongside
+  each new primitive.  Separate ADR.
+- Potential: hashed-signature variant to bound key length as active-
+  concept counts grow.  Currently deferred -- plain-string key is
+  deliberate for debuggability.
 
 ---
 
@@ -1110,8 +1166,8 @@ subtrees whose READMEs promised modules the loop layer never called.
   `src/agent/loop_action.nova::loop_action_step` delegate without a
   signature change), and `motor_map.nova` (the
   substrate-activation → effector-class registry, ships empty at
-  MVP; a follow-up round populates it with real activation-signature
-  → TOOL / FILE / HTTP mappings). `src/agent/autonomous_loop.nova::agent_new`
+  MVP; Phase R1 (ADR-0107, 2026-10-03) **populated it + wired into
+  `action_derive_intent`** -- DONE). `src/agent/autonomous_loop.nova::agent_new`
   now allocates `AG_ACTION_MODULE` at slot 22 via
   `action_module_init(agent_dl(a), 0)`; accessors
   `agent_action_module(a)` + `agent_dl(a)` expose the wire. The
