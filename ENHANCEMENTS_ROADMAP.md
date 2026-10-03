@@ -789,10 +789,13 @@ Follow-ups:
 - **R3-arc post-queue (unchanged from R3d)**: RELAY_BIN sealed-frame
   (P R3 defer) -- **CLOSED by Phase P R4 (ADR-0110)**, motor_map
   population (N R2 shell) -- **CLOSED by Phase R1 (ADR-0107)**,
-  auto-broadcast-on-snapshot-save (M R3 defer), split 924KB
-  NEXT_SESSION.md, NOVA Makefile push (`ef4c3c6` local-only —
-  operator action), UDP rewrite of gossip (blocked on NOVA sendto/
-  recvfrom).
+  auto-broadcast-on-snapshot-save (M R3 defer) -- **PARTIAL-SHIPPED
+  by Phase M R5 (ADR-0111)**: hook primitive + unit tests + ADR
+  landed; caller integration in `crossengin_daemon.nova` deferred
+  (daemon carries no gossip state today -- see ADR-0111 Follow-up),
+  split 924KB NEXT_SESSION.md, NOVA Makefile push (`ef4c3c6`
+  local-only — operator action), UDP rewrite of gossip (blocked on
+  NOVA sendto/recvfrom).
 - **Upstream NOVA (operator action; closes the whole workaround family):**
   fix `memcpy_raw` codegen + `type_of()` regression in
   `codegen.nova`. The current `type_of()` renders strings as a
@@ -1226,6 +1229,40 @@ R20E/R20F/R21B/R23C chat REPL stub to a real handler. Under-covered
 edges (DTLS 1.2 cert-verify, NAT UDP hole-punch, WebRTC data plane,
 Raft wire integration, auto-broadcast) are documented as post-Phase-M
 candidates below.
+
+### M.R5 -- Auto-broadcast attestation on snapshot save (PARTIAL-SHIPPED, ADR-0111)
+
+Closes ADR-0091 §88-91,203-206 deferred bullet on the federation side
+without touching persistence (ADR-0091:243 contract preserved: `snap_save`
+and every direct caller are byte-identical).
+
+1. **R5.1 -- `src/federation/snapshot_broadcast_hook.nova` (new leaf).**
+   Single public fn
+   `snapshot_broadcast_hook(gs, att_store, seed, pk, soul_id, root_hex, ts_ns)`.
+   Shape guards (empty / SNAP_META_MERKLE_ROOT_NONE sentinel / malformed
+   hex) + dedup via `att_store_latest`+`att_root_hex`+`str_eq_bytes` +
+   local-record-first (`att_store_add` before gossip emit) + return the
+   `gossip_broadcast_attestation` delivery count. Imports are federation ->
+   persistence (allowed); persistence never imports federation. No
+   signer load, no gossip boot, no inbound verification -- thin glue
+   over already-shipped primitives.
+2. **R5.2 -- Caller integration (DEFERRED).** `crossengin_daemon.nova`
+   is single-process (no `gossip_` imports anywhere in 920 lines; no
+   Session slot for `gs` / `att_store` / seed / pk). Full wiring would
+   need a gossip boot path, three new boot-time env flags (self_addr /
+   bootstrap list / signer path), signer load, and a Session shape
+   extension -- all well beyond the plan's ~50-line honest-defer
+   budget. Deferred per plan §Honest-reporting-policy; ADR-0111
+   Follow-up names the specific gaps.
+3. **R5.3 -- `tests/unit/test_snapshot_broadcast_hook.nova` (new,
+   18 checks, OK):** six pure-logic subtests covering the three shape
+   guards, the fresh-root happy path (0 peers -> rc=0, store grows),
+   dedup on identical root, and growth on a new root. No sockets, no
+   sandbox writes.
+4. **R5.4 -- ADR-0111 + roadmap.** New ADR documents the
+   federation-side-leaf decision, the honest R5.2 defer, and the
+   Follow-up gap list. Roadmap post-queue line marked PARTIAL-SHIPPED
+   with the specific defer reason.
 
 ## Phase N — Fill README-only parts subtrees (COMPLETE)
 

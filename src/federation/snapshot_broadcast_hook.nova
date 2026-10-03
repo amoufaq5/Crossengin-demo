@@ -1,0 +1,125 @@
+// CrossEngin federation: Auto-broadcast attestation on snapshot save
+// (ADR-0111 / R5.1).
+//
+// Purpose
+//
+//   ADR-0091 (`docs/adr/0091-federation-durability.md:88-91,203-206`) left
+//   one bullet deferred: when a soul writes a durable snapshot to disk,
+//   it SHOULD also broadcast a signed attestation of the just-written
+//   Merkle root so peers in the mesh learn about the new state without
+//   having to poll. R3 shipped the broadcast primitive
+//   (`gossip_broadcast_attestation`) and the attestation tuple builder
+//   (`att_make_from_hex`) but did NOT wire them into the save path,
+//   because doing so from inside `src/persistence/snapshot_disk.nova`
+//   would invert the ADR-0091:243 dependency contract ("persistence does
+//   not depend on federation"). This module ships the glue on the
+//   FEDERATION side instead: a leaf fn that callers invoke AFTER a
+//   successful save, with the already-written root in hand.
+//
+// Dependency contract
+//
+//   This hook lives on the federation side. It IMPORTS from persistence
+//   (merkle_signing + snapshot_writer, both already pulled transitively
+//   by `snapshot_attestation.nova`) for read-only constants and byte-
+//   decoders -- a direction ADR-0091:243 explicitly permits. Nothing in
+//   `src/persistence/*` imports this file; `snap_save` is untouched and
+//   byte-identical.
+//
+// Public API
+//
+//   snapshot_broadcast_hook(gs, att_store, seed, pk, soul_id,
+//                           root_hex, ts_ns) -> int
+//
+//     Build + sign + locally record + gossip-broadcast a snapshot
+//     attestation. Returns:
+//       * 0 if the hook short-circuited (empty / sentinel / malformed
+//         root, dedup hit, sign failure).
+//       * N >= 0 == the delivery count returned by
+//         `gossip_broadcast_attestation` on the live mesh (may be 0 if
+//         no peers are alive -- the attestation still lands in the
+//         local att_store for future queries).
+//
+//     Caller contract (ADR-0091 env-flag idiom):
+//       - Only invoke when `CE_FED_AUTO_BROADCAST_ON_SAVE=1`.
+//       - `root_hex` MUST be the exact string that `snap_save` wrote to
+//         the on-disk meta block (via `snap_meta_merkle_root`).
+//       - `ts_ns` SHOULD be `now_ns()` captured right after the save.
+//       - `seed` + `pk` are the Ed25519 keypair the soul already uses
+//         for merkle_signing (R16A); the hook does NOT load keys
+//         itself.
+//       - `att_store` is the soul's existing attestation store; the
+//         hook appends the new entry so later dedup calls short-circuit.
+//
+//   Behavior (defensive, early-return happy path):
+//     1. `len(root_hex) == 0`                           -> return 0.
+//     2. root_hex equals the "no root" sentinel         -> return 0.
+//     3. `_att_is_lc_hex_string(root_hex, 64) == 0`     -> return 0.
+//     4. att_store already carries an entry for soul_id with the SAME
+//        root_hex (compared with `str_eq_bytes`)        -> return 0.
+//     5. Build attestation; sign failure                -> return 0.
+//     6. Append to local store (survives mesh partition).
+//     7. Return `gossip_broadcast_attestation(gs, att)`.
+//
+// Non-goals
+//
+//   * This module does NOT load signing keys (caller does).
+//   * This module does NOT boot gossip (caller does).
+//   * This module does NOT verify incoming attestations (that lives in
+//     `snapshot_attestation.nova::att_verify`).
+//   * The pull-side (streaming the actual snapshot bytes) is already
+//     handled lazily by SNAP_FETCH in gossip.nova; this hook ships only
+//     the push-side attestation.
+//
+// CrossEngin dependencies: src/federation/snapshot_attestation.nova,
+// src/federation/gossip.nova, src/util/str_safe.nova,
+// src/persistence/snapshot_writer.nova.
+
+import "std/io"
+import "./snapshot_attestation.nova"
+import "./gossip.nova"
+import "../util/str_safe.nova"
+import "../persistence/snapshot_writer.nova"
+
+fn snapshot_broadcast_hook(gs, att_store, seed, pk, soul_id, root_hex, ts_ns) {
+    // --- shape guards --------------------------------------------------
+    if root_hex == 0 { return 0 }
+    if len(root_hex) == 0 { return 0 }
+    // SNAP_META_MERKLE_ROOT_NONE is the empty-string sentinel in R15E;
+    // the len==0 check above already covers it, but we keep the
+    // explicit comparison so a future sentinel change (e.g., switching
+    // to a reserved hex value) does not silently defeat the guard.
+    if str_eq_bytes(root_hex, SNAP_META_MERKLE_ROOT_NONE) == 1 { return 0 }
+    // Trust-but-verify: snap_save SHOULD only write 64-char lc hex
+    // once R15E signed off, but a bad meta block or an older snapshot
+    // path could still slip a malformed value in. Fail closed.
+    if _att_is_lc_hex_string(root_hex, 64) == 0 { return 0 }
+
+    // --- dedup against last broadcast for this soul --------------------
+    // att_store_latest returns the entry with the highest ts for the
+    // given soul, or 0 when the store carries nothing for it yet. When
+    // the root already matches we no-op: the mesh has already heard
+    // about this exact root, and resending it would churn the gossip
+    // channel for no new information.
+    if att_store != 0 {
+        let last = att_store_latest(att_store, soul_id)
+        if last != 0 {
+            let last_root = att_root_hex(last)
+            if last_root != 0 {
+                if str_eq_bytes(last_root, root_hex) == 1 { return 0 }
+            }
+        }
+    }
+
+    // --- build + sign --------------------------------------------------
+    let att = att_make_from_hex(soul_id, ts_ns, root_hex, seed, pk)
+    if att == 0 { return 0 }
+
+    // --- local record first (survives mesh partition) ------------------
+    // The att_store add is policy-free; we have just signed the tuple
+    // ourselves so verification is trivially true.
+    if att_store != 0 { att_store_add(att_store, att) }
+
+    // --- broadcast on the mesh (best-effort, may be 0 peers) -----------
+    if gs == 0 { return 0 }
+    return gossip_broadcast_attestation(gs, att)
+}
