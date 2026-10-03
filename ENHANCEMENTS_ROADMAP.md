@@ -1026,15 +1026,61 @@ verb-token-only intents; motor_map hits still land at SUSPENDED
 through the operand-missing branch until a planner materializes
 operands.
 
-### R.R3 -- planner-level operand materialization (QUEUED)
+### R.R3 -- operand materialization + reach-ability + SPEAK tier fix (SHIPPED, ADR-0109)
 
-Teach `action_derive_intent` (or a thin planner layer above it) to
-drive operands from the goal engine / belief store so motor_map hits
-mint executable intents end-to-end.  Also folds in:
-- Retiring the two pre-existing SPEAK-tier test fails (rewrite to
-  accept both `EFF_EXECUTED` and `EFF_NOTIFIED` via `eff_runs`).
+Phase R3 closes the three residuals R2 queued -- motor_map hits now
+produce executable intents end-to-end:
+
+1. **`operand_builder.nova`** (new leaf module) -- synthesizes
+   per-class operand tuples via sandbox-safe conventions:
+   `FILE  -> ["/tmp/ce_goal_<id>.txt", goal_name]`,
+   `HTTP  -> ["http://localhost/goal_<id>", "goal:" + goal_name]`,
+   `CODE  -> ["1 + <id>"]`,
+   `MCP   -> ["goal_svc", "req:" + goal_name]`,
+   `AUDIO -> ["/tmp/ce_speech_goal_<id>.wav"]`,
+   `TOOL / INTERNAL -> []`.  These are deliberate placeholders --
+   planner-driven payload is Phase R4+ (likely drives a goal-atom
+   schema extension; own ADR).
+2. **Reach-ability bridge** -- `motor_map.nova` gains
+   `mm_activation_signature_by_name(goal_name)` (verbatim return);
+   `action_derive_intent` probes the registry a second time with the
+   semantic-sig when the handle-sig misses.  This is the ONLY path
+   that reaches `motor_map_default`'s semantic strings
+   (`"write_a_note"`, `"run_code"`, ...) -- the handle-sig
+   (`"g<id>:a<h0>:..."`) never overlaps them.  On a hit, mint via
+   the matching `_with_payload` constructor.
+3. **SPEAK tier assertion fix** (two lines) -- the pre-existing fails
+   in `test_submit_speak_wired_dl` and `test_run_unknown_end_to_end`
+   flip from `ce_eq(..., EFF_EXECUTED)` to `ce_check(..., eff_runs ==
+   1)`.  `ACT_SPEAK` is a NOTIFY-tier action so the gate returns
+   `EFF_NOTIFIED`; `eff_runs` is 1 for both -- uniform predicate
+   across tiers, consistent with R2's non-SPEAK dispatch subtests.
+
+Exit tally:
+- `test_action_module`: **90 passed** (was 74 passed / 2 FAILed); the
+  2 SPEAK fails flipped + 3 new R3 subtests landed.
+- `test_operand_builder`: **18 passed** across 8 subtests (new file).
+- `test_motor_map` 52 OK unchanged; `test_effectors` 19 OK;
+  `test_effector_gate` 23 OK; `test_action_atoms` 79 OK;
+  `test_loop_action` 11 OK (byte-identity preserved).
+- Spot-check: `test_perception_module` 45, `test_arithmetic` 23,
+  `test_type_of_probe` 15, `test_distributed_rules` 42,
+  `test_fed_daemon_boot` 49 all OK.
+- R2's `test_submit_file_missing_path_falls_through_to_suspended`
+  still PASS -- the 5-arg `intent_file_new` path is untouched; R3
+  only changes behavior INSIDE `action_derive_intent`'s motor_map
+  hit branch.
+
+### R.R4 -- planner-driven payload materialization (QUEUED)
+
+Replace Phase R3's convention-driven operand placeholders with a real
+planner that reads goal metadata / belief store / context inference.
+Likely drives a goal-atom schema extension (new ADR).  Also folds in:
 - Live HTTP once TLS maturity + rate-limit audit are complete.
 - Richer audio-mode selection (TTS vs voice-clone vs synth).
+- Lowercase-normalization / stemming in
+  `mm_activation_signature_by_name` once a canonical goal-name
+  normalization policy exists.
 
 ---
 
