@@ -787,9 +787,10 @@ Follow-ups:
 - **R3f**: 4 R3e-deferred tests (above) + dead-code rebuild-guard
   sweep (R2 flag).
 - **R3-arc post-queue (unchanged from R3d)**: RELAY_BIN sealed-frame
-  (P R3 defer), motor_map population (N R2 shell) -- **CLOSED by Phase
-  R1 (ADR-0107)**, auto-broadcast-on-snapshot-save (M R3 defer), split
-  924KB NEXT_SESSION.md, NOVA Makefile push (`ef4c3c6` local-only —
+  (P R3 defer) -- **CLOSED by Phase P R4 (ADR-0110)**, motor_map
+  population (N R2 shell) -- **CLOSED by Phase R1 (ADR-0107)**,
+  auto-broadcast-on-snapshot-save (M R3 defer), split 924KB
+  NEXT_SESSION.md, NOVA Makefile push (`ef4c3c6` local-only —
   operator action), UDP rewrite of gossip (blocked on NOVA sendto/
   recvfrom).
 - **Upstream NOVA (operator action; closes the whole workaround family):**

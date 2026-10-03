@@ -3250,6 +3250,94 @@ fn _gossip_serve_relay_bin(state, fd, line) {
     return 0
 }
 
+// Phase P R4 (ADR-0110): DTLS-aware RELAY_BIN serve. Parallel to
+// `_gossip_serve_relay_bin` above but drains the binary tail across
+// one or more sealed AEAD records via `gds_recv_bin` instead of
+// through `_gnoise_recv_exact` on the raw fd. The plaintext parser +
+// formatter helpers (`_gossip_parse_bin_hdr`, `_gossip_format_bin_hdr`)
+// and the srl inbound-queue layout (slot 8) are reused as-is so the
+// plaintext path at `:3177-3251` stays byte-identical per ADR-0099
+// §Line 275 ("The plaintext RELAY_BIN path is unchanged.").
+//
+// Target handling:
+//   * target == self_addr: enqueue onto SRL_S_INBOUND_BIN, bump
+//     STATS_RELAY_BIN_RX. Same shape as the plaintext terminal path.
+//   * target != self_addr: BUMP STATS_RELAY_BIN_BAD and drop. ADR-0110
+//     §Follow-up records the forward-side defer: the DTLS dial
+//     primitive (`_gossip_dial_dtls`) requires caller-supplied key
+//     material (`priv_bn`, `pub_point`, `hostname`, `anchors`, `now`)
+//     that the state_t does not carry today, so a safe forward would
+//     need a new plumbing round. Operators that need multi-hop binary
+//     relays under DTLS stay on the plaintext path (which does its own
+//     RELAY_BIN forwarding) in the interim.
+//
+// On parse error, recv error, or missing srl state, bumps
+// STATS_RELAY_BIN_BAD and returns 0 (same error semantics as the
+// plaintext twin). Returns 1 on a clean terminal enqueue.
+fn _gossip_serve_relay_bin_dtls(state, fd, dtls_state, line) {
+    let parsed = _gossip_parse_bin_hdr(line)
+    if parsed == 0 {
+        state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+        return 0
+    }
+    let req_id    = parsed[0]
+    let target    = parsed[1]
+    let via       = parsed[2]
+    let from      = parsed[3]
+    let total_len = parsed[4]
+    // Drain the sealed binary tail via gds_recv_bin. On any error the
+    // helper returns [0, <sentinel>]; we don't need to distinguish the
+    // sentinels here (any failure is a BAD; the sentinel is already
+    // reflected in dtls_state[DTLS_S_SLOT_STATS_*]).
+    let rxd = 0
+    if total_len > 0 {
+        let r = gds_recv_bin(fd, dtls_state, total_len)
+        if r[0] == 0 {
+            state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+            return 0
+        }
+        rxd = r
+    }
+    let self_addr = state[GOSSIP_S_SELF_ADDR]
+    if str_eq_bytes(target, self_addr) == 1 {
+        // Terminal delivery: push onto srl's binary inbound queue.
+        let srl = state[GOSSIP_S_SRL_STATE]
+        if srl == 0 {
+            state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+            return 0
+        }
+        let q = srl[GOSSIP_SRL_S_INBOUND_BIN]
+        if q == 0 {
+            state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+            return 0
+        }
+        let rec = list_new()
+        push(rec, req_id)
+        push(rec, from)
+        if total_len > 0 {
+            push(rec, rxd[0])
+            push(rec, rxd[1])
+        } else {
+            push(rec, 0)
+            push(rec, 0)
+        }
+        push(q, rec)
+        state[GOSSIP_S_STATS_RELAY_BIN_RX] = state[GOSSIP_S_STATS_RELAY_BIN_RX] + 1
+        return 1
+    }
+    // Intermediate: forward-under-DTLS deferred to a follow-up round
+    // (see ADR-0110 §Follow-up). The receiver has already drained the
+    // tail off the fd so the connection stays line-synced for the
+    // subsequent BYE / other verbs; we just bump BAD and drop the
+    // payload. Via and the formatter helper are referenced here so
+    // callers that supply them don't trip a "unused parameter"
+    // regression if the ADR-0110 follow-up round reintroduces the
+    // forward path in-place.
+    let _unused_via = via
+    state[GOSSIP_S_STATS_RELAY_BIN_BAD] = state[GOSSIP_S_STATS_RELAY_BIN_BAD] + 1
+    return 0
+}
+
 // ============================================================================
 // Phase O R3 (ADR-0096) -- DTLS-1.2-over-TCP handler variants.
 // ============================================================================
@@ -3373,14 +3461,17 @@ fn gossip_handle_conn_dtls(state, conn_fd, dtls_state) {
                         if _gossip_starts_with(line, GOSSIP_RELAY_ACK_PREFIX) == 1 {
                             _gossip_serve_relay_ack(state, line)
                         }
-                        // RELAY_BIN carries a raw binary tail read
-                        // directly off the fd via `_gnoise_recv_exact`.
-                        // Under DTLS the payload bytes ride sealed
-                        // records interleaved with header frames, which
-                        // this fd-oriented reader does not know how to
-                        // decrypt. R3 does NOT dispatch RELAY_BIN under
-                        // DTLS; a follow-up round that adds a
-                        // sealed-frame binary reader wires it in here.
+                        // Phase P R4 (ADR-0110): RELAY_BIN now dispatched
+                        // under DTLS via the sealed-frame binary reader
+                        // `_gossip_serve_relay_bin_dtls`, which drains
+                        // the binary tail across one or more sealed
+                        // AEAD APPLICATION_DATA records via gds_recv_bin
+                        // instead of `_gnoise_recv_exact` on the raw fd.
+                        // The plaintext RELAY_BIN path is unchanged per
+                        // ADR-0099 §Line 275.
+                        if _gossip_starts_with(line, GOSSIP_RELAY_BIN_PREFIX) == 1 {
+                            _gossip_serve_relay_bin_dtls(state, conn_fd, dtls_state, line)
+                        }
                     }
                 }
             }
@@ -3499,9 +3590,15 @@ fn gossip_handle_conn_kg_dtls(state, conn_fd, dtls_state, kg) {
                             if _gossip_starts_with(line, GOSSIP_RELAY_ACK_PREFIX) == 1 {
                                 _gossip_serve_relay_ack(state, line)
                             }
-                            // RELAY_BIN's binary tail is not yet
-                            // sealed-record aware; see the kg-less
-                            // variant above for the rationale.
+                            // Phase P R4 (ADR-0110): parallel wire-in
+                            // to the kg-less handler above; drains the
+                            // RELAY_BIN tail across sealed records via
+                            // `_gossip_serve_relay_bin_dtls` so the
+                            // kg-aware DTLS handler can accept binary
+                            // relays too. Plaintext path unchanged.
+                            if _gossip_starts_with(line, GOSSIP_RELAY_BIN_PREFIX) == 1 {
+                                _gossip_serve_relay_bin_dtls(state, conn_fd, dtls_state, line)
+                            }
                         }
                     }
                 }

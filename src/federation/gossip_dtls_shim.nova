@@ -153,6 +153,25 @@ let GDS_STAT_HS_OK          = "gds-hs-ok"
 let GDS_STAT_HS_FAIL        = "gds-hs-fail"
 let GDS_STAT_RECV_ALERT     = "gds-recv-alert"
 
+// Phase P R4 (ADR-0110): sealed-frame binary I/O constants.
+//
+// `GDS_CIPHER_INACTIVE` is a shim-local error sentinel returned in the
+// second slot of `gds_recv_bin`'s result when the DTLS state is not
+// yet cipher-active. `dtls_open_record` collapses this case to
+// `DTLS_DECRYPT_FAIL` for oracle-leak hygiene; the shim surfaces it
+// explicitly here so callers can distinguish "cipher never came up"
+// from "cipher came up and a record failed to decrypt".
+//
+// `GDS_PT_PER_RECORD` is the maximum plaintext payload we hand to
+// `dtls_seal_record` in one call. The AEAD seal adds an 8-byte
+// explicit_IV + 16-byte GCM tag; the record body on the wire must
+// fit inside `DTLS_RECORD_MAX_FRAGMENT = 16384` per RFC 6347 §4.1.
+// 16384 - 8 - 16 = 16360. Picking a round value under that so a
+// future RFC-5246-compliant TLS-level framer with slightly different
+// overhead still slots in without recomputing.
+let GDS_CIPHER_INACTIVE     = "gds: cipher inactive"
+let GDS_PT_PER_RECORD       = 16000
+
 // ---- low-level framed record I/O ------------------------------------------
 
 // Send exactly n bytes from `buf` to `fd`. Returns 1 on complete write,
@@ -1264,6 +1283,169 @@ fn gds_recv_line(conn_fd, dtls_state) {
 // DTLS_REPLAY / DTLS_TOO_OLD) via `str_eq`. That avoids the fragile
 // "index into a string" trap that a plain `opened[0]` on a failure
 // return would take.
+
+// ---- post-handshake sealed binary I/O ------------------------------------
+//
+// Phase P R4 (ADR-0110): parallel to `gds_send_line` / `gds_recv_line`
+// but carries a raw byte buffer across one or more sealed AEAD
+// APPLICATION_DATA records instead of a line-oriented plaintext string.
+// Shipped so `_gossip_serve_relay_bin_dtls` can receive the binary
+// tail of a `RELAY_BIN` message under DTLS. ADR-0099 §Deferred first
+// bullet called this out as the only piece missing to close the DTLS
+// RELAY_BIN loop; the plaintext RELAY_BIN path at
+// `gossip.nova::_gossip_serve_relay_bin` is UNCHANGED and reused via
+// its parser/formatter helpers.
+
+// Seal `n` plaintext bytes from `buf` across one or more sealed DTLS
+// AEAD records of record-type APPLICATION_DATA (23), each wrapped in
+// the length-prefix framing by `_gds_send_record`. Returns 1 on
+// complete write of all chunks, 0 on any seal / send failure. On n=0
+// returns 1 immediately (zero-length frame is a valid caller contract).
+//
+// The chunk size (`GDS_PT_PER_RECORD = 16000`) stays comfortably under
+// `DTLS_RECORD_MAX_FRAGMENT - overhead` so `dtls_seal_record` never
+// refuses on body-size grounds. Callers that stream payloads larger
+// than one record MUST pair this with `gds_recv_bin(fd, state, n)` on
+// the receive side so the receiver drains exactly `n` plaintext bytes
+// across the matching record boundary count.
+fn gds_send_bin(conn_fd, dtls_state, buf, n) {
+    if dtls_state == 0 { return 0 }
+    if n < 0 { return 0 }
+    if n == 0 { return 1 }
+    if buf == 0 { return 0 }
+    if dtls_state[DTLS_S_SLOT_CIPHER_ACTIVE] != 1 { return 0 }
+    let off = 0
+    while off < n {
+        let remaining = n - off
+        let chunk_n = GDS_PT_PER_RECORD
+        if remaining < chunk_n { chunk_n = remaining }
+        // Copy chunk into a dedicated plaintext buffer so the AEAD
+        // seal's AAD derivation doesn't accidentally alias caller
+        // memory across records.
+        let chunk = alloc(chunk_n + 1)
+        let i = 0
+        while i < chunk_n {
+            store8(chunk + i, load8(buf + off + i))
+            i = i + 1
+        }
+        store8(chunk + chunk_n, 0)
+        // DTLS_CT_APPLICATION_DATA = 23 per RFC 5246 §6.2.1.
+        let sealed = dtls_seal_record(dtls_state, 23, chunk, chunk_n)
+        if sealed == 0 { return 0 }
+        if _gds_send_record(conn_fd, sealed[0], sealed[1]) == 0 { return 0 }
+        off = off + chunk_n
+    }
+    return 1
+}
+
+// Read sealed records off the fd until `total_len` plaintext bytes
+// have been accumulated. Returns `[out_buf, out_n]` on success, where
+// `out_n == total_len`. Returns `[0, <sentinel>]` on failure, with the
+// second slot being one of:
+//
+//   GDS_CIPHER_INACTIVE  -- caller handed a state whose cipher never
+//                            came up (handshake failure path).
+//   DTLS_DECRYPT_FAIL     -- an EOF / short-read on the fd, or an AEAD
+//                            tag/AAD/ciphertext failure, or an
+//                            unexpected record type on the wire.
+//   DTLS_REPLAY           -- `dtls_open_record` rejected the record
+//                            as replayed (seq inside the window and
+//                            already-set bit).
+//   DTLS_TOO_OLD          -- `dtls_open_record` rejected the record
+//                            as too-old (seq below the window).
+//
+// On `total_len == 0` the function returns `[0, 0]` (zero-byte frame;
+// caller treats the empty tail the same as the plaintext path's
+// no-tail case).
+fn gds_recv_bin(conn_fd, dtls_state, total_len) {
+    let out = list_new()
+    if dtls_state == 0 {
+        push(out, 0)
+        push(out, GDS_CIPHER_INACTIVE)
+        return out
+    }
+    if total_len < 0 {
+        push(out, 0)
+        push(out, 0)
+        return out
+    }
+    if dtls_state[DTLS_S_SLOT_CIPHER_ACTIVE] != 1 {
+        push(out, 0)
+        push(out, GDS_CIPHER_INACTIVE)
+        return out
+    }
+    if total_len == 0 {
+        push(out, 0)
+        push(out, 0)
+        return out
+    }
+    let acc = alloc(total_len + 1)
+    let acc_n = 0
+    while acc_n < total_len {
+        let rec = _gds_recv_record(conn_fd)
+        if rec[0] == 0 {
+            // EOF / short read / malformed length prefix. Collapse to
+            // DTLS_DECRYPT_FAIL so callers only need one error class
+            // for "wire didn't give us a decryptable record".
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_DECRYPT_FAIL)
+            return bad
+        }
+        let opened = dtls_open_record(dtls_state, rec[1], rec[2])
+        // Discriminate the three string sentinels first -- the success
+        // path returns a 4-element list, failures return a string.
+        if str_eq_bytes(opened, DTLS_DECRYPT_FAIL) == 1 {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_DECRYPT_FAIL)
+            return bad
+        }
+        if str_eq_bytes(opened, DTLS_REPLAY) == 1 {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_REPLAY)
+            return bad
+        }
+        if str_eq_bytes(opened, DTLS_TOO_OLD) == 1 {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_TOO_OLD)
+            return bad
+        }
+        let type_byte = opened[0]
+        // Only APPLICATION_DATA (23) is expected on the binary channel.
+        // ALERT (21) or handshake (22) on this path is a protocol
+        // violation; surface as DTLS_DECRYPT_FAIL so callers close the
+        // connection cleanly.
+        if type_byte != 23 {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_DECRYPT_FAIL)
+            return bad
+        }
+        let pt_buf = opened[1]
+        let pt_n   = opened[2]
+        // Clamp to the remaining capacity. A sender that chunks on
+        // GDS_PT_PER_RECORD boundaries will never trip this; a sender
+        // that mis-counts (or a peer feeding more plaintext than
+        // `total_len` advertised in the header line) is capped here so
+        // the accumulator does not run past its allocated size.
+        let take = pt_n
+        let remaining = total_len - acc_n
+        if take > remaining { take = remaining }
+        let i = 0
+        while i < take {
+            store8(acc + acc_n + i, load8(pt_buf + i))
+            i = i + 1
+        }
+        acc_n = acc_n + take
+    }
+    store8(acc + total_len, 0)
+    push(out, acc)
+    push(out, acc_n)
+    return out
+}
 
 // ---- close_notify + close -------------------------------------------------
 
