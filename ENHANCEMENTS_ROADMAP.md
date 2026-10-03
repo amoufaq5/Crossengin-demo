@@ -789,13 +789,25 @@ Follow-ups:
 - **R3-arc post-queue (unchanged from R3d)**: RELAY_BIN sealed-frame
   (P R3 defer) -- **CLOSED by Phase P R4 (ADR-0110)**, motor_map
   population (N R2 shell) -- **CLOSED by Phase R1 (ADR-0107)**,
-  auto-broadcast-on-snapshot-save (M R3 defer) -- **PARTIAL-SHIPPED
-  by Phase M R5 (ADR-0111)**: hook primitive + unit tests + ADR
-  landed; caller integration in `crossengin_daemon.nova` deferred
-  (daemon carries no gossip state today -- see ADR-0111 Follow-up),
-  split 924KB NEXT_SESSION.md, NOVA Makefile push (`ef4c3c6`
-  local-only — operator action), UDP rewrite of gossip (blocked on
-  NOVA sendto/recvfrom).
+  auto-broadcast-on-snapshot-save (M R3 defer) -- **SHIPPED by Phase
+  M R6 (ADR-0111 close-out)**: Session extension (SES_GS /
+  SES_ATT_STORE / SES_SIGNER_SEED / SES_SIGNER_PK / SES_SOUL_ID_INT at
+  slots 16-20, SES_COUNT=21) + `session_attach_fed` + 5 defensive
+  getters; six env resolvers (`_cd_*`) duplicated from fed_daemon;
+  emit-only gossip boot block gated on `CE_FED_AUTO_BROADCAST_ON_SAVE=1`
+  with keypair-load-failure WARN-and-disable; dual-guard hook call at
+  `crossengin_daemon.nova:791`. Four new subtests (3 in
+  `test_session_attach_fed`, 1 in `test_snapshot_broadcast_hook`),
+  all pass. Byte-identity contract preserved when flag off. See
+  ADR-0111 §"Phase M R6 close-out" for the pre-existing
+  `_starts_with` NOVA-toolchain collision that blocks the daemon
+  main() link (same regression affecting `crossengin_chat.nova`
+  since Phase M R1; tracked separately on the upstream-NOVA queue,
+  not R6 scope). Split 924KB NEXT_SESSION.md, NOVA Makefile push
+  (`ef4c3c6` local-only — operator action), UDP rewrite of gossip
+  (blocked on NOVA sendto/recvfrom), future cleanup: extract
+  `_fed_*`/`_cd_*` env-resolver duplication into
+  `src/util/env_resolve.nova`.
 - **Upstream NOVA (operator action; closes the whole workaround family):**
   fix `memcpy_raw` codegen + `type_of()` regression in
   `codegen.nova`. The current `type_of()` renders strings as a
@@ -1230,7 +1242,7 @@ edges (DTLS 1.2 cert-verify, NAT UDP hole-punch, WebRTC data plane,
 Raft wire integration, auto-broadcast) are documented as post-Phase-M
 candidates below.
 
-### M.R5 -- Auto-broadcast attestation on snapshot save (PARTIAL-SHIPPED, ADR-0111)
+### M.R5 -- Auto-broadcast attestation on snapshot save (SHIPPED via M.R6, ADR-0111)
 
 Closes ADR-0091 §88-91,203-206 deferred bullet on the federation side
 without touching persistence (ADR-0091:243 contract preserved: `snap_save`
@@ -1263,6 +1275,85 @@ and every direct caller are byte-identical).
    federation-side-leaf decision, the honest R5.2 defer, and the
    Follow-up gap list. Roadmap post-queue line marked PARTIAL-SHIPPED
    with the specific defer reason.
+
+### M.R6 -- R5.2 close-out: daemon-side gossip boot + hook call (SHIPPED, ADR-0111 close-out)
+
+Closes the R5.2 defer by wiring the hook into `crossengin_daemon.nova`'s
+idle-checkpoint path. Five sub-passes, one commit. All active behavior
+gated on `CE_FED_AUTO_BROADCAST_ON_SAVE=1` so the default-off path is
+byte-identical to pre-R6.
+
+1. **R6.1 -- Session tail-append (`src/session/session.nova`).** Five
+   new slots mirroring the proven `SES_DP` pattern: `SES_GS=16`,
+   `SES_ATT_STORE=17`, `SES_SIGNER_SEED=18`, `SES_SIGNER_PK=19`,
+   `SES_SOUL_ID_INT=20`. `SES_COUNT` bumped to 21; `session_make`
+   pushes zero placeholders for all five (preserves `len(s) == SES_COUNT`
+   invariant). New `session_attach_fed(s, gs, att_store, seed, pk,
+   soul_id_int)` with lazy-grow for pre-R6-shaped 16-slot lists; five
+   defensive getters each guard with `if len(s) <= <SLOT> { return 0 }`
+   so pre-R6 Sessions still byte-identically return 0.
+2. **R6.2 -- Env resolvers in `examples/crossengin_daemon.nova`.** Six
+   helpers (`_cd_env_str`, `_cd_env_int`, `_cd_bool_from_env_value`,
+   `_cd_peers_from_env`, `_cd_soul_id_from_env_int` incl. a `_cd_soul_id_to_int`
+   djb2 mixer with mask 16777215, `_cd_attest_key_base_from_env`)
+   copied byte-for-byte semantically from
+   `crossengin_fed_daemon.nova:163-293`. Deliberate duplication tracked
+   under "future cleanup: extract shared `env_resolve.nova`" on the
+   post-queue; attempting it in R6 would churn fed_daemon's tests.
+3. **R6.3 -- Boot wiring.** After `sreg_register(sreg, sess)`: resolve
+   `CE_FED_LISTEN_ADDR` (default `127.0.0.1:0` -- emit-only, never
+   listens), peers (CE_FED_PEERS -> CE_GOSSIP_PEERS fallback),
+   signer-key base path. Call `merkle_signing_keypair_load`; on failure
+   print one `[warn]` line and leave the fed slots at 0 (fed_daemon
+   WARN-and-disable idiom). On success alloc `gossip_init(...)` +
+   `att_store_new()`, call `gossip_set_att_store` +
+   `gossip_register_att_pubkey`, then `session_attach_fed(sess, ...)`.
+4. **R6.4 -- Hook call at `:791`.** The previous single-branch warn is
+   wrapped in a dual-guard shape: `if saved == 0 { warn } else { if
+   session_gs(sess) != 0 { snapshot_broadcast_hook(...) } }`. The
+   `session_gs(sess) != 0` guard is the byte-identity contract: when
+   the flag is off, `session_attach_fed` was never called, the getter
+   returns 0, and the entire hook branch is unreachable.
+5. **R6.5 -- Tests.** New `tests/unit/test_session_attach_fed.nova` (3
+   subtests, 29 checks, OK): default-no-fed-slots, attach-sets-all-slots
+   (plus idempotency re-attach assertion), and lazy-grow from a
+   pre-R6-shaped 16-slot list. Extended
+   `tests/unit/test_snapshot_broadcast_hook.nova` (was 20 checks, now
+   27, OK) with `test_hook_via_session_accessors` exercising the real
+   daemon-shape chain: `session_make` -> real `gossip_init` +
+   `att_store_new` + keypair -> `session_attach_fed` -> call the hook
+   through the five Session accessors -> assert the att_store the
+   Session carries grew by 1 and the stored root matches the input
+   (aliasing invariant).
+
+**Pre-existing NOVA-toolchain regression surfaced by R6**: the four new
+imports pulled into `crossengin_daemon.nova` (`snapshot_broadcast_hook`,
+`gossip`, `snapshot_attestation`, `merkle_signing`) transitively drag
+in `src/io/transducers/kg_sync.nova`, whose module-private
+`_starts_with` symbol collides with the identically-named module-private
+helper in `src/persistence/snapshot_disk.nova`. The NOVA toolchain does
+not mangle module-private names, so the assembler rejects any `main()`
+that pulls in both. **Pre-existing**: `examples/crossengin_chat.nova`
+imports the same pair (`snapshot_disk` + `gossip`) and has been failing
+the assembler stage since Phase M R1 (`5f2e9f2`); verified by rebuilding
+chat on the pre-R6 tip `9c439e4`. R6 inherits this failure for
+`crossengin_daemon` because the hook integration cannot avoid pulling
+in `gossip`. Fix belongs on the upstream-NOVA queue (requires either
+compiler-level name mangling or renaming `_starts_with` in
+`kg_sync.nova`, which has 10+ call sites across the tree). All R6
+behavioral surface is covered by unit tests regardless, and the
+byte-identity contract still holds -- on the day the collision is
+resolved, the daemon main() links with the flag-off path emitting
+bytes identical to pre-R6.
+
+Verification artifacts: `test_session_attach_fed` OK (29 checks),
+`test_snapshot_broadcast_hook` OK (27 checks; +7 from the new subtest),
+`test_session` OK (66 checks, unchanged), `test_fed_daemon_boot` OK
+(49, unchanged), `test_fed_daemon_replication` OK (59, unchanged). The
+pre-existing canary FAIL counts (`test_snapshot_attestation` 59P/7F,
+`test_snapshot_replication` 61P/12F, `test_fed_daemon_attest` 52P/2F,
+`test_merkle_signing` SEGV, `test_gossip` 32P/2F) are **unchanged
+pre-R6 vs post-R6** (git-stash-verified).
 
 ## Phase N — Fill README-only parts subtrees (COMPLETE)
 
