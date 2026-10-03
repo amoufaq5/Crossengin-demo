@@ -803,11 +803,15 @@ Follow-ups:
   `_starts_with` NOVA-toolchain collision that blocks the daemon
   main() link (same regression affecting `crossengin_chat.nova`
   since Phase M R1; tracked separately on the upstream-NOVA queue
-  as `docs/UPSTREAM_NOVA_BUGS.md` §9, not R6 scope). Candidate
-  one-line user-side rename
-  (`_starts_with` → `_snap_starts_with` in `snapshot_disk.nova:1789`,
-  ~15 in-module callers, zero test edits) would unblock BOTH binary
-  links without a NOVA compiler change. Split 924KB NEXT_SESSION.md, NOVA Makefile push
+  as `docs/UPSTREAM_NOVA_BUGS.md` §9, not R6 scope).
+  **Phase M R6 binary-link blocker RESOLVED** by subsequent commit
+  renaming `_starts_with` → `_snap_starts_with` in
+  `snapshot_disk.nova` (UPSTREAM_NOVA_BUGS §9 option (a)).
+  `crossengin_daemon.nova` now LINKs. `crossengin_chat.nova` still
+  fails at link time but with a different, sibling collision
+  (`_g_PC_TAG`, now tracked as UPSTREAM_NOVA_BUGS §10) that was
+  previously masked by the `_starts_with` error.
+  Split 924KB NEXT_SESSION.md, NOVA Makefile push
   (`ef4c3c6` local-only — operator action), UDP rewrite of gossip
   (blocked on NOVA sendto/recvfrom), future cleanup: extract
   `_fed_*`/`_cd_*` env-resolver duplication into

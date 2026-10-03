@@ -104,24 +104,27 @@ location.
 ## 9. Assembler rejects duplicate module-private `_starts_with` symbol
 
 - **ADR**: 0111 (R6 close-out section).
-- **Workaround**: none shipped. Potential rename rounds, both roughly
-  equal scope (each affects one module + its direct test file where
-  applicable):
-  (a) Rename `_starts_with` → `_snap_starts_with` in
-      `src/persistence/snapshot_disk.nova:1789`. ~15 in-module caller
-      sites; no test file calls it directly. Zero test edits.
-  (b) Rename `_starts_with` → `_tkgsync_starts_with` in
-      `src/io/transducers/kg_sync.nova:410`. ~15 in-module caller
-      sites + 4 call sites in `tests/unit/test_kg_sync.nova:336-339`.
-  Option (a) is marginally simpler (no test edits).
+- **Workaround**: **SHIPPED** via option (a): `_starts_with` →
+  `_snap_starts_with` in `src/persistence/snapshot_disk.nova`.
+  14 occurrences renamed (1 definition + 13 call sites); zero test
+  edits (grep confirmed). `crossengin_daemon.nova` now LINKs.
+  `crossengin_chat.nova` still fails at link time, but with a
+  different collision (`_g_PC_TAG`) — see bug #10 below.
+  Hypothetical alternative (b) — rename `_starts_with` →
+  `_tkgsync_starts_with` in `src/io/transducers/kg_sync.nova:410`
+  (~15 in-module caller sites + 4 call sites in
+  `tests/unit/test_kg_sync.nova:336-339`) — was NOT taken because
+  option (a) needed no test edits.
 - **Tests**: no unit coverage of the collision itself. Affected binary
   builds:
-  * `examples/crossengin_chat.nova` — blocked at link time since Phase M
-    R1 (`5f2e9f2`).
-  * `examples/crossengin_daemon.nova` — blocked at link time since
-    Phase M R6 (`9cbbf12`); every R6 unit test passes (hook is
-    exercised via the Session accessor chain), only the daemon binary
-    cannot LINK.
+  * `examples/crossengin_chat.nova` — was blocked at link time from
+    Phase M R1 (`5f2e9f2`) until this commit; `_starts_with` collision
+    is resolved, but a second collision (`_g_PC_TAG`, bug #10) still
+    blocks the chat binary.
+  * `examples/crossengin_daemon.nova` — was blocked at link time from
+    Phase M R6 (`9cbbf12`) until this commit; every R6 unit test passes
+    (hook is exercised via the Session accessor chain), and the daemon
+    binary now LINKs.
 - **Context**: NOVA's whole-program assembly emits one global symbol
   per `fn` definition without module-mangling. Collisions surface only
   when a `main()` transitively pulls BOTH offending modules
@@ -134,9 +137,42 @@ location.
   with the module path (e.g.
   `_nova_persistence_snapshot_disk__starts_with`). Alternatively a
   loader-side allow-list of "weak" module-private symbols. The
-  user-side rename in option (a) above is a one-line fix that unblocks
-  BOTH `crossengin_chat.nova` and `crossengin_daemon.nova` linking
-  without touching the NOVA compiler.
+  user-side rename in option (a) above is a one-line fix that landed
+  via this commit; it unblocks `crossengin_daemon.nova`. The compiler
+  mangling fix is still desirable because the same shape surfaces on
+  module-level `let` globals too (see bug #10).
+
+## 10. Assembler rejects duplicate module-private `_g_PC_TAG` symbol
+
+- **ADR**: TBD (surfaced immediately after bug #9 workaround landed).
+- **Workaround**: none shipped. Candidate rename rounds:
+  (a) Rename `PC_TAG` → `PR_PC_TAG` (or similar) in
+      `src/parts/reasoning/proof_checker.nova:86`; audit callers in the
+      proof-checker module.
+  (b) Rename `PC_TAG` → `PA_PC_TAG` (or similar) in
+      `src/parts/perception/perception_atoms.nova:90`; audit callers
+      including `perception_atoms.nova:246` and any transitive
+      consumers in the perception subsystem.
+  Scope not yet characterised; option (a) likely smaller because
+  `perception_atoms` has more downstream readers.
+- **Tests**: no unit coverage of the collision itself. Affected binary
+  builds:
+  * `examples/crossengin_chat.nova` — blocked at link time; this
+    collision was previously masked by bug #9's earlier `_starts_with`
+    collision, surfaced only after option (a) in bug #9 shipped.
+- **Context**: same shape as bug #9 but on module-level `let` bindings
+  rather than `fn` definitions. Two modules both declare
+  `let PC_TAG = ...` at module scope, which NOVA emits as the global
+  symbol `_g_PC_TAG`:
+  * `src/parts/reasoning/proof_checker.nova:86`: `let PC_TAG = 1`
+  * `src/parts/perception/perception_atoms.nova:90`: `let PC_TAG = 0`
+  Collision surfaces when a `main()` transitively pulls BOTH modules
+  (chat does; daemon does not, which is why daemon LINKs post bug-#9
+  workaround while chat still errors).
+- **Suggested fix**: same shape as bug #9's suggested fix — NOVA
+  compiler should mangle module-level `let` names with the module
+  path (e.g. `_g_nova_parts_reasoning_proof_checker__PC_TAG`). The
+  user-side rename in either option above is a short-term unblock.
 
 ## 6. Sandbox O_CREAT policy (container, not NOVA)
 
@@ -158,6 +194,7 @@ Fixing (3) first clears four tests on its own and unblocks any schema
 validation downstream (the schemas gate rejects every int under the
 regression). (1) and (2) can land in either order. (4) and (5) are
 independent of the others. (6) is operator / infra, out of band.
-(9) is a one-line user-side rename that would unblock the chat +
-daemon binary links; worth landing even without the upstream NOVA
-name-mangling fix.
+(9) workaround SHIPPED; upstream compiler mangling fix still desirable
+for defense-in-depth. (10) is a new sibling collision on module-level
+`let` bindings (`_g_PC_TAG`), still blocking `crossengin_chat`;
+same shape as (9) but on globals rather than functions.

@@ -116,8 +116,11 @@ would widen the surface R5 touches.
   ships the Session extension, env resolvers, boot wiring, and the hook
   call at the idle-checkpoint; a NOVA-toolchain name-collision tracked
   separately (`_starts_with` dup — see `docs/UPSTREAM_NOVA_BUGS.md`
-  §9 and R6 close-out) blocks the daemon main() link, but every
-  behavioral unit of R6 is covered by unit tests.
+  §9 and R6 close-out) blocked the daemon main() link until
+  `_starts_with` was renamed to `_snap_starts_with` in
+  `snapshot_disk.nova` (`docs/UPSTREAM_NOVA_BUGS.md §9` SHIPPED); the
+  daemon main() link now succeeds. Every behavioral unit of R6 is
+  covered by unit tests.
 - A `test_fed_daemon_attest` subtest exercising the hook via the daemon
   integration: superseded by R6's `test_hook_via_session_accessors`
   (identical composition shape without the heavy fed_daemon boot).
