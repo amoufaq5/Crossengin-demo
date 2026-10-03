@@ -101,6 +101,43 @@ location.
   on an unresolved call rather than lower it to a null callee that
   SEGVs on entry.
 
+## 9. Assembler rejects duplicate module-private `_starts_with` symbol
+
+- **ADR**: 0111 (R6 close-out section).
+- **Workaround**: none shipped. Potential rename rounds, both roughly
+  equal scope (each affects one module + its direct test file where
+  applicable):
+  (a) Rename `_starts_with` → `_snap_starts_with` in
+      `src/persistence/snapshot_disk.nova:1789`. ~15 in-module caller
+      sites; no test file calls it directly. Zero test edits.
+  (b) Rename `_starts_with` → `_tkgsync_starts_with` in
+      `src/io/transducers/kg_sync.nova:410`. ~15 in-module caller
+      sites + 4 call sites in `tests/unit/test_kg_sync.nova:336-339`.
+  Option (a) is marginally simpler (no test edits).
+- **Tests**: no unit coverage of the collision itself. Affected binary
+  builds:
+  * `examples/crossengin_chat.nova` — blocked at link time since Phase M
+    R1 (`5f2e9f2`).
+  * `examples/crossengin_daemon.nova` — blocked at link time since
+    Phase M R6 (`9cbbf12`); every R6 unit test passes (hook is
+    exercised via the Session accessor chain), only the daemon binary
+    cannot LINK.
+- **Context**: NOVA's whole-program assembly emits one global symbol
+  per `fn` definition without module-mangling. Collisions surface only
+  when a `main()` transitively pulls BOTH offending modules
+  (`persistence/snapshot_disk` + anything importing
+  `io/transducers/kg_sync` — e.g. via `federation/gossip`). The other
+  20+ `*_starts_with` definitions in the tree all carry a module prefix
+  (`_gossip_starts_with`, `_sr_starts_with`, `_att_starts_with`, …)
+  and do not collide.
+- **Suggested fix**: NOVA compiler should mangle module-private names
+  with the module path (e.g.
+  `_nova_persistence_snapshot_disk__starts_with`). Alternatively a
+  loader-side allow-list of "weak" module-private symbols. The
+  user-side rename in option (a) above is a one-line fix that unblocks
+  BOTH `crossengin_chat.nova` and `crossengin_daemon.nova` linking
+  without touching the NOVA compiler.
+
 ## 6. Sandbox O_CREAT policy (container, not NOVA)
 
 - **ADR**: 0104
@@ -121,3 +158,6 @@ Fixing (3) first clears four tests on its own and unblocks any schema
 validation downstream (the schemas gate rejects every int under the
 regression). (1) and (2) can land in either order. (4) and (5) are
 independent of the others. (6) is operator / infra, out of band.
+(9) is a one-line user-side rename that would unblock the chat +
+daemon binary links; worth landing even without the upstream NOVA
+name-mangling fix.

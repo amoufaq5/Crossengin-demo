@@ -802,8 +802,12 @@ Follow-ups:
   ADR-0111 §"Phase M R6 close-out" for the pre-existing
   `_starts_with` NOVA-toolchain collision that blocks the daemon
   main() link (same regression affecting `crossengin_chat.nova`
-  since Phase M R1; tracked separately on the upstream-NOVA queue,
-  not R6 scope). Split 924KB NEXT_SESSION.md, NOVA Makefile push
+  since Phase M R1; tracked separately on the upstream-NOVA queue
+  as `docs/UPSTREAM_NOVA_BUGS.md` §9, not R6 scope). Candidate
+  one-line user-side rename
+  (`_starts_with` → `_snap_starts_with` in `snapshot_disk.nova:1789`,
+  ~15 in-module callers, zero test edits) would unblock BOTH binary
+  links without a NOVA compiler change. Split 924KB NEXT_SESSION.md, NOVA Makefile push
   (`ef4c3c6` local-only — operator action), UDP rewrite of gossip
   (blocked on NOVA sendto/recvfrom), future cleanup: extract
   `_fed_*`/`_cd_*` env-resolver duplication into
