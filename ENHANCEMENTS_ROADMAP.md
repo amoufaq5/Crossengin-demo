@@ -972,13 +972,69 @@ Exit tally:
   all OK.
 
 Follow-ups:
-- **R2** -- ship `src/io/effectors/{tool,file,http,code,audio,mcp}.nova`
-  and rewrite `action_submit` to dispatch per-class instead of the
-  SUSPENDED fallback.  Expands `motor_map_default` vocabulary alongside
-  each new primitive.  Separate ADR.
+- **R2** -- SHIPPED (ADR-0108, below).
 - Potential: hashed-signature variant to bound key length as active-
   concept counts grow.  Currently deferred -- plain-string key is
   deliberate for debuggability.
+
+### R.R2 -- payload-shim atoms + per-class dispatch in `action_submit` (SHIPPED, ADR-0108)
+
+Phase R2 closes the "intent mints but doesn't execute" gap R1 left on
+the gate side. Three mechanical additions in one commit:
+
+1. **Payload-shim slots** in `action_atoms.nova` -- eight new slots
+   TAIL-APPENDED after `IN_REASON` (`IN_FILE_PATH`, `IN_FILE_CONTENT`,
+   `IN_HTTP_URL`, `IN_HTTP_CANNED`, `IN_CODE_EXPR`, `IN_MCP_SERVICE`,
+   `IN_MCP_REQUEST`, `IN_AUDIO_OUT_PATH`), each defaulting to `""`.
+   The pre-R2 5-arg `intent_*_new` constructors continue to work; new
+   `_with_payload` constructors populate the operands.  Per-kind
+   accessors (`in_file_path`, ...) include defensive length guards
+   for snapshot-restored older-schema intents.
+2. **Per-class dispatch** in `action_submit` -- the pre-R2 SUSPENDED
+   fallthrough is replaced by a 7-way switch (SPEAK + INTERNAL +
+   FILE / HTTP / CODE / MCP / AUDIO / TOOL meta).  Each non-SPEAK
+   branch synthesizes `effector_submit` (DLK_INTENT) ->
+   `eff_runs` check -> primitive call (`file_ops_write`,
+   `http_action_run(url, 1, canned)` with simulated=1 pinned,
+   `code_exec_run`, `mcp_call_direct`, `effector_speak_audio`) ->
+   `effector_complete` (DLK_OUTCOME).  TOOL meta re-dispatches via
+   `in_effector_class`.
+3. **Operand-missing fallthrough** -- a verb-token-only intent (the
+   R1-era shape minted by `action_derive_intent`'s motor_map hits
+   without a planner) with an empty required-operand slot cleanly
+   falls through to `[EFF_SUSPENDED, -1]`, preserving R1 behavior.
+   `action_derive_intent` is UNCHANGED this round; operand
+   materialization is Phase R3.
+
+Exit tally:
+- `test_action_module`: 74 passed (was 61) / 2 pre-existing FAILs
+  unchanged (`submit result EXECUTED` + `run unknown eff EXECUTED`;
+  these turn out to be SPEAK-path tier semantics -- `ACT_SPEAK` has
+  reversibility floor `PERM_NOTIFY` so the gate returns
+  `EFF_NOTIFIED`, not `EFF_EXECUTED`; the mismatch predates R2 and
+  is NOT about dispatch).  See ADR-0108 Consequences for the fix
+  path.
+- `test_motor_map` 52 OK unchanged; `test_effectors` 19 OK;
+  `test_effector_gate` 23 OK; `test_action_atoms` 79 OK;
+  `test_loop_action` 11 OK (byte-identity preserved).
+- Spot-check canaries: `test_perception_module` 45,
+  `test_arithmetic` 23, `test_type_of_probe` 15,
+  `test_distributed_rules` 42, `test_fed_daemon_boot` 49 all OK.
+
+Non-goal (deferred to R3): `action_derive_intent` continues to mint
+verb-token-only intents; motor_map hits still land at SUSPENDED
+through the operand-missing branch until a planner materializes
+operands.
+
+### R.R3 -- planner-level operand materialization (QUEUED)
+
+Teach `action_derive_intent` (or a thin planner layer above it) to
+drive operands from the goal engine / belief store so motor_map hits
+mint executable intents end-to-end.  Also folds in:
+- Retiring the two pre-existing SPEAK-tier test fails (rewrite to
+  accept both `EFF_EXECUTED` and `EFF_NOTIFIED` via `eff_runs`).
+- Live HTTP once TLS maturity + rate-limit audit are complete.
+- Richer audio-mode selection (TTS vs voice-clone vs synth).
 
 ---
 

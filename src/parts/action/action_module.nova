@@ -41,6 +41,12 @@
 import "action_atoms.nova"
 import "motor_map.nova"
 import "../../io/effectors/effector_gate.nova"
+import "../../io/effectors/effector_file_ops.nova"
+import "../../io/effectors/effector_http_action.nova"
+import "../../io/effectors/effector_code_exec.nova"
+import "../../io/effectors/effector_mcp.nova"
+import "../../io/effectors/audio_speak.nova"
+import "../../io/effectors/tool.nova"
 import "../../safety/reversibility_classifier.nova"
 import "../goals/goal_engine.nova"
 import "../../audit/decision_log.nova"
@@ -262,14 +268,19 @@ fn action_derive_intent(am, ctx, percept, now) {
 // effector_speak's INTENT+OUTCOME, plus the action_module's OUTCOME
 // via `action_complete`).
 //
-// Kinds other than SPEAK / INTERNAL (TOOL_CALL, FILE_OP, etc.) are
-// currently unrouted -- the MVP's motor_map is empty -- so they return
-// [EFF_SUSPENDED, -1] with no side effects. A follow-up round
-// populates `motor_map` and dispatches through the appropriate
-// effector primitive.
+// Kinds other than SPEAK / INTERNAL dispatch through the Phase R2
+// per-class switch (ADR-0108). Each non-SPEAK branch submits via the
+// effector gate (synthesizing an INTENT record), consults `eff_runs`,
+// invokes the matching primitive from `src/io/effectors/*`, then
+// writes a terminal OUTCOME via `effector_complete`. When the required
+// operand slot is empty (verb-token-only intent from a motor_map hit
+// without a planner materializing operands), the branch falls through
+// to `[EFF_SUSPENDED, -1]` -- the R1-era stepping-stone that keeps
+// `action_derive_intent` callers working until Phase R3 wires operand
+// materialization.
 //
 // Returns [eff_result, intent_seq]. `intent_seq` is -1 when the submit
-// was a no-op (INTERNAL, unrouted kind, or a null decision log).
+// was a no-op (INTERNAL, operand-missing, or a null decision log).
 fn action_submit(am, intent, halted, user_approved, soul_ref, now) {
     let out = list_new()
     push(out, EFF_EXECUTED)
@@ -284,53 +295,197 @@ fn action_submit(am, intent, halted, user_approved, soul_ref, now) {
         _am_record_submit(am, EFF_EXECUTED, 0 - 1)
         return out
     }
-    if kind != IN_KIND_SPEAK {
-        // Non-SPEAK kinds are placeholders in the MVP -- motor_map is
-        // empty. Report SUSPENDED so a caller can distinguish this
-        // from an executed emit; a future round populates the map and
-        // dispatches through the appropriate effector primitive.
+    // Common trace-ref for the per-class dispatch: the sequence number
+    // of this intent in the module's monotonic tally.
+    let const_veto = 0
+    let trace = "loop_action:intent_" + int_to_str(am_intent_count(am))
+    in_set_trace_ref(intent, trace)
+    let dl = am[AM_DL]
+
+    if kind == IN_KIND_SPEAK {
+        // SPEAK path (pre-R2 shape; preserved verbatim for byte-identity).
+        if dl == 0 {
+            _am_record_submit(am, EFF_EXECUTED, 0 - 1)
+            return out
+        }
+        let sub = effector_submit(dl, ACT_SPEAK, const_veto, halted,
+                                  user_approved, in_goal_id(intent), trace,
+                                  soul_ref, now)
+        let result = sub[0]
+        let seq = sub[1]
+        list_set(out, 0, result)
+        list_set(out, 1, seq)
+        if eff_runs(result) == 1 {
+            effector_speak(dl, in_text(intent), const_veto, halted,
+                           in_goal_id(intent), trace, soul_ref, now)
+        }
+        _am_record_submit(am, result, seq)
+        return out
+    }
+
+    // Non-SPEAK dispatch. All non-SPEAK branches require a wired dl --
+    // without one there is no audit surface to synthesize INTENT/OUTCOME
+    // against, so we short-circuit to SUSPENDED (parallel to the SPEAK
+    // null-dl EXECUTED-noop, but with SUSPENDED semantics so the caller
+    // can see the intent was not actually run).
+    if dl == 0 {
         list_set(out, 0, EFF_SUSPENDED)
         list_set(out, 1, 0 - 1)
         _am_record_submit(am, EFF_SUSPENDED, 0 - 1)
         return out
     }
-    // SPEAK path.
-    let dl = am[AM_DL]
-    if dl == 0 {
-        // No wired decision log -- the loop is running under a chat
-        // REPL / unit-test fixture with no daemon. Preserve the
-        // pre-R2 behavior (no-op decision log) but report the intent
-        // as executed so the shim writes `in_text(intent)` to
-        // ctx_output.
-        _am_record_submit(am, EFF_EXECUTED, 0 - 1)
+
+    // TOOL meta-dispatch: re-dispatch into the matching concrete class
+    // via `in_effector_class`. INTERNAL and TOOL (self-ref) class fall
+    // through to SPEAK semantics against the verb-token text (the pre-R2
+    // placeholder behavior for tool-wrapped speak-shaped actions).
+    let effective_kind = kind
+    if kind == IN_KIND_TOOL_CALL {
+        let ec = in_effector_class(intent)
+        if ec == EFF_CLASS_FILE  { effective_kind = IN_KIND_FILE_OP }
+        if ec == EFF_CLASS_HTTP  { effective_kind = IN_KIND_HTTP_ACTION }
+        if ec == EFF_CLASS_CODE  { effective_kind = IN_KIND_CODE_EXEC }
+        if ec == EFF_CLASS_MCP   { effective_kind = IN_KIND_MCP }
+        if ec == EFF_CLASS_AUDIO { effective_kind = IN_KIND_AUDIO }
+        // EFF_CLASS_TOOL / INTERNAL / SPEAK: leave as TOOL_CALL; the
+        // post-switch fallthrough catches it as SUSPENDED (unrouted).
+    }
+
+    if effective_kind == IN_KIND_FILE_OP {
+        let path = in_file_path(intent)
+        if len(path) == 0 {
+            // Operand-missing: verb-token-only intent. Fall through to
+            // SUSPENDED (Phase R3 will materialize operands at derive).
+            list_set(out, 0, EFF_SUSPENDED)
+            list_set(out, 1, 0 - 1)
+            _am_record_submit(am, EFF_SUSPENDED, 0 - 1)
+            return out
+        }
+        let sub = effector_submit(dl, ACT_WRITE_LOCAL, const_veto, halted,
+                                   user_approved, in_goal_id(intent), trace,
+                                   soul_ref, now)
+        let result = sub[0]
+        let seq = sub[1]
+        list_set(out, 0, result)
+        list_set(out, 1, seq)
+        if eff_runs(result) == 1 {
+            let tr = file_ops_write(path, in_file_content(intent))
+            let ok = tr_ok(tr)
+            effector_complete(dl, seq, ok, now)
+        }
+        _am_record_submit(am, result, seq)
         return out
     }
-    let const_veto = 0
-    let trace = "loop_action:intent_" + int_to_str(am_intent_count(am))
-    in_set_trace_ref(intent, trace)
-    // Submit the INTENT record. `effector_submit` writes DLK_INTENT to
-    // the decision log before the effector runs; the result is the
-    // gate's disposition (EXECUTED / NOTIFIED / SUSPENDED / VETOED /
-    // HALTED).
-    let sub = effector_submit(dl, ACT_SPEAK, const_veto, halted,
-                              user_approved, in_goal_id(intent), trace,
-                              soul_ref, now)
-    let result = sub[0]
-    let seq = sub[1]
-    list_set(out, 0, result)
-    list_set(out, 1, seq)
-    // If the gate permits the emit, drive the text through
-    // effector_speak. `effector_speak` writes its own INTENT+OUTCOME
-    // pair (for the ACT_SPEAK submission it does itself), so a
-    // fully-executed SPEAK yields a rich audit trail. When the gate
-    // blocked (VETOED / SUSPENDED / HALTED), we skip the emit -- the
-    // INTENT record we wrote above carries the outcome (OUT_VETOED)
-    // per effector_gate policy.
-    if eff_runs(result) == 1 {
-        effector_speak(dl, in_text(intent), const_veto, halted,
-                       in_goal_id(intent), trace, soul_ref, now)
+
+    if effective_kind == IN_KIND_HTTP_ACTION {
+        let url = in_http_url(intent)
+        if len(url) == 0 {
+            list_set(out, 0, EFF_SUSPENDED)
+            list_set(out, 1, 0 - 1)
+            _am_record_submit(am, EFF_SUSPENDED, 0 - 1)
+            return out
+        }
+        let sub = effector_submit(dl, ACT_NET_FETCH, const_veto, halted,
+                                   user_approved, in_goal_id(intent), trace,
+                                   soul_ref, now)
+        let result = sub[0]
+        let seq = sub[1]
+        list_set(out, 0, result)
+        list_set(out, 1, seq)
+        if eff_runs(result) == 1 {
+            // Pin simulated=1 so the dispatch is hermetic -- live fetch
+            // is a Phase R3+ concern once TLS maturity + rate-limit
+            // policy are wired through.
+            let tr = http_action_run(url, 1, in_http_canned(intent))
+            let ok = tr_ok(tr)
+            effector_complete(dl, seq, ok, now)
+        }
+        _am_record_submit(am, result, seq)
+        return out
     }
-    _am_record_submit(am, result, seq)
+
+    if effective_kind == IN_KIND_CODE_EXEC {
+        let expr = in_code_expr(intent)
+        if len(expr) == 0 {
+            list_set(out, 0, EFF_SUSPENDED)
+            list_set(out, 1, 0 - 1)
+            _am_record_submit(am, EFF_SUSPENDED, 0 - 1)
+            return out
+        }
+        let sub = effector_submit(dl, ACT_READ_LOCAL, const_veto, halted,
+                                   user_approved, in_goal_id(intent), trace,
+                                   soul_ref, now)
+        let result = sub[0]
+        let seq = sub[1]
+        list_set(out, 0, result)
+        list_set(out, 1, seq)
+        if eff_runs(result) == 1 {
+            let tr = code_exec_run(expr)
+            let ok = tr_ok(tr)
+            effector_complete(dl, seq, ok, now)
+        }
+        _am_record_submit(am, result, seq)
+        return out
+    }
+
+    if effective_kind == IN_KIND_MCP {
+        let service = in_mcp_service(intent)
+        if len(service) == 0 {
+            list_set(out, 0, EFF_SUSPENDED)
+            list_set(out, 1, 0 - 1)
+            _am_record_submit(am, EFF_SUSPENDED, 0 - 1)
+            return out
+        }
+        let sub = effector_submit(dl, ACT_NET_FETCH, const_veto, halted,
+                                   user_approved, in_goal_id(intent), trace,
+                                   soul_ref, now)
+        let result = sub[0]
+        let seq = sub[1]
+        list_set(out, 0, result)
+        list_set(out, 1, seq)
+        if eff_runs(result) == 1 {
+            // The direct-call shape takes a bound canned response via
+            // IN_MCP_REQUEST (the tool-dispatcher pattern mcp.nova
+            // documents: tool config IS the bound response).
+            let tr = mcp_call_direct(service, in_mcp_request(intent),
+                                     in_mcp_request(intent))
+            let ok = tr_ok(tr)
+            effector_complete(dl, seq, ok, now)
+        }
+        _am_record_submit(am, result, seq)
+        return out
+    }
+
+    if effective_kind == IN_KIND_AUDIO {
+        let out_path = in_audio_out_path(intent)
+        if len(out_path) == 0 {
+            list_set(out, 0, EFF_SUSPENDED)
+            list_set(out, 1, 0 - 1)
+            _am_record_submit(am, EFF_SUSPENDED, 0 - 1)
+            return out
+        }
+        let sub = effector_submit(dl, ACT_SPEAK, const_veto, halted,
+                                   user_approved, in_goal_id(intent), trace,
+                                   soul_ref, now)
+        let result = sub[0]
+        let seq = sub[1]
+        list_set(out, 0, result)
+        list_set(out, 1, seq)
+        if eff_runs(result) == 1 {
+            let ok = effector_speak_audio(in_text(intent), out_path)
+            effector_complete(dl, seq, ok, now)
+        }
+        _am_record_submit(am, result, seq)
+        return out
+    }
+
+    // Unrouted kind (TOOL_CALL that didn't resolve to a concrete class,
+    // or an enum value this switch doesn't cover). Preserve the pre-R2
+    // SUSPENDED semantics so a caller can distinguish an executed
+    // intent from a routed-but-unknown one.
+    list_set(out, 0, EFF_SUSPENDED)
+    list_set(out, 1, 0 - 1)
+    _am_record_submit(am, EFF_SUSPENDED, 0 - 1)
     return out
 }
 
