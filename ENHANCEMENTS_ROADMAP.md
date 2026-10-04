@@ -807,10 +807,15 @@ Follow-ups:
   **Phase M R6 binary-link blocker RESOLVED** by subsequent commit
   renaming `_starts_with` → `_snap_starts_with` in
   `snapshot_disk.nova` (UPSTREAM_NOVA_BUGS §9 option (a)).
-  `crossengin_daemon.nova` now LINKs. `crossengin_chat.nova` still
-  fails at link time but with a different, sibling collision
-  (`_g_PC_TAG`, now tracked as UPSTREAM_NOVA_BUGS §10) that was
-  previously masked by the `_starts_with` error.
+  `crossengin_daemon.nova` now LINKs. `crossengin_chat.nova` initially
+  still failed at link time with a sibling collision
+  (`_g_PC_TAG`, previously masked by the `_starts_with` error) which
+  was then resolved by renaming `PC_TAG` → `PROOF_CHECKER_TAG` in
+  `src/parts/reasoning/proof_checker.nova:86` (UPSTREAM_NOVA_BUGS §10
+  option (a); one-line edit, grep-confirmed zero external callers).
+  **Both binaries now LINK** — chat for the first time since Phase M
+  R1 (`5f2e9f2`); daemon for the first time since Phase M R6
+  (`9cbbf12`). The §9+§10 workarounds close the binary-link arc.
   Split 924KB NEXT_SESSION.md, NOVA Makefile push
   (`ef4c3c6` local-only — operator action), UDP rewrite of gossip
   (blocked on NOVA sendto/recvfrom), future cleanup: extract

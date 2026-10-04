@@ -144,22 +144,24 @@ location.
 
 ## 10. Assembler rejects duplicate module-private `_g_PC_TAG` symbol
 
-- **ADR**: TBD (surfaced immediately after bug #9 workaround landed).
-- **Workaround**: none shipped. Candidate rename rounds:
-  (a) Rename `PC_TAG` → `PR_PC_TAG` (or similar) in
-      `src/parts/reasoning/proof_checker.nova:86`; audit callers in the
-      proof-checker module.
-  (b) Rename `PC_TAG` → `PA_PC_TAG` (or similar) in
-      `src/parts/perception/perception_atoms.nova:90`; audit callers
-      including `perception_atoms.nova:246` and any transitive
-      consumers in the perception subsystem.
-  Scope not yet characterised; option (a) likely smaller because
-  `perception_atoms` has more downstream readers.
+- **ADR**: none (ships as a rename commit referenced from this file).
+- **Workaround**: **SHIPPED** via option (a): `PC_TAG` →
+  `PROOF_CHECKER_TAG` in `src/parts/reasoning/proof_checker.nova:86`.
+  One-line edit; grep across `src/`, `tests/`, `examples/` found zero
+  callers of `PC_TAG` outside `proof_checker.nova` itself and
+  `perception_atoms.nova`'s own `PC_TAG` definition, so zero external
+  touches were needed. `crossengin_chat.nova` now LINKs for the first
+  time since Phase M R1 (`5f2e9f2`). Hypothetical alternative (b) —
+  rename `PC_TAG` → `PA_PC_TAG` in
+  `src/parts/perception/perception_atoms.nova:90` — was NOT taken
+  because option (a) was smaller (1 touch vs 3) and perception's
+  `PC_TAG` is the semantically-primary tag constant.
 - **Tests**: no unit coverage of the collision itself. Affected binary
   builds:
-  * `examples/crossengin_chat.nova` — blocked at link time; this
-    collision was previously masked by bug #9's earlier `_starts_with`
-    collision, surfaced only after option (a) in bug #9 shipped.
+  * `examples/crossengin_chat.nova` — was blocked at link time from
+    Phase M R1 (`5f2e9f2`) until this commit (previously masked by
+    bug #9's `_starts_with` collision, surfaced only after bug #9
+    option (a) shipped). Now LINKs cleanly.
 - **Context**: same shape as bug #9 but on module-level `let` bindings
   rather than `fn` definitions. Two modules both declare
   `let PC_TAG = ...` at module scope, which NOVA emits as the global
@@ -172,7 +174,11 @@ location.
 - **Suggested fix**: same shape as bug #9's suggested fix — NOVA
   compiler should mangle module-level `let` names with the module
   path (e.g. `_g_nova_parts_reasoning_proof_checker__PC_TAG`). The
-  user-side rename in either option above is a short-term unblock.
+  user-side rename in option (a) above has LANDED (closes this bug
+  as a workaround); the compiler mangling fix is still desirable
+  because the `_starts_with` / `PC_TAG` family of collisions
+  will keep arising for any future module-private symbol that two
+  modules happen to pick the same name for.
 
 ## 6. Sandbox O_CREAT policy (container, not NOVA)
 
@@ -194,7 +200,9 @@ Fixing (3) first clears four tests on its own and unblocks any schema
 validation downstream (the schemas gate rejects every int under the
 regression). (1) and (2) can land in either order. (4) and (5) are
 independent of the others. (6) is operator / infra, out of band.
-(9) workaround SHIPPED; upstream compiler mangling fix still desirable
-for defense-in-depth. (10) is a new sibling collision on module-level
-`let` bindings (`_g_PC_TAG`), still blocking `crossengin_chat`;
-same shape as (9) but on globals rather than functions.
+(9) + (10) workarounds BOTH SHIPPED: `_starts_with` renamed in
+`snapshot_disk.nova` (daemon unblocked), `PC_TAG` renamed to
+`PROOF_CHECKER_TAG` in `proof_checker.nova` (chat unblocked). Both
+binaries now LINK. Upstream compiler mangling fix still desirable
+for defense-in-depth — same shape will recur for any future
+module-private name chosen by two modules.
