@@ -816,8 +816,12 @@ Follow-ups:
   **Both binaries now LINK** — chat for the first time since Phase M
   R1 (`5f2e9f2`); daemon for the first time since Phase M R6
   (`9cbbf12`). The §9+§10 workarounds close the binary-link arc.
-  Split 924KB NEXT_SESSION.md, NOVA Makefile push
-  (`ef4c3c6` local-only — operator action), UDP rewrite of gossip
+  Split 924KB NEXT_SESSION.md — SHIPPED by `1da6d99`. NOVA Makefile
+  push — SHIPPED; `ef4c3c6` was rebased onto upstream tip (new hash
+  `f0882c9` on NOVA repo) and pushed; upstream `afff1a9` ("tag int
+  literals with bitwise ops") has semantically superseded the setarch
+  workaround, but the four `*-setarch` Makefile targets remain as a
+  defensive fallback for pre-fix NOVA checkouts. UDP rewrite of gossip
   (blocked on NOVA sendto/recvfrom), future cleanup: extract
   `_fed_*`/`_cd_*` env-resolver duplication into
   `src/util/env_resolve.nova`.

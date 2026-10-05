@@ -369,6 +369,18 @@ what R1 saw in CrossEngin test runs. If any of those classes resurface
 at bootstrap time (e.g. on a new build host), the setarch wrappers
 remain a working fallback.
 
+### Resolution (post-R1 operator action)
+
+Option 1 was taken. `ef4c3c6` was rebased onto
+`origin/claude/confident-fermi-op241b` (upstream tip `e431246`) and
+pushed as `f0882c9`. The rebase was clean — upstream did not touch
+`Makefile` in the five intervening commits. Upstream `afff1a9`
+("fix(compiler): self-host builds again — tag int literals with
+bitwise ops") provides the surgical fix for the exact crash the
+setarch wrappers worked around; the wrappers remain in the Makefile
+as a defensive fallback for pre-fix NOVA checkouts, additive-only
+(the original targets are untouched).
+
 ### The NOVA Makefile diff (for operator reference)
 
 ```makefile
