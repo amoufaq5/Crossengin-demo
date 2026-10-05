@@ -151,7 +151,12 @@ location.
   callers of `PC_TAG` outside `proof_checker.nova` itself and
   `perception_atoms.nova`'s own `PC_TAG` definition, so zero external
   touches were needed. `crossengin_chat.nova` now LINKs for the first
-  time since Phase M R1 (`5f2e9f2`). Hypothetical alternative (b) —
+  time since Phase M R1 (`5f2e9f2`).
+  **Follow-up**: a subsequent dead-constant audit confirmed
+  `PROOF_CHECKER_TAG` had zero readers in-module as well (the real
+  tag used by `proof_new` is `_PC_OBJ_TAG = 5201`). The constant was
+  removed entirely in a later commit — the collision class is now
+  fully retired on this side regardless of upstream NOVA fixes. Hypothetical alternative (b) —
   rename `PC_TAG` → `PA_PC_TAG` in
   `src/parts/perception/perception_atoms.nova:90` — was NOT taken
   because option (a) was smaller (1 touch vs 3) and perception's
