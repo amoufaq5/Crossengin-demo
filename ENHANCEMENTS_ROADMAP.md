@@ -722,6 +722,12 @@ Post-R3d exit tally for the targeted 16:
   same SAR to `rt_str_to_int`'s `load8(s+i)` (or rewrite it over
   `char_at`). Lets us revert `src/util/mem_safe.nova` + the
   `str_to_int` migration.
+- **Upstream NOVA Bug #2 (`rt_str_to_int` tag-polymorphism) SHIPPED**
+  in NOVA commit `b66644b` on `claude/confident-fermi-op241b`
+  (2026-10-05): entry-point inline-asm retag normalizes raw+tagged
+  string handles; `make bin/nova` + `make self-host` fixpoint verified.
+  R3d's user-side `str_to_int` migration remains in place as defensive
+  depth and does not require retirement.
 
 ### Q.R3e — type_of regression workaround + Cluster D/E residuals (SHIPPED, ADR-0104)
 

@@ -27,12 +27,21 @@ location.
 ## 2. `rt_str_to_int` -- `load8` on tagged string handle
 
 - **ADR**: 0103
-- **Workaround**: migrate call sites to the `str_to_int` NOVA builtin
-  (which untags internally).
+- **Workaround**: **UPSTREAM FIX SHIPPED** in NOVA commit `b66644b` on
+  `claude/confident-fermi-op241b` (2026-10-05): `rt_str_to_int` now
+  normalizes raw string handles (literals, `_nova_substr` return) to
+  tagged at entry via an inline-asm `[rbp-8]` retag, so both pointer
+  conventions work. R3d's user-side migration (replace `rt_str_to_int`
+  with the `str_to_int` builtin at call sites) remains in the codebase
+  as a defensive measure — a future round can retire it if desired, but
+  there's no behavioral urgency.
 - **Tests**: `test_kg_query`, `test_kg_query_agg`, `test_kg_query_ext`,
-  `test_fed_daemon_boot`.
-- **Suggested fix**: `/home/user/NOVA/src/runtime/string.nova:226` --
-  untag the string handle in the `load8` operand before dereferencing.
+  `test_fed_daemon_boot`. Upstream regression coverage added in NOVA's
+  `tests/test_runtime.nova`: `rt_str_to_int("42")` and
+  `rt_str_to_int(substr("abc123def", 3, 3))` exercise the raw path.
+- **Suggested fix**: ~~`/home/user/NOVA/src/runtime/string.nova:226` --
+  untag the string handle in the `load8` operand before dereferencing.~~
+  Shipped.
 
 ## 3. `type_of()` regression -- new mapping incompatible with historic constants
 
@@ -203,11 +212,12 @@ location.
 
 Fixing (3) first clears four tests on its own and unblocks any schema
 validation downstream (the schemas gate rejects every int under the
-regression). (1) and (2) can land in either order. (4) and (5) are
-independent of the others. (6) is operator / infra, out of band.
-(9) + (10) workarounds BOTH SHIPPED: `_starts_with` renamed in
-`snapshot_disk.nova` (daemon unblocked), `PC_TAG` renamed to
-`PROOF_CHECKER_TAG` in `proof_checker.nova` (chat unblocked). Both
-binaries now LINK. Upstream compiler mangling fix still desirable
-for defense-in-depth — same shape will recur for any future
-module-private name chosen by two modules.
+regression). (2) SHIPPED upstream (NOVA commit `b66644b`, 2026-10-05) —
+no longer in landing order; user-side migration remains defensive. (1)
+can land independently. (4) and (5) are independent of the others. (6)
+is operator / infra, out of band. (9) + (10) workarounds BOTH SHIPPED:
+`_starts_with` renamed in `snapshot_disk.nova` (daemon unblocked),
+`PC_TAG` renamed to `PROOF_CHECKER_TAG` in `proof_checker.nova` (chat
+unblocked). Both binaries now LINK. Upstream compiler mangling fix
+still desirable for defense-in-depth — same shape will recur for any
+future module-private name chosen by two modules.
