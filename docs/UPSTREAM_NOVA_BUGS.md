@@ -31,7 +31,19 @@ location.
   `claude/confident-fermi-op241b` (2026-10-05): `rt_str_to_int` now
   normalizes raw string handles (literals, `_nova_substr` return) to
   tagged at entry via an inline-asm `[rbp-8]` retag, so both pointer
-  conventions work. R3d's user-side migration (replace `rt_str_to_int`
+  conventions work. **Sweep follow-up** in NOVA commit `41058d2` on the
+  same branch (2026-10-05): the same per-site inline-asm normalizer was
+  extended to 7 more `src/runtime/string.nova` fns across 12 parameter
+  slots — `str_len`, `str_char_at`, `rt_str_eq`, `str_cmp`,
+  `rt_str_find`, `str_starts_with`, `str_ends_with` (all end-to-end
+  verified on raw-literal inputs), plus the second (delim) slot of
+  `str_split`. **Deferred** this round pending a `_nova_memcpy_raw`
+  tagged-vs-raw audit: `str_concat`, `str_slice`, `rt_str_trim`, and
+  `str_split`'s first slot (whose output chain feeds `str_slice`, so
+  the end-to-end `str_split` raw-literal case still SEGVs until that
+  defer closes). **Skipped permanently** per Phase-1: `str_new`,
+  `str_data`, `str_contains` (forwards to `rt_str_find`),
+  `rt_int_to_str`. R3d's user-side migration (replace `rt_str_to_int`
   with the `str_to_int` builtin at call sites) remains in the codebase
   as a defensive measure — a future round can retire it if desired, but
   there's no behavioral urgency.
