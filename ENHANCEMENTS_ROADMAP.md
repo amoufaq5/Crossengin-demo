@@ -742,6 +742,29 @@ Post-R3d exit tally for the targeted 16:
   `s + i` arithmetic — the end-to-end `str_split` raw-literal case
   continues to SEGV until that defer closes. `make bin/nova` +
   `make self-host` fixpoint verified for this sweep as well.
+- **Upstream NOVA Bug #2 deferred-4 sweep SHIPPED** in NOVA commit
+  `2bc1dab` on `claude/confident-fermi-op241b` (2026-10-05): the four
+  previously-deferred fns — `str_concat`, `str_slice`, `rt_str_trim`,
+  and `str_split`'s first slot — now entry-normalize their handle(s)
+  to tagged (same `[rbp-N]` inline-asm retag pattern as the 7-fn
+  sweep). The two that previously called `memcpy_raw` on a tagged
+  alloc dst (`str_concat`, `str_slice`'s former
+  `str_new(s+start, len)` path) were rewritten to byte-copy via
+  `store8`/`load8` — both of which untag addresses correctly, so the
+  fix needs neither a scratch-local untag nor a codegen change and
+  sidesteps the still-broken `str_new(tagged, raw, tagged)` internal
+  flow. Also fixed a latent precedence bug in `rt_str_trim`'s
+  whitespace predicate (`c == 32 | c == 9 | ...` parsed as a chained
+  comparison via `|` which has parse_bitwise precedence; changed to
+  `||`). Standalone-runner verification: all four raw-literal
+  assertions pass (`str_concat("ab","cd")` len=4,
+  `str_slice("hello",1,4)` len=3 first='e'/last='l',
+  `rt_str_trim("  hi  ")` len=2 bytes='h','i',
+  `str_split("a,b,c",",")` list-len=3). `make bin/nova` +
+  `make self-host` fixpoint verified. Honest residual: `str_new`
+  itself (tagged-dst + tagged-count + raw-src memcpy_raw) remains
+  broken; neither sweep touches it. End-to-end `tests/test_runtime.nova`
+  still SEGVs in `test_memory_primitives` (unrelated, pre-existing).
 
 ### Q.R3e — type_of regression workaround + Cluster D/E residuals (SHIPPED, ADR-0104)
 

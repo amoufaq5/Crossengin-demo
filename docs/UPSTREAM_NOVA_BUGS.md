@@ -37,11 +37,21 @@ location.
   slots — `str_len`, `str_char_at`, `rt_str_eq`, `str_cmp`,
   `rt_str_find`, `str_starts_with`, `str_ends_with` (all end-to-end
   verified on raw-literal inputs), plus the second (delim) slot of
-  `str_split`. **Deferred** this round pending a `_nova_memcpy_raw`
-  tagged-vs-raw audit: `str_concat`, `str_slice`, `rt_str_trim`, and
-  `str_split`'s first slot (whose output chain feeds `str_slice`, so
-  the end-to-end `str_split` raw-literal case still SEGVs until that
-  defer closes). **Skipped permanently** per Phase-1: `str_new`,
+  `str_split`. **Deferred-4 sweep closed** in NOVA commit `2bc1dab` on
+  the same branch (2026-10-05): the four previously-deferred fns —
+  `str_concat`, `str_slice`, `rt_str_trim`, and `str_split`'s first
+  slot — now entry-normalize their handle(s) to tagged, and the two
+  that previously called `memcpy_raw` on a tagged alloc dst
+  (`str_concat`, `str_slice`'s former `str_new(s+start, len)` path)
+  were rewritten to byte-copy via `store8`/`load8` — both of which
+  untag addresses correctly, so no scratch-local untag is needed and
+  no reliance on the still-broken `str_new(tagged, raw, tagged)`
+  internal flow. Also fixed a latent precedence bug in `rt_str_trim`'s
+  whitespace predicate: `c == 32 | c == 9 | ...` parsed as a chained
+  comparison via `|` (parse_bitwise, higher precedence than `==`);
+  changed to `||` for the expected bool-OR. Standalone verification
+  confirms all four raw-literal assertions pass; `make self-host`
+  fixpoint holds. **Skipped permanently** per Phase-1: `str_new`,
   `str_data`, `str_contains` (forwards to `rt_str_find`),
   `rt_int_to_str`. R3d's user-side migration (replace `rt_str_to_int`
   with the `str_to_int` builtin at call sites) remains in the codebase
