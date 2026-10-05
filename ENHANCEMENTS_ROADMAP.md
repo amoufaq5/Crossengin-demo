@@ -1147,18 +1147,48 @@ Exit tally:
   11, `test_goal_persistence` 11, `test_perception_module` 45,
   `test_arithmetic` 23.
 
-### R.R5 -- planner-driven operand inference (QUEUED)
+### R.R5 -- planner keyword heuristics for operand materialization (SHIPPED, ADR-0113)
 
-Layer option (b)'s planner on top of R4's registry: on template miss,
-call `planner_materialize(goal_name, ctx)` to infer operands via
-keyword heuristics.  Also folds in:
-- Live HTTP once TLS maturity + rate-limit audit are complete.
-- Richer audio-mode selection (TTS vs voice-clone vs synth).
-- Lowercase-normalization / stemming in
-  `mm_activation_signature_by_name` and `goal_templates_lookup` once
-  a canonical goal-name normalization policy exists.
-- HTTP / MCP / AUDIO template seeds under a `%URL%` / `%SERVICE%`
-  placeholder-vocabulary ADR.
+Phase R5 layers option (b)'s planner on top of R4's registry: between
+the R4 template probe and the R3 convention switch,
+`operand_builder_build` now calls `planner_materialize(goal_name,
+eff_class, goal_id)`. On a hit the planner tuple wins over R3; on a
+miss the R3 convention fires unchanged.
+
+1. **`src/parts/goals/planner.nova`** (new leaf module) ships four
+   keyword heuristics, each with a prefix ending in a SPACE so
+   motor_map's underscore vocabulary cannot match (byte-identity
+   canary): `"write note "` (FILE) -> `["/tmp/ce_note_<id>.txt",
+   <tail>]`, `"fetch "` (HTTP) -> `[<tail>, ""]`, `"run "` (CODE) ->
+   `[<tail>]`, `"say "` (AUDIO) -> `["/tmp/ce_speech.wav"]`. MCP /
+   TOOL / INTERNAL return empty (no heuristic this round).
+   Constants prefixed `PL_` to dodge UPSTREAM §9/§10; local
+   `_pl_starts_with` byte-walker dodges UPSTREAM §1; `_pl_tail_after`
+   guards `len == 0` and `n > len(s)` before `substr`.
+2. **`operand_builder_build`** gains a planner probe between the R4
+   template-miss fallthrough and the R3 convention switch. Signature
+   unchanged (6 args). Three-layer precedence: templates -> planner
+   -> R3 convention.
+3. **Byte-identity contract**: every heuristic prefix ends in a space;
+   motor_map default vocabulary uses underscores; no R3+R4 call path
+   can trigger a planner hit; every pre-R5 test is byte-identical.
+4. Follow-up queued: richer parser (quoted strings, multi-arg), MCP
+   / TOOL / INTERNAL heuristics once vocabulary surfaces, ctx-driven
+   heuristics via `AC_ACTIVE` concept handles, lowercase-norm /
+   stemming once a canonical goal-name normalization policy exists.
+   Goal-atom schema extension (option (a)) remains deferred to R6+.
+
+Exit tally:
+- `test_planner` (new): **21 checks** across 10 subtests.
+- `test_operand_builder`: **41 checks** (was 30), +2 subtests cover
+  planner-hit-when-templates-miss and both-miss-falls-to-R3.
+- `test_goal_templates`: **34 checks** unchanged (6 subtests).
+- `test_action_module`: **94 checks** unchanged (motor_map default
+  vocabulary is underscore-only, never triggers R5 heuristics).
+- Canaries unchanged: `test_motor_map` 52, `test_effectors` 19,
+  `test_effector_gate` 23, `test_action_atoms` 79, `test_loop_action`
+  11, `test_goal_persistence` 11, `test_perception_module` 45,
+  `test_arithmetic` 23.
 
 ---
 
