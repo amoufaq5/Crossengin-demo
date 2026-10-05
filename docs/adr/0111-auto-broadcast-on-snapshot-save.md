@@ -152,7 +152,11 @@ bytes as pre-R6.
   `_cd_peers_from_env`, `_cd_soul_id_from_env_int` incl. djb2 mixer,
   `_cd_attest_key_base_from_env`). Deliberate duplication — extraction
   to `src/util/env_resolve.nova` is tracked on the post-queue; attempting
-  it here would churn fed_daemon's existing tests.
+  it here would churn fed_daemon's existing tests. *Follow-up:* env-resolver
+  duplication resolved — the 7 helpers + mask const extracted into
+  `src/util/env_resolve.nova` and shared with fed_daemon; both daemons
+  import the shared util and the six fed-daemon test canaries pass
+  unchanged.
 - **R6.3** — boot wiring immediately after `sreg_register(sreg, sess)`.
   Resolves `CE_FED_LISTEN_ADDR` (default `127.0.0.1:0`), peers, and the
   signer-key base path. Calls `merkle_signing_keypair_load`; on failure

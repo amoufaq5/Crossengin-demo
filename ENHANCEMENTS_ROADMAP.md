@@ -822,9 +822,11 @@ Follow-ups:
   literals with bitwise ops") has semantically superseded the setarch
   workaround, but the four `*-setarch` Makefile targets remain as a
   defensive fallback for pre-fix NOVA checkouts. UDP rewrite of gossip
-  (blocked on NOVA sendto/recvfrom), future cleanup: extract
-  `_fed_*`/`_cd_*` env-resolver duplication into
-  `src/util/env_resolve.nova`.
+  (blocked on NOVA sendto/recvfrom). Env-resolver duplication cleanup:
+  SHIPPED — the 7 `_fed_*` / `_cd_*` env helpers + mask const extracted
+  into `src/util/env_resolve.nova` (closes Phase M R6 duplication); both
+  daemons import the shared util and all six fed-daemon test canaries
+  pass unchanged.
 - **Upstream NOVA (operator action; closes the whole workaround family):**
   fix `memcpy_raw` codegen + `type_of()` regression in
   `codegen.nova`. The current `type_of()` renders strings as a
