@@ -1,6 +1,6 @@
 # ADR-0104 -- type_of() runtime regression and Cluster D/E residual fixes
 
-Status: Accepted
+Status: Superseded by NOVA commit 651a507 (type_of codegen fix, 2026-10-05)
 Date: 2026-10-01
 Context: Phase Q R3e (segfault-arc close-out). Follows ADR-0101 (str_eq),
 ADR-0102 (SIMD/OCR), ADR-0103 (memcpy_raw / byte_copy / buf_to_str).
@@ -164,3 +164,32 @@ a live sys_open call.
   rest of the post-arc queue (RELAY_BIN sealed-frame, motor_map
   shell, auto-broadcast-on-snapshot-save, NEXT_SESSION split, UDP
   gossip rewrite).
+
+## Resolution
+
+NOVA commit 651a507 (2026-10-05) ships the upstream codegen fix. Three
+tandem edits in `src/compiler/codegen.nova`:
+
+1. `_nova_type_of` at `:18735-18763` now emits tagged NOVA ints:
+   `(N<<1)|1`, so null=1, int=3, str=5, list=7, map=9. Callers see
+   historical `type_of(null)=0, type_of(int)=1, type_of(str)=2,
+   type_of(list)=3, type_of(map)=4` because literal operand integer
+   comparisons are tagged symmetrically.
+2. AST_TYPE_PATTERN match-arm cmp sites at `:5708` and `:6423` now
+   compare the raw tp_id against `(tp_id << 1) | 1`, keeping
+   `x : int / list / str / map` arms consistent with the newly-tagged
+   `_nova_type_of` return.
+3. WASM backend at `:13018-13052` mirrors the same five constants.
+
+The null-tag convention is explicit: a NOVA null (`0`) now reads
+`type_of(0) == 1` because the integer literal `1` is also tagged `1`;
+previously `type_of(0)` returned raw `0`. The user-level `type_safe.nova`
+wrapper is retained as a thin stable-API shim; its three predicates
+now use the historical constants (`is_int_val: == 1`, `is_list_val:
+== 3`, `is_str_val: == 2`).
+
+`test_type_of_probe` has been rewritten (11 checks) to pin the restored
+historical mapping with explicit map coverage. The ~55 operational
+`type_of(x) == N` call sites throughout the KG and federation layer
+were already using the historical values via comments or `is_*_val`
+wrappers; they start working correctly simultaneously with the fix.

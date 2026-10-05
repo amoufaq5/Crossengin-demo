@@ -67,16 +67,20 @@ location.
 
 ## 3. `type_of()` regression -- new mapping incompatible with historic constants
 
-- **ADR**: 0104
-- **Workaround**: `src/util/type_safe.nova` (`is_int_val`,
-  `is_list_val`, `is_str_val`, `is_tagged_list`); call-site migrations
-  across `src/kg/query.nova`, `rule_explain.nova`, `rule_inference.nova`,
-  `src/schemas/schemas.nova`, `src/federation/distributed_rules.nova`.
+- **ADR**: 0104 (Superseded)
+- **Workaround**: **UPSTREAM FIX SHIPPED** in NOVA commit `651a507` on
+  `claude/confident-fermi-op241b` (2026-10-05). Three tandem edits in
+  `src/compiler/codegen.nova`: tag `_nova_type_of` return `(N<<1)|1`,
+  tag the AST_TYPE_PATTERN match-arm cmp operand, mirror in WASM
+  backend. Historical mapping (null=0, int=1, str=2, list=3, map=4) is
+  restored. `src/util/type_safe.nova` is retained as a thin stable-API
+  wrapper and its three constants were swapped to match the historical
+  mapping (`is_int_val: == 1`, `is_list_val: == 3`, `is_str_val: == 2`);
+  a future round can inline-remove the wrapper by migrating callers to
+  raw `type_of(x) == N`.
 - **Tests**: `test_distributed_rules`, `test_kg_query*` (all three),
-  schema validation across the KG stack.
-- **Suggested fix**: `/home/user/NOVA/src/compiler/codegen.nova:18735`
-  -- restore the historical mapping (int=1, string=2, list=3, map=4)
-  rather than the currently-emitted (int=0, list=1, string=tagged "1").
+  schema validation across the KG stack. All pass counts preserved
+  pre/post swap (45/94/52/42/62/67/60/47/54 across spot-checks).
 
 ## 4. bug-#11 sentinel equality on two-large-operand `==`
 
@@ -232,14 +236,15 @@ location.
 
 ## Retirement order
 
-Fixing (3) first clears four tests on its own and unblocks any schema
-validation downstream (the schemas gate rejects every int under the
-regression). (2) SHIPPED upstream (NOVA commit `b66644b`, 2026-10-05) —
-no longer in landing order; user-side migration remains defensive. (1)
-can land independently. (4) and (5) are independent of the others. (6)
-is operator / infra, out of band. (9) + (10) workarounds BOTH SHIPPED:
-`_starts_with` renamed in `snapshot_disk.nova` (daemon unblocked),
-`PC_TAG` renamed to `PROOF_CHECKER_TAG` in `proof_checker.nova` (chat
-unblocked). Both binaries now LINK. Upstream compiler mangling fix
-still desirable for defense-in-depth — same shape will recur for any
-future module-private name chosen by two modules.
+(3) SHIPPED upstream (NOVA commit `651a507`, 2026-10-05) — historical
+`type_of()` mapping restored; `type_safe.nova` wrapper preserved as a
+thin stable-API shim with constants rotated to the historical values.
+(2) SHIPPED upstream (NOVA commit `b66644b`, 2026-10-05) — user-side
+migration remains defensive. (1) can land independently. (4) and (5)
+are independent of the others. (6) is operator / infra, out of band.
+(9) + (10) workarounds BOTH SHIPPED: `_starts_with` renamed in
+`snapshot_disk.nova` (daemon unblocked), `PC_TAG` renamed to
+`PROOF_CHECKER_TAG` in `proof_checker.nova` (chat unblocked). Both
+binaries now LINK. Upstream compiler mangling fix still desirable for
+defense-in-depth — same shape will recur for any future module-private
+name chosen by two modules.

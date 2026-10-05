@@ -688,10 +688,11 @@ Post-R3d exit tally for the targeted 16:
 - Cluster A: `test_stereo_u8_simd` → PASS.
 - Cluster B: `test_http_client`, `test_kg_rss_ingest` → PASS.
 - Cluster C: `test_fed_daemon_boot` → PASS; `test_kg_query{,_agg,_ext}`
-  → clean exit-3 FAIL (SEGV gone; residual behavioural FAILs trace
+  → clean exit-3 FAIL (SEGV gone; residual behavioural FAILs traced
   to a `type_of` runtime regression where strings AND lists both
-  now read `1`, breaking `_qry_is_error`'s `type_of(x) != 3` guard;
-  rolled to R3e).
+  read `1`, breaking `_qry_is_error`'s `type_of(x) != 3` guard; rolled
+  to R3e, then SHIPPED upstream in NOVA commit `651a507` 2026-10-05 —
+  historical mapping null=0/int=1/str=2/list=3/map=4 restored).
 - Cluster D (7 tests): all still SEGV on indexing a null returned
   by a `save`/`serve`; the "downstream of C" hypothesis was wrong,
   roots are per-test module failures (sr/dq/replication paths use
@@ -771,18 +772,22 @@ Post-R3d exit tally for the targeted 16:
 Phase Q R3e closes most of the remaining segfault-arc. Scope split into
 five sub-passes:
 
-1. **R3e.1 -- type_of regression (D1, 4 tests + schemas).** Ship
-   `tests/unit/test_type_of_probe.nova` pinning the current regressed
-   mapping (int=0, list=1, string=tagged "1" that is neither 0 nor 1)
-   and `src/util/type_safe.nova` with `is_int_val`/`is_list_val`/
-   `is_str_val`/`is_tagged_list` probes. Migrate 7 call sites:
+1. **R3e.1 -- type_of regression (D1, 4 tests + schemas).** Shipped
+   `tests/unit/test_type_of_probe.nova` pinning the regressed mapping
+   (int=0, list=1, string=tagged "1" that is neither 0 nor 1) and
+   `src/util/type_safe.nova` with `is_int_val`/`is_list_val`/
+   `is_str_val`/`is_tagged_list` probes. Migrated 7 call sites:
    `src/kg/query.nova:242` (`_qry_is_error`), `src/kg/rule_explain.nova:161`
    (`proof_is_tree`), `src/kg/rule_inference.nova:160,580,717`
    (`_rule_is_error`, `rule_is_parsed`, `rule_engine_is`),
    `src/kg/schemas.nova:135-171` (both FTYPE_INT and FTYPE_STR legs
    plus the min/max int-check), and `src/federation/distributed_rules.nova:408`
-   (`dr_is_state`). Result: `test_kg_query`, `_agg`, `_ext` flip
-   exit-3 → OK; `test_schemas` goes 6/7 → 12/1 FAIL (6 more pass).
+   (`dr_is_state`). Result: `test_kg_query`, `_agg`, `_ext` flipped
+   exit-3 → OK; `test_schemas` went 6/7 → 12/1 FAIL (6 more pass).
+   **Upstream fix landed in NOVA commit `651a507` (2026-10-05)**:
+   historical mapping restored; `type_safe.nova` constants rotated
+   (`is_int_val: == 1`, `is_list_val: == 3`, `is_str_val: == 2`) and
+   `test_type_of_probe` rewritten to pin the historical values.
 2. **R3e.2 -- str_eq residual (D2, 1 test).** Migrate three
    `src/federation/snapshot_replication.nova` sites (`:340`, `:350`,
    `:489`) to `str_eq_bytes`. `test_fed_daemon_replication` flips
@@ -871,12 +876,12 @@ Follow-ups:
   daemons import the shared util and all six fed-daemon test canaries
   pass unchanged.
 - **Upstream NOVA (operator action; closes the whole workaround family):**
-  fix `memcpy_raw` codegen + `type_of()` regression in
-  `codegen.nova`. The current `type_of()` renders strings as a
-  tagged value that neither equals nor differs from any integer --
-  a wider fix than a constant swap. Resolving both retires
-  `src/util/mem_safe.nova`, `src/util/str_safe.nova`,
-  `src/util/type_safe.nova`, and the 7 migrated call sites.
+  `type_of()` regression SHIPPED upstream (NOVA commit `651a507`,
+  2026-10-05) — three-site codegen fix (type_of return + match-arm
+  cmp + WASM mirror); `src/util/type_safe.nova` retained as a thin
+  stable-API wrapper with constants rotated to historical values.
+  `memcpy_raw` codegen fix still desirable; resolving it retires
+  `src/util/mem_safe.nova` and `src/util/str_safe.nova`.
 
 ### Q.R3f -- bug-#11 sentinel equality + rebuild-guard sweep (SHIPPED, ADR-0105)
 
