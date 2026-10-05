@@ -1100,16 +1100,65 @@ Exit tally:
   only changes behavior INSIDE `action_derive_intent`'s motor_map
   hit branch.
 
-### R.R4 -- planner-driven payload materialization (QUEUED)
+### R.R4 -- goal-template registry for operand materialization (SHIPPED, ADR-0112)
 
-Replace Phase R3's convention-driven operand placeholders with a real
-planner that reads goal metadata / belief store / context inference.
-Likely drives a goal-atom schema extension (new ADR).  Also folds in:
+Phase R4 replaces Phase R3's convention-driven operand placeholders
+with a per-goal template registry.  Phase-1 Explore evaluated three
+options -- (a) goal-atom schema extension (HIGH risk, breaks
+`goal_persistence`), (b) planner over `goal_name` (MEDIUM risk, no
+NOVA-safe string-parsing primitives), (c) goal-template registry
+mirroring `motor_map` (LOW risk, zero schema impact) -- and shipped (c):
+
+1. **`src/parts/action/goal_templates.nova`** (new leaf module)
+   mirrors `motor_map.nova:35-124` byte-for-byte: 2-slot handle
+   `[GT_OBJ_TAG=9304, entries]`, linear-scan upsert / lookup via local
+   `_gt_key_eq` byte-walker, placeholder expansion via
+   `_gt_substitute` (`%ID%` / `%NAME%`), seeded with two entries
+   covering FILE + CODE: `"write_a_note"` ->
+   `["file", "/tmp/ce_note_%ID%.txt", "%NAME%"]` and `"run_code"` ->
+   `["code", "1 + %ID%"]`.  HTTP / MCP / AUDIO keep R3 fallback
+   until a `%URL%` / `%SERVICE%` placeholder vocabulary ADR lands.
+2. **`operand_builder_build`** grows an optional 6th `templates` arg.
+   When non-zero AND the lookup hits AND the hit's class tag matches,
+   expand the template.  Otherwise fall through to the R3 convention
+   switch (byte-identical to pre-R4).
+3. **`action_module`** tail-appends `AM_GOAL_TEMPLATES` (slot 8) after
+   R1's `AM_MOTOR_MAP` (slot 7).  Mirrors ADR-0107's byte-identity
+   tail-append pattern.  `action_module_init` seeds via
+   `goal_templates_default()`; `action_derive_intent` passes
+   `am_goal_templates(am)` as the 6th arg.
+4. Follow-up queued: Phase R5 planner (option (b)) layered on top --
+   runs on template miss; HTTP / MCP / AUDIO template seeds under
+   their own placeholder-vocabulary ADR; goal-atom schema extension
+   (option (a)) deferred to Phase R6+ when a demand templates cannot
+   cover surfaces.
+
+Exit tally:
+- `test_goal_templates` (new): **34 checks** across 6 subtests.
+- `test_operand_builder`: **30 checks** (was 18), +2 subtests cover
+  template-hit expansion and `templates=0` byte-identity fallback.
+- `test_action_module`: **94 checks** (was 90), +1 subtest covers
+  `write_a_note` -> `/tmp/ce_note_<id>.txt` via default templates.
+  The pre-existing R3 FILE subtest explicitly clears the templates
+  via `am_set_goal_templates(am, 0)` to continue exercising the R3
+  convention path.
+- Canaries unchanged: `test_motor_map` 52, `test_effectors` 19,
+  `test_effector_gate` 23, `test_action_atoms` 79, `test_loop_action`
+  11, `test_goal_persistence` 11, `test_perception_module` 45,
+  `test_arithmetic` 23.
+
+### R.R5 -- planner-driven operand inference (QUEUED)
+
+Layer option (b)'s planner on top of R4's registry: on template miss,
+call `planner_materialize(goal_name, ctx)` to infer operands via
+keyword heuristics.  Also folds in:
 - Live HTTP once TLS maturity + rate-limit audit are complete.
 - Richer audio-mode selection (TTS vs voice-clone vs synth).
 - Lowercase-normalization / stemming in
-  `mm_activation_signature_by_name` once a canonical goal-name
-  normalization policy exists.
+  `mm_activation_signature_by_name` and `goal_templates_lookup` once
+  a canonical goal-name normalization policy exists.
+- HTTP / MCP / AUDIO template seeds under a `%URL%` / `%SERVICE%`
+  placeholder-vocabulary ADR.
 
 ---
 
