@@ -1977,3 +1977,91 @@ import-graph misses in several Crossengin tests
 `test_differential_privacy`, etc.). `test_motor_map` passes as a
 clean-imports canary. Fixing the affected tests is a follow-up sweep,
 not blocking the upstream close-out.
+
+### Phase: Bug #8 ripple sweep — imports closed (2026-10-06)
+
+Ripple sweep landed in one commit on `claude/confident-fermi-op241b`:
+
+- **Case A (214 tests)**: appended `std/syscall` + `std/string` + `std/io`
+  imports to every test that compile-stopped on `sys_open` / `str_data` /
+  `nanotime`. Idempotent (grep-then-append).
+- **Case B (3 source files)**: added missing project imports so Case-B
+  tests can see transitively-referenced symbols:
+  - `src/kg/multi_kg_manager.nova` += `import "cross_kg_references.nova"`
+    (unblocks `xref_src_kg`).
+  - `src/federation/gossip.nova` += `import "./gossip_relay.nova"`
+    (unblocks `relay_stats_line`).
+  - `src/persistence/snapshot_disk.nova` += `import "../parts/soul/state.nova"`
+    (unblocks `soul_mood_valence`).
+- **Case C (1 typo)**: `tests/unit/test_image_hog.nova:576` call site
+  renamed `test_l2_hys_block_sum_of_squares_near_million` →
+  `test_l2_hys_block_sum_of_squares_in_normalized_range` (actual fn at :297).
+
+**Sweep tally**: 170 CLEAN → 372 CLEAN (+202); 271 ripple → 1 ripple
+(the lone remaining undeclared-callee is a secondary unmasked typo —
+see follow-up queue below); 37 pre-existing non-CLEAN preserved; 0
+regressions (no test that was CLEAN before became non-CLEAN).
+
+### Follow-up queue — Bug #8 unmasked latent failures (69 tests)
+
+The import fix revealed 69 pre-existing bugs the null-callee masked.
+Grouped by surface; each is deferred to a dedicated session, not
+scope-creep on this sweep.
+
+Secondary typo (compile-stage, 1 test):
+- `test_image_records` → undeclared callee
+  `test_parse_text_agrees_with_parse_bytes`; actual fn at :274 is
+  `test_parse_text_refuses_ascii_non_image`. Suspected rename-skew.
+
+Verb-count drift (Case B unmask, flagged in Phase-1):
+- `test_admin_bake_child_verb` (19 pass, 1 FAIL — expected 51 verbs got 53).
+- `test_admin_emit_delta_verb` (23 pass, 1 FAIL — same root).
+
+Persistence / snapshot SEGV cluster (Case B unmask, flagged):
+- `test_snapshot_disk`, `test_snapshot_delta`, `test_snapshot_episodic` SEGV.
+- `test_snapshot_attestation` (59 pass, 7 FAIL), `test_snapshot_replication`
+  (61 pass, 12 FAIL), `test_snapshot_synapses` (85 pass, 4 FAIL).
+
+Gossip (Case B unmask, flagged):
+- `test_gossip` (32 pass, 2 FAIL — identical-seed and dead-peer picks).
+- `test_gossip_dtls_shim` (56 pass, 1 FAIL).
+- `test_gossip_dtls_streams` (compile output truncated — needs re-run).
+
+DTLS / transport / crypto surface (Case A unmask):
+- `test_dtls12` (443 pass, 76 FAIL).
+- `test_dtls_client_flight`, `test_dtls_server_flight`, `test_dtls_ext_parse`
+  (compile-stage output truncated).
+- SEGVs: `test_fed_daemon_transport`, `test_nat_traversal`,
+  `test_p256_keypair_load`, `test_truststore_dir`, `test_tool_goal_plan`,
+  `test_tool_use`, `test_merkle_signing`.
+- Assertion fails: `test_merkle` (3), `test_secure_aggregation` (2),
+  `test_secure_channel` (1), `test_ice_turn` (1),
+  `test_capability_rate_limit` (3), `test_capability_wire` (6),
+  `test_byzantine_aggregation` (2), `test_noise_xk` (2),
+  `test_ed25519` (1), `test_p256` (1).
+- Compile-truncated: `test_md5`, `test_sha1`.
+
+Audio / image / NL assertion failures:
+- `test_audio_synth` (20), `test_audio_tts` (4), `test_speaker_id` (10),
+  `test_voice_clone` (8), `test_nl_generate` (23), `test_nl_query` (4),
+  `test_nl_pipeline_gap_recording` (1), `test_output_generation` (2),
+  `test_word_atoms` (7), `test_pattern_pack` (1).
+- Runtime index-out-of-bounds: `test_syntax_atoms`, `test_graph_clustering`,
+  `test_louvain`.
+
+Cognitive / meta / planner / misc:
+- `test_cognitive_router` (8), `test_meta_observer_feedback` (17),
+  `test_constitutional_filter` (4), `test_self_confidence_verb` (1),
+  `test_self_model_query` (2), `test_proof_checker` (10),
+  `test_episodic` (1), `test_learn_pipeline` (1),
+  `test_realtime_pacer` (6), `test_neighborhood_activation` (1),
+  `test_dp_budget_ui` (3), `test_distributed_query` (6),
+  `test_dr_async_fetch` (4), `test_leader_election` (9),
+  `test_internet_fetch` (4), `test_table` (9),
+  `test_override_mechanism` (1), `test_update_apply_verb` (1),
+  `test_pack_registry` (9), `test_bignum_2048` (4), `test_bignum_256` (4).
+
+These are PRE-EXISTING bugs. The import fix did not CAUSE them — it
+made them VISIBLE for the first time since Bug #8's compile-stop ripple
+hid everything downstream. Honest-defer policy: ship the import closure,
+schedule the latent class as a dedicated multi-session triage round.
