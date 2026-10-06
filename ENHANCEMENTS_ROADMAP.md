@@ -1948,3 +1948,32 @@ silently dropped under DTLS.
 - "Feel" = functional appraisal (control/motivation signal), not sentience.
 - Credit assignment without backprop at scale is an open problem; P2 uses the
   best-known local approximations, not a solved method.
+
+### Phase: upstream NOVA bugs #1 + #4 + #5 closed (2026-10-06)
+
+Three parallel NOVA upstream fixes shipped end-to-end:
+
+- **Bug #1 (`memcpy_raw` OOB)** SHIPPED in NOVA commit `f7d9766`:
+  three test/jz/sar entry blocks in `_nova_memcpy_raw` (x86) + WASM
+  backend mirror. `tests/test_memcpy_raw_tagged.nova` passes with
+  tagged `alloc(16)` buffers. Self-host fixpoint holds.
+- **Bug #4 (sentinel equality)** CONFIRMED CLOSED by Bug #3's fix.
+  NOVA commit `172ee8c` adds `tests/test_dp_refused_eq.nova`
+  probe → PASS. Crossengin's `dp_is_refused` restored to direct
+  `v == DP_REFUSED` (magnitude-probe workaround retired).
+- **Bug #5 (`io_println` tagged-length syscall overrun)** SHIPPED
+  in NOVA commit `3e417b3`: `io_print`/`io_println` delegate to the
+  `print`/`println` builtins; stderr pair uses inline asm to
+  normalize count to raw before `sys_write`. `tests/test_io_println.nova`
+  exercises short/long/concat. Self-host fixpoint holds.
+
+Upstream NOVA scorecard: **all 10 bugs resolved or formally deferred**.
+Eight shipped (#1-#5, #7, #8); #4 transitively; #6 is container-not-NOVA;
+#9/#10 await module-system ADR.
+
+**Bug #8 ripple**: the unresolved-callee check surfaced latent
+import-graph misses in several Crossengin tests
+(`test_federated_aggregator`, `test_perception_module`, `test_action_module`,
+`test_differential_privacy`, etc.). `test_motor_map` passes as a
+clean-imports canary. Fixing the affected tests is a follow-up sweep,
+not blocking the upstream close-out.

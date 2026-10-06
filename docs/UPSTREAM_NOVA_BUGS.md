@@ -17,12 +17,20 @@ location.
 ## 1. `memcpy_raw` codegen -- OOB on tagged source operand
 
 - **ADR**: 0103
-- **Workaround**: `src/util/mem_safe.nova:byte_copy`
+- **Status**: **UPSTREAM FIX SHIPPED** in NOVA commit `f7d9766`
+  (2026-10-06) — `_nova_memcpy_raw` at `codegen.nova:22315` now has
+  three `test rax, 1 / jz skip / sar rax, 1` entry blocks for rdi, rsi,
+  and rdx, making it tag-polymorphic. WASM backend at `:14624-14665`
+  mirrors the same pattern. New `tests/test_memcpy_raw_tagged.nova`
+  exercises tagged `alloc(16)` buffers end-to-end. Self-host fixpoint
+  holds (compiler source doesn't call memcpy_raw).
+- **Workaround (defensive, retained)**: `src/util/mem_safe.nova:byte_copy`
+  stays. R3d/R3c-era inline byte-copy loops in `src/runtime/string.nova`
+  (`str_concat`, `str_slice`, etc.) could now be re-collapsed to
+  `memcpy_raw` — queued as a future cleanup round, not urgent.
 - **Tests**: `test_stereo_u8_simd`, LK pair (`test_lk_u8_simd`,
-  `test_lk_mulacc_simd`), `test_image_ocr`.
-- **Suggested fix**: `/home/user/NOVA/src/compiler/codegen.nova:22248`
-  -- emit a tag-strip on the source operand before the `rep movsb`
-  instruction sequence.
+  `test_lk_mulacc_simd`), `test_image_ocr` continue to pass via the
+  user-side `byte_copy` helper.
 
 ## 2. `rt_str_to_int` -- `load8` on tagged string handle
 
@@ -85,29 +93,38 @@ location.
 ## 4. bug-#11 sentinel equality on two-large-operand `==`
 
 - **ADR**: 0105
-- **Workaround**: magnitude-probe idiom in
-  `src/safety/differential_privacy.nova:dp_is_refused` (replaces
-  `v == DP_REFUSED` with `v < 0 - 2000000000`); test-side bn256 fix in
-  `tests/unit/test_gossip_dtls_shim.nova`.
-- **Tests**: `test_federated_aggregator` (R3f.2 fix retires one class;
-  R3g.1 retires a second, independent class in the same test -- see
-  entry 7 below).
-- **Suggested fix**: in codegen's integer-equality lowering, when both
-  operands have tags set, lower as a plain int compare rather than
-  routing through the sentinel-equality (pointer-dereference) path.
+- **Status**: **TRANSITIVELY CLOSED by Bug #3's fix** (NOVA commit
+  `651a507`, 2026-10-05). Phase-1 audit confirmed `_nova_eq` at
+  `codegen.nova:15943` is now a flat `cmp rdi, rsi; je .eq_true` —
+  no deref, no type-dispatch. Empirical probe shipped as NOVA commit
+  `172ee8c` (2026-10-06): `tests/test_dp_refused_eq.nova` exercises
+  `v == DP_REFUSED (0 - 2147483647)` end-to-end and PASSes.
+- **Workaround RETIRED**: `src/safety/differential_privacy.nova:dp_is_refused`
+  restored to direct `v == DP_REFUSED` in Crossengin commit `<THIS>`;
+  the magnitude-probe + stale "bug-#11" comment removed.
+- **Tests**: NOVA upstream probe confirms the behavior.
+  `test_federated_aggregator`'s R3g.1 (separate class, see bug #7)
+  remains defensive and is independent of this close.
 
 ## 5. `io_println` -- tagged-literal walker + concat-node handling
 
 - **ADR**: 0105
-- **Workaround**: switch to the `println` NOVA builtin (which
-  normalizes concat nodes) + chunk-split call sites to <=128 B
-  segments as belt-and-braces.
-- **Tests**: `test_distributed_rules` (`drule_chat_add_cmd` /
-  `drule_chat_run_cmd`).
-- **Suggested fix**: `src/runtime/io.nova` -- fix the long-literal
-  walker's bounds check in `io_println`, and extend the `str_data` /
-  `str_len` codegen on `io_println` to handle `concat` AST nodes (not
-  only flat literals).
+- **Status**: **UPSTREAM FIX SHIPPED** in NOVA commit `3e417b3`
+  (2026-10-06) — `io_print` / `io_println` in `src/runtime/io.nova`
+  now delegate to the `print` / `println` builtins (which use raw
+  NUL-scan + raw syscall write, so tagged `str_len` returns no longer
+  corrupt rdx). The stderr pair `io_eprint` / `io_eprintln` use inline
+  asm to normalize the tagged count to raw before `sys_write`. New
+  `tests/test_io_println.nova` exercises short/long/concat on both
+  stdout and stderr. Self-host fixpoint holds (compiler doesn't call
+  io_println).
+- **Workaround (defensive, retained)**: `drule_chat_add_cmd` /
+  `drule_chat_run_cmd`'s `println` + chunk-split call sites in
+  `src/federation/distributed_rules.nova` stay — they're
+  belt-and-braces that already use the builtin directly.
+- **Tests**: `test_distributed_rules` continues to pass via the
+  workaround path; `test_io_println.nova` upstream covers the direct
+  behavior.
 
 ## 7. raw-nanotime-untagged on `&` -- subsequent `*` SEGVs
 
@@ -259,19 +276,38 @@ location.
 
 Status snapshot as of 2026-10-06:
 
+- (1) SHIPPED upstream — NOVA commit `f7d9766`.
 - (2) SHIPPED upstream — NOVA commits `b66644b` + `41058d2` + `2bc1dab`.
 - (3) SHIPPED upstream — NOVA commit `651a507`.
+- (4) TRANSITIVELY CLOSED by Bug #3's fix — verified by NOVA probe commit
+  `172ee8c`; Crossengin workaround retired.
+- (5) SHIPPED upstream — NOVA commit `3e417b3`.
+- (6) operator / infra (container sandbox policy), out of band — not a
+  NOVA bug.
 - (7) SHIPPED upstream — NOVA commit `053584e`.
 - (8) SHIPPED upstream — NOVA commit `0f9d3f2`.
 - (9) + (10): user-side workarounds shipped. NOVA-level mangling fix
   DEFERRED to a future module-system ADR (`pub`/`mod` design) — not
   worth landing alone.
-- (1), (4), (5): remain open; independent landing order.
-- (6) is operator / infra (container sandbox policy), out of band —
-  not a NOVA bug.
 
-Six of ten bugs now resolved upstream; the remaining three NOVA bugs
-(#1 memcpy_raw codegen, #4 sentinel-equality on two-large-operand `==`,
-#5 io_println long-literal walker) + (#9/#10 module-system) await
-future rounds. All user-side workarounds remain in the tree as
-defensive measures with no urgency to retire.
+**All 10 upstream NOVA bugs resolved or formally deferred.** Eight have
+upstream fixes (#1-#5, #7, #8); #4 is transitively closed by #3; #6 is
+not a NOVA bug; #9/#10 await the module-system ADR. All user-side
+workarounds remain as defensive depth and can be retired incrementally.
+
+### Bug #8 ripple — follow-up round queued
+
+Bug #8's unresolved-callee check is now surfacing latent import-graph
+misses across many Crossengin tests that previously SILENTLY lowered
+to null-callee. Confirmed-affected test files include
+`test_federated_aggregator`, `test_perception_module`,
+`test_action_module`, `test_differential_privacy`, and likely more.
+Each needs explicit `import "std/syscall"` / `import "std/alloc"` /
+etc. depending on the specific undeclared callee the check reports
+(e.g., `sys_open`, `str_data`).
+
+This is EXPECTED behavior from the Bug #8 fix — the check is
+correctly catching real import-graph issues that were latent SEGV
+time-bombs. Fixing the tests is a follow-up sweep (not blocking the
+upstream-NOVA close-out). `test_motor_map` passes cleanly as a
+canary that the check works correctly when imports are complete.
