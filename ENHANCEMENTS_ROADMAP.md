@@ -2158,3 +2158,69 @@ pipelines); no mandatory sweep queued.
   C5 string.nova sweep ripple audit (13 tests).
 - **Micro-fix sweep** — 11 single-FAIL tests (list in R1 block).
 - **C6** — cognitive/meta grab bag (20 tests, fragmented).
+
+### Latent-triage R3 — close C3 (gossip cluster)
+
+Phase-1 Explore diagnosis **falsified** two framings in the original
+C3 label simultaneously:
+
+- `relay_stats_line` is not involved in any failing gossip test (zero
+  hits over the three test files). The "C3 = gossip relay/dtls shim"
+  label refers to the SOURCE AREA, not a shared contract break.
+- `test_gossip_dtls_streams` is actually already green at tip
+  `82ae0c2` — the "compile output truncated" note was a stale
+  Phase-1 snapshot. (See silent-skip caveat below.)
+
+The two live failures split into two unrelated causes, all test-side,
+total 3 lines:
+
+- `tests/unit/test_gossip.nova:162` — `_pick_random_identical_seed`
+  check used bare `str_eq`; the companion source function
+  `gossip_alive_peers` returns byte-buffer-tagged addresses (companion
+  `src/federation/gossip.nova:855` already uses `str_eq_bytes`). Migrated.
+- `tests/unit/test_gossip.nova:174` — `_pick_random_excludes_dead_peers`
+  same shape; migrated.
+- `tests/unit/test_gossip_dtls_shim.nova:228-229` — Phase P R2
+  (ADR-0098) wired `gds_handshake_client`'s flight builder; the
+  pre-R2 short-circuit sentinel `"dtls-hs-flight-not-wired"` is
+  retired in favour of `"dtls-hs-send-ch"` on a bogus-fd ClientHello.
+  The companion server-side test (:243-244) was updated during R1
+  wire-in but the client-side literal was left behind. Updated the
+  expected tag + label + added a brief comment block mirroring the
+  server-side block.
+
+Per-test status:
+- `test_gossip`:            pre 2 FAIL / post OK (34 checks).
+- `test_gossip_dtls_shim`:  pre 1 FAIL / post OK (57 checks).
+- `test_gossip_dtls_streams`: unchanged (compiles + exits 0 silently).
+
+Canary spot-checks (motor_map, perception_module, action_module) +
+R2 trio (syntax_atoms, graph_clustering, louvain) all still PASS.
+
+Tally delta: 379 → 382 CLEAN / 37 pre-existing / 60 unmasked
+live-FAIL latent, plus 1 newly-documented silent-skip
+(`test_gossip_dtls_streams`).
+
+#### Side-channel discovery: silent-skip anomaly
+
+`test_gossip_dtls_streams.nova` has 18 `test_*` functions each calling
+`ce_eq`/`ce_check` + a `main()` that ends in
+`ce_summary("test_gossip_dtls_streams")`. A healthy sibling test (e.g.
+`test_syntax_atoms`) prints `<name>: OK (N checks)`. This one prints
+nothing after the compiler's `Compiled:` banner, yet exits 0 — i.e.
+all 18 test functions are skipped or no-op silently. Not a FAIL
+(doesn't contribute to the failing-tests count), but not actually
+testing either. Flagged as a separate latent for its own round:
+check whether `_gossip_send_all_maybe_dtls` (first callee) is
+no-oping, or the compiled binary is exiting pre-`main`.
+
+### Latent-triage queue (post-R3, newest first)
+
+- **R4 candidate** — micro-fix sweep (11 single-FAIL tests).
+- **R5 candidate** — C2 snapshot cluster (6 tests, 20-60 LOC):
+  `_snap_starts_with` recursion investigation.
+- **Silent-skip investigation** — `test_gossip_dtls_streams` and
+  any siblings exhibiting the "silent exit after compile" pattern.
+- **ADR-driven** — C4 DTLS12 completion plan (23 tests),
+  C5 string.nova sweep ripple audit (13 tests).
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
