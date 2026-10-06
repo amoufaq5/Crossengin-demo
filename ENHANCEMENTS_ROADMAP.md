@@ -2115,3 +2115,46 @@ Delta: +3 CLEAN tests. Tally **373 → 376 CLEAN / 37 pre-existing /
   `test_secure_channel`, `test_ice_turn`, `test_ed25519`, `test_p256`.
 - **C6** — cognitive/meta grab bag (20 tests, fragmented): queue
   per-test rounds after the cheaper clusters land.
+
+### Latent-triage R2 — close C7 (3 missed `str_eq → str_eq_bytes` sites)
+
+Phase-1 Explore diagnosis falsified the R1 "runtime index-OOB"
+hypothesis for C7. The runtime panic each test prints
+(`index out of bounds: 0`) is a secondary symptom in TEST code —
+unguarded `members[i]`/`out[i]` access after a soft-failing `ce_eq`
+on list length. The SOURCE bug in all three cases is a missed
+`str_eq → str_eq_bytes` migration (tail of R3b `4149c21`): tag-aware
+byte compares on data that round-trips through atom/kg-label storage.
+Bug #8's compile-stop ripple hid these three sites.
+
+Three one-line migrations:
+
+- `src/language/syntax_atoms.nova:50` — `_filler_for` (fixes
+  `test_syntax_atoms`).
+- `src/kg/graph_clustering.nova:282` — `_gc_extract_graph` cross-KG
+  guard (fixes `test_graph_clustering`).
+- `src/kg/louvain.nova:258` — `_lv_extract_graph` cross-KG guard
+  (fixes `test_louvain`).
+
+After the fix, `grep "\bstr_eq("` over `src/kg` returns zero hits
+and over `src/language` returns only the two literal-vs-literal
+`nl_generate.nova:97-98` calls (tag-safe by construction).
+
+Tally delta: 376 → 379 CLEAN / 37 pre-existing / 62 unmasked latent.
+
+C7 is now closed. Reclassified: not an index-OOB cluster but a
+3-site tail of the R3b `str_eq_bytes` migration cohort. The
+tree-wide ~100-call `str_eq(` population lives in dirs whose
+tests pass today (env-var checks, literal-vs-literal, tag-safe
+pipelines); no mandatory sweep queued.
+
+### Latent-triage queue (post-R2, newest first)
+
+- **R3 candidate** — C3 gossip (3 tests): cross-check against
+  `relay_stats_line` contract.
+- **R4+ candidate** — C2 snapshot cluster (6 tests, 20-60 LOC):
+  needs `_snap_starts_with` recursion investigation.
+- **ADR-driven** — C4 DTLS12 completion plan (23 tests) and
+  C5 string.nova sweep ripple audit (13 tests).
+- **Micro-fix sweep** — 11 single-FAIL tests (list in R1 block).
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
