@@ -788,6 +788,28 @@ five sub-passes:
    historical mapping restored; `type_safe.nova` constants rotated
    (`is_int_val: == 1`, `is_list_val: == 3`, `is_str_val: == 2`) and
    `test_type_of_probe` rewritten to pin the historical values.
+   **Upstream NOVA Bug #7 (nanotime raw-untag) SHIPPED** in NOVA
+   commit `053584e` (2026-10-06): `nanotime()` body in
+   `src/runtime/io.nova:252-258` ends on an asm block that tags rax
+   via `lea rax, [rax+rax+1]` before implicit return; new
+   `tests/test_nanotime_tag.nova` exercises `t & 0xFF`, `type_of`,
+   `m * 2`, `int_to_str(m)` — all PASS. R3g.1's `dp_new` seed
+   workaround (`epsilon_budget_milli + 7919`) remains defensive;
+   deterministic seed is a stability feature.
+   **Upstream NOVA Bug #8 (unresolved-callee SEGV) SHIPPED** in NOVA
+   commit `0f9d3f2` (2026-10-06): new `cg_fail(msg)` helper in
+   `codegen.nova`; AST_CALL (`:5064`) + `wasm_gen_expr` AST_CALL
+   both emit `ERROR: undeclared callee: <name>` + `exit(1)` when
+   an identifier can't resolve. New `test_fails_*` harness
+   convention in `tests/run_tests.sh` + fixture
+   `tests/test_fails_unresolved_call.nova`. Self-host fixpoint
+   zero false positives. R3g.2's `gds_extract_keys` shim remains.
+   **Upstream NOVA Bugs #9 + #10 (symbol mangling)**: DEFERRED to
+   a future module-system ADR (`pub`/`mod` design) — Phase-1
+   confirmed proper fix is ~115 LOC refactor across preprocessor +
+   lexer + parser + codegen call-resolution, not worth landing
+   alone. User-side renames (`_snap_starts_with`, `PROOF_CHECKER_TAG`)
+   remain the stable fix; no new collisions in the tree.
 2. **R3e.2 -- str_eq residual (D2, 1 test).** Migrate three
    `src/federation/snapshot_replication.nova` sites (`:340`, `:350`,
    `:489`) to `str_eq_bytes`. `test_fed_daemon_replication` flips

@@ -112,29 +112,44 @@ location.
 ## 7. raw-nanotime-untagged on `&` -- subsequent `*` SEGVs
 
 - **ADR**: 0106
-- **Workaround**: `src/safety/differential_privacy.nova:dp_new`
-  derives the LCG seed from `epsilon_budget_milli + 7919` (an
-  already-tagged caller-supplied int) instead of
-  `nanotime() & _LCG_MASK`. Deterministic seed is acceptable for the
-  Minimum Viable DP; `dp_new_seeded` remains for callers that need
-  to pin the stream.
-- **Tests**: `test_federated_aggregator` (R3g.1).
-- **Suggested fix**: `/home/user/NOVA/src/compiler/codegen.nova` --
-  re-tag the result of `&` (and other bitwise ops) when either operand
-  is a raw int from `nanotime()` / other asm-returning builtins, OR
-  tag `nanotime()`'s return value itself.
+- **Status**: **UPSTREAM FIX SHIPPED** in NOVA commit `053584e`
+  (2026-10-06) — `nanotime()` body in `src/runtime/io.nova:252-258`
+  now ends on an asm block that tags rax via `lea rax, [rax+rax+1]`
+  before implicit return. New test `tests/test_nanotime_tag.nova`
+  exercises `t & 0xFF`, `type_of(m) == 1`, `m * 2`, `int_to_str(m)` —
+  all pre-fix SEGV paths, now PASS.
+- **Workaround (defensive, retained)**:
+  `src/safety/differential_privacy.nova:dp_new` still seeds from
+  `epsilon_budget_milli + 7919` instead of `nanotime() & _LCG_MASK`.
+  No urgency to retire — deterministic seed is a stability feature
+  for the Minimum Viable DP.
+- **Tests**: `test_federated_aggregator` (R3g.1) continues to pass
+  via the workaround path; `test_nanotime_tag.nova` upstream covers
+  the direct behavior.
 
 ## 8. unresolved-callee SEGV on import-graph miss
 
 - **ADR**: 0106
-- **Workaround**: `src/federation/gossip_dtls_shim.nova` defines a
-  shim-local `gds_extract_keys`; `tests/unit/test_gossip_dtls_shim.nova`
-  switches to it (`gossip_dtls_extract_keys` lived in `gossip.nova`,
-  which the test does not import).
-- **Tests**: `test_gossip_dtls_shim` (R3g.2).
-- **Suggested fix**: NOVA's whole-program link should FAIL compilation
-  on an unresolved call rather than lower it to a null callee that
-  SEGVs on entry.
+- **Status**: **UPSTREAM FIX SHIPPED** in NOVA commit `0f9d3f2`
+  (2026-10-06) — new `cg_fail(msg)` helper in `codegen.nova`;
+  AST_CALL at `:5064` and `wasm_gen_expr` AST_CALL both now emit
+  `ERROR: undeclared callee: <name>\n` + `exit(1)` when an
+  identifier can't resolve to {known fn, struct ctor, global,
+  local, param}. New `test_fails_*` harness convention in
+  `tests/run_tests.sh` + fixture `tests/test_fails_unresolved_call.nova`
+  exits 3 with the expected error. Self-host fixpoint zero
+  false positives — NOVA's own source has no latent unresolved
+  calls.
+- **Workaround (defensive, retained)**:
+  `src/federation/gossip_dtls_shim.nova`'s shim-local
+  `gds_extract_keys` remains in place. The upstream fix now
+  surfaces the import-graph miss at compile time with a clean
+  error, so new code written against the fixed NOVA will catch
+  the typo instead of SEGV'ing — but the existing shim stays
+  because retiring it has no behavioral benefit.
+- **Tests**: `test_gossip_dtls_shim` (R3g.2) continues to pass
+  via the shim; `test_fails_unresolved_call.nova` upstream
+  covers the direct behavior.
 
 ## 9. Assembler rejects duplicate module-private `_starts_with` symbol
 
@@ -171,11 +186,15 @@ location.
 - **Suggested fix**: NOVA compiler should mangle module-private names
   with the module path (e.g.
   `_nova_persistence_snapshot_disk__starts_with`). Alternatively a
-  loader-side allow-list of "weak" module-private symbols. The
-  user-side rename in option (a) above is a one-line fix that landed
-  via this commit; it unblocks `crossengin_daemon.nova`. The compiler
-  mangling fix is still desirable because the same shape surfaces on
-  module-level `let` globals too (see bug #10).
+  loader-side allow-list of "weak" module-private symbols.
+- **Status (2026-10-06)**: **DEFERRED at NOVA level to a module-system
+  ADR.** Phase-1 scoping (`a3c06528587c2f6cf`, `adcdffbf8ca150780`)
+  confirmed the proper fix is ~115 LOC spanning preprocessor + lexer +
+  parser + codegen call-resolution refactor, with no existing visibility
+  keyword to anchor the design. Not worth landing alone — belongs with a
+  future `pub`/`mod` design round. User-side renames (option (a) +
+  bug #10's rename) have already shipped as the long-term fix, and
+  no new collisions have arisen in the tree since.
 
 ## 10. Assembler rejects duplicate module-private `_g_PC_TAG` symbol
 
@@ -215,10 +234,12 @@ location.
   compiler should mangle module-level `let` names with the module
   path (e.g. `_g_nova_parts_reasoning_proof_checker__PC_TAG`). The
   user-side rename in option (a) above has LANDED (closes this bug
-  as a workaround); the compiler mangling fix is still desirable
-  because the `_starts_with` / `PC_TAG` family of collisions
-  will keep arising for any future module-private symbol that two
-  modules happen to pick the same name for.
+  as a workaround).
+- **Status (2026-10-06)**: **DEFERRED at NOVA level alongside bug #9.**
+  Same scoping conclusion — part of the module-system ADR, not a
+  standalone fix. User-side rename + dead-constant removal (`85667a7`)
+  have fully retired the collision class on this side regardless of
+  upstream.
 
 ## 6. Sandbox O_CREAT policy (container, not NOVA)
 
@@ -236,15 +257,21 @@ location.
 
 ## Retirement order
 
-(3) SHIPPED upstream (NOVA commit `651a507`, 2026-10-05) — historical
-`type_of()` mapping restored; `type_safe.nova` wrapper preserved as a
-thin stable-API shim with constants rotated to the historical values.
-(2) SHIPPED upstream (NOVA commit `b66644b`, 2026-10-05) — user-side
-migration remains defensive. (1) can land independently. (4) and (5)
-are independent of the others. (6) is operator / infra, out of band.
-(9) + (10) workarounds BOTH SHIPPED: `_starts_with` renamed in
-`snapshot_disk.nova` (daemon unblocked), `PC_TAG` renamed to
-`PROOF_CHECKER_TAG` in `proof_checker.nova` (chat unblocked). Both
-binaries now LINK. Upstream compiler mangling fix still desirable for
-defense-in-depth — same shape will recur for any future module-private
-name chosen by two modules.
+Status snapshot as of 2026-10-06:
+
+- (2) SHIPPED upstream — NOVA commits `b66644b` + `41058d2` + `2bc1dab`.
+- (3) SHIPPED upstream — NOVA commit `651a507`.
+- (7) SHIPPED upstream — NOVA commit `053584e`.
+- (8) SHIPPED upstream — NOVA commit `0f9d3f2`.
+- (9) + (10): user-side workarounds shipped. NOVA-level mangling fix
+  DEFERRED to a future module-system ADR (`pub`/`mod` design) — not
+  worth landing alone.
+- (1), (4), (5): remain open; independent landing order.
+- (6) is operator / infra (container sandbox policy), out of band —
+  not a NOVA bug.
+
+Six of ten bugs now resolved upstream; the remaining three NOVA bugs
+(#1 memcpy_raw codegen, #4 sentinel-equality on two-large-operand `==`,
+#5 io_println long-literal walker) + (#9/#10 module-system) await
+future rounds. All user-side workarounds remain in the tree as
+defensive measures with no urgency to retire.
