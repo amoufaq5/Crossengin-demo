@@ -2065,3 +2065,53 @@ These are PRE-EXISTING bugs. The import fix did not CAUSE them — it
 made them VISIBLE for the first time since Bug #8's compile-stop ripple
 hid everything downstream. Honest-defer policy: ship the import closure,
 schedule the latent class as a dedicated multi-session triage round.
+
+## Latent-triage — triage of 68 unmasked latents
+
+Phase-1 Explore triage grouped the 68 live latent failures into
+7 clusters (one of the original 69 — the `test_image_records`
+duplicate-symbol typo — was already closed by `ac91e4d`):
+
+| Cluster | Count | LOC est. | Shape |
+|---|---|---|---|
+| C1 — Verb-count drift | 3 | 3 lines | mechanical — tests lag `rpc_verb_names()` |
+| C2 — Snapshot `_snap_starts_with` recursion | 6 | 20-60 | needs recursion / helper audit |
+| C3 — Gossip relay/dtls shim | 3 | 10-30 | `relay_stats_line` contract |
+| C4 — DTLS12 handshake/crypto | 23 | high | ADR-driven, multi-session |
+| C5 — Audio/NL assertion | 13 | med-high | string.nova sweep ripple audit |
+| C6 — Cognitive/meta grab bag | 20 | fragmented | per-test rounds |
+| C7 — Runtime index-OOB | 3 | low | len-check-missing idiom |
+
+### Latent-triage R1 — close C1 (verb-count drift)
+
+Shipped as a 3-line mechanical fix. R111/R113 added two verbs each to
+`rpc_verb_names()` at `src/nl/rpc_verbs.nova:5214` (now 53 total);
+`test_child_mode_wire:223` was updated to 53 at the time, but three
+sibling tests kept the old constants:
+
+- `tests/unit/test_admin_bake_child_verb.nova:33` — 51 → 53.
+- `tests/unit/test_admin_emit_delta_verb.nova:25` — 43 → 53.
+- `tests/unit/test_update_apply_verb.nova:44` — 43 → 53.
+
+All three tests pre: FAIL on the verb-count assertion only; post: OK.
+Delta: +3 CLEAN tests. Tally **373 → 376 CLEAN / 37 pre-existing /
+65 unmasked latent**. Zero cross-test risk; no NOVA-side changes.
+
+### Latent-triage queue (post-R1, newest first)
+
+- **R2 candidate** — C7 runtime index-OOB (3 tests:
+  `test_syntax_atoms`, `test_graph_clustering`, `test_louvain`): low
+  LOC, needs per-test idiom scan for a `len`-check-missing shape.
+- **R3 candidate** — C3 gossip (3 tests): cross-check against
+  `relay_stats_line` contract.
+- **R4+ candidate** — C2 snapshot cluster (6 tests, 20-60 LOC):
+  needs `_snap_starts_with` recursion investigation.
+- **ADR-driven** — C4 DTLS12 completion plan (23 tests) and
+  C5 string.nova sweep ripple audit (13 tests).
+- **Micro-fix sweep** (11 single-FAIL tests): `test_pattern_pack`,
+  `test_episodic`, `test_self_confidence_verb`,
+  `test_neighborhood_activation`, `test_override_mechanism`,
+  `test_learn_pipeline`, `test_nl_pipeline_gap_recording`,
+  `test_secure_channel`, `test_ice_turn`, `test_ed25519`, `test_p256`.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented): queue
+  per-test rounds after the cheaper clusters land.
