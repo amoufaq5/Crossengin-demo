@@ -260,6 +260,64 @@ location.
   (`85667a7`) have fully retired the collision class on this side
   regardless of upstream.
 
+## 12. Syscall wrapper tagging audit (sys_open, sys_rename, sys_read, downstream)
+
+- **ADR**: none yet — needs design round for a comprehensive sweep.
+- **Workaround**: none; the 4 affected tests (C2b snapshot cluster) stay
+  in the deferred bucket until the sweep lands.
+- **Tests**: `test_snapshot_disk`, `test_snapshot_disk_full`,
+  `test_snapshot_delta`, `test_snapshot_episodic` (SEGV at
+  `snap_section(snap_load(path), SEC_SOUL)[0]` because snap_load
+  returns 0 because snap_write_durable fails upstream).
+- **Context**: R6b investigation (`a09e8751848a3e5eb` Explore agent)
+  identified `sys_open` as passing tagged `flags`/`mode` to the kernel
+  (same shape as Bug #11): `O_WRONLY|O_CREAT|O_TRUNC = 0x241` becomes
+  `0x483 = (0x241<<1)|1` which the kernel decodes as
+  `O_ACCMODE|O_EXCL|O_APPEND` -- no `O_CREAT` bit, so the tmp-file open
+  fails with ENOENT. Fixing that un-masks three further issues at the
+  syscall-wrapper layer:
+  * `sys_rename` returns raw 0 (success) but caller compares to
+    tagged 0 (which is in-memory 1), so `rr != 0` is always TRUE and
+    the error branch unlinks + returns 0.
+  * `sys_read` passes `buf` (tagged alloc pointer) and `count` (tagged
+    literal) raw to the kernel; `read()` returns `-1 EFAULT` because
+    the buffer address is non-canonical, and even if that were fixed
+    the raw byte-count return doesn't match the tagged values callers
+    expect.
+  * Downstream in `snap_read_text`: `store8(buf + m, 0)` and
+    `acc = acc + buf` both do raw-vs-tagged arithmetic on buffer
+    pointers; even with sys_read untagged, the per-chunk null
+    terminator writes to the wrong address and string-concat on a raw
+    buffer SEGVs (prior session's "NOVA `str_new` tagged-dst fix" item
+    describes the same underlying issue in `str_new`).
+- **R6b outcome**: Investigation found all 4 issues above. Patched
+  `sys_open` + `sys_rename` + `sys_read` with the standard
+  `test rax, 1 / jz / sar rax, 1` untag dance and return-value tagging
+  for `sys_rename`. The combined patch allowed snap_write_durable to
+  WRITE successfully (strace confirms correct `open`/`write`/`rename`
+  syscalls) but snap_load still SEGV'd in `snap_read_text`'s
+  `store8(buf + m, 0)` because `+` on a tagged pointer + raw int
+  gives a non-canonical address. Un-masking `sys_open` also broke
+  `test_decision_log_durable` + `test_chat_state_persistence` +
+  `test_fed_daemon_transport` -- all three previously passed via
+  sandbox-skip (which relied on `_tmp_write_works()` failing because
+  of the tagged flags); fixing flags lets them proceed to the next
+  failure. Full patch reverted to avoid shipping a net regression.
+- **Suggested fix (multi-round sweep)**: Audit every `src/runtime/
+  syscall.nova` wrapper for (a) input untagging (`sar reg, 1` after
+  the `mov reg, [rbp-N]`) and (b) return tagging (`lea rax, [rax +
+  rax + 1]` after `syscall`, bracketed with a `js` for negative
+  errno returns). Separately, audit `src/runtime/string.nova` /
+  `src/runtime/alloc.nova` for buffer+count arithmetic (`str_new`,
+  `_nova_add` on tagged pointers, `store8`/`load8` on computed
+  addresses). Together these likely represent 15-30 LOC in NOVA but
+  need the whole call-graph audit before landing, OR a NOVA codegen
+  change that auto-emits the untag/tag dance for asm-only fns.
+- **Status (2026-10-06)**: DOCUMENTED — no fix shipped in R6b
+  because the surface spans 4+ wrappers and a downstream Crossengin
+  idiom that needs rewrite OR a NOVA str_new fix. Queued for a
+  dedicated multi-session sweep round.
+
 ## 11. `_sys_clock_gettime_monotonic` passes tagged pointer -- clock_gettime EFAULTs silently
 
 - **ADR**: none (direct 1-LOC asm fix).
@@ -334,11 +392,19 @@ Status snapshot as of 2026-10-06:
 - (11) SHIPPED upstream in R6 (nanotime EFAULT) — closes `test_ed25519`,
   `test_bignum_256`, `test_bignum_2048` + 3 of 6 FAILs in
   `test_realtime_pacer`.
+- (12) INVESTIGATED in R6b (syscall wrapper tagging audit) — all 4
+  specific wrapper bugs identified empirically (sys_open flags/mode,
+  sys_rename raw return, sys_read EFAULT, snap_read_text downstream);
+  patches drafted + verified correct but reverted because full close
+  needs multi-wrapper sweep + Crossengin snap_read_text idiom change
+  OR NOVA str_new fix. Deferred to dedicated multi-session sweep.
 
-**All 11 upstream NOVA bugs resolved or formally deferred.** Nine have
-upstream fixes (#1-#5, #7, #8, #11); #4 is transitively closed by #3;
-#6 is not a NOVA bug; #9/#10 await the module-system ADR. All user-side
-workarounds remain as defensive depth and can be retired incrementally.
+**All 12 upstream NOVA bugs resolved, formally deferred, or
+documented for sweep.** Nine have upstream fixes (#1-#5, #7, #8, #11);
+#4 is transitively closed by #3; #6 is not a NOVA bug; #9/#10 await
+the module-system ADR; #12 awaits a dedicated syscall-sweep round.
+All user-side workarounds remain as defensive depth and can be retired
+incrementally.
 
 ### Bug #8 ripple — follow-up round queued
 

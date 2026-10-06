@@ -2447,3 +2447,61 @@ Also updated `docs/UPSTREAM_NOVA_BUGS.md`:
   `_raw_imul_add` tagged-b cleanup (cosmetic), `test_match_expr`
   parser bug, re-collapse string.nova inline byte-copies, Phase R6+,
   real-socket DTLS roundtrip.
+
+### Latent-triage R6b — C2b snap_save investigation (zero shipped)
+
+Phase-1 Explore (`a09e8751848a3e5eb`) correctly identified `sys_open`
+passing tagged `flags`/`mode` to the kernel as the SURFACE root cause
+of the 4 C2b SEGVs. Strace confirmed `O_WRONLY|O_CREAT|O_TRUNC =
+0x241` arriving as `0x483 = (0x241<<1)|1` → no `O_CREAT` bit → ENOENT.
+Agent proposed a 10-LOC untag dance in `sys_open`.
+
+Experimental landing scope grew as un-masking exposed more layers:
+
+1. **sys_open flags/mode** (agent's diagnosis) — fixed with the
+   standard `test/jz/sar` untag dance. Verified in strace: open now
+   succeeds.
+2. **sys_rename raw return** — `snap_write_durable`'s `if rr != 0`
+   compares raw kernel return (0) against tagged-literal 0 (in-memory
+   1), always TRUE → error branch. Fixed with return-tag epilogue
+   `lea rax, [rax+rax+1]`.
+3. **sys_read EFAULT + raw count/return** — buf is tagged alloc,
+   count is tagged literal → kernel got `0x27863481`/`8193` → EFAULT.
+   Fixed inputs with untag dance; return tagged for caller
+   arithmetic.
+4. **snap_read_text downstream** — even with sys_read fixed,
+   `store8(buf + m, 0)` SEGV'd because tagged-ptr + tagged-int
+   arithmetic doesn't normalize cleanly; fallback to `str_new(buf, m)`
+   also SEGV'd (prior-session's known "NOVA `str_new` tagged-dst"
+   issue).
+
+Un-masking also regressed `test_decision_log_durable`,
+`test_chat_state_persistence`, `test_fed_daemon_transport` — all
+three had been passing via sandbox-skip (their `_tmp_write_works()`
+probe failed because of tagged flags; fixing flags lets them proceed
+to the next downstream failure).
+
+**Outcome**: Full NOVA patch reverted. R6b ships zero fixes. All 4
+root causes documented in `docs/UPSTREAM_NOVA_BUGS.md §12` as a
+dedicated sweep-round target. The sweep needs: (a) full syscall
+wrapper audit (input untag + return tag), (b) Crossengin
+`snap_read_text` rewrite OR NOVA `str_new` fix for the downstream
+buffer arithmetic. Likely 15-30 LOC in NOVA + 5-10 in Crossengin,
+multi-session effort.
+
+**Tally delta**: 397 CLEAN unchanged / 35 pre-existing unchanged /
+48 live-FAIL latent unchanged. Baseline preserved; no regressions.
+
+NOVA repo state: clean (no commits in R6b). Crossengin repo: docs
+update only (UPSTREAM §12 + this ROADMAP block).
+
+### Latent-triage queue (post-R6b)
+
+- **R7** — `test_nl_pipeline_gap_recording` source wiring regression.
+- **R8** — `test_realtime_pacer` residual 3 FAILs.
+- **R9+ (multi-session)** — NOVA Bug #12 syscall wrapper sweep +
+  str_new fix / snap_read_text rewrite → closes C2b (4 tests) +
+  likely several other file-I/O-dependent SEGVs.
+- **Silent-skip** — `test_gossip_dtls_streams`.
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
