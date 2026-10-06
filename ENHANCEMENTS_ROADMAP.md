@@ -2315,3 +2315,71 @@ Tally delta: 382 → 391 CLEAN / 37 pre-existing / 51 live-FAIL latent
 - **C6** — cognitive/meta grab bag (20 tests, fragmented).
 - **Potential codebase-hygiene** — tree-wide `str_eq → str_eq_bytes`
   sweep (~70 remaining sites, mostly benign env-literals).
+
+### Latent-triage R5 — close C2a (snapshot Shape-A sub-cluster)
+
+Phase-1 Explore diagnosis **falsified** the stated `_snap_starts_with`
+recursion hypothesis: that fn at `src/persistence/snapshot_disk.nova:1790`
+is a plain iterative byte-compare with 11 callers inside
+`snap_from_text`'s v2 key dispatch — none of the 6 FAIL traces reach
+it on the hot path.
+
+The cluster splits into two sub-clusters with distinct roots:
+
+**C2a (shipped this round)** — pure Shape-A `str_eq → str_eq_bytes`
+migrations on test side (3 files, 24 sites, bulk `replace_all`):
+
+- `tests/unit/test_snapshot_attestation.nova` — 8 sites.
+- `tests/unit/test_snapshot_replication.nova` — 12 sites.
+- `tests/unit/test_snapshot_synapses.nova` — 4 sites.
+
+Perfect 23:23 match between pre-fix failing checks and `str_eq(` call
+counts across the 3 files.
+
+Per-test status:
+- test_snapshot_attestation:  pre 7 FAIL / post OK (66 checks).
+- test_snapshot_replication:  pre 12 FAIL / post OK (73 checks).
+- test_snapshot_synapses:     pre 4 FAIL / post OK (89 checks).
+
+Also discovered mid-triage: **`test_snapshot_disk_full`** is a bonus
+7th cluster member (not in Phase-1's list) that fails with the
+identical signature as `test_snapshot_disk`. Rides along with C2b.
+
+**C2b (deferred to R6b)** — Shape-D source regression in `snap_save`
+path (4 tests SEGV cascade):
+- `test_snapshot_disk`           — root SEGV, snap_save returns 0.
+- `test_snapshot_disk_full`      — same root (bonus discovery).
+- `test_snapshot_delta`          — cascades from same root.
+- `test_snapshot_episodic`       — same root.
+
+Hypothesis tested experimentally this round: 2-line
+`str_eq → str_eq_bytes` migration at `src/persistence/snapshot_writer.nova:321,350`
+(sentinel-equality on `""` meta slots). Verified: the 2-line fix did
+NOT close any of the 4 SEGV tests. Reverted per honest-reporting
+policy. Full isolation work needed — binary-search inside `snap_save`
+→ `snap_write_durable` and/or `snap_to_text`'s Merkle recompute path
+with env probes.
+
+Canary spot-checks (motor_map, perception_module, action_module,
+R1/R2/R3/R4 cohorts) all still PASS.
+
+Tally delta: 391 → 394 CLEAN / 37 pre-existing / 48 live-FAIL latent
++ 1 silent-skip + 3 deferred-source-regression (added: C2b 4 tests —
+reclassified: all 4 are the same `snap_save` SEGV root, so 1 round
+should close all 4).
+
+### Latent-triage queue (post-R5, newest first)
+
+- **R6 candidate** — `test_ed25519` nanotime latency regression
+  (deferred from R4).
+- **R6b candidate** — C2b snapshot `snap_save` path isolation
+  (deferred from R5; 4 tests expected to close together under one
+  source fix).
+- **R7 candidate** — `test_nl_pipeline_gap_recording` source wiring
+  regression (deferred from R4).
+- **Silent-skip investigation** — `test_gossip_dtls_streams`.
+- **ADR-driven** — C4 DTLS12 completion plan (23 tests),
+  C5 string.nova sweep ripple audit (13 tests).
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Potential codebase-hygiene** — tree-wide `str_eq → str_eq_bytes`
+  sweep (~70 remaining sites, mostly benign env-literals).
