@@ -2383,3 +2383,67 @@ should close all 4).
 - **C6** — cognitive/meta grab bag (20 tests, fragmented).
 - **Potential codebase-hygiene** — tree-wide `str_eq → str_eq_bytes`
   sweep (~70 remaining sites, mostly benign env-literals).
+
+### Latent-triage R6 — NOVA Bug #11 (nanotime EFAULT) upstream fix
+
+Phase-1 Explore diagnosis (`a2e86ebc35ae61d28`) traced
+`test_ed25519`'s "latency positive" FAIL to the ACTUAL root cause:
+`_sys_clock_gettime_monotonic` at
+`/home/user/NOVA/src/runtime/io.nova:271-278` was passing a TAGGED
+pointer to the `clock_gettime` syscall; the kernel returned `-EFAULT`
+and never wrote the timespec buffer, so `nanotime()` returned a
+constant `1` (tagged 0) on every call. Every `dt = nanotime() - t0;
+dt > 0` latency assertion silently failed. Strace confirmed EFAULT
+on tag-ending `0x…1` addresses.
+
+Not a codegen CSE issue (disassembly showed two distinct
+`call nanotime` instructions bracketing `call ed25519_sign`). Not a
+Bug #7 regression (that fix only tagged the return value, not the
+input pointer).
+
+**Upstream NOVA fix (1 LOC)**: `src/runtime/io.nova:275` — add
+`sar rsi, 1` after `mov rsi, [rbp-8]` to untag the pointer before
+the `clock_gettime` syscall. Rebuilt NOVA from scratch (`make -B`);
+new binary installed at `bin/nova`.
+
+Scope-of-close (empirically verified post-rebuild):
+
+| Test | Pre | Post | Prior bucket |
+|---|---|---|---|
+| test_ed25519 | FAIL (latency positive) | OK (62 checks, 1601 ms real) | R4-deferred |
+| test_bignum_256 | FAIL (3 latency asserts) | OK (70 checks, 15× speedup) | pre-existing |
+| test_bignum_2048 | FAIL (all `dt > 0`) | OK (65 checks, 27× speedup) | pre-existing |
+| test_realtime_pacer | 6 FAILs | 3 FAILs | pre-existing (partial) |
+
+The `test_realtime_pacer` residual 3 FAILs (`wall-clock ~50ms
+(delta < 15)`, `slow-mo ~60ms (delta < 20)`, `summary starts with
+'pacer:'`) are NOT nanotime-latency shape — the first two measure
+sub-100ms precision which the sandbox clock may not deliver; the
+third smells Shape-A. Defer to R8.
+
+Canary sweep (motor_map, perception_module, action_module,
+R1/R2/R3/R4/R5 cohorts) all PASS.
+
+Tally delta: 394 → 397 CLEAN confirmed + 3 pacer FAILs flipped
+(pacer still fails on 3 others) / 35 pre-existing (down 2:
+bignum_256 + bignum_2048 escaped the pre-existing bucket) /
+48 live-FAIL latent (down 1: ed25519 deferred-regression closed).
+
+Also updated `docs/UPSTREAM_NOVA_BUGS.md`:
+- Added §11 record with strace trace + fix anchor + latent sibling
+  observation (`_raw_imul_add` reads `1000000000` tagged; cosmetic).
+- Updated Retirement order: 11 bugs total, 9 shipped upstream.
+
+### Latent-triage queue (post-R6)
+
+- **R6b** — C2b snapshot `snap_save` path isolation (4 tests, 1 root).
+- **R7** — `test_nl_pipeline_gap_recording` source wiring regression.
+- **R8** — `test_realtime_pacer` residual 3 FAILs.
+- **Silent-skip** — `test_gossip_dtls_streams`.
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **Non-latent queue** — NOVA ADR-0009 impl, `str_new` tagged-dst,
+  `_raw_imul_add` tagged-b cleanup (cosmetic), `test_match_expr`
+  parser bug, re-collapse string.nova inline byte-copies, Phase R6+,
+  real-socket DTLS roundtrip.

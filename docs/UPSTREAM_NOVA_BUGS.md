@@ -260,6 +260,46 @@ location.
   (`85667a7`) have fully retired the collision class on this side
   regardless of upstream.
 
+## 11. `_sys_clock_gettime_monotonic` passes tagged pointer -- clock_gettime EFAULTs silently
+
+- **ADR**: none (direct 1-LOC asm fix).
+- **Workaround**: none needed; upstream fix lands immediately.
+- **Tests**: FAIL→PASS cohort = `test_ed25519` (`ed25519_sign latency
+  positive`), `test_bignum_256` (3 latency asserts), `test_bignum_2048`
+  (all `dt > 0` asserts), partial close on `test_realtime_pacer`
+  (3 of 6 FAILs flipped).
+- **Context**: `_sys_clock_gettime_monotonic(ts)` at
+  `/home/user/NOVA/src/runtime/io.nova:271-278` loads `ts` from
+  `[rbp-8]` into `rsi` and syscalls `clock_gettime(CLOCK_MONOTONIC,
+  ts)`. But `alloc` returns a TAGGED pointer (`(raw<<1)|1`); the
+  kernel receives a non-canonical address and returns `-EFAULT`. The
+  caller's `load64(ts)` / `load64(ts+8)` correctly untags, but the
+  underlying buffer never got written -- it reads the zeroed alloc
+  slot. Result: `nanotime()` returns constant `1` (tagged 0) on every
+  call. Every `dt = nanotime() - t0; dt > 0` latency assertion fails
+  because `dt == 0`. Strace confirms:
+  ```
+  clock_gettime(CLOCK_MONOTONIC, 0x7567c8a1) = -1 EFAULT (Bad address)
+  clock_gettime(CLOCK_MONOTONIC, 0x7845c6d1) = -1 EFAULT (Bad address)
+  ```
+  All addresses end in `1` (the tag bit). This has been latent since
+  the fn was introduced (`3fd1a6a`); Bug #7's test only checked
+  tag/type of the return value, not that time actually advances, so
+  it passed trivially even with the kernel never writing the buffer.
+- **Fix**: 1 LOC in `_sys_clock_gettime_monotonic` -- add `sar rsi, 1`
+  after `mov rsi, [rbp-8]` to untag the pointer before `syscall`.
+  Equivalent `shr` works since bit 0 of a tagged int is always 1.
+  No codegen involvement (confirmed in disassembly: two distinct
+  `call nanotime` instructions bracket the measured operation; CSE
+  is not implicated).
+- **Status (2026-10-06)**: SHIPPED upstream in this round (R6).
+- **Latent sibling observation (not part of this fix)**:
+  `_raw_imul_add(sec, 1000000000, nsec)` at `io.nova:296` reads the
+  literal `1000000000` TAGGED from `[rbp-16]`, so the asm actually
+  computes `sec*(2e9+1) + nsec`. Does NOT cause the current FAIL (the
+  diff is still positive once EFAULT is fixed and the `dt_ms < 30000`
+  ceiling still holds under normal uptime). Cosmetic; separate pass.
+
 ## 6. Sandbox O_CREAT policy (container, not NOVA)
 
 - **ADR**: 0104
@@ -291,10 +331,13 @@ Status snapshot as of 2026-10-06:
 - (9) + (10): user-side workarounds shipped. NOVA-level mangling fix
   DEFERRED to a future module-system ADR (`pub`/`mod` design) — not
   worth landing alone.
+- (11) SHIPPED upstream in R6 (nanotime EFAULT) — closes `test_ed25519`,
+  `test_bignum_256`, `test_bignum_2048` + 3 of 6 FAILs in
+  `test_realtime_pacer`.
 
-**All 10 upstream NOVA bugs resolved or formally deferred.** Eight have
-upstream fixes (#1-#5, #7, #8); #4 is transitively closed by #3; #6 is
-not a NOVA bug; #9/#10 await the module-system ADR. All user-side
+**All 11 upstream NOVA bugs resolved or formally deferred.** Nine have
+upstream fixes (#1-#5, #7, #8, #11); #4 is transitively closed by #3;
+#6 is not a NOVA bug; #9/#10 await the module-system ADR. All user-side
 workarounds remain as defensive depth and can be retired incrementally.
 
 ### Bug #8 ripple — follow-up round queued
