@@ -204,14 +204,15 @@ location.
   with the module path (e.g.
   `_nova_persistence_snapshot_disk__starts_with`). Alternatively a
   loader-side allow-list of "weak" module-private symbols.
-- **Status (2026-10-06)**: **DEFERRED at NOVA level to a module-system
-  ADR.** Phase-1 scoping (`a3c06528587c2f6cf`, `adcdffbf8ca150780`)
-  confirmed the proper fix is ~115 LOC spanning preprocessor + lexer +
-  parser + codegen call-resolution refactor, with no existing visibility
-  keyword to anchor the design. Not worth landing alone — belongs with a
-  future `pub`/`mod` design round. User-side renames (option (a) +
-  bug #10's rename) have already shipped as the long-term fix, and
-  no new collisions have arisen in the tree since.
+- **Status (2026-10-06)**: **DEFERRED at NOVA level, now DESIGNED under
+  NOVA ADR-0009** (`docs/adr/0009-module-system-and-symbol-mangling.md`
+  in the NOVA repo, commit `7901bea`). The ADR proposes a file-scoped
+  module system in which the existing `_`-prefix convention becomes
+  real private-visibility syntax, with full-path mangling for private
+  names. Phase-1 scoping estimate stands: ~115 LOC single round once
+  the ADR is Accepted. User-side renames (option (a) + bug #10's rename)
+  remain the long-term fix in the interim and will be revertible after
+  the ADR implementation lands.
 
 ## 10. Assembler rejects duplicate module-private `_g_PC_TAG` symbol
 
@@ -252,11 +253,12 @@ location.
   path (e.g. `_g_nova_parts_reasoning_proof_checker__PC_TAG`). The
   user-side rename in option (a) above has LANDED (closes this bug
   as a workaround).
-- **Status (2026-10-06)**: **DEFERRED at NOVA level alongside bug #9.**
-  Same scoping conclusion — part of the module-system ADR, not a
-  standalone fix. User-side rename + dead-constant removal (`85667a7`)
-  have fully retired the collision class on this side regardless of
-  upstream.
+- **Status (2026-10-06)**: **DEFERRED at NOVA level alongside bug #9,
+  DESIGNED under NOVA ADR-0009** (commit `7901bea`). Same reasoning:
+  module-level `let` mangling uses the same `_g_m_<file>__<name>`
+  scheme as fn mangling. User-side rename + dead-constant removal
+  (`85667a7`) have fully retired the collision class on this side
+  regardless of upstream.
 
 ## 6. Sandbox O_CREAT policy (container, not NOVA)
 
