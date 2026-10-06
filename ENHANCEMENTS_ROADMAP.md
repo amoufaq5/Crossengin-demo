@@ -2224,3 +2224,94 @@ no-oping, or the compiled binary is exiting pre-`main`.
 - **ADR-driven** — C4 DTLS12 completion plan (23 tests),
   C5 string.nova sweep ripple audit (13 tests).
 - **C6** — cognitive/meta grab bag (20 tests, fragmented).
+
+### Latent-triage R4 — micro-fix sweep (9 of 11 single-FAILs)
+
+Two parallel Explore triages diagnosed all 11 single-FAIL latents.
+Nine were 1-LOC each and shipped this round; two are real source
+regressions and were deferred to their own rounds.
+
+Classification by recurring shape:
+
+- **Shape A — missed `str_eq → str_eq_bytes` migration** (6 sites,
+  4 test files + 2 source files).
+- **Shape B — stale ADR-wired literal** (2 test-side sites, from
+  ADR-0206 sandbox-gate ordering and ADR-0092 answer-path exclusion).
+- **Shape C — numeric drift** (1 test-side site; `ownership_kinds()`
+  grew from 4 to 5 under R109/ADR-0210 tier 2).
+
+Test-side edits (7 files):
+
+- `tests/unit/test_episodic.nova:74` (A)
+- `tests/unit/test_secure_channel.nova:80` (A) + import `src/util/str_safe.nova`
+- `tests/unit/test_ice_turn.nova:520` (A) + import `src/util/str_safe.nova`
+- `tests/unit/test_p256.nova:366` (A) + import `src/util/str_safe.nova`
+- `tests/unit/test_self_confidence_verb.nova:235` (B)
+- `tests/unit/test_learn_pipeline.nova:29` (B)
+- `tests/unit/test_pattern_pack.nova:600-601` (C)
+
+Source-side edits (2 files):
+
+- `src/reader/neighborhood.nova:203` (A) — gates `_walk_ops`.
+- `src/safety/override_mechanism.nova:99` (A) — `override_name_vetoed`.
+
+Three Shape-A test files additionally needed an explicit
+`import "../../src/util/str_safe.nova"` — Bug #8's unresolved-callee
+check at compile time caught the fact that none of them transitively
+imported `str_safe`. These import adds (3 lines, 3 files) are
+mechanical and surface identically to the R3b-era import sweep.
+
+Per-test status:
+- test_episodic:                   pre 1 FAIL / post OK (79 checks)
+- test_secure_channel:             pre 1 FAIL / post OK (16 checks)
+- test_ice_turn:                   pre 1 FAIL / post OK (142 checks)
+- test_p256:                       pre 1 FAIL / post OK (52 checks)
+- test_self_confidence_verb:       pre 1 FAIL / post OK (46 checks)
+- test_learn_pipeline:             pre 1 FAIL / post OK (21 checks)
+- test_pattern_pack:               pre 1 FAIL / post OK (144 checks)
+- test_neighborhood_activation:    pre 1 FAIL / post OK (47 checks)
+- test_override_mechanism:         pre 1 FAIL / post OK (27 checks)
+
+Regression sweep: canaries (motor_map, perception_module,
+action_module) + R1 trio + R2 trio + R3 pair + override-family
+siblings (override_wire, self_override_list_verb, self_override_verb,
+self_gaps_verb) — ALL still PASS.
+
+Tally delta: 382 → 391 CLEAN / 37 pre-existing / 51 live-FAIL latent
++ 1 silent-skip + 2 deferred-source-regression.
+
+#### Deferred to their own rounds (not R4 scope)
+
+- **`test_ed25519`** — FAIL `ed25519_sign latency positive`:
+  `nanotime() - t0 == 0` surrounding one `ed25519_sign` call. 60
+  other ed25519 assertions pass including KATs — the algorithm is
+  intact. Likely a nanotime regression or codegen CSE hoisting
+  a pure nanotime call. Trace candidates:
+  `/home/user/NOVA/src/runtime/io.nova:291-296` and
+  `_sys_clock_gettime_monotonic`. Do NOT band-aid to `dt >= 0`;
+  it would mask a real regression.
+- **`test_nl_pipeline_gap_recording`** — FAIL `SKILL_REFUSED bumped`:
+  `rpc_dispatch("skill.run", ...)` against an empty KG no longer
+  bumps `GAP_SKILL_REFUSED`. Trace candidates:
+  `src/skills/skill_dispatch.nova:113,127` (writer),
+  `rpc_ctx_gaps_reg` wiring, research skill manifest's
+  `COND_KG_EMPTY` disarm, or `skill_sup_check_pre_refusals`
+  short-circuit regression in the Bug #8 sweep. The sibling tests
+  `test_self_gaps_verb` + `test_gaps_register` exercise
+  `GAP_SKILL_REFUSED` directly and still pass, so the gap plumbing
+  is fine; the regression is in the refusal firing.
+
+### Latent-triage queue (post-R4, newest first)
+
+- **R5 candidate** — C2 snapshot cluster (6 tests, 20-60 LOC):
+  `_snap_starts_with` recursion investigation.
+- **R6 candidate** — `test_ed25519` nanotime latency regression
+  (deferred from R4).
+- **R7 candidate** — `test_nl_pipeline_gap_recording` source wiring
+  regression (deferred from R4).
+- **Silent-skip investigation** — `test_gossip_dtls_streams`.
+- **ADR-driven** — C4 DTLS12 completion plan (23 tests),
+  C5 string.nova sweep ripple audit (13 tests).
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Potential codebase-hygiene** — tree-wide `str_eq → str_eq_bytes`
+  sweep (~70 remaining sites, mostly benign env-literals).
