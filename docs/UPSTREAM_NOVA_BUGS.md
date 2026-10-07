@@ -317,6 +317,45 @@ location.
   because the surface spans 4+ wrappers and a downstream Crossengin
   idiom that needs rewrite OR a NOVA str_new fix. Queued for a
   dedicated multi-session sweep round.
+- **R10 outcome (2026-10-07)**: Attempted comprehensive sweep as
+  R10a (all 18 syscall wrappers rewritten with input untag + sign-
+  aware return tag) + R10b (_nova_concat tag-polymorphic entry at
+  codegen.nova:16400). Both patches drafted and tested empirically.
+  Reverted at the stage2 build stage after discovering two new
+  constraints:
+  * **Byte-count return tagging breaks the compiler itself**. The
+    NOVA compiler consumes RAW byte counts from sys_read / sys_write /
+    sys_lseek / sys_pread / sys_pwrite / sys_mmap / sys_getcwd (both
+    in reading source files + emitting assembly). Tagging their
+    returns breaks every caller doing raw-count arithmetic — stage2
+    `bin/nova` fails to compile anything (SEGV in file reader).
+    Rule: only tag returns for 0-or-errno-style wrappers (sys_rename,
+    sys_fsync, sys_fdatasync, sys_unlink, sys_mkdir, sys_fstat,
+    sys_ftruncate). Leave byte-count / position / pointer returns raw.
+  * **_nova_concat tag-polymorphic entry breaks direct callers**.
+    6+ sites `call _nova_concat` directly (bypassing _nova_add's
+    dispatcher), including codegen.nova:16917 ("aligned heap copy
+    (bit0=0)") which EXPLICITLY requires the raw-pointer convention.
+    Adding `test rdi,1; jz; sar rdi,1` means any such caller passing
+    a bit-0=1 value (which is unusual but happens for ints that
+    skip the dispatcher) gets its value halved. Breaks compiler
+    bootstrap. Rule: do NOT add tag-polymorphic entry to _nova_concat
+    without first auditing every direct call site and classifying
+    its tag convention.
+- **Suggested fix (next round)**: Replace the broad sweep with a
+  surgical approach:
+  1. Input untag on sys_open flags/mode (safe — doesn't un-mask
+     sandbox-skip paths if applied together with #2).
+  2. Return tag on 0-or-errno wrappers only (sys_rename,
+     sys_fsync, sys_fdatasync, sys_unlink, sys_mkdir, sys_fstat,
+     sys_ftruncate).
+  3. Rewrite snap_read_text in Crossengin to use NOVA's `str_new`
+     primitive (which already handles raw buffer → tagged string
+     properly, per Bug #2 fix) instead of `acc + buf` concat on a
+     raw sys_read buffer. Zero NOVA runtime changes.
+  4. For the 4 C2b tests + 3 sandbox-skip tests, verify the
+     end-to-end flow works via str_new rewrite.
+  Estimated LOC: ~15 NOVA + ~15 Crossengin. Still multi-session.
 
 ## 11. `_sys_clock_gettime_monotonic` passes tagged pointer -- clock_gettime EFAULTs silently
 

@@ -2693,3 +2693,60 @@ to any top-level statements. Document as a potential future ADR.
 - **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add` tagged-b
   cleanup, `test_match_expr` parser bug, re-collapse string.nova
   inline byte-copies, Phase R6+, real-socket DTLS roundtrip.
+
+### Latent-triage R10 — NOVA Bug #12 sweep attempted + reverted (zero shipped)
+
+R10a (all 18 syscall-wrapper rewrites) + R10b (_nova_concat
+tag-polymorphic entry) drafted per Phase-1 agent's scoping
+(`ab332ea78a2493a62`). Both tested empirically. Reverted after
+discovering two new constraints:
+
+1. **Byte-count return tagging breaks the compiler itself.** The
+   NOVA compiler consumes RAW byte counts from sys_read / sys_write /
+   sys_lseek / sys_pread / sys_pwrite / sys_mmap / sys_getcwd when
+   reading source files and emitting assembly. Tagging those returns
+   makes stage2 `bin/nova` SEGV on any compile input. Updated rule:
+   only tag returns for 0-or-errno wrappers (sys_rename, sys_fsync,
+   sys_fdatasync, sys_unlink, sys_mkdir, sys_fstat, sys_ftruncate).
+   Leave byte-count / position / raw-pointer returns alone.
+
+2. **_nova_concat tag-polymorphic entry breaks direct callers.**
+   codegen.nova has 6+ `call _nova_concat` sites that bypass
+   `_nova_add`'s dispatcher. One (`:16917`) explicitly comments
+   "aligned heap copy (bit0=0)". Adding `test rdi,1; jz; sar rdi,1`
+   halves any input with bit-0=1 — breaks the compiler. Rule: do
+   NOT touch `_nova_concat` entry without auditing every direct
+   call site + classifying its tag convention.
+
+Both patches reverted. NOVA repo state: clean (no commits in R10).
+
+Tally delta: 405 CLEAN unchanged / 31 pre-existing unchanged /
+47 live-FAIL latent + 7 deferred-source-regression unchanged.
+Zero regressions, zero closes.
+
+### Latent-triage queue (post-R10 — revised)
+
+The R10 investigation refined Bug #12's fix shape. **R11 candidate**
+(the next concrete attempt): surgical 3-piece patch instead of broad
+sweep:
+- (a) Input untag on `sys_open` flags/mode only (10 LOC NOVA).
+- (b) Return tag on `sys_rename` only, if even needed in isolation
+  (3 LOC NOVA).
+- (c) Rewrite `src/persistence/snapshot_disk.nova:snap_read_text`
+  to use `str_new(buf, m)` instead of `acc + buf` (6 LOC CE).
+- (d) Verify end-to-end: open path works + read path works +
+  snap_from_text parses correctly. If sandbox-skip trio still
+  SEGVs, add specific untag on their callers rather than un-masking
+  broadly.
+
+Full queue:
+
+- **R11** — Bug #12 surgical attempt (above).
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, re-collapse
+  string.nova inline byte-copies, Phase R6+, real-socket DTLS
+  roundtrip.
