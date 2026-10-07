@@ -2627,3 +2627,69 @@ pre-existing bucket entirely.
   cleanup (cosmetic), `test_match_expr` parser bug, re-collapse
   string.nova inline byte-copies, Phase R6+, real-socket DTLS
   roundtrip.
+
+### Latent-triage R9 — silent-skip audit (6 files missing top-level `main()`)
+
+Phase-1 Explore (`aece0d7d05d701990`) nailed the root cause in one
+pass: NOVA's `_start` emits `argc/argv` setup, float-init guard, and
+a `gen_stmt` loop over top-level decls skipping `AST_FN_DECL`, then
+`exit(0)`. It does **not** auto-invoke `main`; the top-level call
+must be written explicitly. A healthy test's `_start` disassembly
+ends with `call main` → `exit`; the silent-skip binaries' `_start`
+has no `call main` at all because the test file is missing the
+trailing `main()` top-level statement after `fn main() { ... }`.
+
+**6 affected test files** (all pre-existing authoring omissions):
+
+| Test | Pre | Post |
+|---|---|---|
+| test_gossip_dtls_streams | silent-skip | OK (24 checks) |
+| test_dtls_client_flight | silent-skip | OK (86 checks) |
+| test_dtls_ext_parse | silent-skip | OK (45 checks) |
+| test_dtls_server_flight | silent-skip | OK (92 checks) |
+| test_md5 | silent-skip | OK (16 checks) |
+| test_sha1 | silent-skip + 1 FAIL once running | OK (17 checks) after hash fix |
+
+Fix: 1-line append `main()` to each file. Then one bonus fix:
+`test_sha1_a_times_1000` had the FIPS Million-a hash
+(`34aa973...`) copy-pasted instead of the actual 1000-'a' hash
+(`291e9a6c66994949b57ba5e650361e98fc36b1ba`). Verified via openssl
+and empirical compute. Comment block updated to clarify.
+
+Classification: 6 pre-existing silent-skip + 1 pre-existing hash
+typo. NOT a Bug #8 ripple. Also NOT a NOVA codegen issue — the
+`_start` emission convention is intentional (per
+`src/compiler/codegen.nova:10813-10976`).
+
+Canary sweep + R1-R8 cohorts — all PASS.
+
+Tally delta: 399 → 405 CLEAN. Three of the six (`test_md5`,
+`test_sha1`, `test_dtls_*` compile-truncated set) were in the
+pre-existing bucket (-4: md5, sha1, dtls_client_flight,
+dtls_ext_parse, dtls_server_flight; and the silent-skip
+`test_gossip_dtls_streams` disclosed in R3 moves to CLEAN).
+Updated breakdown: 405 CLEAN / 31 pre-existing / 47 live-FAIL latent
++ 7 deferred-source-regression + 0 silent-skip (empty).
+
+Potential codegen enhancement (NOT shipped here, operator decides):
+NOVA's `_start` could emit an implicit `call main` when `main` is
+declared, matching C convention. This would prevent silent-skip
+authoring errors but is a semantic shift — currently the explicit
+`main()` call lets authors control initialization order relative
+to any top-level statements. Document as a potential future ADR.
+
+### Latent-triage queue (post-R9)
+
+- **R10+ (multi-session)** — NOVA Bug #12 syscall wrapper sweep +
+  str_new fix → closes C2b 4 tests + likely more file-I/O-dependent
+  SEGVs.
+- **ADR-driven** — C4 DTLS12 completion plan (fewer tests now that
+  R9 un-stuck 3 DTLS flight suites; re-triage needed to recount),
+  C5 string.nova sweep audit (13 tests).
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **Potential NOVA ADR** — implicit `call main` in `_start` when
+  `main` is declared (prevents silent-skip authoring errors).
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add` tagged-b
+  cleanup, `test_match_expr` parser bug, re-collapse string.nova
+  inline byte-copies, Phase R6+, real-socket DTLS roundtrip.
