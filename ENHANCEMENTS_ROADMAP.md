@@ -2505,3 +2505,67 @@ update only (UPSTREAM §12 + this ROADMAP block).
 - **Silent-skip** — `test_gossip_dtls_streams`.
 - **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
 - **C6** — cognitive/meta grab bag (20 tests, fragmented).
+
+### Latent-triage R7 — `test_nl_pipeline_gap_recording` SKILL_REFUSED wire-in
+
+Phase-1 Explore diagnosis (`a6f1dd5c4956f32e1`) found the root
+cause: the test's expectation at `tests/unit/test_nl_pipeline_gap_recording.nova:149-151`
+is **aspirational** — the comment says "research's manifest lists
+COND_KG_EMPTY" but `research_skill_manifest()` at
+`src/skills/skills/research_skill.nova:41-45` has NEVER declared any
+refusal condition. R103 landed the gap-recording path on
+`skill_run_scoped` but the wire-in from research's manifest to the
+`COND_KG_EMPTY` precondition never shipped. Bug #8's ripple
+unmasked this long-standing gap.
+
+Three edits:
+
+1. **`src/skills/skills/research_skill.nova:41-49`** (manifest):
+   adds `skill_manifest_add_refusal(m, COND_KG_EMPTY, "")` — arm the
+   refusal using `arg=""` as the sentinel for "walks the whole
+   registry, needs at least one non-empty KG."
+
+2. **`src/skills/skill_supervisor.nova:186-213`** (supervisor):
+   extends the `COND_KG_EMPTY` handler with an `arg=""` branch that
+   evaluates:
+   - `reg == 0` → fail-open (preserves no-registry contract for
+     tests like `test_no_registry_ok_but_zero`).
+   - `reg` empty / all KGs empty → refuse.
+   - any KG non-empty → pass.
+   The existing by-name path is unchanged.
+
+3. **`tests/unit/test_research_skill.nova:58-72`** (ripple):
+   `test_empty_topic_returns_noop` + `test_topic_all_stopwords_returns_noop`
+   use empty registries and expect `ok=1`. These test topic-parsing /
+   stopword behavior, not KG-emptiness. Register a 1-atom stub KG
+   via existing `_wire_kg` helper so the new refusal doesn't fire;
+   assertions preserved as-is.
+
+Per-test status:
+- `test_nl_pipeline_gap_recording`: pre 1 FAIL / post OK (17 checks).
+- `test_research_skill`: pre OK (25) / mid 2 FAIL (as predicted by
+  the Edit-2 branch design) / post OK (25).
+
+Ripple audit (full skill/gaps/nl cohort):
+`test_self_gaps_verb` (51), `test_gaps_register` (87),
+`test_nl_rpc_verbs` (87), `test_nl_rpc_metrics_verb` (90),
+`test_capability` (136), `test_ownership` (173),
+`test_nl_executor` (76), `test_skill_supervisor` (46),
+`test_skill_registry` (44) — all PASS.
+
+Canary sweep: motor_map, perception_module, action_module, R2 trio,
+R3 pair, R4 cohort, R5 trio, R6 cohort — all PASS.
+
+Tally delta: 397 → 398 CLEAN / 35 pre-existing / 47 live-FAIL latent
++ 1 silent-skip + 7 deferred-source-regression (down 1: R7
+deferred-regression closed).
+
+### Latent-triage queue (post-R7)
+
+- **R8** — `test_realtime_pacer` residual 3 FAILs (not nanotime;
+  precision + Shape-A smell).
+- **R9+ (multi-session)** — NOVA Bug #12 syscall wrapper sweep.
+- **Silent-skip** — `test_gossip_dtls_streams`.
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
