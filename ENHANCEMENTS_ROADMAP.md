@@ -2750,3 +2750,60 @@ Full queue:
   tagged-b cleanup, `test_match_expr` parser bug, re-collapse
   string.nova inline byte-copies, Phase R6+, real-socket DTLS
   roundtrip.
+
+### Latent-triage R11 — Bug #12 partial infrastructure (sys_open + sys_rename)
+
+Phase-1 Explore verification (`abf5d752de1e20f7b`) analyzed the
+originally-planned surgical R11 and found 2 new blockers in R11-b
+(sys_read + sys_write input untag) and R11-d (snap_read_text str_new
+rewrite). R11 narrowed scope to the two sub-pieces provably safe
+in isolation.
+
+Shipped NOVA commit `f83aa7c`:
+- **R11-a** — `sys_open` flags/mode input untag + path TP untag.
+  `O_WRONLY|O_CREAT|O_TRUNC = 0x241` now reaches the kernel as
+  0x241 (not tagged 0x483). Return left raw: `fd < 0` compare works.
+- **R11-c** — `sys_rename` path TP untag + sign-aware return tag.
+  Kernel 0 (success) → tagged 1 matches caller's `if rr != 0`
+  compare to tagged literal 0.
+
+Deferred to R12:
+- **R11-b** — `sys_write` input-untag-only still returns raw rax;
+  caller `if written != n` compares raw-vs-tagged → always TRUE
+  on non-trivial writes → `snap_write_durable` returns 0 even on
+  successful write. Needs single-caller audit or return-tag with
+  compiler-caller audit.
+- **R11-d** — `str_new(buf, m)` with raw m SEGVs because
+  `alloc(length+1)` dispatches `+` through `_nova_add` → bit-0
+  classifier misclassifies raw m as pointer → jumps to
+  `_nova_concat`. Needs either str_new tolerance for raw lengths
+  OR caller-side raw→tagged helpers.
+
+Expected outcomes verified empirically:
+- Prior-round canaries (motor_map, perception, action, R2-R9 cohorts,
+  27 tests): all PASS post-R11.
+- 4 C2b tests + 3 sandbox-skip trio: still SEGV (unchanged — R11
+  explicitly scoped not to close them).
+- NOVA self-host fixpoint holds (stage2 builds cleanly).
+- `test_bignum_256` flaked once (69/1 → 70/0 on 3 subsequent runs);
+  classic sandbox timing jitter, not an R11 regression.
+
+Tally delta: 405 CLEAN / 31 pre-existing / 47 live-FAIL latent + 7
+deferred-source-regression — ALL unchanged. Zero closes, zero
+regressions. Correct infrastructure in place for R12.
+
+### Latent-triage queue (post-R11)
+
+- **R12** — Bug #12 continuation (3 options; see UPSTREAM §12).
+  Recommended: option (c) — Crossengin-side `_sys_read_tagged` /
+  `_sys_write_tagged` wrappers in `src/util/`, used in
+  snap_read_text + snap_write_durable + `_tmp_write_works` probes.
+  Zero NOVA changes needed; isolates the fix surface to CE.
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, re-collapse
+  string.nova inline byte-copies, Phase R6+, real-socket DTLS
+  roundtrip.

@@ -356,6 +356,35 @@ location.
   4. For the 4 C2b tests + 3 sandbox-skip tests, verify the
      end-to-end flow works via str_new rewrite.
   Estimated LOC: ~15 NOVA + ~15 Crossengin. Still multi-session.
+- **R11 outcome (2026-10-07)**: Shipped NOVA commit `f83aa7c` with
+  only R11-a (sys_open flags/mode untag) + R11-c (sys_rename
+  return tag) — the two sub-pieces provably safe in isolation.
+  **Phase-1 Explore verification** (`abf5d752de1e20f7b`) found 2
+  new blockers in the originally-planned R11-b/d:
+  * `str_new` requires TAGGED length internally (`alloc(length+1)`
+    dispatches `+` through `_nova_add` → `_nova_check_rdi` bit-0
+    classifier). Rewriting `snap_read_text` as `str_new(buf, m)`
+    where m is raw from sys_read SEGVs — misclassifies raw length
+    as pointer → jumps to `_nova_concat`.
+  * `sys_write` input-untag-only still returns raw rax; caller
+    `if written != n` compares raw bytes-written to tagged
+    `len(text)` → always TRUE for non-trivial writes → error branch.
+  Shipping either half of R11-b/d without matching caller fixes
+  guarantees regressions. R11 ships only the safe halves (zero
+  C2b closures, zero regressions, correct infrastructure for
+  future rounds). Verified: all prior-round canaries PASS post-R11.
+  C2b + sandbox-skip trio state unchanged (still SEGV, as expected).
+- **R12 options (next round)**:
+  - (a) `sys_write` + `sys_read` caller audit across NOVA + CE,
+    decide per-caller whether to tag return or untag at callsite.
+    Then land `sys_write` return-tag selectively.
+  - (b) NOVA ADR for syscall-boundary tag convention
+    ("wrappers always return tagged"; patch compiler + stdlib
+    callers to match).
+  - (c) Crossengin-side workaround: `_sys_read_tagged` /
+    `_sys_write_tagged` helpers in `src/util/` that tag returns
+    after calling the raw wrappers. Use them in snap_read_text +
+    snap_write_durable. Zero NOVA changes.
 
 ## 11. `_sys_clock_gettime_monotonic` passes tagged pointer -- clock_gettime EFAULTs silently
 
