@@ -2807,3 +2807,74 @@ regressions. Correct infrastructure in place for R12.
   tagged-b cleanup, `test_match_expr` parser bug, re-collapse
   string.nova inline byte-copies, Phase R6+, real-socket DTLS
   roundtrip.
+
+### Latent-triage R12 — Bug #12 close (option c) — 4 CLOSES
+
+Shipped `src/util/sys_tagged.nova` with inline-asm wrappers
+`_sys_read_tagged` / `_sys_write_tagged` that bypass the raw
+`sys_read` / `sys_write` layer: untag buf (TP) + count (unconditional)
+on input + sign-aware tag non-negative return. Patched 4 source
+files + 1 test file to use the tagged helpers + byte-copy fallback
+for `acc + buf` (str_new has a known compile hang in several
+transducers; byte-copy mirrors proven `_rpc_snap_read:3314-3319`).
+
+Files touched:
+- `src/util/sys_tagged.nova` (new, 50 LOC).
+- `src/persistence/snapshot_disk.nova` (2 call sites + byte-copy).
+- `src/persistence/snapshot_delta.nova` (2 call sites + byte-copy).
+- `src/persistence/chat_state.nova` (2 call sites + byte-copy).
+- `src/audit/decision_log.nova` (2 call sites + byte-copy).
+- `tests/unit/test_decision_log_durable.nova` (1 call site in
+  `_file_size`).
+
+Scope-of-close (verified empirically):
+
+| Test | Pre | Post |
+|---|---|---|
+| test_snapshot_disk | SEGV | **OK (31 checks)** |
+| test_snapshot_delta | SEGV | **OK (84 checks)** |
+| test_snapshot_episodic | SEGV | **OK (51 checks)** |
+| test_decision_log_durable | SEGV | **OK (37 checks)** |
+| test_snapshot_disk_full | SEGV | 126 passed, 1 FAIL (gloss roundtrip) |
+| test_chat_state_persistence | SEGV | SEGV (deeper issue) |
+| test_fed_daemon_transport | SEGV | SEGV (deeper issue) |
+
+**4 clean closes.** test_snapshot_disk_full and the 2 remaining
+SEGVs still have residual issues (likely more sys_read/sys_write
+sites or secondary bugs un-masked by the fix). Deferred to R12b.
+
+Regression sweep: all 28 prior-round canaries (motor_map,
+perception, action, R2-R9 cohorts) PASS. Zero regressions.
+
+Tally delta: 405 → 409 CLEAN / 31 pre-existing / 44 live-FAIL
+latent + 1 silent-skip + 3 deferred-source-regression (down 4:
+snapshot_disk/delta/episodic/decision_log_durable moved from
+deferred/pre-existing to CLEAN).
+
+Phase-1 agent (`a1ba2b2e1e07b5e34`) design verification was precise
+with 2 surprises during execution:
+1. `_sys_read_tagged` as a NOVA wrapper of `sys_read` doesn't work
+   — sys_read's input-untag convention isn't present, so count
+   arrives tagged → kernel reads 2x+1 bytes. Fix: wrapper does its
+   OWN inline syscall with the untag dance, bypassing sys_read
+   entirely. Same for sys_write.
+2. `str_new(buf, m)` with tagged m still SEGVs (not just the hang
+   the agent flagged). Byte-copy loop is the robust fallback.
+
+### Latent-triage queue (post-R12)
+
+- **R12b** — residual Bug #12 cases (test_snapshot_disk_full
+  gloss roundtrip + test_chat_state_persistence/fed_daemon_transport
+  SEGVs). Likely needs additional sys_read/sys_write patches on
+  other source files + maybe a str_new fix in NOVA.
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **NOVA str_new fix** (now higher priority — would allow replacing
+  byte-copy loops with clean `str_new(buf, m)` calls across the 4
+  patched source files).
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, re-collapse
+  string.nova inline byte-copies, Phase R6+, real-socket DTLS
+  roundtrip.

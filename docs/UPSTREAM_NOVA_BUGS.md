@@ -385,6 +385,34 @@ location.
     `_sys_write_tagged` helpers in `src/util/` that tag returns
     after calling the raw wrappers. Use them in snap_read_text +
     snap_write_durable. Zero NOVA changes.
+- **R12 outcome (2026-10-07)**: SHIPPED option (c). Added
+  `src/util/sys_tagged.nova` with inline-asm wrappers that bypass
+  the raw sys_read/sys_write layer entirely — untag buf (TP) +
+  count (unconditional) on input + sign-aware tag non-negative
+  return. Patched 4 source files + 1 test file:
+  snapshot_disk.nova, snapshot_delta.nova, chat_state.nova,
+  decision_log.nova (source), test_decision_log_durable.nova
+  (test). Byte-copy loop replaces `acc = acc + buf` concat (str_new
+  has its own SEGV issue beyond the compile hang).
+
+  Scope-of-close: **4 full closes** (test_snapshot_disk,
+  test_snapshot_delta, test_snapshot_episodic,
+  test_decision_log_durable). 1 near-close (test_snapshot_disk_full:
+  126 passed, 1 FAIL — gloss roundtrip edge case). 2 still SEGV
+  (test_chat_state_persistence, test_fed_daemon_transport —
+  deeper issues deferred to R12b).
+
+  Zero regressions across 28 prior-round canaries.
+
+  Design surprises during execution:
+  * `_sys_read_tagged` as a thin NOVA wrapper of raw sys_read
+    didn't work — count arrives tagged → kernel reads 2x+1 bytes.
+    The wrapper does its OWN inline syscall with the untag dance,
+    bypassing sys_read entirely. Same for sys_write.
+  * `str_new(buf, m)` with tagged m SEGVs (not just the compile
+    hang Phase-1 flagged — a secondary runtime bug). Byte-copy
+    loop (`piece = piece + chr(load8(buf+i))` per index) is the
+    proven fallback used by `_rpc_snap_read:3314-3319`.
 
 ## 11. `_sys_clock_gettime_monotonic` passes tagged pointer -- clock_gettime EFAULTs silently
 
