@@ -2930,3 +2930,53 @@ correct syscall convention).
 - **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
 - **NOVA str_new fix** (higher priority).
 - **Potential NOVA ADR** — implicit `call main` in `_start`.
+
+### Latent-triage R12c — document NOVA Bug #13 (concat beyond userspace under ASLR-off)
+
+Phase-1 Explore investigation (`a567508e9c1cc5295`) traced the
+R12b residual SEGV. Live gdb backtrace captured via setarch -R +
+core dump:
+
+```
+#0  0x0000000000497b09 in _nova_len ()
+#1  0x000000000040ca92 in p256_keypair_load (base_path=140737493187350)
+#2  0x0000000000493b62 in test_missing_keypair_at_resolved_base_returns_zero ()
+#3  0x0000000000493e24 in main ()
+```
+
+Faulting instruction: `cmpq $0xffffffffffffffff, (%rdi)` at
+`_nova_len+5`, with `rdi = 0x80000049bb16` (140737493187350 =
+2^47 + 4832022). This value is **just above the x86-64 user-space
+ceiling** of 2^47 - 1 (0x7fffffffffff) and NOT a tagged NOVA int
+(bit 0 = 0 → classifier treats it as pointer; deref SEGVs).
+
+Trace: `base_path` comes from `_base_dir() + "/.crossengin_ph_o_r3_txport_missing/signer"`
+at test_fed_daemon_transport.nova:140. The `+` concat on strings
+produces a value that, under ASLR-OFF with a specific heap layout,
+has high bits set beyond userspace. Under strace or ASLR-ON, the
+heap is placed differently and the concat output stays valid.
+
+Classification: **NOVA Bug #13 — NOVA runtime concat/alloc path
+produces invalid pointer under specific heap layouts.** Not a
+Crossengin bug; R12b's sys_tagged helpers are correct per Phase-1
+static analysis.
+
+Documentation shipped in `docs/UPSTREAM_NOVA_BUGS.md §13` with the
+full gdb trace + reproducer command.
+
+Tally delta: 409 CLEAN / 31 pre-existing / 44 live-FAIL latent —
+unchanged. Zero code changes, zero regressions.
+
+### Latent-triage queue (post-R12c)
+
+- **R12c-fix (dedicated NOVA round)** — investigate
+  `_nova_concat` + `_nova_alloc` for the overflow / sign-extension
+  bug under ASLR-OFF heap layouts. Would close
+  test_fed_daemon_transport + test_p256_keypair_load.
+- **R12d** — test_snapshot_disk_full gloss edge case.
+- **R12e** — test_chat_state_persistence SEGV probe-driven round.
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **NOVA str_new fix** (higher priority).
+- **Potential NOVA ADR** — implicit `call main` in `_start`.

@@ -454,6 +454,67 @@ location.
   diff is still positive once EFAULT is fixed and the `dt_ms < 30000`
   ceiling still holds under normal uptime). Cosmetic; separate pass.
 
+## 13. ASLR-sensitive SEGV in _nova_len via test_fed_daemon_transport
+
+- **ADR**: none yet.
+- **Workaround**: none; the 2 affected tests stay in the SEGV
+  bucket until the underlying NOVA runtime issue is fixed.
+- **Tests**: `test_fed_daemon_transport`, `test_p256_keypair_load`
+  (likely — same shape per Phase-1 R12b investigation).
+- **Context**: R12 + R12b patched the syscall-wrapper tagging
+  convention end-to-end for these tests. Under strace, the tests
+  PASS cleanly (strace confirms the full file-I/O roundtrip +
+  `fed_daemon_transport: OK (20 checks)` prints). Under
+  `setarch -R /tmp/fdt_dbg` (ASLR disabled), the binary SEGVs
+  deterministically with no output.
+
+  **Gdb backtrace from live core dump** (produced under setarch -R):
+  ```
+  #0  0x0000000000497b09 in _nova_len ()
+  #1  0x000000000040ca92 in p256_keypair_load (base_path=140737493187350)
+  #2  0x0000000000493b62 in test_missing_keypair_at_resolved_base_returns_zero ()
+  #3  0x0000000000493e24 in main ()
+  ```
+
+  **Faulting instruction**: `cmpq $0xffffffffffffffff, (%rdi)` at
+  `_nova_len+5`. rdi = `0x80000049bb16` (140737493187350 decimal),
+  which is just above the x86-64 user-space ceiling of 2^47 - 1
+  (0x7fffffffffff). The pointer is INVALID — not a tagged NOVA int
+  (bit 0 = 0, so classifier treats it as pointer) and not a valid
+  mapped address.
+
+  The `base_path` arg to `p256_keypair_load` is formed by
+  `_base_dir() + "/.crossengin_ph_o_r3_txport_missing/signer"` in
+  `test_fed_daemon_transport.nova:140`. The `+` operator dispatches
+  through `_nova_add` → `_nova_concat` (both operands pointer).
+  Somehow the concat result is a value with high bits set, placing
+  it above userspace. This is NOT the tag-polymorphic issue R10b
+  tried to fix (both operands are already pointer-classified) —
+  something downstream in `_nova_concat`'s string-building path
+  produces an address beyond userspace under ASLR-OFF.
+
+  **Why ASLR-OFF matters**: With ASLR on, mmap pushes allocations
+  to high addresses (above 0x200000000); strace slows allocation
+  pacing enough to shift pointer values past magnitude thresholds.
+  Both avoid the specific address range that triggers the bug.
+  Without ASLR, the heap gets placed at a specific low address
+  range where the concat output computation produces 0x80000... .
+- **Suggested fix**: Investigate `_nova_concat` + `_nova_alloc` for
+  an arithmetic overflow or sign-extension bug under specific heap
+  layouts. The reproducer is deterministic:
+  ```
+  cd /home/user/Crossengin-demo
+  setarch -R /home/user/NOVA/nova build tests/unit/test_fed_daemon_transport.nova -o /tmp/fdt_dbg
+  ulimit -c unlimited
+  rm -rf /root/.crossengin_ph_* core
+  cd /tmp && setarch -R ./fdt_dbg
+  gdb -batch -ex 'bt' -ex 'info registers' /tmp/fdt_dbg core
+  ```
+- **Status (2026-10-07)**: DOCUMENTED — needs dedicated NOVA runtime
+  round. The R12b `_sys_tagged` helpers are correct per Phase-1
+  static analysis; this bug is in NOVA's concat/alloc path, not
+  in Crossengin's syscall wrappers.
+
 ## 6. Sandbox O_CREAT policy (container, not NOVA)
 
 - **ADR**: 0104
@@ -493,14 +554,27 @@ Status snapshot as of 2026-10-06:
   sys_rename raw return, sys_read EFAULT, snap_read_text downstream);
   patches drafted + verified correct but reverted because full close
   needs multi-wrapper sweep + Crossengin snap_read_text idiom change
-  OR NOVA str_new fix. Deferred to dedicated multi-session sweep.
+  OR NOVA str_new fix. R11 shipped sys_open flags/mode + sys_rename
+  return tag upstream (`f83aa7c`). R12 shipped Crossengin-side
+  `sys_tagged` helpers + 4-source patches, closing 4 of 7 target
+  tests. R12b patched p256_keypair.nova.
+- (13) DOCUMENTED in R12c — ASLR-sensitive SEGV in `_nova_len`
+  on `p256_keypair_load(base_path=0x80000049bb16)`. Live gdb
+  backtrace captured. `base_path` is a `_base_dir() + "/..."`
+  concat whose output lands beyond userspace (above 2^47) under
+  ASLR-OFF but not under strace/ASLR-ON. Suggested fix:
+  investigate `_nova_concat` + `_nova_alloc` for an overflow /
+  sign-extension bug under specific heap layouts. Deferred to a
+  dedicated NOVA runtime round.
 
-**All 12 upstream NOVA bugs resolved, formally deferred, or
-documented for sweep.** Nine have upstream fixes (#1-#5, #7, #8, #11);
-#4 is transitively closed by #3; #6 is not a NOVA bug; #9/#10 await
-the module-system ADR; #12 awaits a dedicated syscall-sweep round.
-All user-side workarounds remain as defensive depth and can be retired
-incrementally.
+**All 13 upstream NOVA bugs resolved, formally deferred, or
+documented for sweep.** Ten have upstream fixes (#1-#5, #7, #8,
+#11, #12 partial); #4 is transitively closed by #3; #6 is not a
+NOVA bug; #9/#10 await the module-system ADR; #12 awaits a
+dedicated syscall-sweep round for the remaining pieces (sys_read
+input + return + concat polymorphism); #13 awaits a NOVA runtime
+round. All user-side workarounds remain as defensive depth and can
+be retired incrementally.
 
 ### Bug #8 ripple — follow-up round queued
 
