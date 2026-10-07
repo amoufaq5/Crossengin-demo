@@ -2878,3 +2878,55 @@ with 2 surprises during execution:
   tagged-b cleanup, `test_match_expr` parser bug, re-collapse
   string.nova inline byte-copies, Phase R6+, real-socket DTLS
   roundtrip.
+
+### Latent-triage R12b — p256_keypair sys_tagged patch (zero closes)
+
+Phase-1 Explore (`a8838fa2f73812e39`) identified
+`src/safety/p256_keypair.nova:106,278` as the root cause of
+`test_fed_daemon_transport` SEGV: R12's audit missed this file.
+Fix is a 3-LOC switch to `_sys_read_tagged` / `_sys_write_tagged`
++ the sys_tagged import.
+
+Shipped the 3-LOC patch. Verified via strace that the patched
+binary EXECUTES correctly: writes 32-byte priv + 65-byte pub
+keys, reads them back, prints `fed_daemon_transport: OK (20 checks)`,
+exits 0. HOWEVER, when run via `setarch -R /home/user/NOVA/nova run`
+(the standard harness), the binary SEGVs with no output. Direct
+invocation of the built binary under setarch -R reproduces the
+SEGV; strace (no setarch) shows PASS.
+
+Pattern: 100% deterministic SEGV under setarch -R, 100% PASS
+under strace, non-deterministic (first run SEGV, subsequent exit 0
+silently) under direct run with no wrapper.
+
+Likely cause: an alloc-address-sensitive bug in NOVA's exit path
+or a late finalizer, surfacing only when ASLR is disabled (which
+setarch -R does). The core test logic is correct (strace proves
+it); something in cleanup / shutdown is SEGVing.
+
+**Verdict**: p256_keypair patch is sound (zero regressions across
+33 prior-round canaries), but doesn't fully close
+`test_fed_daemon_transport` due to a separate ASLR-sensitive
+runtime issue. Sibling `test_p256_keypair_load` still SEGVs with
+same shape (was pre-existing).
+
+Tally delta: 409 CLEAN / 31 pre-existing / 44 live-FAIL latent +
+1 silent-skip + 3 deferred — ALL unchanged. Zero regressions.
+Partial infrastructure improvement (p256_keypair now uses the
+correct syscall convention).
+
+### Latent-triage queue (post-R12b)
+
+- **R12c** — Deeper investigation of the setarch -R vs strace
+  SEGV divergence on `test_fed_daemon_transport` + sibling
+  `test_p256_keypair_load`. Needs stack trace capture at SEGV,
+  likely requires attaching gdb or examining the compiled .s
+  output for an exit-path corruption.
+- **R12d** — test_snapshot_disk_full `gloss survived reload` 1 FAIL
+  (not Bug #12 shape; in-memory serialize/parse edge case).
+- **R12e** — test_chat_state_persistence SEGV (needs runtime probes).
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **NOVA str_new fix** (higher priority).
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
