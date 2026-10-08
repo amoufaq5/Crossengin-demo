@@ -3031,3 +3031,66 @@ shape.
 - **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
 - **NOVA str_new fix** (higher priority).
 - **Potential NOVA ADR** — implicit `call main` in `_start`.
+
+### Latent-triage R12e — close test_chat_state_persistence (2-LOC Shape A residual)
+
+Phase-1 Explore (`afc1cedef5f405b31`) **overturned the SEGV
+premise**: at tip `352f7b2` the test runs to completion with 7
+FAILs (155 passed), not SEGV. (The earlier SEGV was state-dependent
+on stale `/tmp/ce_test_chat_state_*` files from previous runs;
+after `rm -rf` the test reproduces the 7-FAIL profile deterministically.)
+
+All 7 FAILs cascade from 2 missed `str_eq → str_eq_bytes`
+migrations at `tests/unit/test_chat_state_persistence.nova:513-514`:
+```nova
+if str_eq(xref_dst_kg(xs[k]), "medicine") == 1 { same_idx = k }
+if str_eq(xref_dst_kg(xs[k]), "biology") == 1  { cross_idx = k }
+```
+
+The R3b sweep + Bug #8 ripple migrated 1465 call sites to
+`str_eq_bytes`; these two inside a `while` body slipped through.
+When both compares return 0 flakily, `same_idx` and `cross_idx`
+stay at `-1`; `xs[-1]` returns the last element (the cross-KG
+xref) — the SAME-KG assertions read CROSS-KG fields, producing
+the exact 7-FAIL cascade.
+
+Classification: **R3b/Bug #8 ripple residual (Shape A)**. NOT Bug
+#12 shape — chat_state.nova's R12 byte-copy patch is working
+correctly (155 passes prove the file-I/O chain works). Only the
+test lagged migration.
+
+Fix: 2-LOC swap `str_eq` → `str_eq_bytes` on lines 513-514.
+
+Per-test status:
+- test_chat_state_persistence: 155 passed, 7 FAILED → **OK (162 checks)**.
+- All 33 prior-round canaries PASS. Zero regressions.
+
+Tally delta: 410 → 411 CLEAN / 31 pre-existing / 44 live-FAIL
+latent + 1 silent-skip + 1 deferred-source-regression (down 1:
+chat_state closes).
+
+### Latent-triage queue (post-R12e)
+
+Bug #12 target cohort status (7 total):
+- test_snapshot_disk, test_snapshot_delta, test_snapshot_episodic,
+  test_decision_log_durable, test_snapshot_disk_full,
+  test_chat_state_persistence → **CLOSED (6/7)**.
+- test_fed_daemon_transport → blocked on Bug #13 (NOVA concat
+  layout bug under ASLR-off). R12b patched p256_keypair correctly;
+  Bug #13 is a dedicated NOVA round.
+- test_p256_keypair_load → same Bug #13 blocker.
+
+- **R13-fix (NOVA)** — ADR-0100 class recurrence / concat overflow
+  (Bug #13). Last 2 Bug #12 tests + likely other ASLR-sensitive
+  SEGVs.
+- **R14-fix (NOVA)** — `_nova_str_replace` no-match bug.
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep
+  (optional, ~210 remaining mostly-benign sites).
+- **NOVA str_new fix** (higher priority).
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, re-collapse
+  string.nova inline byte-copies, Phase R6+, real-socket DTLS
+  roundtrip.
