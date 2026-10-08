@@ -588,14 +588,16 @@ Status snapshot as of 2026-10-06:
   return tag upstream (`f83aa7c`). R12 shipped Crossengin-side
   `sys_tagged` helpers + 4-source patches, closing 4 of 7 target
   tests. R12b patched p256_keypair.nova.
-- (13) DOCUMENTED in R12c — ASLR-sensitive SEGV in `_nova_len`
-  on `p256_keypair_load(base_path=0x80000049bb16)`. Live gdb
-  backtrace captured. `base_path` is a `_base_dir() + "/..."`
-  concat whose output lands beyond userspace (above 2^47) under
-  ASLR-OFF but not under strace/ASLR-ON. Suggested fix:
-  investigate `_nova_concat` + `_nova_alloc` for an overflow /
-  sign-extension bug under specific heap layouts. Deferred to a
-  dedicated NOVA runtime round.
+- (13) SHIPPED upstream in R13 (`_nova_alloc` signed-compare bug) —
+  NOVA commit `ea84104`. Root cause narrowed by Phase-1 agent to
+  `_nova_alloc`'s fast-path `jle` compare at codegen.nova:16348;
+  addresses with bit 47 set compare as negative under SIGNED,
+  slip past the "fits in heap" guard, and get returned as
+  non-canonical pointers that SEGV on later deref. Fix: 1-char
+  `jle` -> `jbe`. Closes `test_fed_daemon_transport` + closes
+  pre-existing `test_p256_keypair_load`. Does NOT close Bug #14
+  (confirmed: reverting the R12d workaround regresses the gloss
+  test; Bug #14 is a separate root cause).
 - (14) WORKAROUND-SHIPPED in R12d — `_nova_str_replace` returns
   `""` on a no-match input under specific heap layouts.
   Crossengin-side scan-first fast path in `_snap_oneline`
@@ -605,14 +607,14 @@ Status snapshot as of 2026-10-06:
   (`_nova_concat` / `_nova_chr` layout sensitivity).
 
 **All 14 upstream NOVA bugs resolved, formally deferred, or
-documented for sweep.** Ten have upstream fixes (#1-#5, #7, #8,
-#11, #12 partial); #4 is transitively closed by #3; #6 is not a
-NOVA bug; #9/#10 await the module-system ADR; #12 awaits a
+documented for sweep.** Eleven have upstream fixes (#1-#5, #7, #8,
+#11, #12 partial, #13); #4 is transitively closed by #3; #6 is
+not a NOVA bug; #9/#10 await the module-system ADR; #12 awaits a
 dedicated syscall-sweep round for the remaining pieces (sys_read
-input + return + concat polymorphism); #13 and #14 await NOVA
-runtime rounds (likely a shared root cause). All user-side
-workarounds remain as defensive depth and can be retired
-incrementally.
+input + return + concat polymorphism); #14 awaits a NOVA runtime
+round (confirmed R13 did NOT close it — separate root cause from
+#13). All user-side workarounds remain as defensive depth and can
+be retired incrementally.
 
 ### Bug #8 ripple — follow-up round queued
 

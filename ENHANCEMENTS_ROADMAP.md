@@ -3094,3 +3094,62 @@ Bug #12 target cohort status (7 total):
   tagged-b cleanup, `test_match_expr` parser bug, re-collapse
   string.nova inline byte-copies, Phase R6+, real-socket DTLS
   roundtrip.
+
+### Latent-triage R13 — NOVA Bug #13 close (_nova_alloc signed compare)
+
+Phase-1 Explore (`a94dafcdc975ab30f`) narrowed the Bug #13 root
+cause from "ASLR-sensitive concat" to a specific 1-char bug in
+NOVA's codegen: `_nova_alloc`'s fast-path "fits in heap?" compare
+at `codegen.nova:16348` used `jle` (signed). Addresses with bit
+47 set (`0x80000000_0000+`, post-brk-expansion heap in some
+layouts) are numerically below `_heap_end` but SIGNED compare
+treats them as negative, slipping past the "fits" guard. The
+returned pointer is non-canonical → SEGV on later deref.
+
+**NOVA Fix (1 char)**: `jle` → `jbe` + comment block referencing
+Bug #13. Shipped in NOVA commit `ea84104`.
+
+Scope-of-close:
+
+| Test | Pre | Post |
+|---|---|---|
+| test_fed_daemon_transport | SEGV | **OK (20 checks)** |
+| test_p256_keypair_load | SEGV (pre-existing) | **OK (31 checks)** |
+| test_snapshot_disk_full | OK via R12d workaround | OK (R12d workaround retained; Bug #14 NOT closed) |
+
+Verified: reverting the R12d workaround regresses the gloss
+test → Bug #14 is SEPARATE from Bug #13 (not shared root cause
+as hypothesized). R12d workaround stays until Bug #14 lands.
+
+Canary sweep (34 tests: motor_map, perception, action, R2-R9
+cohorts + R12 cohort + chat_state) — all PASS. Zero regressions.
+
+Self-host fixpoint holds (make -B completes cleanly).
+
+Tally delta: 411 → **413 CLEAN** (fed_daemon_transport
+leaves deferred bucket, p256_keypair_load leaves pre-existing).
+30 pre-existing (down 1) / 44 live-FAIL latent + 1 silent-skip +
+0 deferred-source-regression (down 1 — all 7 Bug #12 targets
+closed OR deferred ones moved to CLEAN via R13).
+
+Latent sibling flagged (not fixed): the brk/mmap expansion path
+(codegen.nova:16349-16376) doesn't re-check that
+`_heap_ptr + rbx <= _heap_end` after a failed syscall. Rare in
+practice (OOM only) but worth a defensive re-check in a follow-up.
+
+### Latent-triage queue (post-R13)
+
+- **R14-fix (NOVA)** — `_nova_str_replace` no-match bug. Workaround
+  shipped in R12d; investigation of actual root cause deferred.
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep
+  (optional).
+- **NOVA str_new fix** (higher priority).
+- **R13-followup** — defensive brk re-check in `_nova_alloc`
+  expansion path.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, re-collapse
+  string.nova inline byte-copies, Phase R6+, real-socket DTLS
+  roundtrip.
