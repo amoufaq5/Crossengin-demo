@@ -515,6 +515,36 @@ location.
   static analysis; this bug is in NOVA's concat/alloc path, not
   in Crossengin's syscall wrappers.
 
+## 14. `_nova_str_replace` returns "" on no-match input under specific heap layouts
+
+- **ADR**: none yet.
+- **Workaround**: SHIPPED — Crossengin-side scan-first fast path in
+  `_snap_oneline` at `src/persistence/snapshot_disk.nova:358-370`.
+  If input has no CR/LF, returns it unchanged; only invokes
+  `str_replace` when a flatten is actually needed.
+- **Tests**: `test_snapshot_disk_full` `gloss survived reload`
+  (closed via the workaround).
+- **Context**: `_snap_oneline("a happy accident of events")` calls
+  `str_replace` twice (replacing \n then \r). Input has no CR/LF so
+  both calls should be identity. Observed: returns `""`. Three
+  symmetric `len(r[9]) > 0` guards on the gloss slot (:407, :621,
+  :745) cause the empty value to silently cascade through
+  emit → skip-serialize → skip-apply, giving the `got=''`
+  (empty, not corrupted) pattern.
+- **Likely root cause**: Same shape as Bug #13's ASLR-sensitive
+  `_nova_concat` output — a `_nova_str_replace` /
+  `_nova_chr` / `_nova_concat` interaction under specific
+  allocation patterns. All three live in the same codegen area:
+  `_nova_str_replace` at `/home/user/NOVA/src/compiler/codegen.nova:20881`,
+  `_nova_chr` at `:16834`, `_nova_concat` at `:16400`.
+- **Suggested fix**: Investigate `_nova_str_replace`'s no-match
+  path (codegen.nova:20926-20936) + `_nova_chr`'s tag convention
+  (:16834) + possible interaction with `_nova_concat` layout
+  (Bug #13). Likely a shared root cause.
+- **Status (2026-10-08)**: Workaround SHIPPED Crossengin-side.
+  NOVA runtime fix deferred to a dedicated round (co-investigate
+  with Bug #13).
+
 ## 6. Sandbox O_CREAT policy (container, not NOVA)
 
 - **ADR**: 0104
@@ -566,15 +596,23 @@ Status snapshot as of 2026-10-06:
   investigate `_nova_concat` + `_nova_alloc` for an overflow /
   sign-extension bug under specific heap layouts. Deferred to a
   dedicated NOVA runtime round.
+- (14) WORKAROUND-SHIPPED in R12d — `_nova_str_replace` returns
+  `""` on a no-match input under specific heap layouts.
+  Crossengin-side scan-first fast path in `_snap_oneline`
+  bypasses the bug when input has no CR/LF (the common case for
+  one-sentence glosses). Closes `test_snapshot_disk_full`'s
+  gloss roundtrip FAIL. Likely same root cause as Bug #13
+  (`_nova_concat` / `_nova_chr` layout sensitivity).
 
-**All 13 upstream NOVA bugs resolved, formally deferred, or
+**All 14 upstream NOVA bugs resolved, formally deferred, or
 documented for sweep.** Ten have upstream fixes (#1-#5, #7, #8,
 #11, #12 partial); #4 is transitively closed by #3; #6 is not a
 NOVA bug; #9/#10 await the module-system ADR; #12 awaits a
 dedicated syscall-sweep round for the remaining pieces (sys_read
-input + return + concat polymorphism); #13 awaits a NOVA runtime
-round. All user-side workarounds remain as defensive depth and can
-be retired incrementally.
+input + return + concat polymorphism); #13 and #14 await NOVA
+runtime rounds (likely a shared root cause). All user-side
+workarounds remain as defensive depth and can be retired
+incrementally.
 
 ### Bug #8 ripple — follow-up round queued
 

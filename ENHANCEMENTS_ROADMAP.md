@@ -2980,3 +2980,54 @@ unchanged. Zero code changes, zero regressions.
 - **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
 - **NOVA str_new fix** (higher priority).
 - **Potential NOVA ADR** — implicit `call main` in `_start`.
+
+### Latent-triage R12d — close test_snapshot_disk_full gloss (NOVA Bug #14 workaround)
+
+Phase-1 Explore (`a0e6fd248fe0bcc0a`) traced the gloss roundtrip FAIL
+to a NOVA runtime bug (not Bug #12 shape): `_nova_str_replace`
+returns `""` on a no-match input under specific heap layouts.
+
+The failing test is pure in-memory
+`snap_from_text(snap_to_text(s))` — no file I/O, so R12/R12b
+sys_tagged work isn't involved. `_snap_oneline("a happy accident
+of events")` calls `str_replace` twice (replacing \n, \r); input has
+no CR/LF so both calls should be identity. Observed: returns `""`.
+Three symmetric `len(r[9]) > 0` guards on the gloss slot cause the
+empty value to silently cascade through emit → skip-serialize →
+skip-apply, giving the `got=''` pattern.
+
+Likely same root cause as Bug #13 (`_nova_concat` /
+`_nova_chr` / `_nova_str_replace` layout sensitivity).
+
+**Workaround shipped** (7 LOC in
+`src/persistence/snapshot_disk.nova:358-370`): scan-first fast path
+in `_snap_oneline`. If input has no CR/LF, return it unchanged;
+only invoke the (bug-exposed) double `str_replace` when a flatten
+is actually needed. Semantics preserved.
+
+Per-test status:
+- test_snapshot_disk_full: 126 passed, 1 FAILED → **OK (127 checks)**.
+- Full canary sweep (32 prior-round tests): all PASS. Zero regressions.
+
+Tally delta: 409 → 410 CLEAN / 31 pre-existing / 44 live-FAIL latent
++ 1 silent-skip + 2 deferred-source-regression (down 1).
+
+NOVA Bug #14 documented in `docs/UPSTREAM_NOVA_BUGS.md §14` with
+investigation anchor (codegen.nova:20881 / :16834 / :16400). Likely
+co-investigate with Bug #13 since they share the layout-sensitivity
+shape.
+
+### Latent-triage queue (post-R12d)
+
+- **R12e** — test_chat_state_persistence SEGV (needs runtime probes).
+  Last remaining Bug #12 target not closed.
+- **R13-fix (NOVA)** — ADR-0100 class recurrence / concat overflow
+  (Bug #13). Would close test_fed_daemon_transport +
+  test_p256_keypair_load.
+- **R14-fix (NOVA)** — `_nova_str_replace` no-match bug (Bug #14).
+  Would allow reverting the R12d scan-first workaround.
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **NOVA str_new fix** (higher priority).
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
