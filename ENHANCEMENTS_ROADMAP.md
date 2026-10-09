@@ -3146,8 +3146,11 @@ practice (OOM only) but worth a defensive re-check in a follow-up.
 - **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep
   (optional).
 - **NOVA str_new fix** (higher priority).
-- **R13-followup** — defensive brk re-check in `_nova_alloc`
-  expansion path.
+- **R13-followup** — SHIPPED (NOVA commit `c5a14f7`): defensive
+  post-expansion check in `_nova_alloc` with loud `exit(1)` abort
+  on arena exhaustion. Zero test closures (OOM paths not currently
+  exercised); zero regressions. Prevents a future class of
+  hard-to-diagnose SEGVs when brk/mmap/VirtualAlloc fail.
 - **Potential NOVA ADR** — implicit `call main` in `_start`.
 - **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
   tagged-b cleanup, `test_match_expr` parser bug, re-collapse
