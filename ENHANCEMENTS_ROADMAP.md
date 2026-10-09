@@ -3285,8 +3285,71 @@ Canary sweep (36 tests) all PASS. Zero regressions.
 Tally delta: 413 → **414 CLEAN** / 30 pre-existing / 44 live-FAIL
 latent (-11 individual FAIL points; -1 test).
 
-### Latent-triage queue (post-R15)
+### Latent-triage R16 — C4-ADR + test_dtls12 bulk Shape-A migration
 
+**ADR-0114 drafted and shipped**: `docs/adr/0114-dtls12-handshake-completion.md`.
+
+Phase-1 Explore (`ab7ce8193ad318e85`) deep-read `src/federation/dtls12.nova`
+(4328 lines) + 7 prior DTLS ADRs and overturned the C4 re-triage's
+premise. The "stubs" named by the earlier triage
+(`ecdhe_derive`, `seal_record`, `open_record`, `cert_verify`) are
+**intentional regression guards** at `_R29B2_STUB`-suffixed symbols;
+the real implementations landed in R31B / ADR-0094 / ADR-0095. The
+`test_stubs_return_DTLS_ERR_STUB` test at `test_dtls12.nova:671`
+asserts those guards return `DTLS_ERR_STUB` — those assertion LABELS
+are what the triage misread.
+
+The honest work is: freeze test harness seed (Round B), stamp
+`last_err` on invalid SRTP profile (Round C), re-triage the "71
+cascade" FAILs per ADR-0068 methodology (Round A/D).
+
+**R16 ships part of this**: a bulk Shape-A migration of 73 bare
+`str_eq(` → `str_eq_bytes(` sites in `tests/unit/test_dtls12.nova`
+(plus the `../../src/util/str_safe.nova` import). The agent's
+hypothesis that only 1 last_err stamp was needed was wrong — the
+actual bug was that **ALL 6 last_err assertions + ~66 other
+assertions** use raw `str_eq` on tagged `dtls_last_error()`
+return and other dtls error labels. These are all Shape-A migration
+residuals.
+
+Per-test outcome:
+- test_dtls12: 443 passed / 76 FAILED → **515 passed / 4 FAILED**.
+- The 4 residuals are the exact random-seed-drift FAILs ADR-0114
+  Round B predicts (alice/bob client/server random vs seeded
+  harness literal). Round B (freeze seed) will close them.
+
+Side-channel observation (NOT caused by R16): container restart
+mid-session re-exposed Bug #13's underlying class — `test_fed_daemon_transport`,
+`test_chat_state_persistence`, `test_p256_keypair_load` SEGV again
+on a `_base_dir() + "/..."` concat producing a non-canonical
+pointer (0x80000049bb3a, bit 47 set). The R13 `jbe` + R13-followup
+exit(1) are both present in the binary (verified via gdb disas);
+these fixes correctly reject pointers past `_heap_end` but **do
+not prevent `_heap_end` itself from spilling above 2^47** when
+the kernel's mmap/brk lands near the top of userspace under ASLR-OFF.
+Not a R15/R16 regression — these tests had been passing because
+the pre-restart ASLR offset kept mmap below the bit-47 boundary.
+Needs a dedicated NOVA Bug #15 investigation to cap `_heap_end`
+below 2^47 or validate canonicality in `_nova_alloc`.
+
+Tally delta: 414 → 414 CLEAN unchanged (test_dtls12 remains 1 test
+with FAILs, 4 residuals pending Round B; +72 individual FAIL
+points closed). The 3 trio tests move back to the deferred bucket
+pending Bug #15 investigation.
+
+### Latent-triage queue (post-R16)
+
+- **R17 (ADR-0114 Round B)** — freeze `DTLS_TEST_SEED` constant +
+  re-point 4 random-literal expectations in `test_dtls12.nova:734+`.
+  Closes test_dtls12 to 519/0. ~10 LOC test-only.
+- **Bug #15 (NOVA, HIGH priority)** — `_heap_end` can spill above
+  2^47 under ASLR-OFF when kernel chooses high-userspace mmap base.
+  Pointers allocated below `_heap_end` may be non-canonical and
+  SEGV on first dereference. Reproducer: run
+  `test_fed_daemon_transport` under setarch -R post container
+  restart; gdb backtrace shows `_nova_len` on `rdi=0x80000049bb3a`.
+  Fix idea: cap `_heap_end` to `min(mmap_result + 1MB, 0x7fffffffffff)`
+  OR mask bit 47+ in allocation returns.
 - **C5.2** — audio_synth 16 FAILs + audio_tts 3 FAILs. Debug
   round; focus on `audio_write_wav` return path (sys_open/
   sys_write/alloc) + KG phoneme round-trip in `synth_text`.
