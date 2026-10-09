@@ -3221,3 +3221,86 @@ R12e, R13, R14).
 - **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
   tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
   real-socket DTLS roundtrip.
+
+### C4 / C5 re-triage (post-NOVA fixes R11-R14)
+
+Parallel Explore re-triage (C4 agent `a39e6126120a94dc8`, C5 agent
+`a212625973fce4f96`) found both clusters significantly reduced by
+the session's NOVA runtime fixes:
+
+**C4 "DTLS12 handshake/crypto"**:
+- Original scope was 23 tests (overcount; actual = 12). 10/12 PASS
+  now; only 2 remain:
+  - `test_dtls12` 443 passed / 76 FAILED (unchanged, needs a
+    handshake impl ADR for the ~71 Shape-D stubs; 5 Shape-A/D
+    micro-fixes shippable now).
+  - `test_p256_keypair_load` previously SEGV'd (closed via R13 —
+    verified at tip post-R14, OK 31 checks across 3 runs; the
+    agent's SEGV observation was transient dirty state).
+- Recommendation: hybrid round — ship 5-LOC Shape-A/D micro-fixes
+  (4 random-seed drift + 1 last_err stamp) now, write ADR for
+  deep handshake work later.
+
+**C5 "string.nova sweep ripple audit"**:
+- Original scope 13 tests, 73 FAILs. 29 FAILs retroactively closed
+  by NOVA fixes (test_nl_generate 23 → PASS, test_nl_query 4 →
+  PASS, test_output_generation 2 → PASS). 44 FAILs remain across
+  5 tests.
+- Split into 2 sub-cohorts:
+  - **C5.1 "string.nova tail"** — 11 bare `str_eq` sites across
+    3 files (test_word_atoms, src/io/transducers/audio_speaker_id,
+    src/io/effectors/audio_voice_clone). Expected +25 CLEAN.
+  - **C5.2 "audio synth + WAV writer"** — audio_synth 16 FAILs +
+    audio_tts 3 FAILs. Shape-D source bugs centered on
+    `audio_write_wav` returning 0 + KG phoneme round-trip. Needs
+    debug round.
+
+### Latent-triage R15 — C5.1 string.nova tail (partial close)
+
+Migrated 11 bare `str_eq` sites to `str_eq_bytes` across 3 files
+(`replace_all` on 2 source files, 1-line edit on test helper):
+
+- `tests/unit/test_word_atoms.nova:158` (`_has_str` helper).
+- `src/io/transducers/audio_speaker_id.nova` — 9 sites at :308,
+  :698, :705, :720, :723, :726, :729, :732, :836 (gallery/entry
+  decode + "unknown" guard).
+- `src/io/effectors/audio_voice_clone.nova:675`
+  (formant-table lookup).
+
+Per-test outcome:
+- **test_word_atoms**: 7 FAIL → **OK (115 checks)** ✓ full close.
+- test_speaker_id: 10 FAIL → 9 FAIL (1 recovered). Residuals are
+  gallery save/load I/O — Shape-D, not str_eq.
+- test_voice_clone: 8 FAIL → 5 FAIL (3 recovered). Residuals are
+  WAV write I/O — Shape-D, not str_eq.
+
+The 11 migrations recovered **+11 FAILs**; the predicted +25
+assumed Shape-A/B shape across the board but C5.1 flushed out
+Shape-A/D mixing: the str_eq fixes unmask file-I/O Shape-D
+residuals (audio_write_wav, gallery_save) that need C5.2's
+dedicated investigation.
+
+Canary sweep (36 tests) all PASS. Zero regressions.
+
+Tally delta: 413 → **414 CLEAN** / 30 pre-existing / 44 live-FAIL
+latent (-11 individual FAIL points; -1 test).
+
+### Latent-triage queue (post-R15)
+
+- **C5.2** — audio_synth 16 FAILs + audio_tts 3 FAILs. Debug
+  round; focus on `audio_write_wav` return path (sys_open/
+  sys_write/alloc) + KG phoneme round-trip in `synth_text`.
+- **C4-micro** — 5 Shape-A/D fixes for `test_dtls12` (4 random
+  seed drift + 1 last_err stamp). ~10 LOC.
+- **C4-ADR** — DTLS 1.2 handshake state machine (~71 FAILs). ADR
+  topic draft from C4 agent.
+- **test_speaker_id residuals** — 9 FAILs in gallery I/O.
+- **test_voice_clone residuals** — 5 FAILs in WAV write I/O.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **NOVA str_new fix** (higher priority).
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
