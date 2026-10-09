@@ -3156,3 +3156,68 @@ practice (OOM only) but worth a defensive re-check in a follow-up.
   tagged-b cleanup, `test_match_expr` parser bug, re-collapse
   string.nova inline byte-copies, Phase R6+, real-socket DTLS
   roundtrip.
+
+### Latent-triage R14 — NOVA Bug #14 close (_nova_str_replace raw-byte ABI)
+
+Phase-1 Explore (`aaf35ee510f2ef26f`) pinned a specific ABI
+mismatch at `_nova_str_replace`'s no-match branch
+(codegen.nova:20943-20947): the branch reads a RAW byte from the
+source string and passes it to `_nova_chr` via rdi, but
+`_nova_chr` internally does `sar rcx, 1` to untag -- every
+user-visible caller reaches it through the `chr` trampoline
+which guarantees tagged input. Raw bytes got halved: `'a'` (97)
+emitted as 48 (`'0'`), `' '` (32) as 16 (DLE), etc. The garbled
+output misaligned snapshot framing -> `got=''`.
+
+**Important finding**: this is NOT the shared root cause with
+Bug #13 that R12d/R13 hypothesized. Bug #13's `_nova_alloc` fix
+was necessary but not sufficient -- pre-R13 the halved bytes
+never reached the serializer because `_nova_alloc` SEGV'd first.
+Post-R13 the allocation succeeds, and the halved bytes finally
+make it to the serializer where they misalign framing.
+
+NOVA Fix (1 LOC + comment) at codegen.nova:20946: insert
+`lea rdi, [rdi + rdi + 1]` to tag the raw byte before
+`call _nova_chr`. Matches `_nova_char_at`'s tagging idiom at
+:16866. Shipped in NOVA commit `26926a4`.
+
+**R12d scan-first workaround RETIRED**: reverted the defensive
+scan loop in `src/persistence/snapshot_disk.nova:_snap_oneline`
+back to the clean 1-line form:
+```nova
+fn _snap_oneline(s) {
+    return str_replace(str_replace(s, chr(10), " "), chr(13), " ")
+}
+```
+
+Per-test status: `test_snapshot_disk_full` OK (127 checks)
+retained after reverting the workaround.
+
+Canary sweep (36 tests): all PASS. One transient flake in
+test_dtls_client_flight (85/1 FAIL on 1st run -> OK on 2nd+3rd
+runs) attributed to sandbox timing jitter, not caused by this
+fix. Self-host fixpoint holds.
+
+Tally delta: 413 CLEAN unchanged / 30 pre-existing / 44
+live-FAIL latent / 1 silent-skip. All 14 upstream NOVA bugs now
+resolved or formally deferred (12 upstream-fixed, 2 ADR-deferred,
+1 transitively closed, 1 non-NOVA). The Bug #12 ripple arc —
+which began when Bug #8's unresolved-callee check surfaced 68
+latent SEGVs in R6b — is now **fully closed** at the NOVA runtime
+level across 10 rounds (R6b, R10, R11, R12, R12b, R12c, R12d,
+R12e, R13, R14).
+
+### Latent-triage queue (post-R14)
+
+- **ADR-driven** — C4 DTLS12 completion, C5 string.nova sweep audit.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep
+  (optional).
+- **NOVA str_new fix** (higher priority).
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — the remaining sys_write / sys_read input
+  untag + return convention audit (not blocking any specific test
+  anymore but worth cleanup).
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.

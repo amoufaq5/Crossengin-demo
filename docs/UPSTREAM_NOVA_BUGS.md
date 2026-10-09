@@ -598,23 +598,30 @@ Status snapshot as of 2026-10-06:
   pre-existing `test_p256_keypair_load`. Does NOT close Bug #14
   (confirmed: reverting the R12d workaround regresses the gloss
   test; Bug #14 is a separate root cause).
-- (14) WORKAROUND-SHIPPED in R12d — `_nova_str_replace` returns
-  `""` on a no-match input under specific heap layouts.
-  Crossengin-side scan-first fast path in `_snap_oneline`
-  bypasses the bug when input has no CR/LF (the common case for
-  one-sentence glosses). Closes `test_snapshot_disk_full`'s
-  gloss roundtrip FAIL. Likely same root cause as Bug #13
-  (`_nova_concat` / `_nova_chr` layout sensitivity).
+- (14) SHIPPED upstream in R14 — ABI mismatch in
+  `_nova_str_replace`'s no-match branch at
+  codegen.nova:20943-20947: the branch read a RAW byte from the
+  source string and passed it to `_nova_chr`, but `_nova_chr`
+  internally does `sar rcx, 1` to untag -- every other caller
+  reaches it through the `chr` trampoline which guarantees
+  tagged input. So raw bytes got halved: 'a' (97) emitted as 48
+  ('0'), ' ' (32) as 16 (DLE), etc. The garbled output
+  misaligned snapshot framing, surfacing as `gloss roundtrip
+  got=''`. **Not** the hypothesized shared root with Bug #13 --
+  Bug #13's _nova_alloc fix was necessary but not sufficient
+  (pre-R13 the halved bytes never reached the serializer because
+  _nova_alloc SEGV'd first). Fix (1 LOC): tag the raw byte with
+  `lea rdi, [rdi + rdi + 1]` before `call _nova_chr`. NOVA
+  commit `26926a4`. R12d scan-first workaround in
+  `src/persistence/snapshot_disk.nova:_snap_oneline` RETIRED.
 
-**All 14 upstream NOVA bugs resolved, formally deferred, or
-documented for sweep.** Eleven have upstream fixes (#1-#5, #7, #8,
-#11, #12 partial, #13); #4 is transitively closed by #3; #6 is
-not a NOVA bug; #9/#10 await the module-system ADR; #12 awaits a
-dedicated syscall-sweep round for the remaining pieces (sys_read
-input + return + concat polymorphism); #14 awaits a NOVA runtime
-round (confirmed R13 did NOT close it — separate root cause from
-#13). All user-side workarounds remain as defensive depth and can
-be retired incrementally.
+**All 14 upstream NOVA bugs resolved or formally deferred.**
+Twelve have upstream fixes (#1-#5, #7, #8, #11, #12 partial, #13,
+#14); #4 is transitively closed by #3; #6 is not a NOVA bug;
+#9/#10 await the module-system ADR; #12 awaits a dedicated
+syscall-sweep round for the remaining pieces (sys_read input +
+return + concat polymorphism). All user-side workarounds remain
+as defensive depth and can be retired incrementally.
 
 ### Bug #8 ripple — follow-up round queued
 
