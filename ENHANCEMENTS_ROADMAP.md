@@ -3618,6 +3618,94 @@ live-FAIL latent (3 new closes).
 - **NOVA `str_find` canonical fix for position-0 multi-char
   needle** — new, HIGH visibility now (Shape S3 is a one-site
   show-up but the bug is tree-wide latent).
+
+### Latent-triage R21 — C6 cognitive/meta mechanical subset (6/10)
+
+**Scope**: close the 6 C6 FAILing tests whose shapes fit the
+R19/R20 mechanical catalogue (A: `str_eq` → `str_eq_bytes`; S3:
+`str_find` → `find_bytes`). Four other C6 FAILs
+(`test_meta_observer_feedback`, `test_internet_fetch`,
+`test_pack_registry`, `test_dr_async_fetch`) are
+shape-D/E and deferred to their own rounds.
+
+Phase-1 Explore (agent `ade16530fac1b199a`) enumerated the C6
+cluster + classified by shape. Confirmation reads showed one
+test's FAIL set split across source + test helpers (not just test
+helpers as predicted), which widened a few of the edits.
+
+**Six closes**:
+
+| Test                       | FAILs | Pre-R21 | Post-R21 | Shape+ |
+|----------------------------|-------|---------|----------|--------|
+| test_proof_checker         | 10    | 46/10   | **56/0** | A test helper |
+| test_table                 | 9     | 15/9    | **24/0** | A (src ×2 + test ×2) |
+| test_constitutional_filter | 4     | 18/4    | **22/0** | A (src `loyalty_resolve` + source dep `_loyalty_index`) |
+| test_cognitive_router      | 8     | 47/8    | **55/0** | S3 (`_has` helper) + A (src `_cr_two_options` ×4) |
+| test_self_model_query      | 2     | 7/2     | **9/0**  | S3 (test ×9) + A (src ×2) |
+| test_distributed_query     | 6     | 30/6    | **36/0** | A (test ×6) |
+
+**Sub-shape surprises** (noted for future rounds):
+- `test_constitutional_filter` reached down into
+  `src/parts/soul/loyalty.nova:_loyalty_index` — one str_eq there
+  broke every `soul_loyalty_level` lookup. Not just the surface
+  `loyalty_resolve` entry.
+- `test_cognitive_router` S3 fix at `_has` closed 6 of 8 FAILs;
+  the remaining 2 (`debatable hedges` / `debatable names
+  options`) traced to `_cr_two_options` src site using str_eq on
+  `or`/`than`/`vs`/`versus` markers.
+- `test_self_model_query` S3 fix in the test closed 7 of 9; the
+  remaining 2 (`forming when empty` / `identity mentions theme`)
+  traced to `selfmodel_identity` str_eq on empty-string checks.
+- Lesson: a test's FAIL label naming a "contains" check isn't a
+  pure test-side shape — follow the generator path.
+
+**Changes** (~25 LOC across 7 files):
+- `src/data/table.nova`: +import str_safe + 2 str_eq swaps.
+- `src/safety/constitutional_filter.nova`: +import + 2 str_eq swaps.
+- `src/parts/soul/loyalty.nova`: +import + 1 str_eq swap.
+- `src/agent/cognitive_router.nova`: 4 str_eq swaps (import
+  already present from earlier round).
+- `src/parts/meta/self_model_query.nova`: +import + 2 str_eq swaps.
+- `tests/unit/test_proof_checker.nova`: +import + 1 str_eq swap.
+- `tests/unit/test_table.nova`: +import + 2 str_eq swaps.
+- `tests/unit/test_cognitive_router.nova`: +import + `_has` helper
+  swap.
+- `tests/unit/test_self_model_query.nova`: +import + 9 str_find
+  swaps.
+- `tests/unit/test_distributed_query.nova`: +import + 6 str_eq
+  swaps.
+
+Per-test outcome:
+- 6 tests close (39 FAILs removed).
+- Canary (19 tests including the 6 R21 targets): all PASS.
+
+Tally delta: 423 → **429 CLEAN** / 30 pre-existing / 30 live-FAIL
+latent.
+
+### Latent-triage queue (post-R21)
+
+- **C6 deep-investigation subset** (4 tests remain):
+  - test_meta_observer_feedback (counter saturation; observer-
+    feedback audit).
+  - test_internet_fetch (cache record logic; miss recorded as
+    hit).
+  - test_pack_registry (install returns status=1).
+  - test_dr_async_fetch (R31A async-socket; likely NOVA runtime
+    `connect_async`/`fcntl`/`SO_ERROR` wrappers).
+- **Canonical-arena allocator ADR (NOVA)** — unchanged.
+- **NOVA `str_split` canonical fix** — unchanged.
+- **NOVA `str_find` canonical fix for position-0 multi-char
+  needle** — R21 adds 15+ more sites to the retire-on-fix list
+  (across 3 tests + source).
+- **test_audio_wakeword SEGV** — unchanged.
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` +
+  `str_find → find_bytes` sweeps.
+- **NOVA str_new fix**.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
 - **test_audio_wakeword SEGV** — unchanged.
 - **C6** — cognitive/meta grab bag (20 tests, fragmented).
 - **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` +
