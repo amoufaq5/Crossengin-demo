@@ -3757,6 +3757,82 @@ docs/UPSTREAM_NOVA_BUGS.md pending.
     in the current codegen path? Walk the asm.
   - If Q2 confirms, this becomes a NOVA upstream inline-builtin
     return-tagging fix (Shape-E, R23 ships NOVA commit).
+
+### Latent-triage R23 — NOVA Bug #16 close (socket tag leaks)
+
+**Scope**: test_dr_async_fetch 93/4 → 97/0. Fourth and final C6
+test. Confirmed as a Shape-E NOVA runtime bug: three inline-codegen
+socket wrappers in `src/compiler/codegen.nova` were tag-inconsistent.
+
+**Probe findings** (strace -e trace=socket,fcntl,getsockopt):
+- Pre-R23 `socket(2, 1, 0)` reached the kernel as
+  `socket(AF_APPLETALK=5, SOCK_RAW=3, 1)` → -1 EAFNOSUPPORT. The
+  tagged literal `2` → `mov rdi, 5` leaks straight through the
+  wrapper. UDP path (`sys_socket_udp`) was unaffected because it
+  hardcodes constants inside the wrapper.
+- Pre-R23 fcntl + getsockopt returned raw rax. Caller
+  `ce_eq(..., rc, 0)` where `0` is tagged → compare fails, both
+  render as "0" through int_to_str → symptom `expected=0 got=0`
+  (misleadingly identical).
+
+**Fix** (33 LOC in `src/compiler/codegen.nova`):
+- `_nova_socket` Linux x86: `sar rdi, 1; sar rsi, 1; sar rdx, 1`
+  before syscall; `lea rax, [rax + rax + 1]` after.
+- `_nova_sys_fcntl_setfl_nonblock` + `_nova_sys_getsockopt_so_error`
+  Linux x86: tag-polymorphic rdi (`test rdi, 1; jz raw; sar rdi, 1`)
+  so chains rooted at either fixed socket() (tagged fd) or raw
+  sys_socket_udp (raw fd) both work; tag rax return.
+
+The tag-polymorphic rdi choice preserves the pre-existing raw-fd
+chain used by `nat_traversal` through `sys_setsockopt_so_reuseaddr`,
+which was not touched in R23.
+
+Per-test outcome:
+- test_dr_async_fetch: 93/4 → **OK (97 checks)**.
+- Canary (25 tests: gossip, gossip_dtls_shim, fed_daemon_transport,
+  dtls12, full audio chain, C6 subset): all PASS. The socket
+  arg-untag strictly fixes the previously-broken SOCK_RAW-via-tag
+  path and does not regress any UDP caller.
+
+Self-host convergence verified (`make self-host`).
+
+Tally delta: 432 → **433 CLEAN** / 30 pre-existing / 26 live-FAIL
+latent. **C6 fully closed** (10 of 10 live FAILs now green).
+
+ADR: none (deferred until a dedicated tag-consistent full socket
+API round scopes the remaining wrappers). NOVA commit `f5a035a`;
+dossier §16 updated.
+
+**Residual** (queued, not blocking): other socket-family inline
+wrappers (bind, listen, accept, connect, send, recv,
+setsockopt_reuseaddr) remain tag-inconsistent. None of their
+callers compare returns against tagged literals in the current test
+surface, so they stay functional. A full-API round would retire
+the tag-polymorphic rdi guards + make all socket helpers
+tag-consistent.
+
+### Latent-triage queue (post-R23)
+
+- **Tag-consistent full socket API (NOVA)** — new, R23's structural
+  companion. The current socket wrappers (bind, listen, accept,
+  connect, send, recv, setsockopt_reuseaddr) are the next layer
+  down the stack and would retire R23's tag-polymorphic rdi guard
+  pattern. MEDIUM priority (no current callers break).
+- **Canonical-arena allocator ADR (NOVA)** — unchanged.
+- **NOVA `str_split` canonical fix** — unchanged.
+- **NOVA `str_find` canonical fix for position-0 multi-char
+  needle** — unchanged.
+- **NOVA `str_eq` canonical fix** — unchanged (HIGH).
+- **test_audio_wakeword SEGV** — unchanged.
+- **test_audio_capture Runtime-OOB residual** (R20 note).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` +
+  `str_find → find_bytes` sweeps.
+- **NOVA str_new fix**.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
 - **Canonical-arena allocator ADR (NOVA)** — unchanged.
 - **NOVA `str_split` canonical fix** — unchanged.
 - **NOVA `str_find` canonical fix for position-0 multi-char

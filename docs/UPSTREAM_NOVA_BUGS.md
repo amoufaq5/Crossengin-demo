@@ -545,6 +545,56 @@ location.
   NOVA runtime fix deferred to a dedicated round (co-investigate
   with Bug #13).
 
+## 16. `socket()` leaks NOVA-tagged args to kernel; `fcntl`/`getsockopt` leak raw rax to NOVA callers
+
+- **ADR**: none yet.
+- **Status**: SHIPPED upstream — NOVA commit `f5a035a` (R23).
+- **Context**: Three inline-codegen socket wrappers in
+  `/home/user/NOVA/src/compiler/codegen.nova` were tag-inconsistent:
+  - `_nova_socket` (syscall 41, L17605-) passed caller-supplied
+    args (rdi/rsi/rdx) straight to the kernel. NOVA call-sites
+    like `socket(2, 1, 0)` emit tagged literals (`mov rdi, 5`
+    for AF_INET=2 because tagged = `(2<<1)|1 = 5`). Kernel
+    decoded as `socket(AF_APPLETALK=5, SOCK_RAW=3, 1)` → -1
+    EAFNOSUPPORT. Confirmed via `strace`: every direct `socket()`
+    caller in `src/federation/*` hit this.
+  - `_nova_sys_fcntl_setfl_nonblock` (syscall 72) and
+    `_nova_sys_getsockopt_so_error` (syscall 55): return raw rax
+    with no tag. Caller `ce_eq(..., rc, 0)` where literal `0` is
+    tagged `(0<<1)|1 = 1` yielded `expected=0 got=0` symbols that
+    both rendered as "0" through int_to_str but compared unequal.
+- **Observed symptom**: `test_dr_async_fetch` 93/4. First FAIL
+  `connect_async to loopback returns fd != -1` because socket()
+  returned -1 EAFNOSUPPORT; the other three fail on tagged-vs-raw
+  compares of the two accessor returns.
+- **Fix** (33 LOC in codegen):
+  - `_nova_socket` Linux x86: `sar rdi, 1; sar rsi, 1; sar rdx, 1`
+    before syscall; `lea rax, [rax + rax + 1]` after.
+  - `_nova_sys_fcntl_setfl_nonblock` + `_nova_sys_getsockopt_so_error`
+    Linux x86: tag-polymorphic rdi (`test rdi, 1; jz raw; sar
+    rdi, 1`) so both tagged-chain (post-socket-fix) and raw-chain
+    (from `sys_socket_udp` which was unchanged) callers work; tag
+    rax return.
+- **Why tag-polymorphic rdi for fcntl/getsockopt**: `sys_socket_udp`
+  deliberately hardcodes its syscall args and was not changed in
+  R23, so its raw-rax fd return is still raw. `nat_traversal`'s
+  `nat_udp_open` depends on that raw chain through
+  `sys_setsockopt_so_reuseaddr` (also unchanged, also raw-expecting).
+  The tag-polymorphic check lets fcntl/getsockopt accept both the
+  new tagged chain (from fixed `socket()`) and the pre-existing raw
+  chain without a sweep of every socket helper.
+- **Tests**: `test_dr_async_fetch` 93/4 → **OK (97 checks)**.
+  Canary (25 tests: gossip + gossip_dtls_shim + fed_daemon_transport
+  + dtls12 + audio chain + C6) all PASS; the socket arg-untag
+  strictly fixes the previously-broken SOCK_RAW-via-tag path and
+  does not regress any UDP caller.
+- **Residual**: other socket-family inline wrappers (bind, listen,
+  accept, connect, send, recv, setsockopt_reuseaddr) remain
+  tag-inconsistent — none of their callers in the current test
+  surface compare returns against tagged literals, so they stay
+  functional for now. Full tag-consistent socket API would be a
+  dedicated round, queued.
+
 ## 15. `_nova_alloc` can return non-canonical pointers when `_heap_end` spills past 2^47
 
 - **ADR**: none yet.
@@ -642,6 +692,17 @@ Status snapshot as of 2026-10-06:
   pre-existing `test_p256_keypair_load`. Does NOT close Bug #14
   (confirmed: reverting the R12d workaround regresses the gloss
   test; Bug #14 is a separate root cause).
+- (16) SHIPPED upstream in R23 — three socket inline wrappers in
+  `src/compiler/codegen.nova`: `_nova_socket` now untags its three
+  caller args + tags its rax return, and
+  `_nova_sys_fcntl_setfl_nonblock` + `_nova_sys_getsockopt_so_error`
+  are tag-polymorphic on rdi + tag their rax return. Closes
+  `test_dr_async_fetch` 93/4 → 97/0 and strace-confirms the
+  previously-leaking `socket(AF_APPLETALK, SOCK_RAW, 1)` is now the
+  intended `socket(AF_INET, SOCK_STREAM, 0)`. NOVA commit `f5a035a`.
+  Residual: other socket-family inline wrappers (bind, listen,
+  accept, connect, send, recv, setsockopt_reuseaddr) remain
+  tag-inconsistent — queued as a dedicated full-API round.
 - (15) SHIPPED upstream in R18 (defensive guard) — `_nova_alloc`
   canonical-pointer check at `.alloc_ok`. NOVA commit `a83f874`.
   Non-canonical allocations (bit 47+ set) now `exit(1)` instead of
@@ -667,15 +728,16 @@ Status snapshot as of 2026-10-06:
   commit `26926a4`. R12d scan-first workaround in
   `src/persistence/snapshot_disk.nova:_snap_oneline` RETIRED.
 
-**All 15 upstream NOVA bugs resolved or formally deferred.**
-Thirteen have upstream fixes (#1-#5, #7, #8, #11, #12 partial,
-#13, #14, #15 defensive); #4 is transitively closed by #3; #6
-is not a NOVA bug; #9/#10 await the module-system ADR; #12
-awaits a dedicated syscall-sweep round for the remaining pieces
-(sys_read input + return + concat polymorphism); #15 is a
-defensive guard pending a future canonical-arena allocator
-redesign. All user-side workarounds remain as defensive depth
-and can be retired incrementally.
+**All 16 upstream NOVA bugs resolved or formally deferred.**
+Fourteen have upstream fixes (#1-#5, #7, #8, #11, #12 partial,
+#13, #14, #15 defensive, #16); #4 is transitively closed by
+#3; #6 is not a NOVA bug; #9/#10 await the module-system ADR;
+#12 awaits a dedicated syscall-sweep round for the remaining
+pieces (sys_read input + return + concat polymorphism); #15 is
+a defensive guard pending a future canonical-arena allocator
+redesign; #16's structural companion (tag-consistent full
+socket API) remains queued. All user-side workarounds remain
+as defensive depth and can be retired incrementally.
 
 ### Bug #8 ripple — follow-up round queued
 
