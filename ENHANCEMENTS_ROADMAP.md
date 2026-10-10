@@ -3471,3 +3471,90 @@ scopes the real fix). NOVA commit `a83f874`; dossier §15 updated.
 - **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
   tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
   real-socket DTLS roundtrip.
+
+### Latent-triage R19 — C5.2 close (audio_synth + audio_tts)
+
+**Scope**: test_audio_synth 193/16 → 209/0 and test_audio_tts
+65/3 → 68/0. Two distinct shapes under one brief:
+
+**Shape S1 — split("asp", " ") returns ["a"] not ["asp"]** (3
+FAILs in audio_synth: hello/three/five phoneme sample counts).
+
+Phase-1 probe traced synth_text:1067 through `split(text, " ")`
+and observed `tok[0]='a' len=1` for input "asp". NOVA's
+`str_split` empirically returns a 1-byte slice via the final
+`str_slice(s, start, s_len)` push — a tag/arithmetic issue in
+str_slice's inner byte-copy loop against a function-boundary
+parameter. Direct `str_slice("asp", 0, 3)` SEGVs. Already
+documented in `src/util/str_safe.nova:28-36` ("NOVA's `split`
+builtin, which is empirically broken").
+
+Fix (3 LOC in `src/io/effectors/audio_synth.nova:1067`): swap
+`split(text, " ")` → `split_space(text)` from the existing
+`str_safe` helper (walks bytes via `char_at` + `substr`, both of
+which work correctly). No source rewrite of NOVA's `str_split`;
+future canonical fix queued as an upstream codegen round.
+
+**Shape S2 — sys_write + sys_read EFAULT on tagged alloc buf**
+(13 audio_synth + 3 audio_tts FAILs: write_wav returns 0,
+read-back `n = -14`).
+
+Classic Bug #12 class-B pattern (R12 arc): NOVA's raw
+`sys_write` / `sys_read` wrappers pass the tagged alloc buffer
+and tagged count straight to the kernel syscall. Kernel sees a
+non-canonical pointer address → EFAULT (-14, displayed as -7
+through tagged int_to_str). Fix is the R12-shipped
+`_sys_write_tagged` / `_sys_read_tagged` helpers from
+`src/util/sys_tagged.nova` which untag both and return
+tagged-on-success / raw -errno on failure (so `written != n` /
+`n == 4` compares against tagged operands work).
+
+Changes:
+- `src/io/effectors/audio_synth.nova`: import `sys_tagged.nova`;
+  `audio_write_wav` uses `_sys_write_tagged`.
+- `src/io/effectors/audio_tts.nova`: `tts_save_wav` uses
+  `_sys_write_tagged` (reachable transitively).
+- `tests/unit/test_audio_synth.nova`: 5 `sys_read` call sites →
+  `_sys_read_tagged`.
+- `tests/unit/test_audio_tts.nova`: 1 `sys_read` call site →
+  `_sys_read_tagged`.
+
+Total: ~30 LOC changed across 4 files.
+
+Per-test outcome:
+- test_audio_synth: 193/16 → **OK (209 checks)**.
+- test_audio_tts: 65/3 → **OK (68 checks)**.
+- Canary (10 tests + 7 audio-adjacent): all PASS except
+  pre-existing `test_audio_capture` (OOB index) and
+  `test_audio_wakeword` (SEGV) — both in the pre-R19 live-FAIL
+  tally, not regressed by this round.
+
+Tally delta: 418 → **420 CLEAN** / 30 pre-existing / 39
+live-FAIL latent.
+
+New entry pending at `docs/UPSTREAM_NOVA_BUGS.md`: track S1 as a
+sibling to §12 (str_split tag arithmetic). Scope: canonical fix
+is in NOVA codegen's handling of pointer+int arithmetic through
+function boundaries; defer to a future NOVA ADR.
+
+### Latent-triage queue (post-R19)
+
+- **Canonical-arena allocator ADR (NOVA)** — unchanged.
+- **NOVA str_split canonical fix** — new, HIGH impact (would
+  retire `split_space` workaround + any similar `split(x, "y")`
+  sites). Shape-S1 above surfaces the specific repro.
+- **speaker_id/voice_clone residuals** — 9 + 5 I/O FAILs,
+  likely Shape-S2 pattern. R15 only migrated str_eq; the
+  sys_write/read audit is still pending.
+- **test_audio_capture OOB + test_audio_wakeword SEGV** — new
+  surface area, needs its own probe.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes`
+  sweep.
+- **NOVA str_new fix**.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit
+  (now partly reduced by R19).
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
