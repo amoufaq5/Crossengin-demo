@@ -3546,6 +3546,92 @@ function boundaries; defer to a future NOVA ADR.
 - **speaker_id/voice_clone residuals** — 9 + 5 I/O FAILs,
   likely Shape-S2 pattern. R15 only migrated str_eq; the
   sys_write/read audit is still pending.
+
+### Latent-triage R20 — speaker_id + voice_clone + audio_capture close
+
+**Scope**: test_speaker_id 44/9 → 53/0, test_voice_clone 50/5 →
+55/0, and test_audio_capture (which had been FAILing with a
+Runtime-OOB) → 28/0 as a side-effect close under the same
+syscall-tagging brief.
+
+**Three shapes under one brief**:
+
+- **Shape S2** (R19 pattern): raw `sys_write`/`sys_read` wrappers
+  hand tagged alloc buf + tagged count straight to the kernel →
+  EFAULT. Fix: swap for `_sys_write_tagged`/`_sys_read_tagged`
+  from `src/util/sys_tagged.nova`. Sites patched:
+  - `audio_speaker_id.nova:567` (sys_write)
+  - `audio_capture.nova:281` (sys_read, inside `_ac_read_file`
+    — this is what reached voice_clone's 200Hz FAILs via
+    `vc_analyze_reference` → `audio_capture_to_pcm`)
+  - `test_audio_capture.nova:92` (sys_write in `_write_bytes`
+    fixture helper)
+  - **sys_tagged.nova import added** to both source files.
+
+- **Shape S2' — read-loop body re-shape** (new sub-shape):
+  `audio_speaker_id.nova:_spk_read_text` previously used
+  `store8(buf + m, 0); acc = acc + buf` with raw sys_read, which
+  was never exercised pre-R20 (SAVE failed first). After the
+  SAVE fix, _spk_read_text ran — and the `store8(buf + m, 0)`
+  with tagged m, followed by `acc + buf` concat, SEGV'd inside
+  `_nova_concat`. Fix: byte-copy into acc one `chr(load8(buf +
+  i))` at a time, same R12d workaround shape. One tagged-arith
+  gotcha avoided per loop.
+
+- **Shape S1** (R19 pattern): `split(arg, " ")` in
+  `audio_voice_clone.nova:955` (`vc_run_clone_command`). Fix:
+  swap to `split_space(arg)` from `str_safe.nova` (reachable
+  transitively via audio_synth).
+
+- **Shape S3 — str_find phantom-zero at position 0** (new
+  pattern, documented but not previously surfaced in a round):
+  `test_voice_clone.nova:test_run_clone_happy_path` checked
+  `str_find(r, "(clone") >= 0` on a response that starts with
+  "(clone ". NOVA's `str_find` returns a phantom-zero that
+  compares as `< 0` for multi-char needles at position 0 (per
+  `str_safe.nova:62`). Fix: swap to `find_bytes` for the three
+  str_find sites in that test (keeps the pattern consistent
+  even though only the position-0 one failed).
+
+**Changes** (~25 LOC across 5 files):
+- `src/io/transducers/audio_speaker_id.nova`: +import +sys_write
+  swap +_spk_read_text byte-copy rewrite.
+- `src/io/transducers/audio_capture.nova`: +import +sys_read swap.
+- `src/io/effectors/audio_voice_clone.nova`: split → split_space.
+- `tests/unit/test_audio_capture.nova`: sys_write swap.
+- `tests/unit/test_voice_clone.nova`: 3 str_find → find_bytes.
+
+Per-test outcome:
+- test_speaker_id: 44/9 → **OK (53 checks)**.
+- test_voice_clone: 50/5 → **OK (55 checks)**.
+- test_audio_capture: FAIL+Runtime-OOB → **OK (28 checks)**
+  (bonus close under the same brief).
+- Canary (16 tests): all PASS. No regressions.
+
+Tally delta: 420 → **423 CLEAN** / 30 pre-existing / 36
+live-FAIL latent (3 new closes).
+
+### Latent-triage queue (post-R20)
+
+- **Canonical-arena allocator ADR (NOVA)** — unchanged.
+- **NOVA `str_split` canonical fix** — unchanged.
+- **NOVA `str_find` canonical fix for position-0 multi-char
+  needle** — new, HIGH visibility now (Shape S3 is a one-site
+  show-up but the bug is tree-wide latent).
+- **test_audio_wakeword SEGV** — unchanged.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` +
+  `str_find → find_bytes` sweeps.
+- **NOVA str_new fix**.
+- **Potential NOVA ADR** — implicit `call main` in `_start`
+  (confirmed as a real bite in R20: a probe without `main()`
+  top-level call exits 0 silently).
+- **R12 continuation** — remaining sys_write/sys_read audit
+  (further reduced by R20; most high-traffic sites are now
+  covered — speaker_id, audio_capture, audio_synth, audio_tts).
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
 - **test_audio_capture OOB + test_audio_wakeword SEGV** — new
   surface area, needs its own probe.
 - **C6** — cognitive/meta grab bag (20 tests, fragmented).
