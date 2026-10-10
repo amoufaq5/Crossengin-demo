@@ -3692,6 +3692,91 @@ latent.
   - test_pack_registry (install returns status=1).
   - test_dr_async_fetch (R31A async-socket; likely NOVA runtime
     `connect_async`/`fcntl`/`SO_ERROR` wrappers).
+
+### Latent-triage R22 — C6 deep subset: 3/4 Shape-A reclass + close
+
+**Classifier correction**: three of the four C6 "deep" tests
+turned out to be Shape-A `str_eq` after all — the R21 Explore
+agent had labelled them D (counter arithmetic, cache logic,
+install path) based on the FAIL symptom shape, missing that one
+missed `str_eq` in a lookup helper cascades to "every assert
+returns the empty default" and reads identical to a logic bug.
+
+Phase-1 investigation ran as two parallel Explore agents
+(`ab303ed66abcbadb4` + `a39d5fa72fdb3b8a2`) that traced each FAIL
+into its implementation. The reclassification table:
+
+| Test                           | Pre-R21 verdict        | Actual shape | Site                                                        |
+|--------------------------------|------------------------|--------------|-------------------------------------------------------------|
+| test_internet_fetch            | D (cache record logic) | **A**        | `src/learning/internet_fetch.nova:74` `_if_cache_index`     |
+| test_meta_observer_feedback    | D (counter arithmetic) | **A**        | `tests/unit/test_meta_observer_feedback.nova:45` helper      |
+| test_pack_registry             | D (install returns 1)  | **A**        | `tests/unit/test_pack_registry.nova` 9 install-asserts       |
+| test_dr_async_fetch            | E (NOVA runtime)       | **deeper**   | `expected=0 got=0` FAIL — inline-builtin return-tagging probe needed |
+
+**R22 scope** = the 3 Shape-A closes (dr_async_fetch deferred to
+R23 probe round).
+
+**Changes** (~11 LOC across 3 files):
+- `src/learning/internet_fetch.nova:74`: 1 str_eq → str_eq_bytes
+  swap. The `_if_cache_index` comparator is the only cache-side
+  gate; one swap fixes all 4 cache FAILs.
+- `tests/unit/test_meta_observer_feedback.nova:45`: 1 str_eq
+  swap in the `_manufacture` helper. The helper fails to find
+  the matching source tag → injected counters stay at 0 →
+  every downstream feedback-arithmetic assertion sees `promo
+  rate=0`, `action=NONE`, tier unchanged — one site cascades
+  all 17 FAILs.
+- `tests/unit/test_pack_registry.nova`: 9 str_eq swaps at install
+  status asserts. Sed-safe (word-boundary) swap that leaves the
+  3 `ce_str_eq` sites untouched.
+
+Per-test outcome:
+- test_internet_fetch: 32/4 → **OK (36 checks)**.
+- test_meta_observer_feedback: 37/17 → **OK (54 checks)**.
+- test_pack_registry: 22/9 → **OK (31 checks)**.
+- Canary (21 tests): all PASS.
+
+Tally delta: 429 → **432 CLEAN** / 30 pre-existing / 27 live-FAIL
+latent (3 of the 30 pre-R22 live latents were these 3 tests;
+dr_async_fetch is the fourth).
+
+**Classifier lesson recorded** for future rounds: when a test's
+FAILs cluster by "every assert touching data stored earlier
+returns the empty default", strongly suspect a missed `str_eq`
+in the storage or lookup helper BEFORE accepting a logic-bug
+classification. The lesson lives in the plan file +
+docs/UPSTREAM_NOVA_BUGS.md pending.
+
+### Latent-triage queue (post-R22)
+
+- **test_dr_async_fetch probe round** (R23 candidate):
+  - Q1: Does `socket(2,1,0)` return -1 under current sandbox?
+    Does TCP SOCK_STREAM differ from the UDP path?
+  - Q2: `ce_eq(label, rc, 0)` prints `expected=0 got=0` yet
+    FAILs — is `sys_fcntl_setfl_nonblock`'s rax tagged on return
+    in the current codegen path? Walk the asm.
+  - If Q2 confirms, this becomes a NOVA upstream inline-builtin
+    return-tagging fix (Shape-E, R23 ships NOVA commit).
+- **Canonical-arena allocator ADR (NOVA)** — unchanged.
+- **NOVA `str_split` canonical fix** — unchanged.
+- **NOVA `str_find` canonical fix for position-0 multi-char
+  needle** — unchanged.
+- **NOVA `str_eq` canonical fix** — HIGH priority after R22. R22
+  is the 7th round of workaround swaps; a real NOVA fix would
+  retire the `str_eq_bytes` migration and recover ~1465 call
+  sites across the project. Scope: NOVA codegen's `str_eq`
+  implementation (currently referenced from
+  `src/util/str_safe.nova:3-10` as "environmentally flaky").
+- **test_audio_wakeword SEGV** — unchanged.
+- **test_audio_capture Runtime-OOB residual** (R20 note).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` +
+  `str_find → find_bytes` sweeps.
+- **NOVA str_new fix**.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
 - **Canonical-arena allocator ADR (NOVA)** — unchanged.
 - **NOVA `str_split` canonical fix** — unchanged.
 - **NOVA `str_find` canonical fix for position-0 multi-char
