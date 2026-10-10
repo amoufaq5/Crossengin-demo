@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (2026-10-09).
+Proposed (2026-10-09); §1 superseded by R17 (2026-10-10).
 
 ## Context
 
@@ -87,15 +87,31 @@ The remaining honest work for `test_dtls12` to reach 519/0 is:
 
 ## Decision
 
-### 1. Freeze the test harness to a deterministic seed
+### 1. ~~Freeze the test harness to a deterministic seed~~ (SUPERSEDED by R17)
 
-Replace the `nanotime()`-seeded fixtures block at
-`tests/unit/test_dtls12.nova:734+` with a fixed 32-byte seed constant
-`DTLS_TEST_SEED` (`0x0102030405060708 0x090a...20`). Every seeded-P256
-keypair + every ClientRandom/ServerRandom used in the full-handshake
-tests derives from `DTLS_TEST_SEED || <role_tag>`. This isolates the
-test suite from NOVA-upstream `nanotime` tagging changes (Bug #7, Task
-#24) and makes literal-expected values byte-stable.
+**Status**: Superseded by R17 — the premise was wrong.
+
+The original wording proposed replacing a `nanotime()`-seeded harness
+with a fixed 32-byte `DTLS_TEST_SEED`. R17 Phase-1 investigation
+(agent `a41b8275b7c78125b`) found that `tests/unit/test_dtls12.nova`
+has **no `nanotime()` call** at all. The harness RNG
+(`_tdtls_make_random32(start)` at :774) is already fully deterministic
+(`byte i = (start + i) mod 256`).
+
+The real defect at the 4 failing assertions
+(`test_r2_random_accessors_after_handshake:2709-2716`) was a
+**pointer-identity compare where byte-equality was intended**:
+`dtls_ecdhe_derive` (`src/federation/dtls12.nova:3237-3248`) allocates
+fresh buffers for `client_random` / `server_random` and copies the
+caller's bytes in; the accessors return the fresh pointers — 3
+distinct allocator addresses per handshake. `ce_eq` is strict
+integer equality on pointer values that can never match.
+
+R17 shipped the correct 4-LOC fix: wrap each compare in
+`_tdtls_buf_eq(a, b, 32) == 1` using the project's existing byte-eq
+helper (already used 8 lines earlier at :2686). Seed-freezing was
+unnecessary (harness already deterministic) and insufficient
+(doesn't resolve pointer identity).
 
 ### 2. Stamp `DTLS_S_SLOT_LAST_ERR` on the invalid-SRTP-profile path
 

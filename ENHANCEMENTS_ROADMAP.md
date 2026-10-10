@@ -3367,3 +3367,47 @@ pending Bug #15 investigation.
 - **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
   tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
   real-socket DTLS roundtrip.
+
+### Latent-triage R17 — close test_dtls12 to 519/0 (ADR-0114 §1 superseded)
+
+Phase-1 Explore (`a41b8275b7c78125b`) **overturned ADR-0114 §1**:
+`tests/unit/test_dtls12.nova` has no `nanotime()` call. The harness
+RNG `_tdtls_make_random32(start)` at :774 is already fully
+deterministic. The 4 residual FAILs at :2709-2716 were pointer-
+identity compares where byte-equality was intended.
+
+Root cause: `dtls_ecdhe_derive` (`src/federation/dtls12.nova:3237-3248`)
+allocates FRESH buffers for client_random/server_random and copies
+the caller's bytes in. The accessors return those fresh pointers —
+3 distinct allocator addresses per handshake. `ce_eq` is strict
+integer equality on pointer values that can never match.
+
+Fix (4 LOC in `tests/unit/test_dtls12.nova:2709-2716`): wrap each
+compare in `_tdtls_buf_eq(a, b, 32) == 1` using the project's
+existing byte-eq helper (already used 8 lines earlier at :2686).
+
+Per-test outcome:
+- test_dtls12: 515/4 → **OK (519 checks)**. C4 fully closed.
+
+Canary sweep (34 tests, Bug #15 trio excluded): all PASS.
+
+ADR-0114 §1 marked superseded with full rationale.
+
+Tally delta: 414 → **415 CLEAN** / 30 pre-existing / 44 live-FAIL
+latent -4 (test_dtls12 closes); test_fed_daemon_transport +
+test_chat_state_persistence + test_p256_keypair_load remain
+deferred pending Bug #15 (NOVA heap-end 2^47 overflow).
+
+### Latent-triage queue (post-R17)
+
+- **Bug #15 (NOVA, HIGH)** — `_heap_end` 2^47 overflow fix.
+- **C5.2** — audio_synth 16 FAILs + audio_tts 3 FAILs.
+- **speaker_id/voice_clone residuals** — 9 + 5 I/O FAILs.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **NOVA str_new fix** (higher priority).
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
