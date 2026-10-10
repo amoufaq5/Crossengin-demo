@@ -545,6 +545,50 @@ location.
   NOVA runtime fix deferred to a dedicated round (co-investigate
   with Bug #13).
 
+## 15. `_nova_alloc` can return non-canonical pointers when `_heap_end` spills past 2^47
+
+- **ADR**: none yet.
+- **Status**: SHIPPED upstream (defensive guard) — NOVA commit
+  `a83f874` (R18). Not a correctness-under-canonical-heap bug;
+  this turns a silent SEGV-many-frames-later into a loud `exit(1)`
+  the moment a non-canonical allocation would be handed back.
+- **Context**: On x86_64 user-space addresses must have bit 47 clear
+  (equivalently bits 48-63 equal to bit 47; Linux `TASK_SIZE` with
+  4-level paging is `0x7FFF_FFFF_FFFF`). Any pointer with bit 47 set
+  but bits 48-63 clear is **non-canonical** and SEGVs on first
+  dereference.
+- **Observed symptom (pre-R18)**: Under certain ASLR layouts the
+  brk base (and later `_heap_end`) can land near or above 2^47.
+  Bug #13's `jbe` fix guarantees the arithmetic comparison in
+  `_nova_alloc`'s fast path is correct, but if the arena itself
+  straddles the canonical boundary, both `_heap_ptr` and
+  `_heap_end` can be non-canonical together; the fast-path
+  `cmp rcx, [rip + _heap_end]` + `jbe .alloc_ok` still passes
+  (both operands high) and we hand back a doomed pointer. First
+  deref SEGVs many frames away from the allocation site.
+- **Tests**: Intermittent — reproduces when the kernel places brk
+  past 2^47. In this session the failing trio
+  (`test_fed_daemon_transport`, `test_chat_state_persistence`,
+  `test_p256_keypair_load`) was consistent after a container
+  restart that shifted ASLR, consistent-passing after a later
+  restart. Shape matches Bug #13 but at a different place in the
+  invariant chain (arena-canonical vs. pointer-canonical).
+- **Fix** (~15 LOC of generated asm in `_nova_alloc`): at
+  `.alloc_ok`, test whether the computed new `_heap_ptr` has any
+  bit above 46 set (`mov rdx, rcx; shr rdx, 47; jnz
+  .alloc_bad_heap`). If so, `exit(1)` instead of returning a
+  non-canonical pointer. Source: `src/compiler/codegen.nova:16396-16412`.
+- **Why defensive-only** (not an unconditional close): a real
+  fix would require either (a) requesting a canonical arena from
+  the kernel (mmap with `MAP_FIXED_NOREPLACE` at a known-canonical
+  base) or (b) rejecting the arena and retrying with a different
+  allocation strategy. Both are considerably more code and need
+  cross-platform scoping (brk vs mmap vs VirtualAlloc). The
+  defensive guard lets us FAIL LOUDLY on this edge case while
+  future work decides on the structural fix. Deployment reality:
+  the three tests pass with ASLR off (`setarch -R`) under current
+  layouts; the guard protects against future layout drift.
+
 ## 6. Sandbox O_CREAT policy (container, not NOVA)
 
 - **ADR**: 0104
@@ -598,6 +642,14 @@ Status snapshot as of 2026-10-06:
   pre-existing `test_p256_keypair_load`. Does NOT close Bug #14
   (confirmed: reverting the R12d workaround regresses the gloss
   test; Bug #14 is a separate root cause).
+- (15) SHIPPED upstream in R18 (defensive guard) — `_nova_alloc`
+  canonical-pointer check at `.alloc_ok`. NOVA commit `a83f874`.
+  Non-canonical allocations (bit 47+ set) now `exit(1)` instead of
+  SEGV'ing many frames later. Three target tests
+  (`test_fed_daemon_transport`, `test_chat_state_persistence`,
+  `test_p256_keypair_load`) pass with current ASLR layouts; the
+  guard protects against future drift. See §15 for the full
+  structural-fix rationale.
 - (14) SHIPPED upstream in R14 — ABI mismatch in
   `_nova_str_replace`'s no-match branch at
   codegen.nova:20943-20947: the branch read a RAW byte from the
@@ -615,13 +667,15 @@ Status snapshot as of 2026-10-06:
   commit `26926a4`. R12d scan-first workaround in
   `src/persistence/snapshot_disk.nova:_snap_oneline` RETIRED.
 
-**All 14 upstream NOVA bugs resolved or formally deferred.**
-Twelve have upstream fixes (#1-#5, #7, #8, #11, #12 partial, #13,
-#14); #4 is transitively closed by #3; #6 is not a NOVA bug;
-#9/#10 await the module-system ADR; #12 awaits a dedicated
-syscall-sweep round for the remaining pieces (sys_read input +
-return + concat polymorphism). All user-side workarounds remain
-as defensive depth and can be retired incrementally.
+**All 15 upstream NOVA bugs resolved or formally deferred.**
+Thirteen have upstream fixes (#1-#5, #7, #8, #11, #12 partial,
+#13, #14, #15 defensive); #4 is transitively closed by #3; #6
+is not a NOVA bug; #9/#10 await the module-system ADR; #12
+awaits a dedicated syscall-sweep round for the remaining pieces
+(sys_read input + return + concat polymorphism); #15 is a
+defensive guard pending a future canonical-arena allocator
+redesign. All user-side workarounds remain as defensive depth
+and can be retired incrementally.
 
 ### Bug #8 ripple — follow-up round queued
 

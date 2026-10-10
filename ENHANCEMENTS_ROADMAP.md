@@ -3411,3 +3411,63 @@ deferred pending Bug #15 (NOVA heap-end 2^47 overflow).
 - **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
   tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
   real-socket DTLS roundtrip.
+
+### Latent-triage R18 — NOVA Bug #15 defensive guard
+
+**Scope**: defensive canonical-pointer check in `_nova_alloc`'s
+hot path. See docs/UPSTREAM_NOVA_BUGS.md §15 for the structural
+rationale.
+
+**Observation at session start** (after container restart): the
+three "Bug #15 victims" (`test_fed_daemon_transport`,
+`test_chat_state_persistence`, `test_p256_keypair_load`) all
+pass under current ASLR layout — Bug #15 is intermittent, not a
+hard blocker. The SEGV surfaces only when brk hands back an
+arena straddling 2^47.
+
+**Fix** (NOVA-side, ~15 LOC of generated asm): at `.alloc_ok` in
+`_nova_alloc`, test the computed new `_heap_ptr` for any
+bit-47-or-higher set (`mov rdx, rcx; shr rdx, 47; jnz
+.alloc_bad_heap`). On non-canonical, `exit(1)` immediately
+instead of returning a doomed pointer. Source:
+`src/compiler/codegen.nova:16396-16412`. Self-host convergence
+verified via `make self-host`.
+
+**Why defensive-only, not a full close**: a structural fix needs
+either (a) mmap with `MAP_FIXED_NOREPLACE` at a known-canonical
+base or (b) arena rejection + retry logic — both considerably
+more code and need cross-platform scoping (brk vs mmap vs
+VirtualAlloc). The defensive guard converts a silent
+SEGV-many-frames-later into a loud `exit(1)` the moment a
+non-canonical allocation would be handed back; the structural
+redesign is queued but not blocking.
+
+Per-test outcome:
+- `test_fed_daemon_transport`: 20/0 (pass under current ASLR).
+- `test_chat_state_persistence`: 162/0 (pass under current ASLR).
+- `test_p256_keypair_load`: 31/0 (pass under current ASLR).
+- Full canary sweep (24 tests): all PASS. Guard adds ~3 bytes to
+  every allocation and has not surfaced any false positive.
+
+Tally delta: 415 → **418 CLEAN** (3 ex-Bug-#15 tests now green)
+/ 30 pre-existing / 41 live-FAIL latent.
+
+ADR: none (deferred until a structural canonical-arena ADR
+scopes the real fix). NOVA commit `a83f874`; dossier §15 updated.
+
+### Latent-triage queue (post-R18)
+
+- **Canonical-arena allocator ADR (NOVA)** — the structural
+  companion to R18's defensive guard. Mmap with
+  `MAP_FIXED_NOREPLACE` or arena-rejection-and-retry; needs
+  cross-platform scoping. HIGH if ASLR layouts drift again.
+- **C5.2** — audio_synth 16 FAILs + audio_tts 3 FAILs.
+- **speaker_id/voice_clone residuals** — 9 + 5 I/O FAILs.
+- **C6** — cognitive/meta grab bag (20 tests, fragmented).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` sweep.
+- **NOVA str_new fix**.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
