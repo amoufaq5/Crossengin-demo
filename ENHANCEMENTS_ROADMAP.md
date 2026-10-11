@@ -3964,6 +3964,77 @@ on the queue (`_cm_read_file` + the never-triaged 25-latent tail
 - **`_cm_read_file` refactor** — MEDIUM priority
   (`src/factory/child_mode.nova:141`). Different idiom (4 MiB
   cap, returns `""` not `0`); needs its own small round.
+
+### Latent-triage R27 — `_cm_read_file` tag-fix (variant idiom)
+
+**Scope**: close the Bug #12 class-B tag leak in
+`src/factory/child_mode.nova:141 _cm_read_file`. Variant idiom
+(`""`-return + 4 MiB cap + per-iter alloc) doesn't fit the R25
+shared helper, so this round applies a minimum-change in-place
+tag fix instead.
+
+**Why not the R25 helper**: the two callers at :223
+(`child_mode_bootstrap`) and :394
+(`child_mode_current_fingerprint_load`) check `len(bundle_text)
+== 0` / `len(raw) == 0`, not `== 0`. `_read_file_tagged` returns
+integer `0` on open failure; `len(0)` is undefined-ish. Keeping
+the `""`-sentinel preserves the caller contract.
+
+**Fix** (~3 LOC):
+- `src/factory/child_mode.nova`: +import `../util/sys_tagged.nova`;
+  swap `sys_read` → `_sys_read_tagged` at :151 with a Bug #12
+  class-B comment.
+
+The subsequent `while i < m` compare also gets fixed as a
+side-effect: pre-R27 `m` was raw and `i` was tagged (iteration
+count wrong under scaling); post-R27 both are tagged, loop runs
+the intended number of iterations.
+
+Not changed:
+- `""`-return sentinel (preserved — caller `len()` convention).
+- 4 MiB cap (preserved — defensive against oversized bundles).
+- Per-iter `alloc(4097)` (cosmetic hygiene; queued as separate
+  LOW-priority item).
+
+Per-test outcome:
+- test_child_mode_wire: OK (48 checks) — unchanged.
+- test_capability_wire: OK (265 checks) — unchanged.
+- test_admin_emit_delta_verb: OK (24 checks) — unchanged.
+- Canary (R25/R26 siblings + core, 13 tests): all PASS except
+  test_chat_state_persistence + test_fed_daemon_transport SEGV
+  **pre-existing**: verified by git-stashing R27's diff and
+  re-running — both SEGV with the stash, so this is the known
+  Bug #15 ASLR intermittent (R18 note), not an R27 regression.
+
+Tally delta: 434 CLEAN unchanged (pure tag-fix of
+previously-passing surface; no new closes, no regressions).
+
+### Latent-triage queue (post-R27)
+
+- **`_cm_read_file` inner-loop `alloc` hoist** — cosmetic
+  hygiene, LOW priority. Move `let buf = alloc(4097)` out of the
+  inner loop; preserves semantics but spares 1024 wasted
+  allocations per 4 MiB read.
+- **~25 live-FAIL latent long tail** — never-triaged; needs an
+  enumeration round to classify by shape.
+- **Tag-consistent full socket API (NOVA)** — unchanged.
+- **Canonical-arena allocator ADR (NOVA)** — unchanged.
+- **NOVA `str_split` canonical fix** — unchanged.
+- **NOVA `str_find` canonical fix for position-0 multi-char
+  needle** — unchanged.
+- **NOVA `str_eq` canonical fix** — unchanged (HIGH).
+- **test_audio_capture Runtime-OOB residual** (R20 note).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` +
+  `str_find → find_bytes` sweeps.
+- **NOVA str_new fix**.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit
+  (R23/R24/R25/R26/R27 all contributed; the audit tail is now
+  mostly `_cm_read_file`'s per-iter alloc + any as-yet-undiscovered
+  sys_write/read sites).
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
 - **~25 live-FAIL latent long tail** — never-triaged; needs an
   enumeration round to classify by shape.
 - **Tag-consistent full socket API (NOVA)** — unchanged.
