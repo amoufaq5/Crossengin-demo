@@ -3866,6 +3866,78 @@ would retire both duplicates in one shot.
   helper in `src/util/sys_tagged.nova` (or sibling) would retire
   both + any future S2' hit. MEDIUM priority (works as-is, just
   duplicated).
+
+### Latent-triage R25 — shared `_read_file_tagged` helper (hygiene refactor)
+
+**Scope**: pure refactor. R12d / R20 / R24 each landed a
+near-identical S2' byte-copy read loop as a per-file Bug #12
+workaround. Phase-1 scoping found **six copies** across the
+codebase. R25 extracts one shared helper and reduces each to a
+1-line shim.
+
+**Pre-R25 duplicates** (all PASSING, 6 call sites):
+
+| File | Function | Visibility |
+|------|----------|------------|
+| `src/io/transducers/audio_speaker_id.nova:642` | `_spk_read_text` | private |
+| `src/io/transducers/audio_wakeword.nova:464` | `_wake_read_text` | private |
+| `src/persistence/snapshot_disk.nova:2762` | `snap_read_text` | **public** |
+| `src/persistence/snapshot_delta.nova:612` | `delta_read_text` | **public** |
+| `src/audit/decision_log.nova:409` | `_dl_read_text` | private |
+| `src/persistence/chat_state.nova:241` | `_cs_read_text` | private |
+
+**Fix**:
+- Added `_read_file_tagged(path)` to `src/util/sys_tagged.nova`
+  using the piece-batched variant (one `_nova_concat` per 4KB
+  chunk, not per byte). Also added `import "std/syscall"` to
+  that file for `sys_open`/`sys_close`/`O_RDONLY`.
+- Each of the 6 call sites reduced to `return _read_file_tagged(path)`.
+  Public names (`snap_read_text`, `delta_read_text`) kept as
+  shims; 3+3+1 external callers of those names unchanged.
+
+**Totals**: ~22 LOC added in `sys_tagged.nova` + ~70 LOC retired
+across the 6 call sites. Net reduction with no behavior change.
+
+Per-test outcome:
+- All 6 affected tests: still PASS (behavior preserved).
+- Canary (17 tests: audio chain + 5 snapshot_* siblings sharing
+  the public `snap_read_text`/`delta_read_text` surface + dtls12
+  + fed_daemon_transport): all PASS, no regressions.
+
+Tally delta: 434 CLEAN unchanged (pure refactor; no new closes).
+30 pre-existing / 25 live-FAIL latent unchanged.
+
+**New queue item from scoping**: `_lt_read_text` at
+`src/bench/llm_transcript.nova:152` still uses the raw-`sys_read`
++ `store8(buf+m, 0); acc + buf` R12d-legacy pattern — a latent
+Bug #12 class-B hit that just hasn't SEGV'd because the test
+surface doesn't exercise it under certain allocation layouts. The
+R25 helper would close it with a 1-line shim.
+
+### Latent-triage queue (post-R25)
+
+- **Close `_lt_read_text` latent S2' via the shared helper** —
+  new, HIGH priority. Confirmed latent Bug #12 class-B at
+  `src/bench/llm_transcript.nova:152`; one-commit close via the
+  R25 helper.
+- **`_cm_read_file` refactor** — new, MEDIUM priority
+  (`src/factory/child_mode.nova:141`). Different idiom (4 MiB
+  cap, returns `""` not `0`); needs its own small round.
+- **Tag-consistent full socket API (NOVA)** — unchanged.
+- **Canonical-arena allocator ADR (NOVA)** — unchanged.
+- **NOVA `str_split` canonical fix** — unchanged.
+- **NOVA `str_find` canonical fix for position-0 multi-char
+  needle** — unchanged.
+- **NOVA `str_eq` canonical fix** — unchanged (HIGH).
+- **test_audio_capture Runtime-OOB residual** (R20 note).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` +
+  `str_find → find_bytes` sweeps.
+- **NOVA str_new fix**.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
 - **Tag-consistent full socket API (NOVA)** — unchanged.
 - **Canonical-arena allocator ADR (NOVA)** — unchanged.
 - **NOVA `str_split` canonical fix** — unchanged.
