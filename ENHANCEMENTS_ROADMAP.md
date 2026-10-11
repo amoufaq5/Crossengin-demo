@@ -3818,6 +3818,69 @@ tag-consistent.
   connect, send, recv, setsockopt_reuseaddr) are the next layer
   down the stack and would retire R23's tag-polymorphic rdi guard
   pattern. MEDIUM priority (no current callers break).
+
+### Latent-triage R24 — close test_audio_wakeword SEGV (S2' hit)
+
+**Scope**: test_audio_wakeword had SEGV'd on every canary sweep
+since R19. It was deferred as "latent, pre-existing" until a probe
+round. Phase-1 investigation (Explore agent) pinned the root cause
+to a **direct S2' catalogue match** — the exact pattern R20 fixed
+in `audio_speaker_id._spk_read_text`.
+
+**Probe findings** (strace -e trace=open,read,write,close):
+- `wake_template_save` writes 2773 bytes successfully.
+- `wake_template_load` → `_wake_read_text` passes a NOVA-tagged
+  alloc'd buf straight to raw `sys_read` → kernel sees
+  non-canonical address (e.g. `0x11d96ca1`) → EFAULT.
+- `_wake_read_text` returns garbage; `wake_template_load` returns
+  0; test line 223 `ce_check("loaded template is non-zero", tpl2
+  != 0)` FAILs but doesn't abort; next line 224
+  `wake_template_n_mfcc(tpl2)` = `t[4]` where `t == 0` → **SEGV**
+  at `si_addr=0x1`.
+
+**Fix** (~10 LOC in one function at
+`src/io/transducers/audio_wakeword.nova:_wake_read_text`):
+rewrite the inner loop body to byte-copy into `acc` via
+`chr(load8(buf + i))` with `_sys_read_tagged` for the read.
+Same shape as R20's `_spk_read_text` rewrite. `_sys_read_tagged`
+reaches via `audio_capture.nova`'s R20-added `sys_tagged` import —
+no new import needed.
+
+Per-test outcome:
+- test_audio_wakeword: SEGV → **OK (41 checks)**.
+- Canary (15 tests: full audio chain + core + dr_async_fetch +
+  dtls12 + fed_daemon_transport): all PASS, no regressions.
+
+Tally delta: 433 → **434 CLEAN** / 30 pre-existing / 25 live-FAIL
+latent.
+
+**Hygiene note**: R20 (`_spk_read_text`) + R24 (`_wake_read_text`)
+now carry near-identical copies of the S2' byte-copy read loop.
+Queue adds a "shared `_read_file_tagged` hygiene helper" item that
+would retire both duplicates in one shot.
+
+### Latent-triage queue (post-R24)
+
+- **Shared `_read_file_tagged` hygiene helper** — new. R20 +
+  R24 carry near-identical S2' byte-copy read loops. One shared
+  helper in `src/util/sys_tagged.nova` (or sibling) would retire
+  both + any future S2' hit. MEDIUM priority (works as-is, just
+  duplicated).
+- **Tag-consistent full socket API (NOVA)** — unchanged.
+- **Canonical-arena allocator ADR (NOVA)** — unchanged.
+- **NOVA `str_split` canonical fix** — unchanged.
+- **NOVA `str_find` canonical fix for position-0 multi-char
+  needle** — unchanged.
+- **NOVA `str_eq` canonical fix** — unchanged (HIGH).
+- **test_audio_capture Runtime-OOB residual** (R20 note).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` +
+  `str_find → find_bytes` sweeps.
+- **NOVA str_new fix**.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
 - **Canonical-arena allocator ADR (NOVA)** — unchanged.
 - **NOVA `str_split` canonical fix** — unchanged.
 - **NOVA `str_find` canonical fix for position-0 multi-char
