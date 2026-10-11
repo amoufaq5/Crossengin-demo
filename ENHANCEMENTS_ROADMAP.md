@@ -3920,6 +3920,68 @@ R25 helper would close it with a 1-line shim.
   new, HIGH priority. Confirmed latent Bug #12 class-B at
   `src/bench/llm_transcript.nova:152`; one-commit close via the
   R25 helper.
+
+### Latent-triage R26 — close `_lt_read_text` latent S2'
+
+**Scope**: close the latent S2' hit at
+`src/bench/llm_transcript.nova:152` via the R25 shared helper. One
+import + one 20-line body replaced with a 1-line shim.
+
+Pre-R26: `_lt_read_text` had the exact pre-R20/R24 pattern
+(`let m = sys_read(fd, buf, chunk); store8(buf+m, 0); acc = acc +
+buf`). Under benign allocation layouts both callers
+(`test_llm_transcript`, `test_reasoning_bench`) coincidentally
+passed — but the read path was returning partial/garbage text,
+quietly short-circuiting assertions through the "load FAILED"
+sentinel branch.
+
+**Fix**:
+- `src/bench/llm_transcript.nova`: +import `../util/sys_tagged.nova`;
+  replace `_lt_read_text`'s body with
+  `return _read_file_tagged(path)`.
+
+Per-test outcome (observe the check-count jump — exposes the
+pre-R26 silent short-circuit):
+- test_llm_transcript: **6 → 10 checks** (OK; 4 assertions that
+  pre-R26 skipped past the "load FAILED" branch now actually fire
+  and pass).
+- test_reasoning_bench: 45 → 45 checks (OK, no change in exercised
+  surface).
+- Canary (10 tests: full snapshot_* / audio / dtls / fed_daemon):
+  all PASS.
+
+Tally delta: 434 → **434 CLEAN** (no new test closes; +4
+previously-skipped assertions now firing within existing passing
+test).
+
+The R25 queue item "Close `_lt_read_text` latent S2' via the
+shared helper" is now **retired**. Three mechanical latents remain
+on the queue (`_cm_read_file` + the never-triaged 25-latent tail
++ the structural NOVA ADRs).
+
+### Latent-triage queue (post-R26)
+
+- **`_cm_read_file` refactor** — MEDIUM priority
+  (`src/factory/child_mode.nova:141`). Different idiom (4 MiB
+  cap, returns `""` not `0`); needs its own small round.
+- **~25 live-FAIL latent long tail** — never-triaged; needs an
+  enumeration round to classify by shape.
+- **Tag-consistent full socket API (NOVA)** — unchanged.
+- **Canonical-arena allocator ADR (NOVA)** — unchanged.
+- **NOVA `str_split` canonical fix** — unchanged.
+- **NOVA `str_find` canonical fix for position-0 multi-char
+  needle** — unchanged.
+- **NOVA `str_eq` canonical fix** — unchanged (HIGH, would
+  retire ~1465 workaround call sites).
+- **test_audio_capture Runtime-OOB residual** (R20 note).
+- **Codebase-hygiene** — tree-wide `str_eq → str_eq_bytes` +
+  `str_find → find_bytes` sweeps.
+- **NOVA str_new fix**.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **R12 continuation** — remaining sys_write/sys_read audit.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
 - **`_cm_read_file` refactor** — new, MEDIUM priority
   (`src/factory/child_mode.nova:141`). Different idiom (4 MiB
   cap, returns `""` not `0`); needs its own small round.
