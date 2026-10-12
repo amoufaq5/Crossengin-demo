@@ -4291,3 +4291,78 @@ etc) + 8 shape-ambiguous residuals needing per-test probes.
 - **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
   tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
   real-socket DTLS roundtrip.
+
+### Latent-triage R30 — image/stereo cluster close (7/8)
+
+**Scope**: 7 of the 8 image/stereo cluster tests closed via
+mechanical Shape-A test-side `str_eq` sweep + 1 partial close
+on `test_face_recognize` save path.
+
+**Shape split**:
+- 7 tests had Shape-A `str_eq` sites in TEST files (R29 was
+  src/-only, missed these). Pattern: `/flow no-arg returns
+  usage`, `/depth no-arg returns usage`, `top-heavy
+  distribution emits ...` — all `str_eq(reply, "literal")`
+  idioms in the test files.
+- test_face_recognize had Shape S2 (sys_write class-B) on the
+  save path and a mixed convention issue on the load path
+  (binary-reader uses `int_add` for raw-byte offsets; swapping
+  the read to `_sys_read_tagged` broke downstream arithmetic).
+
+**Changes** (~18 LOC):
+- Test-side sweep: 7 files, +7 imports + 16 `str_eq → str_eq_bytes`:
+  tests/unit/test_optical_flow.nova (3)
+  tests/unit/test_optical_flow_perpixel.nova (3)
+  tests/unit/test_optical_flow_pyramid.nova (3)
+  tests/unit/test_stereo.nova (2)
+  tests/unit/test_stereo_quality.nova (2)
+  tests/unit/test_stereo_sgm.nova (2)
+  tests/unit/test_image_harris.nova (1)
+- `src/io/transducers/image_face_recognize.nova`: +import
+  sys_tagged.nova; swap save-side `sys_write → _sys_write_tagged`
+  with Bug #12 comment. Kept raw `sys_read` on the load path
+  (binary-reader `int_add` convention breaks under tagged
+  byte counts; needs its own refactor round).
+
+Per-test outcome:
+- test_image_harris: 17/2 → **OK (19)**
+- test_optical_flow: 50/3 → **OK (53)**
+- test_optical_flow_perpixel: 31/3 → **OK (34)**
+- test_optical_flow_pyramid: 49/3 → **OK (52)**
+- test_stereo: 52/2 → **OK (54)**
+- test_stereo_quality: 40/2 → **OK (42)**
+- test_stereo_sgm: 37/2 → **OK (39)**
+- test_face_recognize: 38/9 → 41/7 (save closes 2 FAILs; load
+  path's 7 FAILs remain — queued for R31 as "face_recognize
+  load-path binary-reader refactor").
+- Canary (8 tests: dtls12, fed_daemon, speaker_id, audio_wakeword,
+  voice_clone, themes, vosk_backend, whisper_backend): all PASS,
+  no regressions.
+
+Tally delta: 451 → **458 CLEAN** / 30 pre-existing / 23
+non-passing. 7 tests closed in this round; face_recognize
+partial-close counts as "improved not closed".
+
+### Latent-triage queue (post-R30)
+
+- **test_face_recognize load-path refactor** — new, from R30
+  deferral. `_face_rec_read_file` returns `[buf, total]` using
+  raw-byte offsets throughout (`int_add`). Needs either a
+  consistent conversion to NOVA `+` tag-aware arithmetic, or
+  swapping to _sys_read_tagged + untagging the return. Scope:
+  one function, 7 FAIL closes.
+- **Network/crypto cluster** (~10 tests): byzantine_aggregation,
+  gossip_relay, ice, merkle, noise_xk, relay_ranking,
+  relay_secure, secure_aggregation, stun_rfc8489, webrtc. Mix of
+  str_eq + str_find expected.
+- **voice_conversation** (21 FAILs) — large single-test.
+- **Smaller residuals**: gc_metrics, preprocess, research_sources,
+  schemas, sensor_fusion.
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir, voice_dialog.
+- **Compile-error**: test_reader_xref_traversal.
+- **str_find phantom-zero sweep** — 7 src/ files unchanged.
+- **NOVA structural ADRs** — str_eq canonical fix, str_split,
+  str_find, str_new, full socket API, canonical allocator.
+- **Codebase-hygiene — tests/ str_eq sweep (continuing)** — R30
+  closed the image/stereo subset; other test files remain.
