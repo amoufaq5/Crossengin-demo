@@ -4693,3 +4693,32 @@ files have no dedicated unit tests), but 4 compile-errors retired.
 - **Small-FAIL residuals**: gc_metrics (1).
 - **str_find phantom-zero sweep** — 7 src/ files unchanged.
 - **NOVA structural ADRs** — HIGH priority.
+
+### Latent-triage R37 — test_research_sources close via split_space
+
+**Scope**: 8 FAILs residual from R31 — all in `dict_genus`
+"head extraction" tests. Expected = full word, got = odd substring
+(e.g. "combinati(on)" → "ati"; "boundary" → "ary"). Classic
+Shape-S1 NOVA `split(x, " ")` bug — same pattern as R19
+(audio_synth phoneme count) + R20 (voice_clone).
+
+**Fix** (1 LOC): `src/learning/research_sources.nova:281` — swap
+`split(str_lower(definition), " ")` → `split_space(str_lower(
+definition))` (helper from `src/util/str_safe.nova` already
+imported). Added a Bug #12/§12 reference comment.
+
+Per-test outcome:
+- test_research_sources: 50/8 → **OK (61 checks)**.
+- Canary (7 tests): all PASS.
+
+Tally delta: 473 → **474 CLEAN** / 30 pre-existing / 7 non-passing.
+
+### Latent-triage queue (post-R37)
+
+- **face_recognize deep refactor** — unchanged.
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir.
+- **Compile-error**: test_reader_xref_traversal.
+- **Small-FAIL residuals**: gc_metrics (1).
+- **str_find phantom-zero sweep** — 7 src/ files unchanged.
+- **NOVA structural ADRs** — HIGH priority.
