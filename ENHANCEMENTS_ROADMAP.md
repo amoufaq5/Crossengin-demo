@@ -4775,3 +4775,32 @@ first dword of each buffer).
   Would retire the `(a - b) != 0` workaround pattern.
 - **str_find phantom-zero sweep** — 7 src/ files unchanged.
 - **NOVA structural ADRs** — HIGH priority.
+
+### Latent-triage R39 — test_reader_xref_traversal close
+
+**Scope**: 1 compile error — `error[line 7163]: expected
+identifier but got none` at `let none = xr_iter_from(...)`.
+NOVA's parser reserves `none` as an identifier/token; it can't
+be used as a let-binding name.
+
+**Fix** (3 LOC in test):
+- Rename `let none = ...` → `let empty_r = ...` at line 106-107.
+- Add `import "std/syscall" / "std/string" / "std/io"` (Bug #8
+  ripple leftover — the file was missing these).
+
+Per-test outcome:
+- test_reader_xref_traversal: compile-error → **OK (51 checks)**.
+
+Tally delta: 475 → **476 CLEAN** / 30 pre-existing / 5
+non-passing.
+
+### Latent-triage queue (post-R39)
+
+- **face_recognize deep refactor** — unchanged.
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir.
+- **NOVA structural ADRs** — HIGH priority.
+- **NOVA `none`-reserved-token doc** — new, from R39. Could
+  retire by making NOVA's parser accept `none` as an ordinary
+  identifier in let bindings (or user-side: find other `let none`
+  sites and rename).
