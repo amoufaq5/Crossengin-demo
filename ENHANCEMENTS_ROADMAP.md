@@ -4228,11 +4228,40 @@ Per-test (smoke-tested canary + R29 targets):
   own probe).
 
 Full post-sweep results captured to
-`scratchpad/sweep_r29.log` (running background at commit time);
-residual list + per-cluster triage queued for R30+.
+`scratchpad/sweep_r29.log` (completed post-commit).
 
-Tally delta: 434 → ~454-459 CLEAN (estimate; pending the full
-sweep's actual count).
+**Final post-R29 tally**: 47 → **30** non-passing;
+**17 tests closed** by the sweep:
+- test_autocompact_trigger (7 FAILs)
+- test_autonomous_loop (1 FAIL)
+- test_chat_state_persistence (was SEGV — Bug #15 passing now)
+- test_consolidation (was Runtime-OOB)
+- test_fed_daemon_transport (was SEGV — Bug #15 passing now)
+- test_image_tracker (was Runtime-OOB)
+- test_p256_keypair_load (was SEGV — Bug #15 passing now)
+- test_stt_seam (5 FAILs)
+- test_themes (4 FAILs)
+- test_tool / test_tool_goal_plan / test_tool_use (3× SEGV)
+- test_video_perception (3 FAILs)
+- test_video_smooth (was Runtime-OOB)
+- test_visual_perception (5 FAILs)
+- test_vosk_backend / test_whisper_backend (1 FAIL each)
+
+Interesting side-effects:
+- **4 Runtime-OOBs closed** (consolidation, image_tracker,
+  video_smooth, visual_perception's underlying) — the "lookup
+  returns garbage → index out of bounds" pattern was Shape-A
+  cascading.
+- **3 SEGVs closed** (tool, tool_goal_plan, tool_use) — Shape-A
+  at the top of their call chain.
+- Bug #15 ASLR trio (chat_state, fed_daemon, p256_keypair) all
+  green currently (favorable ASLR layout); structural fix still
+  queued.
+
+Tally delta: 434 → **451 CLEAN**. ~17 fewer non-passing tests;
+residual 30 non-passing split as the ~22 structural non-A
+clusters (image/stereo + network/crypto + voice_conversation
+etc) + 8 shape-ambiguous residuals needing per-test probes.
 
 ### Latent-triage queue (post-R29)
 
