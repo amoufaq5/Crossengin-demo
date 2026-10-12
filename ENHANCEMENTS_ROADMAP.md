@@ -4505,3 +4505,65 @@ new helper available).
   tag-polymorphism clarification (new, from R32 lesson),
   str_split, str_find, str_new, full socket API, canonical
   allocator.
+
+### Latent-triage R33 — face_recognize refactor attempt, reverted
+
+**Scope**: attempted the "full NOVA `+` convention" refactor R32
+queued. Converted the 5 load-path functions
+(`_face_rec_read_file`, `_face_rec_next_nl`,
+`_face_rec_extract_str`, `_face_rec_extract_int`,
+`face_gallery_load`'s int_add sites). strace confirmed all 7
+reads succeeded (24688 bytes).
+
+**Why it still SEGV'd**: `face_gallery_recognize` (and sibling
+save-side helpers like `_face_rec_emit_str`) continue to use
+`int_add` for iteration loops. With a non-empty gallery (3 live
+entries from the fixture), the recognize path now runs — and
+hits the same NOVA-`+`-on-tagged+raw mis-computation that the
+load path had before conversion. The load fix converted a crash
+into a cascade: load returns correctly, parser produces 3 entries,
+recognize crashes on them.
+
+**Observation**: `_face_rec_emit_str` on the SAVE side has the
+identical pattern (`store8(buf + int_add(off, i), ...)`) and
+saves DO work (24688 bytes written correctly). So the save path
+somehow works with int_add + tagged buf while the load path's
+recognize-side doesn't. Why remains unclear — may hinge on
+subtle NOVA `+`/`int_add` tag-polymorphism we haven't fully
+mapped.
+
+**Decision**: reverted R33's changes. Face_recognize stays at
+R30 state (41/7). This refactor needs:
+1. A clean read of NOVA codegen for `+` / `int_add` /
+   list indexing / tagged-arithmetic rules.
+2. A per-site conversion plan rather than "convert all iteration
+   loops at once".
+3. Possibly a probe helper that prints raw-vs-tagged values at
+   key sites to confirm the actual tag state.
+
+That's a session of its own, not a round within an existing
+sweep arc.
+
+**Changes landed**: none in src/. R32's `_sys_read_raw_at` helper
+remains in sys_tagged.nova as future-use infrastructure.
+
+Per-test: test_face_recognize unchanged (41/7). Canary clean.
+
+Tally delta: 471 CLEAN unchanged.
+
+### Latent-triage queue (post-R33)
+
+- **face_recognize deep refactor** — needs a dedicated session.
+  Per-site NOVA +/int_add audit. Start with a probe helper that
+  prints the raw int value at each `buf + N` site to understand
+  what NOVA's `+` actually produces.
+- **voice_conversation** (21 FAILs) — large single-test.
+- **test_research_sources residual** (8 FAILs).
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir, voice_dialog.
+- **Compile-error**: test_reader_xref_traversal.
+- **Small-FAIL residuals**: gc_metrics (1).
+- **str_find phantom-zero sweep** — 7 src/ files unchanged.
+- **NOVA structural ADRs** — str_eq canonical, NOVA `+`
+  tag-polymorphism doc (new, from R32+R33 lessons), str_split,
+  str_find, str_new, full socket API, canonical allocator.
