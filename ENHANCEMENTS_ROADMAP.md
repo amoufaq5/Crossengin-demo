@@ -4366,3 +4366,70 @@ partial-close counts as "improved not closed".
   str_find, str_new, full socket API, canonical allocator.
 - **Codebase-hygiene — tests/ str_eq sweep (continuing)** — R30
   closed the image/stereo subset; other test files remain.
+
+### Latent-triage R31 — tree-wide tests/ `str_eq` sweep
+
+**Scope**: close the network/crypto/sensor residual cluster via
+mechanical test-side str_eq swap. R29 was src/-only; R30 did
+image/stereo tests; R31 covers the remaining 17 test files with
+`str_eq` sites.
+
+**Pre-R31 state**: 17 files with 63 total `str_eq` sites.
+- 15 FAIL tests (webrtc, stun_rfc8489, preprocess, relay_ranking,
+  gossip_relay, merkle, secure_aggregation, schemas,
+  research_sources, relay_secure, noise_xk, ice,
+  byzantine_aggregation, sensor_fusion, nat_traversal)
+- 1 SEGV (nat_traversal)
+- 2 pre-passing with latent str_eq (snapshot_compaction, scram)
+
+**The sweep**: 17 files, +17 imports (`../../src/util/str_safe.nova`)
++ word-boundary sed swap `str_eq → str_eq_bytes` (preserves
+`ce_str_eq`).
+
+Per-test outcome:
+- **13 tests closed**: test_webrtc (48/11 → OK 59), test_stun_rfc8489
+  (125/10 → OK 135), test_preprocess (94/5 → OK 99),
+  test_relay_ranking (39/3 → OK 42), test_gossip_relay (56/5 →
+  OK 61), test_merkle (57/3 → OK 60), test_secure_aggregation
+  (162/2 → OK 170), test_schemas (12/1 → OK 13),
+  test_relay_secure (42/2 → OK 44), test_noise_xk (42/2 → OK 44),
+  test_ice (68/2 → OK 70), test_byzantine_aggregation (68/2 →
+  OK 74), test_sensor_fusion (58/1 → OK 59).
+- 2 pre-passing preserved: test_snapshot_compaction (48 OK),
+  test_scram (43 OK).
+- 1 partial close: test_research_sources (50/11 → 53/8). 3 FAILs
+  closed; 8 residuals likely str_find phantom-zero or deeper
+  shape.
+- 1 unchanged: test_nat_traversal SEGV (not a str_eq case; needs
+  per-test probe for Bug #15 vs real crash).
+
+Canary (14 tests across R25-R30 wins + core): all PASS, no
+regressions.
+
+Tally delta: 458 → **471 CLEAN** / 30 pre-existing / 10
+non-passing (3 fewer than post-R30's 23).
+
+**Milestone**: R29 + R30 + R31 together drained the entire
+mechanical `str_eq` Shape-A arc from the project (src/ fully,
+tests/ fully). The remaining non-passing tests are shape-D/E/S3
+residuals: face_recognize load-path (R30 deferral),
+voice_conversation (large single-test), SEGVs, Runtime-OOB,
+compile-error, and small-FAIL residuals like
+test_research_sources (8), test_gc_metrics (1), test_merkle_signing
+(SEGV).
+
+### Latent-triage queue (post-R31)
+
+- **test_face_recognize load-path refactor** — R30 deferral
+  (7 FAILs).
+- **voice_conversation** (21 FAILs) — large single-test.
+- **test_research_sources residual** (8 FAILs post-R31) — likely
+  S3 or deeper.
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir, voice_dialog.
+- **Compile-error**: test_reader_xref_traversal.
+- **Small-FAIL residuals**: gc_metrics (1).
+- **str_find phantom-zero sweep** — 7 src/ files unchanged.
+- **NOVA structural ADRs** — str_eq canonical fix (would retire
+  the entire R16-R31 str_eq_bytes workaround arc), str_split,
+  str_find, str_new, full socket API, canonical allocator.
