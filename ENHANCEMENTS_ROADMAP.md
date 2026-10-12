@@ -4722,3 +4722,56 @@ Tally delta: 473 → **474 CLEAN** / 30 pre-existing / 7 non-passing.
 - **Small-FAIL residuals**: gc_metrics (1).
 - **str_find phantom-zero sweep** — 7 src/ files unchanged.
 - **NOVA structural ADRs** — HIGH priority.
+
+### Latent-triage R38 — test_gc_metrics close (NOVA smart-eq workaround)
+
+**Scope**: 1 FAIL residual — `ce_check("post-reset is distinct
+from alt", d4 != alt)`. Addresses were clearly different
+(d4=2122072, alt=2120852, delta -1220 via subtraction) but
+`d4 != alt` returned 0.
+
+**Root cause** (via NOVA codegen read):
+`_nova_neq` in NOVA codegen is a "smart" not-equal:
+```
+cmp rdi, rsi    # direct int compare
+je .neq_false   # equal -> false
+call _nova_check_rdi  # is rdi a string?
+jz .neq_true    # not string -> different, true
+...
+call _nova_str_eq
+```
+`_nova_check_rdi` is a heuristic that misclassifies list
+pointers (from `list_new`) as strings. Both empty lists then
+hit `_nova_str_eq`, which compares two empty strings as EQUAL,
+and `_nova_neq` returns 0 (false). Two distinct list pointers
+compare as "equal" via smart-eq.
+
+**Fix** (1 LOC in test): swap `d4 != alt` → `(d4 - alt) != 0`.
+Subtraction forces integer arithmetic; `!= 0` compares against
+a literal 0 which doesn't trigger the string path.
+
+Per-test outcome:
+- test_gc_metrics: 85/1 → **OK (86 checks)**.
+- Canary: no changes beyond this test.
+
+Tally delta: 474 → **475 CLEAN** / 30 pre-existing / 6
+non-passing.
+
+**New NOVA bug recorded**: smart-eq (`_nova_eq` / `_nova_neq`)
+misclassifies list pointers as strings. Any test that compares
+freshly-allocated list pointers via `==`/`!=` can hit this.
+Queued as a sibling to Bug #4 (sentinel equality family). A
+NOVA fix would tighten `_nova_check_rdi/rsi` to properly
+distinguish lists from strings (perhaps via tag bits on the
+first dword of each buffer).
+
+### Latent-triage queue (post-R38)
+
+- **face_recognize deep refactor** — unchanged.
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir.
+- **Compile-error**: test_reader_xref_traversal.
+- **NOVA smart-eq list-pointer fix** — new, from R38 probe.
+  Would retire the `(a - b) != 0` workaround pattern.
+- **str_find phantom-zero sweep** — 7 src/ files unchanged.
+- **NOVA structural ADRs** — HIGH priority.
