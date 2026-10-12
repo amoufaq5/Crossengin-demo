@@ -4616,3 +4616,51 @@ non-passing (one fewer than post-R33's 10).
 - **Small-FAIL residuals**: gc_metrics (1).
 - **str_find phantom-zero sweep** — 7 src/ files unchanged.
 - **NOVA structural ADRs** — unchanged.
+
+### Latent-triage R35 — voice_dialog `str_eq` sweep (OOB collapsed)
+
+**Scope**: `examples/voice_dialog.nova` — 142 str_eq sites +
+test Runtime-OOB. R34 excluded this as "needs own round".
+
+**Fix** (143 LOC): word-boundary sed `str_eq → str_eq_bytes` on
+all 142 sites + 1 import add (`../src/util/str_safe.nova`).
+
+Per-test outcome:
+- test_voice_dialog: Runtime-OOB + 14+ FAILs → **OK (319 checks)**.
+- Runtime-OOB collapsed cleanly: the OOB was downstream of empty
+  parse results from the str_eq cascade — once the cascade
+  closed, the parses returned real data and the OOB-triggering
+  indexing calls had non-empty inputs. Shape-A → implicit OOB
+  fix as side effect, same pattern as R29's 4-OOB bonus.
+- Canary (8 tests: voice_conversation, dtls12, fed_daemon, core
+  action/motor + audio chain): all PASS.
+
+Tally delta: 472 → **473 CLEAN** / 30 pre-existing / 8
+non-passing (one fewer).
+
+**Milestone**: str_eq_bytes migration is now complete across the
+entire project tree — src/ (R29), tests/ (R30, R31), examples/
+(R34, R35). The ~1465 call-site workaround arc that spanned
+R16-R35 (20 rounds) is drained. Future `str_eq` sites must come
+in via upstream patches or new regressions; a NOVA `str_eq`
+canonical fix would retire the whole `str_eq_bytes` helper
+mechanism.
+
+### Latent-triage queue (post-R35)
+
+- **examples/ Bug #8 ripple cleanup** — 4 files
+  (companion_spine, crossengin_kg_subscriber/publisher/
+  fed_coordinator) need `import "std/syscall"` + 1 needs
+  `std/string` for str_data. Small micro-round.
+- **face_recognize deep refactor** — unchanged.
+- **test_research_sources residual** (8 FAILs).
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir.
+- **Compile-error**: test_reader_xref_traversal.
+- **Small-FAIL residuals**: gc_metrics (1).
+- **str_find phantom-zero sweep** — 7 src/ files unchanged.
+- **NOVA structural ADRs** — HIGH after R35 completed the
+  str_eq_bytes arc. A NOVA `str_eq` canonical fix would retire
+  R16-R35's ~1465 workaround sites. Also: NOVA `+`
+  tag-polymorphism doc, str_split, str_find, str_new, full
+  socket API, canonical allocator.
