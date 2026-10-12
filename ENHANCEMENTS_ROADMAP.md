@@ -4433,3 +4433,75 @@ test_research_sources (8), test_gc_metrics (1), test_merkle_signing
 - **NOVA structural ADRs** — str_eq canonical fix (would retire
   the entire R16-R31 str_eq_bytes workaround arc), str_split,
   str_find, str_new, full socket API, canonical allocator.
+
+### Latent-triage R32 — face_recognize probe + new helper landed
+
+**Scope**: R30 deferred face_recognize load-path. R32 probed it,
+added the `_sys_read_raw_at` helper, but ultimately deferred the
+close — the fix needs a bigger refactor than one commit.
+
+**Probe findings**:
+- Pre-R32: raw `sys_read(fd, buf+total, want)` leaked tagged buf
+  + tagged count to the kernel → EFAULT on first read → loop
+  exits with total=1, downstream parser reads 1 byte → "empty
+  gallery" cascade.
+- Attempted fix: `_sys_read_raw` (new helper, untags args, returns
+  raw). First read succeeded. But NOVA's `+` on `tagged_buf +
+  raw_total` doesn't compute `X+N` byte offset; it computes
+  `(2X+1)+N` which untags to `X+(N+1)/2`. Second read EFAULT'd
+  on the wrong address.
+- Second attempt: `_sys_read_raw_at(fd, buf, off, count)` — untags
+  buf + adds raw offset INSIDE asm, bypassing NOVA `+`. All 7 reads
+  succeeded (24688 bytes). But downstream `store8(buf + total, 0)`
+  and parser helpers (`_face_rec_next_nl`, `_face_rec_extract_str`,
+  `_face_rec_extract_int`, main parse loop) each use `buf + i` on
+  tagged buf + raw i — same NOVA `+` mis-computation. SEGV at the
+  terminator store.
+
+**Verdict**: closing face_recognize cleanly requires a 10-file
+30-site refactor to consistent NOVA `+` + `_sys_read_tagged`
+convention throughout (like audio_capture does). That's a
+dedicated multi-file round, not a one-commit fix. Reverted the
+in-file swap; face_recognize stays at R30 state (41/7).
+
+**Changes landed**:
+- Added `_sys_read_raw_at(fd, buf, off, count)` to
+  `src/util/sys_tagged.nova`. Available for future binary-reader
+  callers whose downstream pointer math stays in raw int_add
+  convention (none exist currently; helper is forward-looking).
+- No functional change to face_recognize (reverted to R30 state).
+
+**Lesson** recorded for future rounds: NOVA's `+` operator on
+`tagged_pointer + raw_int` mis-computes (produces `tagged_X +
+raw_N` which untags to `X + N/2`). Binary readers that mix tagged
+alloc pointers with raw-byte offset accumulators have a
+convention conflict that single-site swaps cannot resolve.
+
+Per-test outcome:
+- test_face_recognize: unchanged (41/7).
+- Canary (11 tests): all PASS except 2 Bug #15 ASLR intermittents
+  (fed_daemon_transport, chat_state_persistence — pre-existing,
+  not R32-related).
+
+Tally delta: 471 CLEAN unchanged (no new closes, no regressions,
+new helper available).
+
+### Latent-triage queue (post-R32)
+
+- **face_recognize load-path refactor** — upgraded in priority
+  per R32 findings. Needs 10-file 30-site conversion from
+  `int_add` raw-byte convention to NOVA `+` + `_sys_read_tagged`.
+  Scope: `_face_rec_read_file` + `_face_rec_next_nl` +
+  `_face_rec_extract_str` + `_face_rec_extract_int` + the main
+  parser in `face_gallery_load`.
+- **voice_conversation** (21 FAILs) — large single-test.
+- **test_research_sources residual** (8 FAILs post-R31).
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir, voice_dialog.
+- **Compile-error**: test_reader_xref_traversal.
+- **Small-FAIL residuals**: gc_metrics (1).
+- **str_find phantom-zero sweep** — 7 src/ files unchanged.
+- **NOVA structural ADRs** — str_eq canonical fix, NOVA `+`
+  tag-polymorphism clarification (new, from R32 lesson),
+  str_split, str_find, str_new, full socket API, canonical
+  allocator.
