@@ -4804,3 +4804,38 @@ non-passing.
   retire by making NOVA's parser accept `none` as an ordinary
   identifier in let bindings (or user-side: find other `let none`
   sites and rename).
+
+### Latent-triage R40 — face_recognize minimum-change attempt, reverted
+
+**Scope**: tried a 2-LOC minimum-change fix per R32/R33 lessons:
+`sys_read → _sys_read_raw_at` + remove `store8(buf + total, 0)`
+null terminator (parser bounds on `total`, doesn't deref past).
+
+**Hypothesis**: int_add raw-byte convention is internally
+consistent (save path works), only the sys_read tag leak + the
+terminator-store needed fixing.
+
+**Outcome**: SEGV. The hypothesis is wrong. The parser downstream
+also hits NOVA `+` arithmetic in `_face_rec_extract_str`'s inner
+loop (`store8(s + i, load8(buf + start + i))`) on tagged buf +
+tagged offsets, which SEGVs when start/i reach larger values from
+non-trivial file content.
+
+Reverted. face_recognize stays at R30 state (41/7).
+
+**Decision**: this test needs a proper diagnostic probe round
+with runtime prints of raw/tagged buf+offset values at each site,
+not another refactor attempt. Marking as **R41+ dedicated
+probe round** — not within a mechanical sweep.
+
+Tally delta: 476 CLEAN unchanged.
+
+### Latent-triage queue (post-R40)
+
+- **face_recognize diagnostic probe** (new, elevated priority).
+  Build a probe that prints raw/tagged values at each `buf + N`
+  site to pin the exact NOVA `+` behavior at those specific
+  tag states. Then propose a surgical fix (not a sweep).
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir.
+- **NOVA structural ADRs** — HIGH priority.
