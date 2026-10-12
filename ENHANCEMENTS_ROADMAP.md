@@ -4918,3 +4918,37 @@ non-passing.
   session audit of all socket-syscall codegen wrappers.
 - **Runtime-OOB**: truststore_dir.
 - **NOVA structural ADRs** — unchanged.
+
+### Latent-triage R42 — test_truststore_dir close (missing mkdir)
+
+**Scope**: 1 FAIL + Runtime-OOB. The test's `_tdir()` helper
+returns a per-test directory path like
+`$HOME/.crossengin_ph_o_r1_single/`, then calls `write_file()` to
+lay down `<dir>/rsa.pem` + `<dir>/manifest.txt`. But the parent
+`<dir>` doesn't exist, and NOVA's `write_file` doesn't create
+parent dirs (contrary to an outdated comment at :68 that claimed
+otherwise).
+
+strace confirmed: every `open(..., O_WRONLY|O_CREAT|O_TRUNC)` for
+a fixture path returned -1 ENOENT. The manifest was never written,
+`truststore_load_dir` saw no manifest and returned empty anchors,
+then `anchors[0]` OOB'd on the next assertion.
+
+**Fix** (3 LOC in test): add `sys_mkdir(d, 448)` (0700) inside
+`_tdir(name)` so every per-test dir is eagerly created on first
+use. Also updated the outdated comment.
+
+Per-test outcome:
+- test_truststore_dir: FAIL + OOB → **OK (20 checks)**.
+
+Tally delta: 477 → **478 CLEAN** / 30 pre-existing / 3
+non-passing.
+
+### Latent-triage queue (post-R42)
+
+- **face_recognize diagnostic probe** — unchanged.
+- **kg_rss_ingest diagnostic probe** — unchanged.
+- **Full socket-API tag-consistency (NOVA)** — HIGH priority
+  (would retire test_nat_traversal + simplify R23/R41
+  tag-poly guards).
+- **NOVA structural ADRs** — HIGH priority.
