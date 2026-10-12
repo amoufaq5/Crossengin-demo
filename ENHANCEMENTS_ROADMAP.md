@@ -4839,3 +4839,82 @@ Tally delta: 476 CLEAN unchanged.
 - **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
 - **Runtime-OOB**: truststore_dir.
 - **NOVA structural ADRs** — HIGH priority.
+
+### Latent-triage R41 — SEGV cluster triage (1 close, 2 deferrals)
+
+**Scope**: probe + address the 3-SEGV cluster. One cleanly closed,
+two surfaced as deeper structural issues.
+
+#### test_merkle_signing — CLOSED (Bug #12 class-B)
+
+strace showed `write(3, 0xe9cc3411, 65) = -1 EFAULT` — direct
+tagged-buf leak via raw sys_write.
+
+Fix (~6 LOC in `src/persistence/merkle_signing.nova`):
+- +import `../util/sys_tagged.nova`.
+- L353 `sys_write(fd, buf, n)` → `_sys_write_tagged(fd, buf, n)`.
+- L379 `sys_read(fd, buf, expect_len + 1)` → `_sys_read_tagged(...)`.
+
+Per-test: test_merkle_signing SEGV → **OK (51 checks)**.
+
+#### test_kg_rss_ingest — DEFERRED
+
+strace: write side swapped to tagged helper (success, 552 bytes
+written). Read side (`src/io/transducers/kg_rss_ingest.nova:705`)
+has the same shape as audio_capture's `_ac_read_file` using NOVA
+`+` convention. Swapped to `_sys_read_tagged`. Reads succeeded.
+
+But SEGV persists at `si_addr=0x5b81c0a1` AFTER the read loop
+closes — downstream in rss parse logic (likely `substr(buf, 0,
+total)` or similar). Pattern matches R33's face_recognize puzzle:
+NOVA's `+` on tagged pointer + tagged offset isn't consistent
+with downstream expectations.
+
+Reverted this round's src+test edits; test_kg_rss_ingest stays
+SEGV. Needs its own diagnostic probe round (like face_recognize).
+
+#### test_nat_traversal — DEFERRED (full socket-API tag mismatch)
+
+strace: `socket(AF_INET, SOCK_DGRAM, IPPROTO_IP) = 6` (socket
+works), then bind fails with raw -98 (EADDRINUSE, printed as
+-50 through int_to_str's tagged display) or -99 after various
+fix attempts.
+
+Root cause: `_nova_bind` in NOVA codegen passes tagged args
+straight to the kernel syscall (same shape `_nova_socket` had
+pre-R23). Attempted R23-pattern fix (untag fd + sockaddr + addrlen,
+tag return) but hit the raw-vs-tagged-fd ambiguity: raw fd=3 and
+tagged fd=7 both have bit 0 = 1, so tag-polymorphism can't
+distinguish them without context. Chose the wrong branch → wrong
+fd → kernel errors.
+
+The structural fix needs to make the ENTIRE socket API
+tag-consistent: `sys_socket_udp` must return tagged (like `socket`
+post-R23), AND every socket-syscall wrapper (bind, listen, accept,
+connect, send, recv, setsockopt_reuseaddr, close_fd,
+sys_fcntl_setfl_nonblock, sys_getsockopt_so_error) must
+unconditionally untag fd. That's a multi-session audit — queued.
+
+Reverted the attempted bind-only fix.
+
+**Per-test outcome**:
+- test_merkle_signing: **OK (51 checks)**.
+- test_kg_rss_ingest: unchanged (SEGV).
+- test_nat_traversal: unchanged (SEGV).
+
+Tally delta: 476 → **477 CLEAN** / 30 pre-existing / 4
+non-passing.
+
+### Latent-triage queue (post-R41)
+
+- **face_recognize diagnostic probe** — unchanged.
+- **kg_rss_ingest diagnostic probe** (new) — downstream of
+  read-fix NOVA `+` consistency issue in rss parse logic.
+  Pattern-matches face_recognize's unresolved deep refactor.
+- **Full socket-API tag-consistency (NOVA)** — upgraded from
+  "queued" to HIGH priority. Would retire R23's tag-poly guard,
+  R41 nat_traversal defer, and probably simplify
+  _sys_fcntl_setfl_nonblock / _sys_getsockopt_so_error. Multi-
+  session audit of all socket-syscall codegen wrappers.
+- **Runtime-OOB**: truststore_dir.
+- **NOVA structural ADRs** — unchanged.
