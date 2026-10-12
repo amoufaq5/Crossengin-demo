@@ -4664,3 +4664,32 @@ mechanism.
   R16-R35's ~1465 workaround sites. Also: NOVA `+`
   tag-polymorphism doc, str_split, str_find, str_new, full
   socket API, canonical allocator.
+
+### Latent-triage R36 — examples/ Bug #8 ripple cleanup
+
+**Scope**: close the 4 compile-error examples R34 surfaced
+(NOVA Bug #8 unresolved-callee check correctly rejecting silent
+null-call patterns that pre-dated the check).
+
+**Fix** (7 import lines across 4 files):
+- examples/companion_spine.nova: +import `std/syscall` + `std/string`
+- examples/crossengin_kg_subscriber.nova: +import `std/syscall` + `std/string`
+- examples/crossengin_kg_publisher.nova: +import `std/syscall` + `std/string`
+- examples/crossengin_fed_coordinator.nova: +import `std/syscall` + `std/string`
+
+Post-fix: all 4 compile cleanly. Canary (voice_dialog +
+voice_conversation + dtls12 + motor_map): all PASS.
+
+Tally delta: 473 CLEAN unchanged (no test suite closes — these
+files have no dedicated unit tests), but 4 compile-errors retired.
+
+### Latent-triage queue (post-R36)
+
+- **face_recognize deep refactor** — unchanged.
+- **test_research_sources residual** (8 FAILs).
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir.
+- **Compile-error**: test_reader_xref_traversal.
+- **Small-FAIL residuals**: gc_metrics (1).
+- **str_find phantom-zero sweep** — 7 src/ files unchanged.
+- **NOVA structural ADRs** — HIGH priority.
