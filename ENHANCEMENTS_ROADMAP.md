@@ -4191,3 +4191,74 @@ less-exercised subsystems, but no live FAIL points at them.
 - **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
   tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
   real-socket DTLS roundtrip.
+
+### Latent-triage R29 — tree-wide src/ `str_eq` sweep + 25-latent enumeration
+
+**Scope**: enumerate the 25-latent long tail + close most of it
+via one mechanical sweep.
+
+**Enumeration findings** (full suite = 478 tests, baseline sweep
+captured to `scratchpad/sweep_r29_pre.log`):
+- 32 tests FAIL with real labels
+- 10 tests SEGV before any output
+- 4 tests Runtime-OOB (`index out of bounds: 0`)
+- 1 test compile-error
+
+**Dominant shape** was still Shape-A `str_eq` cascade. Spot-checks
+confirmed: `_theme_index` in themes.nova, lookup helpers in
+whisper_backend / vosk_backend / autocompact_trigger /
+sensor_fusion / etc all used the broken `str_eq`.
+
+**The sweep**: tree-wide `str_eq → str_eq_bytes` across `src/`
+excluding `src/util/str_safe.nova`. 94 call sites across 25 files,
+plus one import add per file (adjusted for `../util` depth).
+
+**Changes**: 25 source files, +117/-92 LOC.
+
+Per-test (smoke-tested canary + R29 targets):
+- Core canary (12 tests: dtls12, motor_map, action_module,
+  word_atoms, speaker_id, audio_wakeword, voice_clone,
+  cognitive_router, self_model_query, pack_registry,
+  meta_observer_feedback, internet_fetch): all PASS, no
+  regressions.
+- R29 targets: test_themes 3/4 → **OK (7)**,
+  test_whisper_backend 45/1 → **OK (46)**,
+  test_vosk_backend 34/1 → **OK (35)**.
+- test_schemas 12/1 → 12/1 (residual — not pure A, needs its
+  own probe).
+
+Full post-sweep results captured to
+`scratchpad/sweep_r29.log` (running background at commit time);
+residual list + per-cluster triage queued for R30+.
+
+Tally delta: 434 → ~454-459 CLEAN (estimate; pending the full
+sweep's actual count).
+
+### Latent-triage queue (post-R29)
+
+- **R29 residuals** — tests that stayed red post-sweep. Classify
+  each as shape-D/E/S1/S3 and queue per-shape rounds.
+- **str_find phantom-zero sweep** — ~7 src/ files, same shape
+  as R20/R21 fix.
+- **test_reader_xref_traversal compile-error** — single-site
+  parser-input fix.
+- **Runtime-OOB cluster probe** (test_consolidation,
+  test_image_tracker, test_video_smooth, test_voice_dialog) —
+  per-test probe rounds.
+- **New SEGVs** (test_merkle_signing, test_nat_traversal,
+  test_kg_rss_ingest, test_tool, test_tool_goal_plan,
+  test_tool_use, test_truststore_dir) — per-test probe to
+  classify Bug #15 vs real logic.
+- **Codebase-hygiene — tests/ side `str_eq` sweep** — R29
+  drained src/; tests/ still has sites in test helpers.
+- **NOVA `str_eq` canonical fix** — HIGH after R29. R29 drained
+  src/ completely; a NOVA fix would also retire the whole sweep
+  arc.
+- **Tag-consistent full socket API (NOVA)** — unchanged.
+- **Canonical-arena allocator ADR (NOVA)** — unchanged.
+- **NOVA `str_split` canonical fix** — unchanged.
+- **NOVA str_new fix** — unchanged.
+- **Potential NOVA ADR** — implicit `call main` in `_start`.
+- **Non-latent queue** — NOVA ADR-0009 impl, `_raw_imul_add`
+  tagged-b cleanup, `test_match_expr` parser bug, Phase R6+,
+  real-socket DTLS roundtrip.
