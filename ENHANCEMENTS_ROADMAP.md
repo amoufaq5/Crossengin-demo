@@ -4015,6 +4015,36 @@ previously-passing surface; no new closes, no regressions).
   hygiene, LOW priority. Move `let buf = alloc(4097)` out of the
   inner loop; preserves semantics but spares 1024 wasted
   allocations per 4 MiB read.
+
+### Latent-triage R28 — `_cm_read_file` alloc-hoist cosmetic
+
+**Scope**: pure cosmetic refactor. Hoisted `let buf = alloc(4097)`
+out of the inner `while` loop in
+`src/factory/child_mode.nova:_cm_read_file`. The 4 KB buffer is
+reusable across reads (`_sys_read_tagged` overwrites the first `m`
+bytes on each call and `acc` byte-copies out before the next
+iteration), so pre-R28 we were firing ~1024 wasted allocations per
+4 MiB read.
+
+**Fix** (~1 LOC moved + 5 LOC comment):
+- Move `let buf = alloc(4097)` from inside the `else` branch to
+  before the `while done == 0 {` outer loop.
+
+Per-test outcome:
+- test_child_mode_wire: OK (48 checks) — unchanged.
+- test_capability_wire: OK (265 checks) — unchanged.
+- test_admin_emit_delta_verb: OK (24 checks) — unchanged.
+- Canary (11 tests: R26/R27 siblings + core): all PASS, no
+  regressions.
+
+Tally delta: 434 CLEAN unchanged (pure cosmetic; no new closes).
+
+All `_cm_read_file` hygiene items are now retired. `R12
+continuation — sys_write/sys_read audit` goes from "mostly drained"
+to **effectively complete** for the known-reachable surface:
+R23/R24/R25/R26/R27/R28 covered every sys_read site identified in
+R25's scoping. The sys_write side still has unaudited sites in
+less-exercised subsystems, but no live FAIL points at them.
 - **~25 live-FAIL latent long tail** — never-triaged; needs an
   enumeration round to classify by shape.
 - **Tag-consistent full socket API (NOVA)** — unchanged.
