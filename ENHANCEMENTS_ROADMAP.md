@@ -4567,3 +4567,52 @@ Tally delta: 471 CLEAN unchanged.
 - **NOVA structural ADRs** — str_eq canonical, NOVA `+`
   tag-polymorphism doc (new, from R32+R33 lessons), str_split,
   str_find, str_new, full socket API, canonical allocator.
+
+### Latent-triage R34 — examples/ `str_eq` sweep (voice_conversation close)
+
+**Scope**: close test_voice_conversation (6/21) via Shape-A sweep
+in `examples/voice_conversation.nova` + swept the 6 smaller
+examples with str_eq sites. voice_dialog (142 sites, Runtime-OOB)
+excluded — needs a dedicated round.
+
+**Changes** (~19 LOC + 7 imports): 7 files touched —
+voice_conversation + crossengin_daemon + companion_spine +
+snap_keygen + crossengin_kg_subscriber + crossengin_kg_publisher
++ crossengin_fed_coordinator. Word-boundary sed swap + 7 imports
+added.
+
+Per-test outcome:
+- test_voice_conversation: 6/21 → **OK (27 checks)**.
+
+Compile smoke:
+- `examples/crossengin_daemon`: Built ✓
+- `examples/snap_keygen`: Built ✓
+- `examples/companion_spine`: pre-existing undeclared-callee
+  `str_data` (NOVA Bug #8 ripple leftover; verified by stashing
+  R34 and reproducing — not introduced here).
+- `examples/crossengin_kg_subscriber/publisher/fed_coordinator`:
+  pre-existing undeclared-callee `sys_open` (same ripple
+  category — files missing `import "std/syscall"`).
+
+Those 4 pre-existing compile errors predate R34 and are queued
+as a separate micro-round ("examples/ Bug #8 ripple cleanup").
+
+Tally delta: 471 → **472 CLEAN** / 30 pre-existing / 9
+non-passing (one fewer than post-R33's 10).
+
+### Latent-triage queue (post-R34)
+
+- **examples/ Bug #8 ripple cleanup** — new, small. 4 files need
+  explicit `import "std/syscall"` + 1 needs `std/string` for
+  str_data. Pre-existing undeclared-callees surfaced by R34's
+  compile smoke.
+- **voice_dialog** (142 str_eq sites + Runtime-OOB) — dedicated
+  round. Sweep + OOB probe.
+- **face_recognize deep refactor** — unchanged.
+- **test_research_sources residual** (8 FAILs post-R31).
+- **SEGVs**: kg_rss_ingest, merkle_signing, nat_traversal.
+- **Runtime-OOB**: truststore_dir.
+- **Compile-error**: test_reader_xref_traversal.
+- **Small-FAIL residuals**: gc_metrics (1).
+- **str_find phantom-zero sweep** — 7 src/ files unchanged.
+- **NOVA structural ADRs** — unchanged.
