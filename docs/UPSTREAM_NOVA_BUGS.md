@@ -755,3 +755,95 @@ correctly catching real import-graph issues that were latent SEGV
 time-bombs. Fixing the tests is a follow-up sweep (not blocking the
 upstream-NOVA close-out). `test_motor_map` passes cleanly as a
 canary that the check works correctly when imports are complete.
+
+## 17. `_nova_len` and `_nova_substr` dereference `rdi` without untagging
+
+**Status**: confirmed R43. Root cause for face_recognize load-path
+SEGV cluster (R30/R32/R33/R40 revert chain). Likely root cause for
+kg_rss_ingest and any `alloc + len/substr` latent SEGV.
+
+**Shape**:
+
+The user-visible `alloc()` wrapper
+(`src/compiler/codegen.nova:22091`) tags its returned address:
+
+```
+out_label("alloc")
+    sar rdi, 1                 // untag size
+    call _nova_alloc           // returns RAW
+    lea rax, [rax + rax + 1]   // re-tag address (bit 0 = 1)
+    ret
+```
+
+The low-level byte accessors untag `rdi` on entry (`load8`,
+`store8`, `load64`, `memcpy_raw`), so alloc'd buffers work fine
+through the direct-access path. But `_nova_len`
+(`src/compiler/codegen.nova:16610`) and `_nova_substr`
+(`src/compiler/codegen.nova:16887`) do not:
+
+```
+out_label("_nova_len")
+    test rdi, rdi
+    jz .len_zero
+    cmp qword ptr [rdi], -1    // rdi tagged -> misaligned deref -> SEGV
+    ...
+```
+
+```
+out_label("_nova_substr")
+    ...
+    sar rsi, 1                 // untag start
+    sar rdx, 1                 // untag len
+    lea r12, [rdi + rsi]       // rdi tagged -> wrong base, OOB read
+    ...
+```
+
+**Minimum reproducer**:
+
+```nova
+let buf = alloc(16)
+store8(buf + 0, 72); store8(buf + 1, 0)
+println(int_to_str(load8(buf + 0)))   // OK: 72
+let n = len(buf)                      // SEGV (exit 139)
+```
+
+String literals have raw pointers in the data segment, so
+`len("hello")` works. `concat()` and most string-building paths
+go through `_nova_alloc` directly (not the `alloc()` wrapper),
+so they return raw and `len()` works on their outputs. Only the
+`alloc()` wrapper + `len`/`substr` combination SEGVs.
+
+**Fix proposal** (surgical, 2x2 LOC):
+
+Add a tag-polymorphic untag prolog to both `_nova_len` and
+`_nova_substr`, matching `memcpy_raw`'s shape:
+
+```
+test rdi, 1
+jz .already_raw
+sar rdi, 1
+.already_raw:
+```
+
+This leaves raw-pointer callers (string literals, `_nova_concat`
+results) unchanged and makes tagged-pointer callers (anything
+alloc'd by user code) work. No Crossengin source needs to
+change.
+
+**Alternatives rejected**:
+
+- Make `alloc()` return a raw pointer. Breaks every caller that
+  stores alloc'd pointers through tag-sensitive paths
+  (`push`, list storage, polymorphic equality).
+- Have every caller untag before calling len/substr. Fragile;
+  requires knowing whether the buf came from alloc or a literal.
+
+**Impact if fixed** (R44):
+
+- Unblocks face_recognize load path (reverted R30/R32/R33/R40).
+- Likely unblocks kg_rss_ingest same-shape latent SEGV.
+- Retires a broad class of latent "alloc + len" bugs
+  tree-wide — any user code that builds a buffer via alloc and
+  then calls len() or substr() on it has been working by
+  accident of heap layout, and R44 would make the pattern
+  safe.

@@ -4952,3 +4952,137 @@ non-passing.
   (would retire test_nat_traversal + simplify R23/R41
   tag-poly guards).
 - **NOVA structural ADRs** — HIGH priority.
+
+### Latent-triage R43 — face_recognize diagnostic probe (findings-only)
+
+**Scope**: no production edits. Pure diagnostic round to resolve
+the R30/R32/R33/R40 puzzle — why `_face_rec_emit_str`
+(save side, alloc+store8 loop) works and the symmetric
+`_face_rec_extract_str` (load side, same shape) SEGVs.
+
+**Method**: scratchpad `probe_r43_tag.nova` isolating the
+smallest reproducer:
+
+```nova
+let buf = alloc(16)
+store8(buf + 0, 72); store8(buf + 1, 105); store8(buf + 2, 0)
+println("load8(buf+0): " + int_to_str(load8(buf + 0)))  // OK: 72
+println("load8(buf+1): " + int_to_str(load8(buf + 1)))  // OK: 105
+let n = len(buf)                                        // SEGV 139
+```
+
+The crash is one call deep: `len()` on a freshly-alloc'd buffer
+segfaults. No parser, no file I/O, no `+ int_add` interaction
+needed. The two low-level accessors `load8` / `store8` work
+correctly on the same buffer.
+
+**Root cause** (verified in NOVA codegen):
+
+1. The user-visible `alloc()` wrapper
+   (`src/compiler/codegen.nova:22091`) re-tags its return value:
+   ```
+   out_label("alloc")
+       sar rdi, 1                 // untag size
+       call _nova_alloc           // _nova_alloc returns RAW
+       lea rax, [rax + rax + 1]   // re-tag address (bit 0 = 1)
+       ret
+   ```
+   So every `alloc()` call returns a TAGGED pointer.
+
+2. Low-level byte accessors untag before use
+   (`src/compiler/codegen.nova:22410-22418`):
+   ```
+   out_label("store8")
+       sar rdi, 1                 // untag address  ✓
+       sar rsi, 1                 // untag byte value
+       mov byte ptr [rdi], sil
+       ret
+   out_label("load8")
+       sar rdi, 1                 // untag address  ✓
+       movzx eax, byte ptr [rdi]
+       lea rax, [rax + rax + 1]
+       ret
+   ```
+   `memcpy_raw` is tag-polymorphic via `test rdi, 1 / sar rdi, 1`.
+
+3. `_nova_len` (`src/compiler/codegen.nova:16610`) does NOT
+   untag rdi:
+   ```
+   out_label("_nova_len")
+       test rdi, rdi
+       jz .len_zero
+       cmp qword ptr [rdi], -1    // ← rdi is tagged! misaligned deref
+       je .len_list
+       xor eax, eax
+   .len_str_loop:
+       cmp byte ptr [rdi + rax], 0
+       ...
+   ```
+   With `alloc()` returning tagged rdi, the first `cmp qword ptr
+   [rdi], -1` reads from `(raw*2)+1` — a misaligned address far
+   above the real heap address — which SEGVs.
+
+4. `_nova_substr` (`src/compiler/codegen.nova:16887`) has the same
+   shape: it `sar`s rsi (start) and rdx (len) but reads
+   `[rdi + rsi]` with rdi still tagged. So the "fix" of swapping
+   the extract_str alloc-loop for `substr(buf, start, n)` SEGVs
+   too — tried in-session, confirmed to still crash. Reverted.
+
+**Why save works but load doesn't**:
+
+- Save path (`_face_rec_emit_str`): writes into buf via
+  `store8(buf + N, V)` only. store8 untags rdi, so a tagged buf
+  behaves identically to a raw one. No `len()` or `substr()` is
+  called on the save-side temporary.
+
+- Load path (`_face_rec_extract_str`): the symmetric helper
+  alloc's a new buf (tagged), fills it, and returns it. The
+  caller stuffs each extracted field into a list; downstream
+  code (or `len()` inside the parser bounds check) eventually
+  dereferences via a tag-naive runtime fn and SEGVs. The
+  previously-"working" shape in R30 was coincidence of the
+  specific input size + heap layout keeping the misaligned
+  deref inside a mapped page; larger inputs trip the SEGV.
+
+Documented as UPSTREAM §17.
+
+**R44 proposal** (surgical NOVA codegen patch, 2 LOC):
+
+Add `test rdi, 1 / jz ... / sar rdi, 1` tag-polymorphic prolog
+to `_nova_len` and `_nova_substr`, matching `memcpy_raw`'s
+shape. This closes the alloc/len mismatch for all callers
+tree-wide without churning any Crossengin source.
+
+Alternative A: make `alloc()` return a RAW pointer (drop the
+`lea rax, [rax + rax + 1]`). Rejected: breaks every caller that
+currently stores alloc'd pointers in lists / passes them to
+`push` / etc., because those paths may inspect the tag bit.
+
+Alternative B: tree-wide untag at call sites (`len(buf-1)` /
+`substr(buf-1, ...)`). Rejected: fragile, requires every caller
+to know whether its buf came from alloc or a string literal.
+
+**Deliverables**:
+
+- No production edits (R43 is findings-only, per plan).
+- No tests touched.
+- Scratchpad probe `probe_r43_tag.nova` (not committed).
+- Roadmap record (this entry).
+- UPSTREAM_NOVA_BUGS §17 entry.
+- Commit: docs-only.
+
+**Not fixed in R43**: `face_recognize` load path remains the
+same latent FAIL as pre-R43. R44 will land the NOVA codegen
+tag-poly patch; the load path then works unmodified.
+
+### Latent-triage queue (post-R43)
+
+- **R44 — NOVA `_nova_len`/`_nova_substr` tag-polymorphism patch**
+  (surgical 2x2-LOC codegen fix, per R43 memo). CRITICAL
+  priority — unblocks face_recognize load path, likely also
+  helps kg_rss_ingest, and retires a broad class of latent
+  "alloc + len/substr" SEGVs tree-wide.
+- **kg_rss_ingest diagnostic probe** — now likely covered by
+  R44 (same alloc/len mismatch suspected). Re-check after R44.
+- **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
+- **NOVA structural ADRs** — unchanged, HIGH.
