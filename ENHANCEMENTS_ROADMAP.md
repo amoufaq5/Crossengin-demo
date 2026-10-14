@@ -5086,3 +5086,94 @@ tag-poly patch; the load path then works unmodified.
   R44 (same alloc/len mismatch suspected). Re-check after R44.
 - **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
 - **NOVA structural ADRs** — unchanged, HIGH.
+
+### Latent-triage R44 — NOVA tag-poly patch landed upstream
+
+**Scope**: landed the R43-proposed fix in NOVA. No Crossengin
+source edits.
+
+**Upstream commit**: NOVA `claude/confident-fermi-op241b`
+commit `f2fbbe6`:
+`fix(codegen): tag-polymorphic prolog on _nova_len /
+_nova_substr (R44)`.
+
+**Shape**: 21 LOC inserted into
+`src/compiler/codegen.nova`:
+
+- `_nova_len` (x86-64, L16610): add `test rdi, 1 / jz
+  .nlen_raw / sar rdi, 1 / .nlen_raw:` prolog ahead of the
+  existing body, matching `memcpy_raw`'s shape.
+- `_nova_substr` (x86-64, L16887): same prolog on `rdi` only
+  (rsi/rdx handling unchanged — any caller-side raw-offset
+  quirk is pre-existing, deferred).
+- `_nova_warm_len` (aarch64 warm variant, L9759): aarch64
+  equivalent `tbz x0, #0, .Lwarm_len_untag ; asr x0, x0, #1 ;
+  .Lwarm_len_untag:` for cross-platform consistency.
+
+**Self-host**: verified. `make self-host-setarch` emits
+`=== SELF-HOSTING VERIFIED ===` (stage-2 == stage-3 asm diff).
+
+**R43 probe**: now returns `len(alloc'd) = 2` and
+`len(substr(tagged, 0, 2)) = 2` instead of exit 139.
+
+**Regression spot-check** (20 tests sampled):
+
+- test_truststore_dir — OK (20 checks).
+- test_merkle_signing — OK (51 checks).
+- test_voice_dialog — OK (319 checks).
+- test_federated_aggregator — OK (91 checks).
+- test_motor_map — OK (52 checks).
+- test_nl_generate — OK (35 checks).
+- test_nl_rpc_verbs — OK (87 checks).
+- test_differential_privacy — OK (52 checks).
+- test_admin_emit_delta_verb — OK (24 checks).
+- test_webrtc — OK (59 checks).
+- test_audio_records — OK (31 checks).
+- test_forward_sim — OK (7 checks).
+- test_skills_kg — OK (26 checks).
+- test_tls_session — OK (35 checks).
+- test_contradiction — OK (52 checks).
+- test_snapshot_selfmodel — OK (38 checks).
+- test_turn_server — OK (111 checks).
+- test_optical_flow_pyramid — OK (52 checks).
+- test_json_records — OK (65 checks).
+- test_output_generation — OK (14 checks).
+
+Zero regressions across the sample. The patch is tag-poly
+(`test rdi, 1`-guarded), so raw-pointer callers execute the
+exact same instructions as before.
+
+**face_recognize** (R30/R32/R33/R40/R43 revert chain):
+
+- Pre-R44: SEGV (exit 139) in the load path.
+- Post-R44: no SEGV. Clean FAIL (exit 3):
+  `loaded gallery live_size = 3 expected=3 got=0` and
+  downstream `recognize ... got='unknown'`.
+
+Per plan honest-reporting policy ("If face_recognize passes the
+probe but fails real tests: there's a parser-layer bug in
+`_face_rec_read_file` / `_face_rec_next_nl` that the R43 memo
+didn't catch; record and queue a dedicated round. Do NOT touch
+Crossengin source in R44."): no src/ edits in R44. Parser-layer
+investigation deferred to R45.
+
+Per-test outcome:
+- test_face_recognize: SEGV (exit 139) → **FAIL (clean, exit 3,
+  7/48 checks failing)**. Not yet CLEAN.
+
+Tally unchanged: still **478 CLEAN** / 30 pre-existing / 3
+non-passing. The R44 unblock will visibly land in R45 when the
+parser-layer fix flips face_recognize to CLEAN.
+
+### Latent-triage queue (post-R44)
+
+- **R45 — face_recognize parser-layer bug**. Loaded gallery
+  returns `live_size=0` where 3 expected. Likely in
+  `_face_rec_next_nl` offset tracking or
+  `_face_rec_extract_str` boundary math now that the
+  underlying substr works. Scope: Crossengin `src/io/
+  transducers/image_face_recognize.nova`, read side only.
+- **kg_rss_ingest** — re-probe post-R44 to see if the same
+  alloc/len issue was its root cause.
+- **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
+- **NOVA structural ADRs** — unchanged, HIGH.

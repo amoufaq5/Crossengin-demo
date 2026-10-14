@@ -758,9 +758,16 @@ canary that the check works correctly when imports are complete.
 
 ## 17. `_nova_len` and `_nova_substr` dereference `rdi` without untagging
 
-**Status**: confirmed R43. Root cause for face_recognize load-path
+**Status**: FIXED R44 — NOVA `claude/confident-fermi-op241b`
+commit `f2fbbe6`. Tag-poly prolog landed on `_nova_len`,
+`_nova_substr` (x86-64) and `_nova_warm_len` (aarch64). R43
+scratchpad probe now returns `len(alloc'd) = 2` instead of
+exit 139. 20-test regression sample is zero regressions. Entry
+retained below for historical reference.
+
+(Originally confirmed R43. Root cause for face_recognize load-path
 SEGV cluster (R30/R32/R33/R40 revert chain). Likely root cause for
-kg_rss_ingest and any `alloc + len/substr` latent SEGV.
+kg_rss_ingest and any `alloc + len/substr` latent SEGV.)
 
 **Shape**:
 
