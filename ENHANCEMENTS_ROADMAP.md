@@ -5177,3 +5177,74 @@ parser-layer fix flips face_recognize to CLEAN.
   alloc/len issue was its root cause.
 - **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
 - **NOVA structural ADRs** — unchanged, HIGH.
+
+### Latent-triage R45 — face_recognize load path (reverted, findings only)
+
+**Scope** (planned): 1-LOC `sys_read` → `_sys_read_tagged` swap
+in `_face_rec_read_file` (image_face_recognize.nova:552), per
+R45 Explore's identification of a surviving R30/R32 "deferred
+half-fix" as the real root cause of `live_size=0` after R44.
+
+**Outcome**: swap applied. Test still SEGV'd (exit 139) with
+no output. Reverted per plan honest-reporting policy ("If
+after the swap the test STILL fails: ... revert, queue a
+different approach for R46. Do NOT layer additional
+'mechanical fixes.'").
+
+**New root cause** (verified via scratchpad probe
+`probe_str_to_int.nova`): `_nova_str_to_int` has the same
+tag-poly gap R44 fixed in `_nova_len`/`_nova_substr`.
+
+```nova
+let buf = alloc(4)
+store8(buf + 0, 52); store8(buf + 1, 50); store8(buf + 2, 0)  // "42\0"
+let n = str_to_int(buf)   // SEGV (exit 139)
+```
+
+At `src/compiler/codegen.nova:16933`, `_nova_str_to_int` reads
+`[rdi]` directly without an untag prolog. So after the R45
+swap, bytes get read correctly, parser helpers call
+`_face_rec_extract_int` → `str_to_int(alloc'd_str)` → SEGV.
+
+**NOT a parser bug**. The R45 Explore's find was correct about
+the `sys_read` leak but missed that `_face_rec_extract_int`'s
+call-into-NOVA-runtime also hits an alloc'd buffer.
+
+**Additional tag-poly runtime-fn candidates** (grep scan of
+`codegen.nova`, no `sar rdi, 1` prolog + first-byte deref of
+`rdi`):
+
+- `_nova_strlen` (L16424) — `cmp byte ptr [rdi + rax], 0`
+- `_nova_str_eq` (L16536) — `mov cl, [rdi]`
+- `_nova_str_to_int` (L16933) — `cmp byte ptr [rdi], 45`
+  *(confirmed SEGV)*
+- `_nova_contains` (L17004) — `cmp qword ptr [rdi], -2`
+- `_nova_starts_with` (L17077) — `cmp cl, [rdi]`
+
+Each is one tag-poly prolog, identical pattern to R44's
+targets. Rough bound: ~5 × 4 LOC = ~20 LOC NOVA codegen.
+
+**No roadmap tally change.** face_recognize stays in the
+non-passing bucket. Tally remains 478 CLEAN / 30 pre-existing
+/ 3 non-passing.
+
+**No Crossengin edits committed.** R45's working tree was
+restored to the R44 post-state.
+
+### Latent-triage queue (post-R45)
+
+- **R46 — NOVA tag-poly prolog sweep for runtime string fns**:
+  add the R44-style `test rdi, 1 / jz / sar rdi, 1` prolog to
+  `_nova_strlen`, `_nova_str_eq`, `_nova_str_to_int`,
+  `_nova_contains`, `_nova_starts_with` (and audit
+  `_nova_concat`, `_nova_chr`, `_nova_str_find`, `_nova_split`
+  for the same shape). Verify with the R45 scratchpad probe +
+  R43 probe + face_recognize test. CRITICAL — likely closes
+  face_recognize in one shot, retires a broad latent-SEGV
+  class tree-wide.
+- **R47 (after R46) — face_recognize re-attempt**: re-apply
+  the R45 1-LOC `sys_read` → `_sys_read_tagged` swap once
+  R46 lands upstream. Expected: 48/48 checks.
+- **kg_rss_ingest** — re-probe post-R46.
+- **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
+- **NOVA structural ADRs** — unchanged, HIGH.
