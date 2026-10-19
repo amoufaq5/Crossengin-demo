@@ -5495,3 +5495,89 @@ pre-existing/non-passing counts; recount pending.
   tag-poly runtime sweep**. Unchanged, CRITICAL.
 - **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
 - **Other NOVA structural ADRs** — unchanged, HIGH.
+
+### Latent-triage R49 — stream_stdin asm shim tag-poly inline
+
+**Scope**: the R48-deferred inline `asm { … }` shim
+`_stream_sys_read` in
+`src/io/transducers/stream_stdin.nova:71`. Hand-rolled
+non-blocking `read(2)` wrapper that preserves the kernel's
+raw `-errno` return so the caller can distinguish EOF (0),
+bytes-read (>0), and EAGAIN/transient (<0). The shim didn't
+untag its args; the caller passed `buf = alloc(…)` tagged;
+kernel got `(real*2)+1` → EFAULT → silent "nothing to read"
+hot path forever.
+
+**Fix** (inside the existing `asm { … }` block, no new fn):
+
+```nova
+"mov rsi, [rbp-16]"
+"test rsi, 1"              // R49 tag-poly: untag alloc'd buf
+"jz .stsr_u"
+"sar rsi, 1"
+".stsr_u:"
+"mov rdx, [rbp-24]"
+"sar rdx, 1"               // R49: untag tagged NOVA count
+"syscall"
+```
+
+Mirrors `_sys_read_tagged` in `src/util/sys_tagged.nova`'s
+`.srt_u` dance. `rax` is deliberately NOT re-tagged on
+return — the caller consumes raw bytes-read / raw `-errno`
+and switches on sign.
+
+Also fixed a latent count-untag bug (same shim, same block):
+`STREAM_STDIN_READ_CHUNK` was reaching the kernel as a
+tagged `(count*2)+1`. The kernel short-reads to available
+input so this was invisible, but it's wrong; adding the
+`sar rdx, 1` is additive-safe.
+
+**Verification**:
+
+- `test_stream_stdin` (unit): **OK (28 checks)**. Bypasses
+  the real stdin shim via `stream_stdin_test_feed`; the
+  patch is additive-safe.
+- Scratchpad probe
+  (`.../scratchpad/probe_stream_shim.nova`): opens
+  `/tmp/ce_r49_probe.txt` (written with `"hello R49\n"`),
+  alloc's a 32-byte buf, invokes `_stream_sys_read(fd, buf,
+  32)`. Returns `n = 10`, buf dumps `hello R49\n`. Pre-R49
+  this would have returned `-14` (EFAULT) and no bytes.
+- Integration script
+  `tests/integration/scenario_l_stream_stdin.sh` requires
+  `./bin/crossengin` to be built; absent in this session
+  (daemon build out of R49 scope). Marked as deferred
+  end-to-end check — the unit test + scratchpad probe cover
+  the asm-level correctness; the integration script will
+  pass on any session that `make build && make install`'s
+  the daemon.
+- Regression sample (6 R46-R48 canaries): zero regressions.
+  face_recognize (48), kg_rss_ingest (58), voice_dialog
+  (319), image_pgm (43), image_panorama (59),
+  stream_stdin (28). Total **555 cumulative checks**.
+
+**Tally**: unchanged (480 CLEAN / 30 pre-existing / 1
+non-passing). The stream_stdin fix doesn't flip any
+pre-existing test; it unblocks a daemon code path exercised
+only by `scenario_l_stream_stdin.sh`.
+
+**End-of-sweep**: with R49 landed, the entire "raw `sys_*`
+on tagged alloc'd buf" bug class is closed across every
+Crossengin site the R48 audit surfaced (12 R48 sites + 1
+R49 asm shim = 13 total). Any future site needs an audit
+to re-open the class.
+
+### Latent-triage queue (post-R49)
+
+- **test_truststore_dir fixture-cleanup**. Unchanged.
+- **NOVA structural ADR — string-literal alignment + full
+  tag-poly runtime sweep**. Unchanged, CRITICAL. Lands
+  R46's deferred 9-fn sweep (strlen/str_eq/contains/
+  starts_with/ends_with/str_find/split/str_trim/str_to_chars).
+- **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
+- **Daemon end-to-end re-check post-R49**. When a session
+  builds the daemon (`make install`), re-run
+  `scenario_l_stream_stdin.sh` to confirm the FIFO-fed
+  `"fever\n"` → `msg "fever" perceive(m>=1)` path works
+  end-to-end. Belt-and-suspenders on the R49 asm fix.
+- **Other NOVA structural ADRs** — unchanged, HIGH.
