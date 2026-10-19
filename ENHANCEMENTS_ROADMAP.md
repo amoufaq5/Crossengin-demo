@@ -5728,3 +5728,62 @@ table; the "deferred str_to_chars" item is closed.
 - **Daemon end-to-end re-check post-R49**. Unchanged, needs
   a session that `make install`s the daemon.
 - **Other NOVA structural ADRs** — unchanged, HIGH.
+
+### Latent-triage R52 — full socket-API two-tier tag-poly sweep
+
+**Scope**: extends R50's two-tier tag-poly contract from
+string fns to the full socket API. 12 public shims gain
+tag handling (`bind_socket`, `listen_socket`, `accept_conn`,
+`connect_socket`, `send_data`, `recv_data`, `close_fd`,
+`make_sockaddr_in`, `sys_sendto`, `sys_recvfrom`,
+`sys_setsockopt_so_reuseaddr`, `sys_poll`) plus
+`sys_socket_udp` gets a return-tag so its raw-fd chain joins
+the tagged-fd convention. Internal `_nova_*` bodies unchanged.
+
+**R41 bind-ambiguity resolution** (raw fd=3 and tagged NOVA 1
+both have bit 0 = 1): the two-tier design puts tag handling
+at the shim boundary rather than in the internal fn, so bind
+can `sar rdi, 1` unconditionally because the shim is only
+reached from user code that always holds a tagged fd.
+
+**Patch**: NOVA `57cbfac` — 144 LOC net at
+`codegen.nova:L22215+`. Per-shim prolog recipes in the
+UPSTREAM §17 extension.
+
+**Verification**:
+
+- NOVA self-host verified (stage-2 == stage-3).
+- R23 canary `test_dr_async_fetch`: **OK (97/0)**. Chain
+  protected.
+- **test_nat_traversal: SEGV / EBADF chain → clean FAIL (197
+  passed / 12 FAILED)**. R41 blocker partially cleared;
+  socket path works end-to-end. Residual 12 failures are a
+  secondary tagging issue in `sys_sendto`/`sys_recvfrom`'s
+  IP arg packing (sender_ip readback shows halved IP:
+  `127.0.0.1 → 16777343 expected, 8388671 got`). Queued as
+  R53.
+- TLS stack regression (test_tls_session 35, test_turn_server
+  111, test_webrtc 59): all green.
+- 11-test R50 wins sample (face_recognize, kg_rss_ingest,
+  voice_dialog, stream_stdin, image_pgm, image_panorama,
+  federated_aggregator, motor_map, nl_rpc_verbs,
+  merkle_signing, truststore_dir after clean $HOME): zero
+  regressions.
+
+**Tally**: unchanged observable (nat_traversal still has 12
+FAILs post-R52), but the socket-API latent-SEGV class is
+closed. nat_traversal is on track for R53 close.
+
+### Latent-triage queue (post-R52)
+
+- **R53 — nat_traversal residual (12 FAILs)**. The sys_sendto
+  / sys_recvfrom IP packing path still halves tagged IPs
+  because the shim's unconditional `sar rcx, 1` on IP matches
+  tagged inputs but mis-handles IPs that reach the shim
+  already raw (e.g. from Crossengin's byte-packing helpers).
+  Needs: either tag-poly on `rcx` (and `r8` port) in the
+  sendto shim, or audit the Crossengin callers to confirm
+  which convention they use. Low-LOC fix once decided.
+- **test_truststore_dir fixture-cleanup**. Unchanged, cosmetic.
+- **Daemon end-to-end re-check post-R49**. Unchanged.
+- **Other NOVA structural ADRs** — unchanged, HIGH.

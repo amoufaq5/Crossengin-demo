@@ -898,3 +898,52 @@ change.
   then calls len() or substr() on it has been working by
   accident of heap layout, and R44 would make the pattern
   safe.
+
+## 18. Socket API — two-tier tag-poly contract
+
+**Status**: FIXED R23 + R52. NOVA
+`claude/confident-fermi-op241b` commits `f5a035a` (R23) and
+`57cbfac` (R52).
+
+Extends §17's two-tier contract from string fns to the full
+socket API. Internal `_nova_*` socket fn bodies stay raw-only;
+public shims at codegen.nova:L22215+ gate tag transitions at
+the user-API boundary.
+
+**R41 bind-ambiguity**: raw fd=3 and tagged NOVA 1 both have
+bit 0 = 1 — a tag-poly prolog inside `_nova_bind` can't
+distinguish them. The two-tier design resolves this: the
+`bind_socket` shim knows its caller is user code holding a
+tagged fd (from `socket()` or `sys_socket_udp()`, both of
+which tag their returns post-R23/R52), so the shim can
+unconditionally `sar rdi, 1`.
+
+**Fn coverage**:
+
+- R23 (internal-fn fix): `_nova_socket` (untag args + tag
+  return), `_nova_sys_fcntl_setfl_nonblock` (tag-poly rdi +
+  tag return), `_nova_sys_getsockopt_so_error` (same).
+- R52 (public-shim prolog): `bind_socket`, `listen_socket`,
+  `accept_conn`, `connect_socket`, `send_data`, `recv_data`,
+  `close_fd`, `make_sockaddr_in`, `sys_sendto`,
+  `sys_recvfrom`, `sys_setsockopt_so_reuseaddr`, `sys_poll`.
+  Return-tag on all except `make_sockaddr_in` (raw ptr) and
+  `sys_recvfrom` (list handle). Pointer args to send / recv /
+  sendto / recvfrom / sys_poll are tag-poly (buf may be
+  alloc'd tagged or raw concat).
+- R52 (return-tag at shim): `sys_socket_udp` wraps its
+  internal call with `lea rax, [rax+rax+1]` so the UDP
+  fd-return joins the tagged-fd convention (unblocks
+  `nat_udp_open` → `bind_socket` chain).
+
+**Verification**:
+
+- NOVA self-host verified at R23 and R52.
+- R23 canary `test_dr_async_fetch`: 97/0.
+- R52 unblock: `test_nat_traversal` moved from SEGV / EBADF
+  chain to clean FAIL 197/12. Residual 12 FAILs are a
+  secondary IP-arg packing issue in sys_sendto/sys_recvfrom
+  (shim unconditional `sar rcx, 1` halves IPs that reach the
+  shim raw); queued as R53.
+- TLS stack regression (tls_session, turn_server, webrtc):
+  all green across R52.
