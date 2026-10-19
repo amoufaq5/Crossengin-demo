@@ -758,12 +758,31 @@ canary that the check works correctly when imports are complete.
 
 ## 17. `_nova_len` and `_nova_substr` dereference `rdi` without untagging
 
-**Status**: FIXED R44 — NOVA `claude/confident-fermi-op241b`
-commit `f2fbbe6`. Tag-poly prolog landed on `_nova_len`,
-`_nova_substr` (x86-64) and `_nova_warm_len` (aarch64). R43
-scratchpad probe now returns `len(alloc'd) = 2` instead of
-exit 139. 20-test regression sample is zero regressions. Entry
-retained below for historical reference.
+**Status**: FIXED R44 + R46 (partial). NOVA
+`claude/confident-fermi-op241b` commits `f2fbbe6` (R44) and
+`ffeaac9` (R46).
+
+- R44: tag-poly prolog on `_nova_len`, `_nova_substr` (x86-64)
+  and `_nova_warm_len` (aarch64).
+- R46: same prolog on `_nova_char_at` and `_nova_str_to_int`
+  (both user-facing data accessors with no compiler-internal
+  callers).
+
+An R46 attempt to sweep 9 more runtime string fns
+(`_nova_strlen`, `_nova_str_eq`, `_nova_contains`,
+`_nova_starts_with`, `_nova_ends_with`, `_nova_str_find`,
+`_nova_split`, `_nova_str_trim`, `_nova_str_to_chars`,
+`_nova_str_len`) broke self-host: compiler-internal callers
+pass raw string-literal pointers (`.rodata`) that happen to
+have bit 0 = 1 (odd addresses), and the tag-poly `sar rdi, 1`
+halves those into bogus addresses. Those fns stay unpatched
+pending a structural fix (string-literal `.align 2` at
+emission, or a different tag convention).
+
+R43 scratchpad probe now returns `len(alloc'd) = 2`; R46
+scratchpad probe returns `str_to_int(alloc'd) = 42`. 21-test
+regression sample (1,341 cumulative checks) is zero
+regressions. Entry retained below for historical reference.
 
 (Originally confirmed R43. Root cause for face_recognize load-path
 SEGV cluster (R30/R32/R33/R40 revert chain). Likely root cause for

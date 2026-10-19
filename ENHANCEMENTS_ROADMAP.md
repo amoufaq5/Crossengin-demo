@@ -5248,3 +5248,96 @@ restored to the R44 post-state.
 - **kg_rss_ingest** — re-probe post-R46.
 - **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
 - **NOVA structural ADRs** — unchanged, HIGH.
+
+### Latent-triage R46 — NOVA tag-poly narrowed to 2 fns + face_recognize CLOSED
+
+**Scope** (planned): sweep the R44-style tag-poly prolog across
+11 NOVA runtime string fns (planned R46 + bonus `_nova_str_len`).
+
+**Outcome**: the 11-fn sweep **broke self-host**. Compiler-internal
+code paths pass raw string-literal pointers (from `.rodata`) that
+happen to have bit 0 = 1 (odd addresses) directly into runtime
+string fns like `_nova_strlen`, `_nova_str_eq`, `_nova_str_find`.
+Pre-R46 their tolerated the misaligned deref byte-wise. Post-R46
+the tag-poly prolog's `sar rdi, 1` halved the raw literal pointer
+into a bogus address and SEGV'd.
+
+**Narrowed scope** (what landed): only the two runtime fns that
+have **no compiler-internal callers**:
+
+1. `_nova_char_at` — user-facing string indexing. Used by
+   `char_at(buf, i)` in Crossengin parsers (face_recognize, PEM,
+   many others).
+2. `_nova_str_to_int` — user-facing string-to-int conversion.
+   Used by `str_to_int(buf)` in face_recognize's
+   `_face_rec_extract_int` and dozens of other data-parsing
+   paths.
+
+Both reach alloc'd (tagged) buffers from user code; neither is
+called from the compiler itself. Patched with the R44 prolog.
+
+**Upstream commit**: NOVA `claude/confident-fermi-op241b` commit
+`ffeaac9` — 15 LOC inserted. Self-host verified
+(stage-2 == stage-3).
+
+**Crossengin edit** (R45 1-LOC swap re-applied):
+`src/io/transducers/image_face_recognize.nova:552` —
+`sys_read(fd, buf + total, want)` →
+`_sys_read_tagged(fd, buf + total, want)`. Pairs with the save
+side's `_sys_write_tagged`. Stale R30/R32 "deferred half-fix"
+comment removed.
+
+**Verification**:
+
+- `probe_r43_tag.nova`: `len(alloc'd) = 2`,
+  `len(substr(tagged, 0, 2)) = 2` (R44 unchanged).
+- `probe_str_to_int.nova`: `str_to_int(alloc'd) = 42` (R46).
+- `test_face_recognize`: **OK (48 checks)** — up from 41
+  passed / 7 FAILED at R45 and from the SEGV baseline before
+  R43.
+- Regression spot-check (21 tests, 1,341 cumulative checks):
+  zero regressions. Full roster: face_recognize, truststore_dir,
+  merkle_signing, voice_dialog, federated_aggregator,
+  motor_map, nl_generate, nl_rpc_verbs, differential_privacy,
+  admin_emit_delta_verb, webrtc, audio_records, forward_sim,
+  skills_kg, tls_session, contradiction, snapshot_selfmodel,
+  turn_server, optical_flow_pyramid, json_records,
+  output_generation.
+
+Per-test outcome:
+- test_face_recognize: FAIL (7 of 48) → **OK (48 checks)**.
+
+**Tally delta**: 478 → **479 CLEAN** / 30 pre-existing / **2
+non-passing**.
+
+**What's left unfixed** (deferred to R47+): the 9 other runtime
+string fns in the same bug class (`_nova_strlen`, `_nova_str_len`,
+`_nova_str_eq`, `_nova_contains`, `_nova_starts_with`,
+`_nova_ends_with`, `_nova_str_find`, `_nova_split`,
+`_nova_str_trim`, `_nova_str_to_chars`). Their safe-untag
+requires either:
+
+- forcing even-byte alignment of all string literals at
+  emission (`.align 2` ahead of each `.ascii`), so every raw
+  literal pointer has bit 0 = 0 and the tag-poly prolog can
+  cleanly distinguish; or
+- a different tag convention (high-bit, or stealing a bit from
+  the alignment-forced-even heap bottom); or
+- auditing every internal caller and routing raw-literal
+  callers through a non-tag-poly entry point.
+
+Any of those is a multi-session structural fix. Queued as a
+NOVA ADR.
+
+### Latent-triage queue (post-R46)
+
+- **R47 — kg_rss_ingest re-probe**. Same alloc/str-handling
+  class as face_recognize; R46 may have unblocked it. Scope:
+  run the test, diagnose if still failing.
+- **NOVA structural ADR — string-literal alignment + full
+  tag-poly runtime sweep**. Choose between .align-2 at
+  emission vs. tag-bit-reassignment vs. caller audit. Lands
+  the remaining 9 runtime fns from R46's expanded scope.
+  CRITICAL for retiring the latent-SEGV class tree-wide.
+- **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
+- **Other NOVA structural ADRs** — unchanged, HIGH.
