@@ -5581,3 +5581,95 @@ to re-open the class.
   `"fever\n"` → `msg "fever" perceive(m>=1)` path works
   end-to-end. Belt-and-suspenders on the R49 asm fix.
 - **Other NOVA structural ADRs** — unchanged, HIGH.
+
+### Latent-triage R50 — NOVA structural ADR: two-tier tag-poly
+
+**Scope**: the CRITICAL NOVA structural task queued post-R47.
+Lands R46's deferred 7-fn sweep, documents the design, and
+records why the "patch internal `_nova_*` fns" approach
+R46 attempted was wrong.
+
+**Design** (committed in NOVA `333394f`, 83 LOC):
+
+Two-tier tag-polymorphism contract:
+
+1. **Internal `_nova_*` fns stay raw-pointer only**. They
+   receive stack pointers (e.g. `_nova_int_to_str:16515`
+   passes `[rbp-1]` to `_nova_strlen`), mid-string pointers
+   after `inc rdi`, and env/argv strings. A tag-poly prolog
+   on these fns halves raw pointers with coincidentally-odd
+   addresses → SEGV. This is why R46's broader sweep broke
+   self-host.
+2. **Public shims gate tag transitions at the API
+   boundary**. User code calling `str_eq(a, b)` enters the
+   shim at codegen.nova:L22097+, which tag-polys rdi/rsi,
+   then jmps/calls into the raw-pointer internal fn.
+
+**Patched shims** (NOVA `codegen.nova`, L22097-22323):
+
+| Shim | rdi | rsi | Return |
+|------|-----|-----|--------|
+| `str_eq` | tag-poly | tag-poly | `call + lea rax,[rax+rax+1] + ret` |
+| `contains` | tag-poly | — (value, may be tagged int) | jmp |
+| `starts_with` | tag-poly | tag-poly | jmp |
+| `ends_with` | tag-poly | tag-poly | jmp |
+| `str_find` | tag-poly | tag-poly | `call + lea rax,[rax+rax+1] + ret` |
+| `split` | tag-poly | tag-poly | jmp |
+| `str_trim` | tag-poly | — (1-arg) | jmp |
+
+`str_eq` and `str_find`'s internal fns return raw 0/1 or raw
+index; previously only `_nova_eq`'s post-call `lea rax, [rax
++ rax + 1]` tagged them. The public shims used to be `jmp
+_nova_fn` which bypassed that tagging — user code calling
+`str_eq(a, b)` got raw 0/1 back and `int_to_str` on the result
+showed wrong values (e.g. str_find returning raw 3 displayed
+as 1 via int_to_str's unconditional `sar rax, 1`). R50
+switches those two shims from `jmp` to `call + tag + ret`.
+
+**Not patched in R50**:
+
+- `_nova_str_to_chars` has no public shim — compiler emits
+  `call _nova_str_to_chars` directly at codegen.nova:L6282 for
+  for-each loops. Low-frequency; separate round.
+- `_nova_str_len` (duplicate of `_nova_strlen` used by trim /
+  to_chars internally): stays raw. Shim-level R50 fix for its
+  public callers already covers the user path.
+
+**Verification**:
+
+- Self-host verified (stage-2 == stage-3 asm diff clean).
+- Scratchpad probe
+  (`.../scratchpad/probe_r50_shims.nova`) exercises each
+  shim with alloc'd (tagged) bufs: `str_eq=1` for equal
+  bufs, `str_find("foobar baz", "bar")=3`,
+  starts_with/ends_with/contains/str_trim all green.
+- 15-test Crossengin regression sample
+  (1,114 cumulative checks, clean $HOME): zero regressions.
+  test_truststore_dir needed its stale fixtures cleaned
+  (same per-run flake confirmed in R48) then passes 20/20.
+
+**Scope docs updated**:
+
+- `docs/UPSTREAM_NOVA_BUGS.md` §17 — two-tier contract
+  memorialized, R44/R46/R50 fn coverage table, deferred items
+  called out. This serves as the structural ADR.
+
+**Tally**: unchanged (480 CLEAN). R50 is a latent-bug-class
+retirement, not a per-test unblock. Pre-R50 user code that
+used `str_eq(alloc_buf, alloc_buf)` or `str_find(alloc_buf,
+needle)` was silently returning wrong values; those are now
+correct. Any downstream Crossengin test that depended on
+raw str_eq / str_find returns would have been incorrect but
+accidentally working; none observed in the 15-sample.
+
+### Latent-triage queue (post-R50)
+
+- **R51 — `_nova_str_to_chars` tag-poly** at the direct
+  codegen call site at `codegen.nova:L6282` (for-each loop
+  handler). Low frequency; the only path through
+  `str_to_chars` is user `for ch in str_or_bytes { ... }`.
+- **test_truststore_dir fixture-cleanup**. Unchanged, cosmetic.
+- **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
+- **Daemon end-to-end re-check post-R49**. Unchanged, needs a
+  session that `make install`s the daemon.
+- **Other NOVA structural ADRs** — unchanged, HIGH.

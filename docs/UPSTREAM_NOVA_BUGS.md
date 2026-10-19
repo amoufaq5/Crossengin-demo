@@ -758,31 +758,55 @@ canary that the check works correctly when imports are complete.
 
 ## 17. `_nova_len` and `_nova_substr` dereference `rdi` without untagging
 
-**Status**: FIXED R44 + R46 (partial). NOVA
-`claude/confident-fermi-op241b` commits `f2fbbe6` (R44) and
-`ffeaac9` (R46).
+**Status**: FIXED R44 + R46 + R50 (two-tier design). NOVA
+`claude/confident-fermi-op241b` commits `f2fbbe6` (R44),
+`ffeaac9` (R46), and `333394f` (R50).
 
-- R44: tag-poly prolog on `_nova_len`, `_nova_substr` (x86-64)
-  and `_nova_warm_len` (aarch64).
-- R46: same prolog on `_nova_char_at` and `_nova_str_to_int`
-  (both user-facing data accessors with no compiler-internal
-  callers).
+Two-tier tag-polymorphism contract:
 
-An R46 attempt to sweep 9 more runtime string fns
-(`_nova_strlen`, `_nova_str_eq`, `_nova_contains`,
-`_nova_starts_with`, `_nova_ends_with`, `_nova_str_find`,
-`_nova_split`, `_nova_str_trim`, `_nova_str_to_chars`,
-`_nova_str_len`) broke self-host: compiler-internal callers
-pass raw string-literal pointers (`.rodata`) that happen to
-have bit 0 = 1 (odd addresses), and the tag-poly `sar rdi, 1`
-halves those into bogus addresses. Those fns stay unpatched
-pending a structural fix (string-literal `.align 2` at
-emission, or a different tag convention).
+- **Internal `_nova_*` fns are raw-pointer-only**. The compiler's
+  own emission passes stack addresses (e.g. `_nova_int_to_str`
+  passes `[rbp-1]` to `_nova_strlen`), mid-string pointers after
+  `inc rdi`, and env/argv strings into these fns. A tag-poly
+  prolog here would halve legit raw pointers that happen to
+  have bit 0 = 1 and SEGV.
+- **Public shims handle user tag at the API boundary**. User
+  code calling `str_eq(a, b)` goes through the `str_eq` shim
+  at codegen.nova:L22097+, which tag-polys rdi/rsi then calls
+  into the raw-pointer internal fn.
 
-R43 scratchpad probe now returns `len(alloc'd) = 2`; R46
-scratchpad probe returns `str_to_int(alloc'd) = 42`. 21-test
-regression sample (1,341 cumulative checks) is zero
-regressions. Entry retained below for historical reference.
+Fn coverage so far:
+
+- R44 (internal-fn prolog, safe because no stack-pointer
+  callers): `_nova_len`, `_nova_substr`, `_nova_warm_len`.
+- R46 (same): `_nova_char_at`, `_nova_str_to_int`.
+- R50 (public-shim prolog): `str_eq`, `contains`, `starts_with`,
+  `ends_with`, `str_find`, `split`, `str_trim`. `str_eq` and
+  `str_find` additionally re-tag their raw int return in the
+  shim (`call + lea rax, [rax+rax+1] + ret` rather than `jmp`)
+  so user-code arithmetic on the result is NOVA-consistent.
+
+Still deferred:
+
+- `_nova_str_to_chars` has no public shim — the compiler emits
+  `call _nova_str_to_chars` directly in the for-each loop
+  handler at codegen.nova:L6282. Needs either a new shim or a
+  prolog at the emission site. Non-blocking; low frequency.
+- `_nova_str_len` (duplicate of `_nova_strlen` used by trim /
+  to_chars) stays raw; the R50 shim-level fix for its public
+  callers covers the user-facing path.
+- `_nova_eq`'s internal direct `call _nova_str_eq` bypasses
+  the shim, but that path works because `_nova_eq` already
+  does post-call tagging. No action needed.
+
+R43 scratchpad probe: `len(alloc'd) = 2`. R46 probe:
+`str_to_int(alloc'd) = 42`. R50 probe: `str_eq` returns 1 for
+equal alloc'd bufs, `str_find("foobar baz", "bar") = 3`,
+`starts_with`/`ends_with`/`contains`/`str_trim` all green.
+
+Full regression sample across R44 + R46 + R50 landings:
+15 Crossengin tests, 1,114 cumulative checks, zero regressions.
+Entry retained below for historical reference.
 
 (Originally confirmed R43. Root cause for face_recognize load-path
 SEGV cluster (R30/R32/R33/R40 revert chain). Likely root cause for
