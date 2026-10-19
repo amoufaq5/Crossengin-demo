@@ -785,13 +785,14 @@ Fn coverage so far:
   `str_find` additionally re-tag their raw int return in the
   shim (`call + lea rax, [rax+rax+1] + ret` rather than `jmp`)
   so user-code arithmetic on the result is NOVA-consistent.
+- R51 (inline normalize-to-raw at direct emission site):
+  for-each over iterable at `codegen.nova:L6278` normalizes
+  `[rsp+8]` to raw before the list-magic check / `_nova_str_to_chars`
+  call / list-iteration body. The `_nova_str_to_chars` internal
+  fn stays raw-only.
 
 Still deferred:
 
-- `_nova_str_to_chars` has no public shim — the compiler emits
-  `call _nova_str_to_chars` directly in the for-each loop
-  handler at codegen.nova:L6282. Needs either a new shim or a
-  prolog at the emission site. Non-blocking; low frequency.
 - `_nova_str_len` (duplicate of `_nova_strlen` used by trim /
   to_chars) stays raw; the R50 shim-level fix for its public
   callers covers the user-facing path.

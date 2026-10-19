@@ -5673,3 +5673,58 @@ accidentally working; none observed in the 15-sample.
 - **Daemon end-to-end re-check post-R49**. Unchanged, needs a
   session that `make install`s the daemon.
 - **Other NOVA structural ADRs** — unchanged, HIGH.
+
+### Latent-triage R51 — for-each-over-string tag-fix landed
+
+**Scope**: the final R50-deferred tag-poly site —
+`_nova_str_to_chars` reached via inlined codegen in the
+for-each over-iterable handler (`codegen.nova:L6278-6283`).
+No public shim exists for `str_to_chars`; the compiler emits
+`call _nova_str_to_chars` directly after a list-magic check
+and before downstream list-iteration derefs. All three
+operations (magic check, str_to_chars call, list-iteration
+body) need the iterable in raw form.
+
+**Fix** (NOVA `013ca17`, 13 LOC): normalize-to-raw once at
+the top of the handler. `[rsp+8]` becomes canonically raw
+for the rest of the loop; the magic check, the
+`_nova_str_to_chars` call, and `[rdi+8]` / `[rdi+24]` /
+`[rdi+rcx*8]` list-iteration derefs are all tag-safe
+without further changes. `_nova_str_to_chars`'s internal
+body is unchanged.
+
+**Verification**:
+
+- Self-host verified.
+- Scratchpad probe exercises three iterable kinds:
+  - `alloc`'d (tagged) `"Hello\0"` → chars 72, 101, 108, 108, 111.
+  - Literal `"hi"` → chars 104, 105.
+  - List `[1, 2, 3]` → 1, 2, 3.
+  All three iterate correctly. Pre-R51 the tagged alloc'd
+  case was SEGV territory.
+- 15-test regression sample (clean $HOME): zero regressions.
+
+**End-of-sweep**: with R51 landed, the NOVA tag-polymorphism
+sweep across all identified string-fn + str-iterable entry
+points is complete. R44 + R46 + R50 + R51 together close
+the latent-SEGV class for user code mixing alloc'd buffers
+with runtime string operations.
+
+**Tally**: unchanged (480 CLEAN). R51 is a latent-bug-class
+retirement, not a per-test unblock.
+
+**UPSTREAM §17** updated to list R51 in the fn-coverage
+table; the "deferred str_to_chars" item is closed.
+
+### Latent-triage queue (post-R51)
+
+- **test_truststore_dir fixture-cleanup**. Cosmetic flaky-
+  binary issue: binaries built during a prior-fixture-polluted
+  session SEGV when re-run; freshly built binary + clean
+  `$HOME/.crossengin_ph_o_r1_*` always passes 20/20. Fix:
+  either rm-tree the dirs at test entry or use a per-run
+  uuid in the dir name.
+- **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
+- **Daemon end-to-end re-check post-R49**. Unchanged, needs
+  a session that `make install`s the daemon.
+- **Other NOVA structural ADRs** — unchanged, HIGH.
