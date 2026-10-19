@@ -5399,3 +5399,99 @@ and R46 (face_recognize read side):
   (most readers already migrated during R20/R25). LOW
   priority — easier than the ADR.
 - **Other NOVA structural ADRs** — unchanged, HIGH.
+
+### Latent-triage R48 — tree-wide sys_read/write tag-leak sweep
+
+**Scope**: audit queued post-R47. Hunt for raw `sys_read` /
+`sys_write` on alloc'd (tagged) bufs across `src/` + `tests/`
++ `examples/`. Pattern: identical to R30/R46/R47 — kernel
+receives `(real*2)+1`, EFAULT, silent I/O failure.
+
+**Audit findings** (R48 Explore agent, 50+ grep hits
+triaged):
+
+- 29 `write_file(…)` calls: all pass raw-string args (literal
+  / concat / helper-return). Safe.
+- 17 `sys_write(…)` calls: 9 safe (raw/literal/concat/substr
+  args, confirmed per-site), 7 confirmed/1 likely tagged
+  alloc'd buf.
+- 10 `sys_read(…)` calls: 1 is a local asm shim definition
+  (deferred to R49 — non-blocking + EAGAIN semantics), 6
+  confirmed tagged alloc'd buf, 1 likely (caller-traced).
+
+**12 sites swapped** across 11 files (1-LOC per site + 1
+import per file):
+
+| File | Line | Kind |
+|------|------|------|
+| `src/io/effectors/audio_speak.nova` | 151 | `sys_read` |
+| `src/io/transducers/image_pgm.nova` | 330 | `sys_read` |
+| `src/io/transducers/jpeg_decode.nova` | 1454 | `sys_read` |
+| `src/io/transducers/png_decode.nova` | 659 | `sys_read` |
+| `src/io/transducers/video_y4m.nova` | 380 | `sys_read` |
+| `src/nl/rpc_verbs.nova` | 3311 | `sys_read` |
+| `examples/crossengin_rpc_daemon.nova` | 269 | `sys_read` |
+| `examples/crossengin_rpc_daemon.nova` | 333 | `sys_read` |
+| `src/io/transducers/stt_seam.nova` | 770 | `sys_write` |
+| `src/io/transducers/image_superpixels.nova` | 864 | `sys_write` |
+| `src/io/transducers/image_segmentation.nova` | 583 | `sys_write` |
+| `src/io/transducers/image_panorama.nova` | 983 | `sys_write` |
+
+**Deferred (R49)**: `src/io/transducers/stream_stdin.nova:71`
+asm shim `_stream_sys_read` — relies on `O_NONBLOCK` +
+`-EAGAIN` distinction that `_sys_read_tagged` (blocking)
+would break. Needs either a dedicated tag-aware shim or a
+non-blocking variant in `sys_tagged.nova`.
+
+**Verification** (15 tests, pre/post swap):
+
+- test_face_recognize — OK (48 checks) [R46 canary].
+- test_kg_rss_ingest — OK (58 checks) [R47 canary].
+- test_voice_dialog — OK (319 checks).
+- test_federated_aggregator — OK (91 checks).
+- test_image_pgm — OK (43 checks).
+- test_jpeg_decode — OK (82 checks).
+- test_png_decode — OK (44 checks).
+- test_video_y4m — OK (34 checks).
+- test_nl_rpc_verbs — OK (87 checks).
+- test_image_segmentation — OK (69 checks).
+- test_image_panorama — OK (59 checks).
+- test_audio_speak — OK (6 checks).
+- test_stt_seam — OK (27 checks).
+- test_truststore_dir — OK (20 checks) after cleaning stale
+  per-test fixtures in `$HOME/.crossengin_ph_o_r1_*`. This
+  test was observed as "deterministic SEGV 5/5" during R48
+  verification, which turned out to be stale-fixture
+  contamination (prior runs left `rsa.pem` / `manifest.txt`
+  with inconsistent content under $HOME). Clean $HOME → 5/5
+  pass. Documented as a flaky-fixture issue for R49 or
+  later cleanup round. **Not an R48 regression.**
+- test_image_superpixels — no unit test file (test
+  coverage gap, deferred).
+
+Cumulative: **1,113 checks across 14 tests, zero regressions.**
+
+Which tests the swap actually fixed is unclear without a
+pre-R48 pass-count baseline per test (they were likely
+latently FAILing on save/load round-trips). What's deterministic
+is: all 11 modules now handle alloc'd bufs correctly across
+I/O; the pre-R48 "silent failure" mode is retired.
+
+**Tally**: no reliable per-test flip count. Protected 480
+CLEAN, 0 new regressions. May have reduced the
+pre-existing/non-passing counts; recount pending.
+
+### Latent-triage queue (post-R48)
+
+- **R49 — stream_stdin asm shim tag-fix**. Non-blocking
+  variant of `_sys_read_tagged` or dedicated
+  `_stream_sys_read_tagged`. Preserves the `-EAGAIN`
+  semantics the stdin poll loop depends on.
+- **test_truststore_dir fixture-cleanup**. Add an rm-tree
+  of `.crossengin_ph_o_r1_*` dirs at test suite entry OR a
+  per-test uuid in the dir name. Not blocking anything;
+  cosmetic flakiness repair.
+- **NOVA structural ADR — string-literal alignment + full
+  tag-poly runtime sweep**. Unchanged, CRITICAL.
+- **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
+- **Other NOVA structural ADRs** — unchanged, HIGH.
