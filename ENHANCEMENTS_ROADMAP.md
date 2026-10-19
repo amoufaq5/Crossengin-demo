@@ -5341,3 +5341,61 @@ NOVA ADR.
   CRITICAL for retiring the latent-SEGV class tree-wide.
 - **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
 - **Other NOVA structural ADRs** — unchanged, HIGH.
+
+### Latent-triage R47 — kg_rss_ingest closed (2 LOC + 1 import)
+
+**Pre-R47 state**: `test_kg_rss_ingest` ran cleanly (no SEGV
+post-R44/R46) but reported 4 FAILs:
+`first ingest adds 3 got=0`, `kg count = 3 got=0`,
+`kg count unchanged got=0`, `a0 exists`. 54 passing /
+4 FAIL / 0 SEGV.
+
+**Diagnosis**: two independent same-class sites, both the
+"raw sys_read/write on tagged alloc'd buf" pattern that
+UPSTREAM §17 covers for len/substr/char_at/str_to_int but
+NOT for the sys_* wrappers.
+
+1. **`src/io/transducers/kg_rss_ingest.nova:710`**: file:// URL
+   fetch loop uses `sys_read(fd, buf + total, want)` where
+   `buf` is from `alloc(RSS_MAX_FEED_BYTES + 1)` → tagged
+   pointer → kernel gets `(real*2)+1` → EFAULT → `n <= 0` →
+   loop exits with `total = 0`. Then `substr(buf, 0, 0)` ="",
+   parse returns empty item list.
+
+2. **`tests/unit/test_kg_rss_ingest.nova:295`**: the TEST
+   itself writes the fixture via
+   `sys_write(fd, buf, nlen)` where `buf = alloc(nlen + 1)` →
+   same tag leak → EFAULT → file written as empty → re-ingest
+   reads an empty file → 0 items.
+
+Either bug alone would produce the observed 4 FAILs. Both
+exist. Fix is symmetric with R30 (face_recognize save side)
+and R46 (face_recognize read side):
+
+- src/ edit: 1 LOC + 1 import. `sys_read` → `_sys_read_tagged`.
+- test edit: 1 LOC + 1 import. `sys_write` → `_sys_write_tagged`.
+
+**Verification**:
+
+- `test_kg_rss_ingest`: 4 FAIL → **OK (58 checks)**.
+- `test_face_recognize`: still **OK (48 checks)**.
+- Regression sample (5 tests, 536 checks): zero regressions.
+
+**Tally delta**: 479 → **480 CLEAN** / 30 pre-existing /
+**1 non-passing**.
+
+### Latent-triage queue (post-R47)
+
+- **NOVA structural ADR — string-literal alignment + full
+  tag-poly runtime sweep**. Choose between .align-2 at
+  emission vs. tag-bit-reassignment vs. caller audit. Lands
+  the remaining 9 runtime string fns (R46 expanded scope).
+  CRITICAL for retiring the latent-SEGV class tree-wide.
+- **Full socket-API tag-consistency (NOVA)** — unchanged, HIGH.
+- **Audit remaining `sys_read` / `sys_write` on alloc'd bufs
+  tree-wide** — grep for `sys_read(fd, buf` and
+  `sys_write(fd, buf` across src/ + tests/ to catch any other
+  surviving sites in the R30-R47 class. Likely a small set
+  (most readers already migrated during R20/R25). LOW
+  priority — easier than the ADR.
+- **Other NOVA structural ADRs** — unchanged, HIGH.
