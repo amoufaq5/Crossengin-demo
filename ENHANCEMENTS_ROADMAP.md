@@ -5787,3 +5787,69 @@ closed. nat_traversal is on track for R53 close.
 - **test_truststore_dir fixture-cleanup**. Unchanged, cosmetic.
 - **Daemon end-to-end re-check post-R49**. Unchanged.
 - **Other NOVA structural ADRs** — unchanged, HIGH.
+
+### Latent-triage R53 — nat_traversal closed (R41 blocker fully retired)
+
+**Scope**: R52-residual 12 FAILs in `test_nat_traversal`.
+R53 Explore trace showed the root cause was not in the
+`sys_sendto` shim's IP handling (R52 was correct there — IPs
+reach sendto tagged from `_nat_ip_str_to_int`'s tagged-int
+arithmetic). The actual bug was in `_nova_sys_recvfrom`'s
+internal body: it pushed three numeric list elements
+(bytes_read, sender_ip, sender_port) RAW into the result list
+via `_nova_push`, breaking the NOVA tagged-int invariant.
+
+**Mechanism**: user reads `rx[1]` → raw u32 (e.g. 16777343
+for 127.0.0.1) → `int_to_str` applies `sar rax, 1` → prints
+`8388671` (the exact symptom). Downstream `sys_sendto(rx_ip,
+...)` then feeds raw IP into R52's shim unconditional `sar
+rcx, 1` → kernel gets bogus IP → `EINVAL (-22)` → responder
+reply never lands → cascading 12 FAILs.
+
+**Fix** (NOVA `d0c974a`, 24 LOC net at
+`src/compiler/codegen.nova:_nova_sys_recvfrom`):
+
+- Linux success path (L18092+) and Windows success path
+  (L18015+): insert `lea rsi, [rsi + rsi + 1]` ahead of each
+  of the three `call _nova_push` on numeric slots.
+- Linux fallback (L18115+) and Windows fallback (L18042+):
+  change the two `xor rsi, rsi` pushes to `mov rsi, 1`
+  (tagged 0). The `-1` sentinel push is self-tagging on
+  2's-complement (`(-1 << 1) | 1 == -1`), unchanged.
+
+**Verification**:
+
+- NOVA self-host verified (stage-2 == stage-3).
+- **test_nat_traversal: FAIL 197/12 → OK (209 checks)**. R41
+  blocker fully retired.
+- R23 canary `test_dr_async_fetch`: **OK (97/0)**. Chain
+  protected.
+- 14-test regression sample: zero regressions (tls_session,
+  turn_server, webrtc, face_recognize, kg_rss_ingest,
+  voice_dialog, stream_stdin, image_pgm, image_panorama,
+  federated_aggregator, motor_map, nl_rpc_verbs,
+  merkle_signing, truststore_dir — all green). Cumulative
+  1,159 checks across 15 tests.
+
+**Tally delta**: 480 → **481 CLEAN** / 30 pre-existing /
+**0 non-passing**. The entire R43-R53 latent-triage arc on
+NOVA tag-polymorphism (strings via R44/R46/R50/R51 + sockets
+via R23/R52/R53) is closed. All 48 R-rounds completed.
+
+**UPSTREAM §18** updated to list R53's recvfrom numeric-tag
+addition in the fn-coverage table.
+
+### Latent-triage queue (post-R53)
+
+- **test_truststore_dir fixture-cleanup**. Cosmetic flake,
+  not blocking anything.
+- **Daemon end-to-end re-check post-R49**. Belt-and-suspenders
+  on the stdin asm fix; needs a session that `make install`s
+  the daemon then runs `scenario_l_stream_stdin.sh`.
+- **Other NOVA structural ADRs** — HIGH, no specific items
+  currently queued.
+
+**Status**: with 481 CLEAN / 0 non-passing, the triage queue
+is at a quiescent point. Next work (new features, product
+rounds, or deeper NOVA ADRs) should go through a fresh
+planning cycle rather than extending R-numbering.

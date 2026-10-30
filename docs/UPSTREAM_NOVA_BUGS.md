@@ -941,9 +941,20 @@ unconditionally `sar rdi, 1`.
 - NOVA self-host verified at R23 and R52.
 - R23 canary `test_dr_async_fetch`: 97/0.
 - R52 unblock: `test_nat_traversal` moved from SEGV / EBADF
-  chain to clean FAIL 197/12. Residual 12 FAILs are a
-  secondary IP-arg packing issue in sys_sendto/sys_recvfrom
-  (shim unconditional `sar rcx, 1` halves IPs that reach the
-  shim raw); queued as R53.
+  chain to clean FAIL 197/12.
 - TLS stack regression (tls_session, turn_server, webrtc):
   all green across R52.
+
+**R53 (`d0c974a`)**: tagged `_nova_sys_recvfrom`'s three
+numeric list elements (bytes_read, sender_ip, sender_port) on
+both Linux and Windows success paths, plus tagged the two 0
+slots in the timeout/fail fallbacks. The `-1` sentinel push
+is self-tagging on 2's-complement so stays unchanged.
+Reason: R52 kept recvfrom's shim with no return re-tag
+(correct — the list handle is raw by convention) but the
+list's int ELEMENTS were being pushed raw, breaking NOVA
+tagged-int invariants for downstream consumers like
+nat_traversal's `rx_ip` readback. **test_nat_traversal:
+FAIL 197/12 → OK (209 checks). R41 blocker fully retired.**
+
+End-of-sweep for the socket API's tag-mismatch class.
