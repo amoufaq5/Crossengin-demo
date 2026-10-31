@@ -5929,8 +5929,31 @@ pattern (same pattern already shipped for `_nova___arg`).
   `scripts/test.sh`. test_noise_xk now opts to 240s and passes
   44/44 under the full suite driver. Avoids raising the global
   default (keeps "detect hung test fast" for every other test).
-- **Daemon end-to-end re-check post-R49**. Unchanged,
-  belt-and-suspenders.
+- **Daemon end-to-end re-check post-R49** — **partial** (R58).
+  Rebuilt the daemon and ran `scenario_l_stream_stdin.sh`. Surfaced
+  two companion tag bugs R49 missed:
+  1. `_stream_fcntl` leaked tagged fd/cmd/arg to the fcntl syscall
+     (fd=0 → kernel saw 1, cmd=4 → saw 9) so the O_NONBLOCK init
+     always returned -EBADF; the daemon then dropped stdin as a
+     stream source and `stream : stdin` banner stayed empty.
+  2. `_stream_sys_read` left its rax raw per R49's note, but
+     `stream_stdin_poll` compares `n == 0` and `n < 0` against
+     NOVA tagged-int literals — raw 0 compares less than tagged 0
+     (register value 1) so the EAGAIN branch always fired.
+
+  R58 added `sar rdi/rsi/rdx` to `_stream_fcntl`'s inline asm and
+  the matching `test rax,rax / js / lea rax,[rax+rax+1]` tag-on-
+  non-negative dance to BOTH shims. Scenario: 2/5 → 4/5 pass.
+  "stream : stdin" banner shows; streaming-mode announced;
+  scripted-episode suppression works. Remaining FAIL: the FIFO-
+  fed "fever" line never produces a `msg "fever" perceive(m=N)`
+  output; likely a third bug in `stream_stdin_poll`'s drain or
+  the EV_MESSAGE event-queue integration. Queued as **R59**.
+- **R59 — stdin perception-line pipeline** (new). Diagnose why
+  the daemon's event loop never processes the EV_MESSAGE event
+  that `stream_stdin_poll` should post after reading from a
+  FIFO-connected stdin. Likely in `_stream_bytes_to_str`,
+  `_stream_stdin_post_line`, or hs_post_event / hs_step_paced.
 - **Other NOVA structural ADRs** — HIGH, no specific items.
 
 **Status**: with 478 CLEAN / 0 non-passing (full-suite
