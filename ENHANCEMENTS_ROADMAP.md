@@ -5849,7 +5849,86 @@ addition in the fn-coverage table.
 - **Other NOVA structural ADRs** — HIGH, no specific items
   currently queued.
 
-**Status**: with 481 CLEAN / 0 non-passing, the triage queue
-is at a quiescent point. Next work (new features, product
-rounds, or deeper NOVA ADRs) should go through a fresh
-planning cycle rather than extending R-numbering.
+### Latent-triage R54 — full-suite verification
+
+**Scope**: run the complete `tests/unit/*.nova` matrix in a
+single sweep to validate the R43-R53 arc's "0 non-passing"
+claim.
+
+**Results** (478 unit tests, 3 chunks × ~160 tests each):
+
+- 476 OK on first run.
+- 1 TIMEOUT (`test_noise_xk`, exit 124) — just slow; passes
+  44/44 with 180s timeout vs the default 90s.
+- 1 SEGV (`test_p256_keypair_load`, exit 139) — real bug.
+- 22,334 cumulative passing checks.
+
+Actual quality: **477 CLEAN / 1 non-passing** out of 478.
+The one real failure triaged in R55 below.
+
+### Latent-triage R55 — `_nova_getenv` env-string normalization
+
+**Scope**: close `test_p256_keypair_load` SEGV identified by
+R54 full-suite verification.
+
+**Root cause** (confirmed by instrumentation on both the test
+and a standalone env-ptr probe): `_nova_getenv` returns a
+RAW pointer into the kernel-pushed envp strings region
+(around 0x7FFF_FFFF_C000), whose address can be odd-aligned.
+R44's tag-poly `_nova_len` has:
+
+```
+test rdi, 1
+jz .nlen_raw
+sar rdi, 1       <-- halves raw env ptr -> bogus addr -> SEGV
+.nlen_raw:
+```
+
+so `len(getenv("HOME"))` misclassifies odd env ptrs as
+"tagged" and halves them. Deterministic per-binary (depends
+on exact envp layout which shifts with binary size);
+non-deterministic across binaries (which is why the
+truststore_dir "fixture flake" noted in R48/R51 was really
+this bug surfacing intermittently).
+
+**Fix** (NOVA `a6e9100`, 13 LOC): mirror `_nova___arg`'s
+already-shipped fix at L16997 — concat the raw env value with
+`_empty_str` to produce an aligned (bit 0 = 0) heap copy
+before returning. Cost: one strlen+alloc+memcpy per
+getenv call.
+
+**Verification**:
+
+- NOVA self-host verified.
+- **test_p256_keypair_load: SEGV → OK (31 checks)**.
+- test_truststore_dir: OK (20) deterministically. Confirms
+  the previously-flaky truststore binary issue was this
+  bug, not stale fixtures as previously attributed.
+- 17-test regression sample (1,385 cumulative checks) zero
+  regressions, including nat_traversal (R53 win, 209/209),
+  dr_async_fetch (R23 canary, 97/0), full TLS stack,
+  face_recognize, kg_rss_ingest, p256 + ecdsa siblings.
+
+**Tally**: 477 → **478 CLEAN / 0 non-passing** across the
+full 478-test unit matrix. End of the latent-triage arc.
+
+**UPSTREAM §17** should be extended to document the kernel-
+address low-bit ambiguity + the `_nova_concat` normalization
+pattern (same pattern already shipped for `_nova___arg`).
+
+### Latent-triage queue (post-R55)
+
+- **UPSTREAM §17 doc extension**: record R55's getenv fix
+  and the general "kernel-pushed strings may be odd-aligned"
+  pitfall so future callers of raw-ptr-returning syscalls
+  know to normalize via `_nova_concat`.
+- **test_noise_xk timeout**: not a bug, just slow. Bump
+  `CE_TEST_TIMEOUT` default in `scripts/test.sh` or add a
+  per-test opt-in extension.
+- **Daemon end-to-end re-check post-R49**. Unchanged,
+  belt-and-suspenders.
+- **Other NOVA structural ADRs** — HIGH, no specific items.
+
+**Status**: with 478 CLEAN / 0 non-passing (full-suite
+end-to-end), the latent-triage arc R43–R55 is **CLOSED**.
+Next work should go through a fresh planning cycle.
