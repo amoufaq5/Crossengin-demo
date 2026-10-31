@@ -5924,9 +5924,11 @@ pattern (same pattern already shipped for `_nova___arg`).
   normalize-at-source rule for raw-kernel-pointer builtins
   (`_nova___arg`, `_nova_getenv`, candidates for future
   `readlink`/`realpath`/`strerror`).
-- **test_noise_xk timeout**: not a bug, just slow. Bump
-  `CE_TEST_TIMEOUT` default in `scripts/test.sh` or add a
-  per-test opt-in extension.
+- ~~**test_noise_xk timeout**~~ — **DONE** (R57). Added per-test
+  opt-in header `// CE_TEST_TIMEOUT: 240` support to
+  `scripts/test.sh`. test_noise_xk now opts to 240s and passes
+  44/44 under the full suite driver. Avoids raising the global
+  default (keeps "detect hung test fast" for every other test).
 - **Daemon end-to-end re-check post-R49**. Unchanged,
   belt-and-suspenders.
 - **Other NOVA structural ADRs** — HIGH, no specific items.

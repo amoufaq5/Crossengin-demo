@@ -40,16 +40,27 @@ pass=0
 fail=0
 failed_names=()
 
-echo "=== CrossEngin unit tests (NOVA: $NOVA; per-test timeout ${CE_TEST_TIMEOUT}s) ==="
+echo "=== CrossEngin unit tests (NOVA: $NOVA; default per-test timeout ${CE_TEST_TIMEOUT}s) ==="
 for t in "${tests[@]}"; do
   printf '  %-36s ' "$(basename "$t")"
   # Per-test timeout so a single hang can't block the whole suite. `timeout`
   # exits 124 on TERM (its default signal) or 137 on KILL if the child didn't
   # respect TERM; we surface both distinctly from a normal FAIL.
-  out="$(timeout --preserve-status "${CE_TEST_TIMEOUT}s" "$NOVA" run "$t" 2>&1)"
+  #
+  # Tests that need longer than the global default (e.g. test_noise_xk's full
+  # Noise-XK handshake crypto takes ~110s) can opt in via a header comment
+  # anywhere in the file's first 20 lines:
+  #     // CE_TEST_TIMEOUT: 240
+  # The explicit value wins over the global $CE_TEST_TIMEOUT. Lets slow
+  # legitimate tests keep running without raising the default and losing the
+  # "detect a hung test fast" property for every other test.
+  per_test_to="$CE_TEST_TIMEOUT"
+  override="$(head -20 "$t" | grep -E '^// CE_TEST_TIMEOUT: *[0-9]+' | head -1 | sed -E 's|^// CE_TEST_TIMEOUT: *([0-9]+).*|\1|')"
+  if [ -n "$override" ]; then per_test_to="$override"; fi
+  out="$(timeout --preserve-status "${per_test_to}s" "$NOVA" run "$t" 2>&1)"
   rc=$?
   if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
-    echo "TIMEOUT (>${CE_TEST_TIMEOUT}s, exit $rc)"
+    echo "TIMEOUT (>${per_test_to}s, exit $rc)"
     sed 's/^/        /' <<<"$out"
     fail=$((fail + 1))
     failed_names+=("$(basename "$t"):timeout")
