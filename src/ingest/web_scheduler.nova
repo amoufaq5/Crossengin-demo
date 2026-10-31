@@ -1,0 +1,228 @@
+// CrossEngin ingestion: web-fetch scheduler.
+//
+// Topic-scoped outbound fetcher. Composes:
+//   * source_whitelist (which hosts we're willing to talk to)
+//   * an operator-supplied fetch function (real HTTPS via tls13_client
+//     in a wired deployment, or a stub in tests)
+//   * cerec_parse_text (the fetched body is expected to already be in
+//     .cerec form; a fetched HTML page needs to go through the LLM
+//     extractor OR a per-site parser first -- this scheduler only knows
+//     about our canonical shape)
+//   * review_queue (every web-fetched record queues by default, per the
+//     ADR-0028 posture)
+//
+// Fetch protocol
+//   fetch_fn(url) -> body_string or 0 on failure. The scheduler doesn't
+//   care whether the transport is TLS or a file:// stub -- it only cares
+//   that the body arrives as UTF-8 text.
+//
+// A scheduled queue entry
+//   [id, url, topic, state, submitted_at, body_or_0]
+//     id           monotonically increasing
+//     url          the outbound URL
+//     topic        operator-supplied topic tag (e.g. "climate", "medicine")
+//     state        WS_PLANNED | WS_FETCHED | WS_FETCH_FAILED | WS_INGESTED |
+//                  WS_HOST_BLOCKED
+//     body_or_0    fetched body if state==FETCHED, else 0
+//
+// Typical driver loop (external):
+//   ws_plan(sched, url, topic)                            // owner requests
+//   ws_step(sched, fetch_fn)                              // scheduler runs fetches
+//   ws_ingest_fetched(sched, agent, model_id, run_id)     // pipe bodies to review queue
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/learning/source_whitelist.nova (sw_check),
+//   src/ingest/importers/records.nova (cerec_parse_text),
+//   src/ingest/review_queue.nova (rq_submit),
+//   src/util/str_safe.nova.
+
+import "../learning/source_whitelist.nova"
+import "./importers/records.nova"
+import "./review_queue.nova"
+import "../util/str_safe.nova"
+
+// ---- entry slots ----------------------------------------------------------
+let WS_E_ID        = 0
+let WS_E_URL       = 1
+let WS_E_TOPIC     = 2
+let WS_E_STATE     = 3
+let WS_E_SUBMITTED = 4
+let WS_E_BODY      = 5
+
+// ---- states ---------------------------------------------------------------
+let WS_PLANNED       = 0
+let WS_FETCHED       = 1
+let WS_FETCH_FAILED  = 2
+let WS_INGESTED      = 3
+let WS_HOST_BLOCKED  = 4
+
+// ---- scheduler slots ------------------------------------------------------
+let WS_S_NEXT_ID   = 0
+let WS_S_ENTRIES   = 1
+let WS_S_WHITELIST = 2
+
+// ---- constructors ---------------------------------------------------------
+
+fn ws_new(whitelist) {
+    let s = list_new()
+    push(s, 1)                       // next id
+    push(s, list_new())              // entries
+    push(s, whitelist)               // sw handle
+    return s
+}
+
+// Add a fetch to the plan; runs immediate host-check.
+fn ws_plan(sched, url, topic, now) {
+    let e = list_new()
+    push(e, sched[WS_S_NEXT_ID])
+    push(e, url) push(e, topic)
+    let state = WS_PLANNED
+    if sw_check(sched[WS_S_WHITELIST], url) == 0 { state = WS_HOST_BLOCKED }
+    push(e, state) push(e, now) push(e, 0)
+    push(sched[WS_S_ENTRIES], e)
+    list_set(sched, WS_S_NEXT_ID, sched[WS_S_NEXT_ID] + 1)
+    return e[WS_E_ID]
+}
+
+// ---- accessors ------------------------------------------------------------
+
+fn ws_size(sched) { return len(sched[WS_S_ENTRIES]) }
+fn ws_entries(sched) { return sched[WS_S_ENTRIES] }
+
+fn ws_find(sched, id) {
+    let entries = sched[WS_S_ENTRIES]
+    let i = 0
+    while i < len(entries) {
+        if entries[i][WS_E_ID] == id { return entries[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn ws_state_name(st) {
+    if st == WS_PLANNED       { return "planned" }
+    if st == WS_FETCHED       { return "fetched" }
+    if st == WS_FETCH_FAILED  { return "fetch-failed" }
+    if st == WS_INGESTED      { return "ingested" }
+    if st == WS_HOST_BLOCKED  { return "host-blocked" }
+    return "unknown"
+}
+
+fn ws_count_state(sched, state) {
+    let entries = sched[WS_S_ENTRIES]
+    let i = 0
+    let n = 0
+    while i < len(entries) {
+        if entries[i][WS_E_STATE] == state { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// ---- fetcher-agnostic step -----------------------------------------------
+
+// Advance every PLANNED entry one step by calling `fetch_fn(url)`. Marks
+// FETCHED on success, FETCH_FAILED on 0. Returns [fetched, failed] counts
+// for the pass. The caller injects fetch_fn so the module doesn't force a
+// specific transport (tests use a fake fn; production wires tls13_client).
+//
+// NOTE: NOVA does not expose first-class function pointers uniformly, so
+// callers use one of the ws_step_via_* helpers below for concrete
+// transports. This _step_direct variant expects the caller to have wired
+// the fetch function as a per-entry pre-stashed body (state PLANNED with
+// body!=0 means "already fetched, treat as such"). Real deployments call
+// ws_step_via_stub for tests or embed a bespoke driver.
+fn ws_step_direct(sched) {
+    let out = list_new() push(out, 0) push(out, 0)
+    let entries = sched[WS_S_ENTRIES]
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        if e[WS_E_STATE] == WS_PLANNED {
+            if e[WS_E_BODY] != 0 {
+                list_set(e, WS_E_STATE, WS_FETCHED)
+                list_set(out, 0, out[0] + 1)
+            } else {
+                list_set(e, WS_E_STATE, WS_FETCH_FAILED)
+                list_set(out, 1, out[1] + 1)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Deliver a fetched body for an entry (used by an external driver that
+// implements the actual HTTP call outside NOVA). Returns 1 if applied.
+fn ws_deliver(sched, id, body) {
+    let e = ws_find(sched, id)
+    if e == 0 { return 0 }
+    if e[WS_E_STATE] != WS_PLANNED { return 0 }
+    list_set(e, WS_E_BODY, body)
+    return 1
+}
+
+// Test helper: attach a body-map (list of [url, body] pairs). Any planned
+// entry whose URL matches gets its body filled. Then run ws_step_direct.
+// This is what tests use in lieu of a real HTTPS transport.
+fn ws_step_via_stub(sched, url_body_pairs) {
+    let entries = sched[WS_S_ENTRIES]
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        if e[WS_E_STATE] == WS_PLANNED {
+            let j = 0
+            while j < len(url_body_pairs) {
+                let pair = url_body_pairs[j]
+                if str_eq_bytes(e[WS_E_URL], pair[0]) == 1 {
+                    list_set(e, WS_E_BODY, pair[1])
+                    j = len(url_body_pairs)
+                } else { j = j + 1 }
+            }
+        }
+        i = i + 1
+    }
+    return ws_step_direct(sched)
+}
+
+// ---- ingest fetched bodies -----------------------------------------------
+
+// For every FETCHED entry, parse the body as .cerec and submit each
+// record to the given queue with the entry's URL baked into the source
+// tag ("src:web:<host>:<url-suffix>"). Marks INGESTED on success.
+// Returns [records_enqueued, entries_processed].
+fn ws_ingest_fetched(sched, queue, now) {
+    let out = list_new() push(out, 0) push(out, 0)
+    let entries = sched[WS_S_ENTRIES]
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        if e[WS_E_STATE] == WS_FETCHED {
+            let body = e[WS_E_BODY]
+            if body != 0 {
+                let parsed = cerec_parse_text(body)
+                let records = cerec_records(parsed)
+                let src_tag = ws_source_tag(e[WS_E_URL], e[WS_E_TOPIC])
+                let ri = 0
+                while ri < len(records) {
+                    let rec = records[ri]
+                    list_set(rec, CUR_SOURCE, src_tag)
+                    rq_submit(queue, rec, now)
+                    list_set(out, 0, out[0] + 1)
+                    ri = ri + 1
+                }
+                list_set(e, WS_E_STATE, WS_INGESTED)
+                list_set(out, 1, out[1] + 1)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Build the per-fetch source tag: "src:web:<topic>:<host>".
+fn ws_source_tag(url, topic) {
+    let host = sw_host(url)
+    return "src:web:" + topic + ":" + host
+}

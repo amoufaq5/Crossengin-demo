@@ -1,0 +1,368 @@
+// CrossEngin ingestion: N-Triples (RDF) importer.
+//
+// N-Triples is the flat line-based RDF serialization used by Wikidata
+// dumps, DBpedia dumps, ConceptNet 5, and effectively every semantic-web
+// export. One triple per line:
+//
+//   <http://s/subject> <http://s/predicate> <http://s/object> .
+//   <http://s/subject> <http://s/predicate> "a string literal" .
+//   <http://s/subject> <http://s/predicate> "42"^^<http://.../int> .
+//   <http://s/subject> <http://s/predicate> "Bonjour"@fr .
+//
+// Mapping into curriculum records:
+//   * Subject URI  -> atom label (URI kept as-is; sanitize downstream if needed)
+//   * Predicate URI -> IMP strength=EMPIRICAL (URI encoded into imp target label
+//                      via helper "subj-<pred_id>-obj")
+//   * Object URI    -> another atom (labeled by URI)
+//   * Object literal -> a fact atom whose label combines the subject and
+//                      predicate (so different subjects reporting the same
+//                      literal don't collide)
+//
+// The base N-Triples layer stays generic. Vocabulary-specific mappings
+// (Wikidata Qxxx / Pxxx, ConceptNet URIs) layer on top in their own
+// importers (wikidata.nova, conceptnet.nova) and use the primitives here
+// (_nt_lex_uri, _nt_lex_literal, nt_parse_line) rather than duplicating
+// the tokenizer.
+//
+// Return
+//   nt_parse(path, kg_name, source_tag) -> [records, errors]
+//   One record per file (all triples merge). Errors is a list of
+//   [line_no, msg] pairs.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/ingest/curriculum.nova, src/util/str_safe.nova, src/kg/atom_store.nova.
+
+import "../curriculum.nova"
+import "../../util/str_safe.nova"
+import "../../kg/atom_store.nova"
+
+// ---- token kinds ----------------------------------------------------------
+let NT_TOK_URI     = 1
+let NT_TOK_LITERAL = 2
+let NT_TOK_BNODE   = 3
+let NT_TOK_END     = 4     // '.'
+
+// ---- character predicates -------------------------------------------------
+fn _nt_ws(c) {
+    if c == 32 { return 1 }
+    if c == 9  { return 1 }
+    if c == 13 { return 1 }
+    return 0
+}
+
+fn _nt_skip_ws(line, p) {
+    let n = len(line)
+    while p < n {
+        let c = char_at(line, p)
+        if _nt_ws(c) == 1 { p = p + 1 }
+        else { return p }
+    }
+    return p
+}
+
+// ---- lexers ---------------------------------------------------------------
+
+// Lex a URI starting at p (assumes line[p]=='<'). Returns [uri_string, next_p]
+// or [0, p] on error.
+fn _nt_lex_uri(line, p) {
+    let n = len(line)
+    if p >= n { let r = list_new() push(r, 0) push(r, p) return r }
+    if char_at(line, p) != 60 { let r = list_new() push(r, 0) push(r, p) return r }
+    let start = p + 1
+    let i = start
+    while i < n {
+        if char_at(line, i) == 62 {          // '>'
+            let uri = substr(line, start, i - start)
+            let r = list_new() push(r, uri) push(r, i + 1) return r
+        }
+        i = i + 1
+    }
+    let r = list_new() push(r, 0) push(r, p) return r
+}
+
+// Lex a literal starting at p (assumes line[p]=='"'). Handles \" escape,
+// optional @lang tag or ^^<datatype>. Returns [content_string, next_p] or
+// [0, p] on error.
+fn _nt_lex_literal(line, p) {
+    let n = len(line)
+    if p >= n { let r = list_new() push(r, 0) push(r, p) return r }
+    if char_at(line, p) != 34 { let r = list_new() push(r, 0) push(r, p) return r }
+    let out = ""
+    let i = p + 1
+    let closed = 0
+    while i < n {
+        let c = char_at(line, i)
+        if c == 92 {                             // '\'
+            if i + 1 < n {
+                let esc = char_at(line, i + 1)
+                if esc == 34 { out = out + chr(34) i = i + 2 }
+                else { if esc == 92 { out = out + chr(92) i = i + 2 }
+                else { if esc == 110 { out = out + chr(10) i = i + 2 }   // \n
+                else { if esc == 116 { out = out + chr(9)  i = i + 2 }   // \t
+                else { if esc == 114 { out = out + chr(13) i = i + 2 }   // \r
+                else { out = out + chr(esc) i = i + 2 } } } } }
+            } else { i = i + 1 }
+        } else {
+            if c == 34 {                         // '"'
+                closed = 1 i = i + 1 i = n + 1
+            } else { out = out + chr(c) i = i + 1 }
+        }
+    }
+    if closed == 0 { let r = list_new() push(r, 0) push(r, p) return r }
+    // Discard the actual position we jumped over.
+    // Recompute a defensible next_p by finding the end quote position.
+    let np = 0
+    let j = p + 1
+    let esc_mode = 0
+    while j < n {
+        if esc_mode == 1 { esc_mode = 0 j = j + 1 }
+        else {
+            let c = char_at(line, j)
+            if c == 92 { esc_mode = 1 j = j + 1 }
+            else { if c == 34 { np = j + 1 j = n + 1 } else { j = j + 1 } }
+        }
+    }
+    if np == 0 { let r = list_new() push(r, 0) push(r, p) return r }
+    // Skip optional @lang or ^^<datatype>.
+    if np < n {
+        if char_at(line, np) == 64 {         // '@'
+            np = np + 1
+            while np < n {
+                let c = char_at(line, np)
+                if c == 45 { np = np + 1 }
+                else { if c >= 97 { if c <= 122 { np = np + 1 } else { np = n + 1 } }
+                       else { if c >= 65 { if c <= 90 { np = np + 1 } else { np = n + 1 } }
+                              else { np = n + 1 } } }
+            }
+            if np > n { np = np - 1 - 1 }
+        }
+    }
+    if np < n {
+        if char_at(line, np) == 94 {         // '^'
+            if np + 1 < n { if char_at(line, np + 1) == 94 {
+                np = np + 2
+                if np < n { if char_at(line, np) == 60 {
+                    let uu = _nt_lex_uri(line, np)
+                    if uu[0] != 0 { np = uu[1] }
+                } }
+            } }
+        }
+    }
+    let r = list_new() push(r, out) push(r, np) return r
+}
+
+// Lex a blank node "_:name". Returns [name, next_p] or [0, p].
+fn _nt_lex_bnode(line, p) {
+    let n = len(line)
+    if p + 1 >= n { let r = list_new() push(r, 0) push(r, p) return r }
+    if char_at(line, p)     != 95 { let r = list_new() push(r, 0) push(r, p) return r }   // '_'
+    if char_at(line, p + 1) != 58 { let r = list_new() push(r, 0) push(r, p) return r }   // ':'
+    let start = p + 2
+    let i = start
+    while i < n {
+        let c = char_at(line, i)
+        let ok = 0
+        if c >= 65 { if c <= 90  { ok = 1 } }
+        if c >= 97 { if c <= 122 { ok = 1 } }
+        if c >= 48 { if c <= 57  { ok = 1 } }
+        if c == 45 { ok = 1 }
+        if c == 95 { ok = 1 }
+        if ok == 0 { let r = list_new() push(r, substr(line, start, i - start)) push(r, i) return r }
+        i = i + 1
+    }
+    let r = list_new() push(r, substr(line, start, n - start)) push(r, n) return r
+}
+
+// Read one token; returns [kind, value, next_p]. kind==0 on error.
+fn _nt_next(line, p) {
+    let n = len(line)
+    let q = _nt_skip_ws(line, p)
+    if q >= n {
+        let r = list_new() push(r, 0) push(r, 0) push(r, q) return r
+    }
+    let c = char_at(line, q)
+    if c == 60 {         // '<' URI
+        let u = _nt_lex_uri(line, q)
+        if u[0] == 0 { let r = list_new() push(r, 0) push(r, 0) push(r, q) return r }
+        let r = list_new() push(r, NT_TOK_URI) push(r, u[0]) push(r, u[1]) return r
+    }
+    if c == 34 {         // '"' literal
+        let l = _nt_lex_literal(line, q)
+        if l[0] == 0 { let r = list_new() push(r, 0) push(r, 0) push(r, q) return r }
+        let r = list_new() push(r, NT_TOK_LITERAL) push(r, l[0]) push(r, l[1]) return r
+    }
+    if c == 95 {         // '_' blank node
+        let b = _nt_lex_bnode(line, q)
+        if b[0] == 0 { let r = list_new() push(r, 0) push(r, 0) push(r, q) return r }
+        let r = list_new() push(r, NT_TOK_BNODE) push(r, b[0]) push(r, b[1]) return r
+    }
+    if c == 46 {         // '.'
+        let r = list_new() push(r, NT_TOK_END) push(r, "") push(r, q + 1) return r
+    }
+    let r = list_new() push(r, 0) push(r, 0) push(r, q) return r
+}
+
+// ---- URI/label helpers ----------------------------------------------------
+
+// Take the last path segment of a URI as a display fragment, else the
+// whole URI. Kept simple: last '/' or '#' boundary.
+fn nt_uri_local(uri) {
+    let n = len(uri)
+    let last = 0 - 1
+    let i = 0
+    while i < n {
+        let c = char_at(uri, i)
+        if c == 47 { last = i }         // '/'
+        if c == 35 { last = i }         // '#'
+        i = i + 1
+    }
+    if last < 0 { return uri }
+    return substr(uri, last + 1, n - last - 1)
+}
+
+// Sanitize URI-derived text into a curriculum-safe atom label.
+fn nt_safe_label(s) {
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        let keep = 0
+        if c >= 65 { if c <= 90  { keep = 1 } }
+        if c >= 97 { if c <= 122 { keep = 1 } }
+        if c >= 48 { if c <= 57  { keep = 1 } }
+        if c == 45 { keep = 1 }
+        if c == 95 { keep = 1 }
+        if c == 46 { keep = 1 }
+        if keep == 1 { out = out + chr(c) }
+        else { out = out + "_" }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- line iterator (shared) -----------------------------------------------
+fn _nt_lines(text) {
+    let out = list_new()
+    let n = len(text)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(text, i) == 10 {
+            push(out, substr(text, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(out, substr(text, start, n - start))
+    return out
+}
+
+// ---- parser (one line) ----------------------------------------------------
+
+// Parse one N-Triples line. Returns [subj, pred, obj_kind, obj_val] or 0 on
+// blank/comment/error. Used by higher-level importers that want per-triple
+// dispatch (e.g. wikidata.nova mapping specific predicates).
+fn nt_parse_line(line) {
+    let n = len(line)
+    let p = _nt_skip_ws(line, 0)
+    if p >= n { return 0 }
+    if char_at(line, p) == 35 { return 0 }        // '#' comment
+    let s = _nt_next(line, p)
+    if s[0] == 0 { return 0 }
+    if s[0] != NT_TOK_URI { if s[0] != NT_TOK_BNODE { return 0 } }
+    let subj = s[1]
+    let pk = _nt_next(line, s[2])
+    if pk[0] != NT_TOK_URI { return 0 }
+    let pred = pk[1]
+    let ok = _nt_next(line, pk[2])
+    if ok[0] == 0 { return 0 }
+    let obj_kind = ok[0]
+    let obj_val = ok[1]
+    let end = _nt_next(line, ok[2])
+    if end[0] != NT_TOK_END { return 0 }
+    let r = list_new()
+    push(r, subj) push(r, pred) push(r, obj_kind) push(r, obj_val)
+    return r
+}
+
+// ---- default full-file parser ---------------------------------------------
+
+// Parse an entire N-Triples document into a single curriculum record.
+// Default mapping: each URI subject/object is an ATOM_CONCEPT (belief 700);
+// each URI predicate becomes an EMPIRICAL implication subj->obj (predicate
+// identity itself becomes a separate concept atom); literal objects seed a
+// fact atom labeled "<subj_local>-<pred_local>" with belief 800.
+fn nt_parse_text(text, kg_name, source_tag) {
+    let out_records = list_new()
+    let errors = list_new()
+    let record = cur_new(kg_name, source_tag)
+    let seen = list_new()
+    let lines = _nt_lines(text)
+    let i = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        let t = nt_parse_line(ln)
+        if t != 0 {
+            let s_lab = nt_safe_label(nt_uri_local(t[0]))
+            let p_lab = nt_safe_label(nt_uri_local(t[1]))
+            if len(s_lab) > 0 {
+                if _nt_seen_add(seen, s_lab) == 1 {
+                    cur_add_atom(record, s_lab, ATOM_CONCEPT, 700)
+                }
+                if len(p_lab) > 0 {
+                    if _nt_seen_add(seen, p_lab) == 1 {
+                        cur_add_atom(record, p_lab, ATOM_CONCEPT, 700)
+                    }
+                }
+                if t[2] == NT_TOK_URI {
+                    let o_lab = nt_safe_label(nt_uri_local(t[3]))
+                    if len(o_lab) > 0 {
+                        if _nt_seen_add(seen, o_lab) == 1 {
+                            cur_add_atom(record, o_lab, ATOM_CONCEPT, 700)
+                        }
+                        cur_add_imp(record, s_lab, o_lab, "EMPIRICAL")
+                    }
+                } else {
+                    if t[2] == NT_TOK_LITERAL {
+                        let fact_lab = s_lab + "-" + p_lab
+                        if _nt_seen_add(seen, fact_lab) == 1 {
+                            cur_add_atom(record, fact_lab, ATOM_FACT, 800)
+                        }
+                        cur_add_imp(record, s_lab, fact_lab, "EMPIRICAL")
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    push(out_records, record)
+    let out = list_new() push(out, out_records) push(out, errors)
+    return out
+}
+
+fn _nt_seen_add(seen, label) {
+    let i = 0
+    while i < len(seen) {
+        if str_eq_bytes(seen[i], label) == 1 { return 0 }
+        i = i + 1
+    }
+    push(seen, label)
+    return 1
+}
+
+fn nt_parse(path, kg_name, source_tag) {
+    let text = read_file(path)
+    if text == 0 {
+        let recs = list_new()
+        let errs = list_new()
+        let e = list_new() push(e, 0) push(e, "could not read: " + path)
+        push(errs, e)
+        let out = list_new() push(out, recs) push(out, errs) return out
+    }
+    return nt_parse_text(text, kg_name, source_tag)
+}
+
+fn nt_records(result) { return result[0] }
+fn nt_errors(result)  { return result[1] }

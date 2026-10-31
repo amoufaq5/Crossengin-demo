@@ -1,0 +1,318 @@
+// R113 (Phase K part 4) unit tests for src/sandbox/holder_rate.nova.
+//
+// Covers:
+//   * registry construction with a default cap
+//   * holder_rate_check under / at / above the limit
+//   * 1-second window rollover
+//   * two holders don't interfere
+//   * qps_max=0 (unlimited) never refuses
+//   * explicit holder_rate_set overrides the default
+//   * anonymous holder ("") is one aggregate bucket
+//   * default read/write + set_default takes effect on next window
+//   * reset zeros the counter without touching the ceiling
+//   * snapshot rows carry resolved cap + explicit-bit
+//   * negative defaults clamp to 0 (unlimited)
+//   * refusal string carries "per holder" (not "for this token")
+
+import "../ce_test.nova"
+import "../../src/sandbox/holder_rate.nova"
+import "../../src/util/str_safe.nova"
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+// ---- constructor ----------------------------------------------------
+
+fn test_registry_new_carries_default() {
+    let r = holder_rate_registry_new(10)
+    ce_eq("default=10",         holder_rate_default(r), 10)
+    ce_eq("no holders yet",     holder_rate_count(r), 0)
+}
+
+fn test_registry_new_negative_default_clamps() {
+    let r = holder_rate_registry_new(0 - 5)
+    ce_eq("negative default clamps to 0", holder_rate_default(r), 0)
+}
+
+fn test_registry_new_zero_default_ok() {
+    let r = holder_rate_registry_new(0)
+    ce_eq("zero default (unlimited)", holder_rate_default(r), 0)
+    // check-and-increment is a no-op when the effective cap is 0.
+    let e = holder_rate_check(r, "alice", 1000000000)
+    ce_eq("unlimited -> no refusal len", len(e), 0)
+    ce_eq("unlimited -> no row created", holder_rate_count(r), 0)
+}
+
+// ---- default read/write --------------------------------------------
+
+fn test_set_default_updates() {
+    let r = holder_rate_registry_new(10)
+    holder_rate_set_default(r, 42)
+    ce_eq("default now 42", holder_rate_default(r), 42)
+}
+
+fn test_set_default_clamps_negative_to_zero() {
+    let r = holder_rate_registry_new(10)
+    holder_rate_set_default(r, 0 - 3)
+    ce_eq("negative clamps to 0", holder_rate_default(r), 0)
+}
+
+fn test_get_returns_default_for_unknown_holder() {
+    let r = holder_rate_registry_new(7)
+    ce_eq("unknown -> default", holder_rate_get(r, "ghost"), 7)
+    ce_eq("no side effect on get", holder_rate_count(r), 0)
+}
+
+// ---- basic check under the limit -----------------------------------
+
+fn test_check_under_limit_passes() {
+    let r = holder_rate_registry_new(3)
+    ce_eq("req 1 ok", len(holder_rate_check(r, "alice", 1000000000)), 0)
+    ce_eq("req 2 ok", len(holder_rate_check(r, "alice", 1000000001)), 0)
+    ce_eq("req 3 ok", len(holder_rate_check(r, "alice", 1000000002)), 0)
+    // Fourth request is at the limit boundary.
+    let e = holder_rate_check(r, "alice", 1000000003)
+    ce_check("req 4 refused",       len(e) > 0)
+    ce_check("names rate limit",    _has(e, "rate limit exceeded"))
+    ce_check("names per-holder",    _has(e, "per holder"))
+    ce_check("names max 3",         _has(e, "max 3 req/s"))
+}
+
+fn test_check_at_limit_refuses_message_shape() {
+    let r = holder_rate_registry_new(1)
+    ce_eq("req 1 ok", len(holder_rate_check(r, "alice", 5000000000)), 0)
+    let e = holder_rate_check(r, "alice", 5000000001)
+    // The R56 per-TOKEN refusal reads "for this token"; per-holder
+    // must NOT reuse that suffix so operators grepping logs can
+    // distinguish the two windows.
+    ce_check("does NOT say 'for this token'",
+             _has(e, "for this token") == 0)
+    ce_check("says 'per holder'",  _has(e, "per holder"))
+}
+
+// ---- 10-request-then-refuse (matches R113 spec) --------------------
+
+fn test_ten_requests_ok_eleventh_refused() {
+    let r = holder_rate_registry_new(10)
+    let base = 2000000000
+    let i = 0
+    while i < 10 {
+        let e = holder_rate_check(r, "bob", base + i * 100)
+        ce_eq("under-limit request ok", len(e), 0)
+        i = i + 1
+    }
+    let e11 = holder_rate_check(r, "bob", base + 10 * 100)
+    ce_check("11th refused",       len(e11) > 0)
+    ce_check("says max 10 req/s",  _has(e11, "max 10 req/s"))
+    ce_check("says per holder",    _has(e11, "per holder"))
+}
+
+// ---- window rollover -----------------------------------------------
+
+fn test_window_rolls_after_one_second() {
+    let r = holder_rate_registry_new(2)
+    let base = 3000000000
+    ce_eq("req 1 ok", len(holder_rate_check(r, "carol", base)), 0)
+    ce_eq("req 2 ok", len(holder_rate_check(r, "carol", base + 1)), 0)
+    // Third under 1s -> refused.
+    let e3 = holder_rate_check(r, "carol", base + 2)
+    ce_check("req 3 refused", len(e3) > 0)
+    // Fourth exactly 1s later -> new window, counter resets, ok again.
+    let e4 = holder_rate_check(r, "carol", base + 1000000000)
+    ce_eq("req 4 (new window) ok", len(e4), 0)
+    // And under new window count restarts.
+    let e5 = holder_rate_check(r, "carol", base + 1000000001)
+    ce_eq("req 5 (new window) ok", len(e5), 0)
+    let e6 = holder_rate_check(r, "carol", base + 1000000002)
+    ce_check("req 6 refused (2/s cap)", len(e6) > 0)
+}
+
+// ---- two holders don't interfere -----------------------------------
+
+fn test_two_holders_isolated() {
+    let r = holder_rate_registry_new(1)
+    let now = 4000000000
+    ce_eq("alice req 1 ok",  len(holder_rate_check(r, "alice", now)), 0)
+    // Bob's first request under the same window MUST pass (isolated).
+    ce_eq("bob req 1 ok",    len(holder_rate_check(r, "bob", now + 1)), 0)
+    // Both are now at their cap.
+    ce_check("alice req 2 refused",
+             len(holder_rate_check(r, "alice", now + 2)) > 0)
+    ce_check("bob req 2 refused",
+             len(holder_rate_check(r, "bob", now + 3)) > 0)
+    ce_eq("registry has 2 holders", holder_rate_count(r), 2)
+}
+
+// ---- explicit per-holder override ---------------------------------
+
+fn test_explicit_set_overrides_default() {
+    let r = holder_rate_registry_new(1)
+    holder_rate_set(r, "power_user", 100)
+    ce_eq("power_user -> 100", holder_rate_get(r, "power_user"), 100)
+    // Default still applies to others.
+    ce_eq("noob -> default 1", holder_rate_get(r, "noob"), 1)
+    // power_user gets 50 in a tight burst -> all ok.
+    let now = 5000000000
+    let i = 0
+    while i < 50 {
+        let e = holder_rate_check(r, "power_user", now + i)
+        ce_eq("50 in one window ok", len(e), 0)
+        i = i + 1
+    }
+    // noob still bound to 1/s.
+    ce_eq("noob req 1 ok",  len(holder_rate_check(r, "noob", now)), 0)
+    ce_check("noob req 2 refused",
+             len(holder_rate_check(r, "noob", now + 1)) > 0)
+}
+
+fn test_set_qps_zero_marks_unlimited_for_holder() {
+    let r = holder_rate_registry_new(1)
+    holder_rate_set(r, "svc", 0)
+    ce_eq("svc -> 0 (unlimited)", holder_rate_get(r, "svc"), 0)
+    let now = 6000000000
+    let i = 0
+    while i < 200 {
+        let e = holder_rate_check(r, "svc", now + i)
+        ce_eq("svc never refused", len(e), 0)
+        i = i + 1
+    }
+}
+
+fn test_set_negative_qps_clamps_to_zero() {
+    let r = holder_rate_registry_new(5)
+    holder_rate_set(r, "svc", 0 - 10)
+    ce_eq("svc negative clamps to 0", holder_rate_get(r, "svc"), 0)
+}
+
+// ---- anonymous holder ("") is one aggregate bucket -----------------
+
+fn test_anonymous_shares_one_bucket() {
+    let r = holder_rate_registry_new(2)
+    let now = 7000000000
+    // Anonymous callers all share the "" key.
+    ce_eq("anon req 1 ok", len(holder_rate_check(r, "", now)), 0)
+    ce_eq("anon req 2 ok", len(holder_rate_check(r, "", now + 1)), 0)
+    // Third anonymous request MUST be refused (aggregate bucket).
+    let e = holder_rate_check(r, "", now + 2)
+    ce_check("anon req 3 refused", len(e) > 0)
+    ce_check("anon refusal per-holder", _has(e, "per holder"))
+    // Authenticated holder unaffected.
+    ce_eq("alice unaffected by anon", len(holder_rate_check(r, "alice", now)), 0)
+}
+
+fn test_anonymous_bucket_can_be_tuned_alone() {
+    // Explicit per-"" setting shouldn't affect other holders.
+    let r = holder_rate_registry_new(10)
+    holder_rate_set(r, "", 1)      // tighten anon to 1/s
+    ce_eq("anon cap -> 1",   holder_rate_get(r, ""), 1)
+    ce_eq("alice cap -> 10", holder_rate_get(r, "alice"), 10)
+}
+
+// ---- reset --------------------------------------------------------
+
+fn test_reset_zeros_counter_keeps_cap() {
+    let r = holder_rate_registry_new(3)
+    let now = 8000000000
+    let i = 0
+    while i < 3 {
+        holder_rate_check(r, "dave", now + i)
+        i = i + 1
+    }
+    // At cap; 4th refuses.
+    ce_check("pre-reset 4th refused",
+             len(holder_rate_check(r, "dave", now + 3)) > 0)
+    let ok = holder_rate_reset(r, "dave")
+    ce_eq("reset dave", ok, 1)
+    // Counter zero + start reset -> new request must pass.
+    ce_eq("post-reset req ok",
+          len(holder_rate_check(r, "dave", now + 4)), 0)
+    // Cap unchanged.
+    ce_eq("cap preserved", holder_rate_get(r, "dave"), 3)
+}
+
+fn test_reset_unknown_holder_returns_zero() {
+    let r = holder_rate_registry_new(1)
+    ce_eq("reset unknown -> 0", holder_rate_reset(r, "ghost"), 0)
+}
+
+// ---- snapshot -----------------------------------------------------
+
+fn test_snapshot_row_shape() {
+    let r = holder_rate_registry_new(10)
+    holder_rate_set(r, "alice", 100)
+    // bob has NO explicit setting; a check pass allocates his row.
+    holder_rate_check(r, "bob", 9000000000)
+    let rows = holder_rate_snapshot(r)
+    ce_eq("2 rows", len(rows), 2)
+    // Row for alice: explicit=1, resolved=100.
+    ce_str_eq("row0 holder alice", hrs_holder(rows[0]), "alice")
+    ce_eq("row0 explicit=1",       hrs_explicit(rows[0]), 1)
+    ce_eq("row0 qps 100",          hrs_qps_max(rows[0]), 100)
+    // Row for bob: explicit=0, resolved=default(10).
+    ce_str_eq("row1 holder bob",   hrs_holder(rows[1]), "bob")
+    ce_eq("row1 explicit=0",       hrs_explicit(rows[1]), 0)
+    ce_eq("row1 qps default 10",   hrs_qps_max(rows[1]), 10)
+    ce_eq("row1 count 1 (one check ran)", hrs_window_count(rows[1]), 1)
+    ce_check("row1 window_start != 0", hrs_window_start(rows[1]) != 0)
+}
+
+fn test_snapshot_empty() {
+    let r = holder_rate_registry_new(10)
+    let rows = holder_rate_snapshot(r)
+    ce_eq("no rows", len(rows), 0)
+}
+
+// ---- guards ------------------------------------------------------
+
+fn test_null_registry_no_ops() {
+    ce_eq("null default is 0",     holder_rate_default(0), 0)
+    ce_eq("null get is 0",         holder_rate_get(0, "x"), 0)
+    ce_eq("null set returns 0",    holder_rate_set(0, "x", 5), 0)
+    ce_eq("null check is empty",   len(holder_rate_check(0, "x", 1)), 0)
+    ce_eq("null reset returns 0",  holder_rate_reset(0, "x"), 0)
+    ce_eq("null snapshot empty",   len(holder_rate_snapshot(0)), 0)
+    ce_eq("null count 0",          holder_rate_count(0), 0)
+    ce_eq("null set_default 0",    holder_rate_set_default(0, 5), 0)
+}
+
+// ---- main --------------------------------------------------------
+
+fn main() {
+    // constructor
+    test_registry_new_carries_default()
+    test_registry_new_negative_default_clamps()
+    test_registry_new_zero_default_ok()
+    // default r/w
+    test_set_default_updates()
+    test_set_default_clamps_negative_to_zero()
+    test_get_returns_default_for_unknown_holder()
+    // check-and-increment
+    test_check_under_limit_passes()
+    test_check_at_limit_refuses_message_shape()
+    test_ten_requests_ok_eleventh_refused()
+    // window rollover
+    test_window_rolls_after_one_second()
+    // isolation
+    test_two_holders_isolated()
+    // explicit override
+    test_explicit_set_overrides_default()
+    test_set_qps_zero_marks_unlimited_for_holder()
+    test_set_negative_qps_clamps_to_zero()
+    // anonymous
+    test_anonymous_shares_one_bucket()
+    test_anonymous_bucket_can_be_tuned_alone()
+    // reset
+    test_reset_zeros_counter_keeps_cap()
+    test_reset_unknown_holder_returns_zero()
+    // snapshot
+    test_snapshot_row_shape()
+    test_snapshot_empty()
+    // guards
+    test_null_registry_no_ops()
+    ce_summary("holder_rate")
+    return 0
+}
+
+main()

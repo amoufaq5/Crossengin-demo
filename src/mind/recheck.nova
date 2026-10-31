@@ -1,0 +1,172 @@
+// Periodic re-check sweep (ADR-0088): the "periodic substrate sweep" re-check
+// trigger. The cascade module (cascade.nova) handles re-check on a KNOWN
+// failure -- a lemma flips and dependents follow. This module handles the OTHER
+// direction: proactively re-running the kernel over FORMAL atoms on a cadence to
+// catch silent corruption (a tampered proof blob, a dependency that changed
+// without firing an explicit invalidate) BEFORE anything queries the atom.
+//
+// The kernel needs a proof's full packet (axioms / hyps / proof tree / claim
+// term) to re-check it, and atoms don't carry that. So pinning records the
+// (atom, packet) pair in a re-check registry (rck_register, called right after
+// verify_pin_atom); the sweep walks the registry, re-runs verify_check, and on
+// any failure cascades through verify_cascade_invalidate -- so one tampered
+// lemma withdraws its whole downstream cone, same as an explicit invalidate.
+//
+// The sweep is SAMPLED: each due tick re-checks a bounded window of the
+// registry (a cursor advances and wraps), so a large proof base is amortised
+// across many ticks rather than re-verified all at once on the hot path. This
+// is the ADR-0088 "periodic sweep walks a sample of FORMAL atoms" line.
+//
+// ADRs implemented: ADR-0088 (periodic re-check trigger). CrossEngin
+// dependencies: src/mind/cascade.nova (verify_check + verify_cascade_invalidate
+// + the packet accessors + atom_store).
+
+import "cascade.nova"
+
+// ---- re-check registry -----------------------------------------------------
+// A flat list of entries; each entry is [atom, pkt]. Pinning appends one.
+let RCK_TAG = 8810
+
+fn rck_new() {
+    let r = list_new()
+    push(r, RCK_TAG)
+    return r
+}
+
+// Register an (atom, packet) pair for periodic re-checking. Call right after a
+// successful verify_pin_atom with the SAME packet, so the sweep can re-run the
+// kernel over it later. Returns the entry index.
+fn rck_register(rck, atom, pkt) {
+    let e = list_new()
+    push(e, atom)
+    push(e, pkt)
+    push(rck, e)
+    return len(rck) - 1 - 1   // minus the tag slot
+}
+
+// Number of registered proofs (excludes the tag slot).
+fn rck_count(rck) { return len(rck) - 1 }
+
+fn _rck_entry(rck, i) { return rck[i + 1] }   // skip the tag slot
+fn _rck_atom(e)       { return e[0] }
+fn _rck_pkt(e)        { return e[1] }
+
+// ---- the sweep -------------------------------------------------------------
+// Result record: [checked, failed, unpinned].
+let RS_CHECKED  = 0   // entries re-run through the kernel
+let RS_FAILED   = 1   // entries whose re-check did NOT hold (-> cascade)
+let RS_UNPINNED = 2   // atoms whose FORMAL grade was withdrawn by the cascades
+
+fn _rck_result() {
+    let r = list_new()
+    push(r, 0); push(r, 0); push(r, 0)
+    return r
+}
+
+fn rck_checked(r)  { return r[RS_CHECKED] }
+fn rck_failed(r)   { return r[RS_FAILED] }
+fn rck_unpinned(r) { return r[RS_UNPINNED] }
+
+// Re-check the entries in window [start, start+count) of the registry (count
+// clamped to the registry size; the window does NOT wrap here -- the cadence
+// wrapper owns cursor wrapping). For each entry whose atom is still FORMAL,
+// re-run verify_check; on failure, cascade-invalidate that proof so the atom
+// and its dependents are withdrawn. An atom already unpinned by an earlier
+// cascade in this same sweep is skipped (not FORMAL -> not re-checked). Returns
+// [checked, failed, unpinned].
+fn rck_sweep_window(proofs_reg, kgreg, rck, start, count) {
+    let res = _rck_result()
+    let n = rck_count(rck)
+    let i = start
+    let seen = 0
+    while seen < count {
+        if i >= n { i = n }     // clamp; the wrapper handles wrap, not us
+        if i >= n {
+            seen = count        // nothing left in this non-wrapping window
+        } else {
+            let e = _rck_entry(rck, i)
+            let atom = _rck_atom(e)
+            // Only re-check atoms that still hold the FORMAL grade; one already
+            // withdrawn (by a prior cascade) is not re-verified.
+            if atom_evidence_grade(atom) == GRADE_FORMAL {
+                let pkt = _rck_pkt(e)
+                list_set(res, RS_CHECKED, res[RS_CHECKED] + 1)
+                let ok = verify_check(proofs_reg, pkt[VPKT_AXIOMS],
+                    pkt[VPKT_HYPS], pkt[VPKT_PROOF], pkt[VPKT_TERM])
+                if ok == 0 {
+                    list_set(res, RS_FAILED, res[RS_FAILED] + 1)
+                    let casc = verify_cascade_invalidate(
+                        proofs_reg, kgreg, atom_proof_ref(atom))
+                    list_set(res, RS_UNPINNED,
+                        res[RS_UNPINNED] + cascade_unpinned(casc))
+                }
+            }
+            i = i + 1
+            seen = seen + 1
+        }
+    }
+    return res
+}
+
+// Full sweep over the whole registry in one call (no sampling). Convenience for
+// tests and for a clean-shutdown integrity check.
+fn rck_sweep(proofs_reg, kgreg, rck) {
+    return rck_sweep_window(proofs_reg, kgreg, rck, 0, rck_count(rck))
+}
+
+// ---- cadence wrapper (mirrors maintenance.nova's tick hook) -----------------
+// Bundles the re-check state so the live loop can fire it on its own interval,
+// independent of the belief-decay / GC cadences. SAMPLE entries are checked per
+// due tick, with a cursor that advances and wraps -- so the whole base is
+// covered over time without a full re-verify on any single tick.
+let RCKS_TAG     = 8820
+let RCKS_PROOFS  = 1
+let RCKS_KGREG   = 2
+let RCKS_RCK     = 3
+let RCKS_EVERY   = 4   // run a sample every N ticks (0 disables)
+let RCKS_SAMPLE  = 5   // entries to re-check per due tick
+let RCKS_LAST    = 6   // tick of the last sample
+let RCKS_CURSOR  = 7   // next registry index to re-check (wraps)
+
+fn rcks_new(proofs_reg, kgreg, rck, every, sample) {
+    let s = list_new()
+    push(s, RCKS_TAG)
+    push(s, proofs_reg)
+    push(s, kgreg)
+    push(s, rck)
+    push(s, every)
+    push(s, sample)
+    push(s, 0)          // last
+    push(s, 0)          // cursor
+    return s
+}
+
+fn rcks_cursor(s) { return s[RCKS_CURSOR] }
+fn rcks_every(s)  { return s[RCKS_EVERY] }
+
+fn _rcks_due(s, now) {
+    if s[RCKS_EVERY] <= 0 { return 0 }
+    if now - s[RCKS_LAST] >= s[RCKS_EVERY] { return 1 }
+    return 0
+}
+
+// THE HOOK. Call once per tick. When due, re-check up to SAMPLE entries
+// starting at the cursor, advancing (and wrapping) the cursor so successive
+// due ticks cover the whole registry. Returns the sweep result, or 0 if not
+// due / registry empty.
+fn rcks_on_tick(s, now) {
+    if _rcks_due(s, now) == 0 { return 0 }
+    list_set(s, RCKS_LAST, now)
+    let n = rck_count(s[RCKS_RCK])
+    if n == 0 { return 0 }
+    let start = s[RCKS_CURSOR]
+    if start >= n { start = 0 }
+    let count = s[RCKS_SAMPLE]
+    if count > n { count = n }
+    let res = rck_sweep_window(s[RCKS_PROOFS], s[RCKS_KGREG], s[RCKS_RCK], start, count)
+    // Advance the cursor, wrapping at the registry end.
+    let next = start + count
+    if next >= n { next = 0 }
+    list_set(s, RCKS_CURSOR, next)
+    return res
+}

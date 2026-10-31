@@ -1,0 +1,1030 @@
+// CrossEngin in-process TLS: X.509 subset parser + chain verifier (R92).
+//
+// Scope
+//   Minimal RFC 5280 X.509 v3 profile paired with RFC 8410 Ed25519
+//   for the TLS 1.3 CHACHA20_POLY1305_SHA256 / x25519 / Ed25519 suite
+//   chosen in the R86 ADR. This parser knows just enough DER to pull:
+//
+//     * serialNumber       (offset + length in cert buf)
+//     * issuer CN          (UTF8String or PrintableString content)
+//     * subject CN         (ditto)
+//     * validity           (notBefore + notAfter -> unix seconds)
+//     * SPKI algorithm     (asserts Ed25519 OID; refuses everything else)
+//     * SPKI pubkey        (32 raw Ed25519 bytes, referenced in-buffer)
+//     * TBS byte range     (exact tag+length+content bytes -- the input
+//                           to Ed25519 signature verification)
+//     * signature algorithm (asserts Ed25519 OID; refuses everything else)
+//     * signature          (64 raw Ed25519 bytes, referenced in-buffer)
+//
+//   Chain length is capped at 2 (leaf + root). The root is passed in
+//   explicitly by the caller and self-verified; there is no external
+//   trust anchor store in R92 -- that lands with the R95+ trust
+//   material rounds.
+//
+//   Explicitly out of scope (rejected cleanly if seen):
+//     * Any signature algorithm other than Ed25519 (RSA, ECDSA, other
+//       EdDSA curves). The ECDSA-P-256 world lives in
+//       `src/safety/x509.nova` for the DTLS 1.2 path and is
+//       intentionally NOT reused here -- different suite, different
+//       algorithm rigidity.
+//     * Extensions marked CRITICAL that we do not understand (the R92
+//       parser understands zero critical extensions, so any critical
+//       extension present -> reject). Non-critical extensions are
+//       tolerated and stepped over.
+//     * Multi-CN DNs / anything beyond the first CN component.
+//     * UTCTime / GeneralizedTime without a trailing 'Z'. Non-Z time
+//       zones would require timezone offset math the R92 helper does
+//       not carry (and TLS 1.3 servers issue Z-suffix certs in
+//       practice anyway).
+//     * Chain length > 2. Root that is not self-signed. Leaf that is
+//       self-signed (leaf byte-equal to root -> reject).
+//
+// Buffer conventions
+//   Certificates are held as byte LISTS. Every offset/length in a
+//   parsed cert refers back into the SAME buf the caller passed to
+//   `x509_parse`; the parsed struct never holds copies. This keeps
+//   verification cheap (no re-materialization for the TBS slice) and
+//   makes the byte-equal Name comparison in `x509_check_issuer`
+//   straightforward.
+//
+// Parsed-cert layout
+//   A parsed cert is a NOVA list with fixed indices (see the
+//   X509_IDX_* constants below). Values are ints; offsets and lengths
+//   refer into cert_buf. This is a "struct-shaped list" -- the whole
+//   codebase uses that pattern (see p256 point representation).
+//
+// Errors
+//   Every parse / verify function returns 1 on success and 0 on any
+//   failure. The failure mode is not exposed as an enum -- the TLS
+//   spec only needs the boolean, and TLS-alert generation happens at
+//   the R93 handshake layer.
+//
+// NOVA quirks acknowledged
+//   * NUL bytes are common in certs (OID payloads, INTEGER content,
+//     BIT STRING content, BOOLEAN 0x00) -- byte lists throughout.
+//   * `len(0)` segfaults; every function guards `buf_len` against
+//     `len(buf)`.
+//   * Time parsing walks ASCII digit bytes -- no str_to_int (which
+//     silently returns 0 on garbage, an integrity landmine for cert
+//     validity comparison).
+//   * 63-bit signed ints hold unix seconds through year 9999 with
+//     headroom.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/net/tls/der.nova       -- DER TLV walker.
+//   src/safety/ed25519.nova    -- ed25519_verify.
+
+import "./der.nova"
+import "../../safety/ed25519.nova"
+
+// ---- constants -----------------------------------------------------------
+
+// Ed25519 signature-algorithm OID content bytes (RFC 8410 §3):
+//   1.3.101.112 -> 2B 65 70. Full TLV: 06 03 2B 65 70.
+// The three CONTENT bytes are what `der_oid_equal` compares.
+let X509_ED25519_OID_LEN = 3
+fn _x509_ed25519_oid_bytes() {
+    let b = list_new()
+    push(b, 43)   // 0x2B
+    push(b, 101)  // 0x65
+    push(b, 112)  // 0x70
+    return b
+}
+// Cache the OID bytes list at module scope via lazy init. NOVA
+// singletons are lazy-init to avoid the "module-init order" trap.
+let _X509_ED25519_OID_CACHE = list_new()
+fn _x509_ed25519_oid() {
+    if len(_X509_ED25519_OID_CACHE) == 0 {
+        let b = _x509_ed25519_oid_bytes()
+        let i = 0
+        while i < X509_ED25519_OID_LEN {
+            push(_X509_ED25519_OID_CACHE, b[i])
+            i = i + 1
+        }
+    }
+    return _X509_ED25519_OID_CACHE
+}
+
+// CN attribute-type OID content bytes: 2.5.4.3 -> 55 04 03.
+let X509_CN_OID_LEN = 3
+let _X509_CN_OID_CACHE = list_new()
+fn _x509_cn_oid() {
+    if len(_X509_CN_OID_CACHE) == 0 {
+        push(_X509_CN_OID_CACHE, 85)  // 0x55
+        push(_X509_CN_OID_CACHE, 4)
+        push(_X509_CN_OID_CACHE, 3)
+    }
+    return _X509_CN_OID_CACHE
+}
+
+// Ed25519 pubkey / signature byte lengths (mirrored from RFC 8032).
+let X509_ED25519_PUBKEY_LEN     = 32
+let X509_ED25519_SIGNATURE_LEN  = 64
+
+// Parsed-cert struct field indices.
+let X509_IDX_SERIAL_OFF     = 0
+let X509_IDX_SERIAL_LEN     = 1
+let X509_IDX_ISSUER_CN_OFF  = 2
+let X509_IDX_ISSUER_CN_LEN  = 3
+let X509_IDX_SUBJECT_CN_OFF = 4
+let X509_IDX_SUBJECT_CN_LEN = 5
+let X509_IDX_SPKI_ALG_OK    = 6
+let X509_IDX_SPKI_PUB_OFF   = 7
+let X509_IDX_NOT_BEFORE     = 8
+let X509_IDX_NOT_AFTER      = 9
+let X509_IDX_TBS_OFF        = 10
+let X509_IDX_TBS_LEN        = 11
+let X509_IDX_SIG_ALG_OK     = 12
+let X509_IDX_SIG_OFF        = 13
+let X509_IDX_ISSUER_NAME_OFF = 14
+let X509_IDX_ISSUER_NAME_LEN = 15
+let X509_IDX_SUBJECT_NAME_OFF = 16
+let X509_IDX_SUBJECT_NAME_LEN = 17
+let X509_IDX_STRUCT_SIZE     = 18
+
+// Allocate a fresh parsed-cert struct with all fields zeroed. Callers
+// pass this in as `out_parsed` to `x509_parse`.
+fn x509_parsed_new() {
+    let s = list_new()
+    let i = 0
+    while i < X509_IDX_STRUCT_SIZE {
+        push(s, 0)
+        i = i + 1
+    }
+    return s
+}
+
+// Accessor sugar (kept for callers that don't want to memorize
+// indices). Each returns the raw int.
+fn x509_parsed_tbs_off(p)       { return p[X509_IDX_TBS_OFF] }
+fn x509_parsed_tbs_len(p)       { return p[X509_IDX_TBS_LEN] }
+fn x509_parsed_sig_off(p)       { return p[X509_IDX_SIG_OFF] }
+fn x509_parsed_pub_off(p)       { return p[X509_IDX_SPKI_PUB_OFF] }
+fn x509_parsed_not_before(p)    { return p[X509_IDX_NOT_BEFORE] }
+fn x509_parsed_not_after(p)     { return p[X509_IDX_NOT_AFTER] }
+fn x509_parsed_spki_alg_ok(p)   { return p[X509_IDX_SPKI_ALG_OK] }
+fn x509_parsed_sig_alg_ok(p)    { return p[X509_IDX_SIG_ALG_OK] }
+
+// ---- time parsing --------------------------------------------------------
+//
+// UTCTime      -- "YYMMDDHHMMSSZ"        (13 bytes)
+// GeneralizedTime -- "YYYYMMDDHHMMSSZ"   (15 bytes)
+// Both are ASCII; both MUST end with 'Z' (0x5A). We reject any other
+// timezone suffix -- TLS servers ship Z-suffix certs and adding
+// offset math risks a validity-window off-by-a-few-hours bug that
+// nothing in tree would flag.
+//
+// Day-count conversion is Howard Hinnant's public-domain
+// days_from_civil algorithm (https://howardhinnant.github.io/date_algorithms.html).
+// Reference implementation, adapted to NOVA:
+//
+//   days_from_civil(y, m, d):
+//     y -= (m <= 2)
+//     era = (y >= 0 ? y : y - 399) / 400
+//     yoe = y - era * 400                     -- [0, 399]
+//     doy = (153*(m + (m > 2 ? -3 : 9)) + 2)/5 + d - 1   -- [0, 365]
+//     doe = yoe * 365 + yoe/4 - yoe/100 + doy            -- [0, 146096]
+//     return era * 146097 + doe - 719468
+//
+// Unix seconds = days * 86400 + hh * 3600 + mm * 60 + ss.
+
+// Parse an ASCII digit byte. Returns the numeric value, or -1 if the
+// byte is not '0'..'9' (48..57).
+fn _x509_digit(b) {
+    if b < 48 { return 0 - 1 }
+    if b > 57 { return 0 - 1 }
+    return b - 48
+}
+
+// Read `n` consecutive digit bytes starting at `off` in `buf` and
+// return the concatenated decimal int. Returns -1 on any non-digit
+// byte or out-of-range access.
+fn _x509_read_digits(buf, off, n) {
+    if off < 0 { return 0 - 1 }
+    if off + n > len(buf) { return 0 - 1 }
+    let acc = 0
+    let i = 0
+    while i < n {
+        let d = _x509_digit(buf[off + i])
+        if d < 0 { return 0 - 1 }
+        acc = acc * 10 + d
+        i = i + 1
+    }
+    return acc
+}
+
+// Howard Hinnant days_from_civil, adapted for NOVA's 63-bit signed
+// int arithmetic. y is a full year (1970, 2049, ...); m in [1, 12];
+// d in [1, 31]. Returns integer days from 1970-01-01 (may be
+// negative for pre-1970 dates).
+fn _x509_days_from_civil(y, m, d) {
+    let yy = y
+    if m <= 2 { yy = yy - 1 }
+    let era = 0
+    if yy >= 0 {
+        era = int_div(yy, 400)
+    } else {
+        era = int_div(yy - 399, 400)
+    }
+    let yoe = yy - era * 400
+    let mm = m
+    if mm > 2 {
+        mm = mm - 3
+    } else {
+        mm = mm + 9
+    }
+    let doy = int_div(153 * mm + 2, 5) + d - 1
+    let doe = yoe * 365 + int_div(yoe, 4) - int_div(yoe, 100) + doy
+    return era * 146097 + doe - 719468
+}
+
+// Very cheap sanity gate: reject obviously-bad month / day / hour /
+// minute / second values before feeding into the day-count formula.
+// Not a full "days-in-month" check (Feb 30 slips through); the strict
+// check would trip on tricky leap-year edges without adding real
+// safety for TLS cert validity. Callers get a monotone-ish unix time
+// even for slightly-malformed inputs, and the validity-window check
+// still fires correctly.
+fn _x509_calendar_sane(y, mo, d, h, mi, s) {
+    if mo < 1 { return 0 }
+    if mo > 12 { return 0 }
+    if d < 1 { return 0 }
+    if d > 31 { return 0 }
+    if h < 0 { return 0 }
+    if h > 23 { return 0 }
+    if mi < 0 { return 0 }
+    if mi > 59 { return 0 }
+    if s < 0 { return 0 }
+    if s > 60 { return 0 }   // 60 for leap-second, tolerated
+    if y < 1 { return 0 }
+    return 1
+}
+
+// UTCTime is 13 bytes "YYMMDDHHMMSSZ". RFC 5280 §4.1.2.5.1:
+//   YY < 50 -> 20YY
+//   YY >= 50 -> 19YY
+fn x509_parse_utctime(buf, off, ln, out_unix) {
+    if ln != 13 { return DER_ERR }
+    if off < 0 { return DER_ERR }
+    if off + ln > len(buf) { return DER_ERR }
+    if buf[off + 12] != 90 { return DER_ERR }  // 'Z' == 90
+    let yy = _x509_read_digits(buf, off + 0, 2)
+    let mo = _x509_read_digits(buf, off + 2, 2)
+    let d  = _x509_read_digits(buf, off + 4, 2)
+    let h  = _x509_read_digits(buf, off + 6, 2)
+    let mi = _x509_read_digits(buf, off + 8, 2)
+    let s  = _x509_read_digits(buf, off + 10, 2)
+    if yy < 0 { return DER_ERR }
+    if mo < 0 { return DER_ERR }
+    if d < 0 { return DER_ERR }
+    if h < 0 { return DER_ERR }
+    if mi < 0 { return DER_ERR }
+    if s < 0 { return DER_ERR }
+    let year = 0
+    if yy < 50 {
+        year = 2000 + yy
+    } else {
+        year = 1900 + yy
+    }
+    if _x509_calendar_sane(year, mo, d, h, mi, s) == 0 { return DER_ERR }
+    let days = _x509_days_from_civil(year, mo, d)
+    let unix = days * 86400 + h * 3600 + mi * 60 + s
+    list_set(out_unix, 0, unix)
+    return DER_OK
+}
+
+// GeneralizedTime is 15 bytes "YYYYMMDDHHMMSSZ".
+fn x509_parse_generalizedtime(buf, off, ln, out_unix) {
+    if ln != 15 { return DER_ERR }
+    if off < 0 { return DER_ERR }
+    if off + ln > len(buf) { return DER_ERR }
+    if buf[off + 14] != 90 { return DER_ERR }
+    let year = _x509_read_digits(buf, off + 0, 4)
+    let mo   = _x509_read_digits(buf, off + 4, 2)
+    let d    = _x509_read_digits(buf, off + 6, 2)
+    let h    = _x509_read_digits(buf, off + 8, 2)
+    let mi   = _x509_read_digits(buf, off + 10, 2)
+    let s    = _x509_read_digits(buf, off + 12, 2)
+    if year < 0 { return DER_ERR }
+    if mo < 0 { return DER_ERR }
+    if d < 0 { return DER_ERR }
+    if h < 0 { return DER_ERR }
+    if mi < 0 { return DER_ERR }
+    if s < 0 { return DER_ERR }
+    if _x509_calendar_sane(year, mo, d, h, mi, s) == 0 { return DER_ERR }
+    let days = _x509_days_from_civil(year, mo, d)
+    let unix = days * 86400 + h * 3600 + mi * 60 + s
+    list_set(out_unix, 0, unix)
+    return DER_OK
+}
+
+// Dispatch on tag: UTCTime (0x17) or GeneralizedTime (0x18). Reads
+// one TLV at `off` in buf[0..buf_len], populates out_unix and
+// next_off. Returns DER_OK / DER_ERR.
+fn _x509_parse_time(buf, buf_len, off, out_unix, next_off_out) {
+    let tag = list_new()
+    push(tag, 0)
+    let ln = list_new()
+    push(ln, 0)
+    let vo = list_new()
+    push(vo, 0)
+    let no = list_new()
+    push(no, 0)
+    let ok = der_read_tlv(buf, buf_len, off, tag, ln, vo, no)
+    if ok == DER_ERR { return DER_ERR }
+    let time_ok = DER_ERR
+    if tag[0] == DER_UTCTIME {
+        time_ok = x509_parse_utctime(buf, vo[0], ln[0], out_unix)
+    } else {
+        if tag[0] == DER_GENERALIZEDTIME {
+            time_ok = x509_parse_generalizedtime(buf, vo[0], ln[0], out_unix)
+        } else {
+            return DER_ERR
+        }
+    }
+    if time_ok == DER_ERR { return DER_ERR }
+    list_set(next_off_out, 0, no[0])
+    return DER_OK
+}
+
+// ---- Name / CN extraction ------------------------------------------------
+//
+// Name ::= SEQUENCE OF RelativeDistinguishedName
+// RelativeDistinguishedName ::= SET SIZE (1..MAX) OF AttributeTypeAndValue
+// AttributeTypeAndValue ::= SEQUENCE {
+//     type   AttributeType,   -- OBJECT IDENTIFIER
+//     value  AttributeValue   -- ANY, in practice a string type
+// }
+//
+// We walk the SEQUENCE, then each SET, then each SEQUENCE inside; if
+// the type OID equals CN (2.5.4.3), we take the value's content as the
+// CN and stop. If no CN found, out lengths stay at 0 (empty CN --
+// which the CN-equality check in `x509_check_issuer` treats as a
+// non-match).
+fn _x509_extract_cn(buf, buf_len, name_off, name_len,
+                    cn_off_out, cn_len_out) {
+    list_set(cn_off_out, 0, 0)
+    list_set(cn_len_out, 0, 0)
+    let end = name_off + name_len
+    // Walk SET items.
+    let pos = name_off
+    while pos < end {
+        let set_val_off = list_new()
+        push(set_val_off, 0)
+        let set_val_len = list_new()
+        push(set_val_len, 0)
+        let set_next = list_new()
+        push(set_next, 0)
+        let ok = der_expect_tag(buf, buf_len, pos, DER_SET,
+                                set_val_off, set_val_len, set_next)
+        if ok == DER_ERR { return DER_ERR }
+        // Walk AttributeTypeAndValue SEQUENCEs inside the SET.
+        let inner_pos = set_val_off[0]
+        let inner_end = set_val_off[0] + set_val_len[0]
+        while inner_pos < inner_end {
+            let atv_val_off = list_new()
+            push(atv_val_off, 0)
+            let atv_val_len = list_new()
+            push(atv_val_len, 0)
+            let atv_next = list_new()
+            push(atv_next, 0)
+            let ok2 = der_expect_tag(buf, buf_len, inner_pos, DER_SEQUENCE,
+                                     atv_val_off, atv_val_len, atv_next)
+            if ok2 == DER_ERR { return DER_ERR }
+            // Attribute type = OID.
+            let oid_off = list_new()
+            push(oid_off, 0)
+            let oid_len = list_new()
+            push(oid_len, 0)
+            let oid_next = list_new()
+            push(oid_next, 0)
+            let ok3 = der_expect_tag(buf, buf_len, atv_val_off[0], DER_OID,
+                                     oid_off, oid_len, oid_next)
+            if ok3 == DER_ERR { return DER_ERR }
+            // Attribute value = string (UTF8String / PrintableString).
+            let val_tag = list_new()
+            push(val_tag, 0)
+            let val_ln  = list_new()
+            push(val_ln, 0)
+            let val_vo  = list_new()
+            push(val_vo, 0)
+            let val_no  = list_new()
+            push(val_no, 0)
+            let ok4 = der_read_tlv(buf, buf_len, oid_next[0],
+                                   val_tag, val_ln, val_vo, val_no)
+            if ok4 == DER_ERR { return DER_ERR }
+            // Compare the OID to CN. On match, capture and return.
+            let cn = _x509_cn_oid()
+            if der_oid_equal(buf, oid_off[0], oid_len[0], cn, X509_CN_OID_LEN) == 1 {
+                // Accept UTF8String or PrintableString.
+                if val_tag[0] == DER_UTF8STRING {
+                    list_set(cn_off_out, 0, val_vo[0])
+                    list_set(cn_len_out, 0, val_ln[0])
+                    return DER_OK
+                }
+                if val_tag[0] == DER_PRINTABLESTRING {
+                    list_set(cn_off_out, 0, val_vo[0])
+                    list_set(cn_len_out, 0, val_ln[0])
+                    return DER_OK
+                }
+                // Other string types -- treated as "no CN found here"
+                // but we don't fail the parse; move on.
+            }
+            inner_pos = atv_next[0]
+        }
+        pos = set_next[0]
+    }
+    // No CN found. cn_len_out stays 0, cn_off_out stays 0. Return OK
+    // -- an empty CN is a semantic outcome, not a parse error.
+    return DER_OK
+}
+
+// ---- AlgorithmIdentifier check -------------------------------------------
+//
+// AlgorithmIdentifier ::= SEQUENCE {
+//   algorithm  OBJECT IDENTIFIER,
+//   parameters ANY DEFINED BY algorithm OPTIONAL
+// }
+//
+// For Ed25519 (RFC 8410 §3): the parameters field MUST be absent, but
+// implementations SHOULD tolerate a NULL parameters. This helper
+// returns 1 iff the OID matches Ed25519; the parameters field, if
+// present, is stepped over without checking (matching RFC 8410's
+// generous parsing guidance).
+fn _x509_alg_is_ed25519(buf, buf_len, alg_val_off, alg_val_len) {
+    let end = alg_val_off + alg_val_len
+    let oid_off = list_new()
+    push(oid_off, 0)
+    let oid_len = list_new()
+    push(oid_len, 0)
+    let oid_next = list_new()
+    push(oid_next, 0)
+    let ok = der_expect_tag(buf, buf_len, alg_val_off, DER_OID,
+                            oid_off, oid_len, oid_next)
+    if ok == DER_ERR { return 0 }
+    let ed = _x509_ed25519_oid()
+    if der_oid_equal(buf, oid_off[0], oid_len[0], ed, X509_ED25519_OID_LEN) == 0 {
+        return 0
+    }
+    // The parameters field is optional. If present, we do not inspect
+    // its content but must confirm it doesn't extend past the alg
+    // SEQUENCE boundary.
+    if oid_next[0] < end {
+        let p_tag = list_new()
+        push(p_tag, 0)
+        let p_ln  = list_new()
+        push(p_ln, 0)
+        let p_vo  = list_new()
+        push(p_vo, 0)
+        let p_no  = list_new()
+        push(p_no, 0)
+        let ok2 = der_read_tlv(buf, buf_len, oid_next[0],
+                               p_tag, p_ln, p_vo, p_no)
+        if ok2 == DER_ERR { return 0 }
+        if p_no[0] > end { return 0 }
+    }
+    return 1
+}
+
+// ---- extensions handling -------------------------------------------------
+//
+// Extensions ::= SEQUENCE SIZE (1..MAX) OF Extension
+// Extension  ::= SEQUENCE {
+//   extnID     OBJECT IDENTIFIER,
+//   critical   BOOLEAN DEFAULT FALSE,
+//   extnValue  OCTET STRING
+// }
+//
+// R92 understands zero extensions. Any extension marked critical
+// causes the parse to fail. Non-critical extensions are stepped over.
+fn _x509_walk_extensions(buf, buf_len, exts_off, exts_len) {
+    let end = exts_off + exts_len
+    let pos = exts_off
+    while pos < end {
+        let ext_vo = list_new()
+        push(ext_vo, 0)
+        let ext_ln = list_new()
+        push(ext_ln, 0)
+        let ext_no = list_new()
+        push(ext_no, 0)
+        let ok = der_expect_tag(buf, buf_len, pos, DER_SEQUENCE,
+                                ext_vo, ext_ln, ext_no)
+        if ok == DER_ERR { return DER_ERR }
+        // Inner sequence: OID, [BOOLEAN critical], OCTET STRING.
+        let inner_end = ext_vo[0] + ext_ln[0]
+        // OID.
+        let oid_vo = list_new()
+        push(oid_vo, 0)
+        let oid_ln = list_new()
+        push(oid_ln, 0)
+        let oid_no = list_new()
+        push(oid_no, 0)
+        let ok2 = der_expect_tag(buf, buf_len, ext_vo[0], DER_OID,
+                                 oid_vo, oid_ln, oid_no)
+        if ok2 == DER_ERR { return DER_ERR }
+        // Peek next: BOOLEAN (critical) OR OCTET STRING (extnValue).
+        let peek_tag = list_new()
+        push(peek_tag, 0)
+        let peek_ln  = list_new()
+        push(peek_ln, 0)
+        let peek_vo  = list_new()
+        push(peek_vo, 0)
+        let peek_no  = list_new()
+        push(peek_no, 0)
+        let ok3 = der_read_tlv(buf, buf_len, oid_no[0],
+                               peek_tag, peek_ln, peek_vo, peek_no)
+        if ok3 == DER_ERR { return DER_ERR }
+        let critical = 0
+        if peek_tag[0] == 1 {   // BOOLEAN tag = 0x01
+            if peek_ln[0] != 1 { return DER_ERR }
+            if buf[peek_vo[0]] != 0 { critical = 1 }
+        }
+        if critical == 1 {
+            // Unknown critical extension -- refuse the cert. Zero
+            // critical extensions are understood in R92.
+            return DER_ERR
+        }
+        // Whether or not we saw a BOOLEAN, the rest of the extension
+        // (extnValue OCTET STRING) is stepped over via the outer
+        // ext_no[0] boundary. We don't need to inspect the OCTET STRING.
+        if peek_no[0] > inner_end { return DER_ERR }
+        pos = ext_no[0]
+    }
+    return DER_OK
+}
+
+// ---- top-level cert parse ------------------------------------------------
+//
+// Certificate ::= SEQUENCE {
+//     tbsCertificate       TBSCertificate,
+//     signatureAlgorithm   AlgorithmIdentifier,
+//     signatureValue       BIT STRING
+// }
+// TBSCertificate ::= SEQUENCE {
+//     version         [0] EXPLICIT Version DEFAULT v1,
+//     serialNumber        CertificateSerialNumber,
+//     signature           AlgorithmIdentifier,
+//     issuer              Name,
+//     validity            Validity,
+//     subject             Name,
+//     subjectPublicKeyInfo SubjectPublicKeyInfo,
+//     -- issuerUniqueID, subjectUniqueID: ignored (never seen for
+//     -- Ed25519 profile; if present, treated as a parse failure)
+//     extensions      [3] EXPLICIT Extensions OPTIONAL
+// }
+fn x509_parse(cert_buf, cert_len, out_parsed) {
+    if cert_len < 0 { return DER_ERR }
+    if cert_len > len(cert_buf) { return DER_ERR }
+    // Reset the struct so a re-used out_parsed doesn't leak stale
+    // fields on failure.
+    let ri = 0
+    while ri < X509_IDX_STRUCT_SIZE {
+        list_set(out_parsed, ri, 0)
+        ri = ri + 1
+    }
+    // Outer Certificate SEQUENCE.
+    let cert_vo = list_new()
+    push(cert_vo, 0)
+    let cert_ln = list_new()
+    push(cert_ln, 0)
+    let cert_no = list_new()
+    push(cert_no, 0)
+    let ok = der_expect_tag(cert_buf, cert_len, 0, DER_SEQUENCE,
+                            cert_vo, cert_ln, cert_no)
+    if ok == DER_ERR { return DER_ERR }
+    // Reject trailing bytes past the outer Certificate SEQUENCE.
+    if cert_no[0] != cert_len { return DER_ERR }
+    let cert_body_end = cert_vo[0] + cert_ln[0]
+
+    // --- TBSCertificate. We need the byte-exact TBS slice for
+    // signature verification, so we capture (tbs_start, tbs_end)
+    // spanning the OUTER SEQUENCE (tag + length + content).
+    let tbs_start = cert_vo[0]
+    let tbs_vo = list_new()
+    push(tbs_vo, 0)
+    let tbs_ln = list_new()
+    push(tbs_ln, 0)
+    let tbs_no = list_new()
+    push(tbs_no, 0)
+    let ok2 = der_expect_tag(cert_buf, cert_len, tbs_start, DER_SEQUENCE,
+                             tbs_vo, tbs_ln, tbs_no)
+    if ok2 == DER_ERR { return DER_ERR }
+    let tbs_end = tbs_no[0]
+    list_set(out_parsed, X509_IDX_TBS_OFF, tbs_start)
+    list_set(out_parsed, X509_IDX_TBS_LEN, tbs_end - tbs_start)
+
+    // --- version [0] EXPLICIT Version DEFAULT v1. Optional wrapper.
+    let pos = tbs_vo[0]
+    let tbs_body_end = tbs_vo[0] + tbs_ln[0]
+    let ver_peek_tag = list_new()
+    push(ver_peek_tag, 0)
+    let ver_peek_ln  = list_new()
+    push(ver_peek_ln, 0)
+    let ver_peek_vo  = list_new()
+    push(ver_peek_vo, 0)
+    let ver_peek_no  = list_new()
+    push(ver_peek_no, 0)
+    let ok3 = der_read_tlv(cert_buf, cert_len, pos,
+                           ver_peek_tag, ver_peek_ln, ver_peek_vo, ver_peek_no)
+    if ok3 == DER_ERR { return DER_ERR }
+    if ver_peek_tag[0] == DER_CONTEXT_0 {
+        // Version wrapper present: skip past the wrapped INTEGER but
+        // sanity-check that a v3 cert (INTEGER == 2) is present.
+        let vint_vo = list_new()
+        push(vint_vo, 0)
+        let vint_ln = list_new()
+        push(vint_ln, 0)
+        let vint_no = list_new()
+        push(vint_no, 0)
+        let ok4 = der_expect_tag(cert_buf, cert_len, ver_peek_vo[0],
+                                 DER_INTEGER, vint_vo, vint_ln, vint_no)
+        if ok4 == DER_ERR { return DER_ERR }
+        if vint_ln[0] != 1 { return DER_ERR }
+        // Accept v1 (0), v2 (1), v3 (2). No other values.
+        let v = cert_buf[vint_vo[0]]
+        if v > 2 { return DER_ERR }
+        if vint_no[0] != ver_peek_no[0] { return DER_ERR }
+        pos = ver_peek_no[0]
+    }
+    // -- else: version defaults to v1; leave `pos` alone.
+
+    // --- serialNumber (INTEGER). Capture the CONTENT slice (not the
+    // TLV wrapper) so callers can log it.
+    let ser_vo = list_new()
+    push(ser_vo, 0)
+    let ser_ln = list_new()
+    push(ser_ln, 0)
+    let ser_no = list_new()
+    push(ser_no, 0)
+    let ok5 = der_expect_tag(cert_buf, cert_len, pos, DER_INTEGER,
+                             ser_vo, ser_ln, ser_no)
+    if ok5 == DER_ERR { return DER_ERR }
+    list_set(out_parsed, X509_IDX_SERIAL_OFF, ser_vo[0])
+    list_set(out_parsed, X509_IDX_SERIAL_LEN, ser_ln[0])
+    pos = ser_no[0]
+
+    // --- inner signature AlgorithmIdentifier. Must be Ed25519 and
+    // must equal the outer signatureAlgorithm; we verify both are
+    // Ed25519 and rely on RFC 5280 §4.1.2.3 for the equality (we
+    // could byte-equal-check, but two independent parses catching
+    // "is Ed25519?" cover the same threat surface).
+    let sigalg_inner_vo = list_new()
+    push(sigalg_inner_vo, 0)
+    let sigalg_inner_ln = list_new()
+    push(sigalg_inner_ln, 0)
+    let sigalg_inner_no = list_new()
+    push(sigalg_inner_no, 0)
+    let ok6 = der_expect_tag(cert_buf, cert_len, pos, DER_SEQUENCE,
+                             sigalg_inner_vo, sigalg_inner_ln, sigalg_inner_no)
+    if ok6 == DER_ERR { return DER_ERR }
+    let sigalg_inner_end = sigalg_inner_vo[0] + sigalg_inner_ln[0]
+    if _x509_alg_is_ed25519(cert_buf, cert_len,
+                            sigalg_inner_vo[0], sigalg_inner_ln[0]) == 0 {
+        return DER_ERR
+    }
+    pos = sigalg_inner_no[0]
+
+    // --- issuer Name.
+    let iss_vo = list_new()
+    push(iss_vo, 0)
+    let iss_ln = list_new()
+    push(iss_ln, 0)
+    let iss_no = list_new()
+    push(iss_no, 0)
+    let ok7 = der_expect_tag(cert_buf, cert_len, pos, DER_SEQUENCE,
+                             iss_vo, iss_ln, iss_no)
+    if ok7 == DER_ERR { return DER_ERR }
+    list_set(out_parsed, X509_IDX_ISSUER_NAME_OFF, iss_vo[0])
+    list_set(out_parsed, X509_IDX_ISSUER_NAME_LEN, iss_ln[0])
+    let iss_cn_off = list_new()
+    push(iss_cn_off, 0)
+    let iss_cn_len = list_new()
+    push(iss_cn_len, 0)
+    let ok7b = _x509_extract_cn(cert_buf, cert_len, iss_vo[0], iss_ln[0],
+                                iss_cn_off, iss_cn_len)
+    if ok7b == DER_ERR { return DER_ERR }
+    list_set(out_parsed, X509_IDX_ISSUER_CN_OFF, iss_cn_off[0])
+    list_set(out_parsed, X509_IDX_ISSUER_CN_LEN, iss_cn_len[0])
+    pos = iss_no[0]
+
+    // --- validity SEQUENCE { notBefore, notAfter }.
+    let val_vo = list_new()
+    push(val_vo, 0)
+    let val_ln = list_new()
+    push(val_ln, 0)
+    let val_no = list_new()
+    push(val_no, 0)
+    let ok8 = der_expect_tag(cert_buf, cert_len, pos, DER_SEQUENCE,
+                             val_vo, val_ln, val_no)
+    if ok8 == DER_ERR { return DER_ERR }
+    let nb_unix = list_new()
+    push(nb_unix, 0)
+    let na_unix = list_new()
+    push(na_unix, 0)
+    let nb_next = list_new()
+    push(nb_next, 0)
+    let ok9 = _x509_parse_time(cert_buf, cert_len, val_vo[0], nb_unix, nb_next)
+    if ok9 == DER_ERR { return DER_ERR }
+    let na_next = list_new()
+    push(na_next, 0)
+    let ok10 = _x509_parse_time(cert_buf, cert_len, nb_next[0], na_unix, na_next)
+    if ok10 == DER_ERR { return DER_ERR }
+    if na_next[0] != val_no[0] { return DER_ERR }
+    list_set(out_parsed, X509_IDX_NOT_BEFORE, nb_unix[0])
+    list_set(out_parsed, X509_IDX_NOT_AFTER,  na_unix[0])
+    pos = val_no[0]
+
+    // --- subject Name.
+    let sub_vo = list_new()
+    push(sub_vo, 0)
+    let sub_ln = list_new()
+    push(sub_ln, 0)
+    let sub_no = list_new()
+    push(sub_no, 0)
+    let ok11 = der_expect_tag(cert_buf, cert_len, pos, DER_SEQUENCE,
+                              sub_vo, sub_ln, sub_no)
+    if ok11 == DER_ERR { return DER_ERR }
+    list_set(out_parsed, X509_IDX_SUBJECT_NAME_OFF, sub_vo[0])
+    list_set(out_parsed, X509_IDX_SUBJECT_NAME_LEN, sub_ln[0])
+    let sub_cn_off = list_new()
+    push(sub_cn_off, 0)
+    let sub_cn_len = list_new()
+    push(sub_cn_len, 0)
+    let ok11b = _x509_extract_cn(cert_buf, cert_len, sub_vo[0], sub_ln[0],
+                                 sub_cn_off, sub_cn_len)
+    if ok11b == DER_ERR { return DER_ERR }
+    list_set(out_parsed, X509_IDX_SUBJECT_CN_OFF, sub_cn_off[0])
+    list_set(out_parsed, X509_IDX_SUBJECT_CN_LEN, sub_cn_len[0])
+    pos = sub_no[0]
+
+    // --- subjectPublicKeyInfo SEQUENCE { AlgorithmIdentifier, BIT STRING }.
+    let spki_vo = list_new()
+    push(spki_vo, 0)
+    let spki_ln = list_new()
+    push(spki_ln, 0)
+    let spki_no = list_new()
+    push(spki_no, 0)
+    let ok12 = der_expect_tag(cert_buf, cert_len, pos, DER_SEQUENCE,
+                              spki_vo, spki_ln, spki_no)
+    if ok12 == DER_ERR { return DER_ERR }
+    let spki_body_end = spki_vo[0] + spki_ln[0]
+    // SPKI algorithm.
+    let spki_alg_vo = list_new()
+    push(spki_alg_vo, 0)
+    let spki_alg_ln = list_new()
+    push(spki_alg_ln, 0)
+    let spki_alg_no = list_new()
+    push(spki_alg_no, 0)
+    let ok13 = der_expect_tag(cert_buf, cert_len, spki_vo[0], DER_SEQUENCE,
+                              spki_alg_vo, spki_alg_ln, spki_alg_no)
+    if ok13 == DER_ERR { return DER_ERR }
+    let spki_alg_ok = _x509_alg_is_ed25519(cert_buf, cert_len,
+                                           spki_alg_vo[0], spki_alg_ln[0])
+    list_set(out_parsed, X509_IDX_SPKI_ALG_OK, spki_alg_ok)
+    if spki_alg_ok == 0 { return DER_ERR }
+    // SPKI subjectPublicKey BIT STRING -- 32 raw Ed25519 pubkey bytes.
+    let pk_bs_vo = list_new()
+    push(pk_bs_vo, 0)
+    let pk_bs_ln = list_new()
+    push(pk_bs_ln, 0)
+    let pk_bs_no = list_new()
+    push(pk_bs_no, 0)
+    let ok14 = der_expect_tag(cert_buf, cert_len, spki_alg_no[0], DER_BIT_STRING,
+                              pk_bs_vo, pk_bs_ln, pk_bs_no)
+    if ok14 == DER_ERR { return DER_ERR }
+    let pk_off = list_new()
+    push(pk_off, 0)
+    let pk_ln = list_new()
+    push(pk_ln, 0)
+    let ok15 = der_bitstring_content(cert_buf, pk_bs_vo[0], pk_bs_ln[0],
+                                     pk_off, pk_ln)
+    if ok15 == DER_ERR { return DER_ERR }
+    if pk_ln[0] != X509_ED25519_PUBKEY_LEN { return DER_ERR }
+    list_set(out_parsed, X509_IDX_SPKI_PUB_OFF, pk_off[0])
+    if pk_bs_no[0] != spki_body_end { return DER_ERR }
+    pos = spki_no[0]
+
+    // --- optional extensions [3] EXPLICIT Extensions. May consume the
+    // rest of TBS.
+    while pos < tbs_body_end {
+        let ext_wrap_tag = list_new()
+        push(ext_wrap_tag, 0)
+        let ext_wrap_ln = list_new()
+        push(ext_wrap_ln, 0)
+        let ext_wrap_vo = list_new()
+        push(ext_wrap_vo, 0)
+        let ext_wrap_no = list_new()
+        push(ext_wrap_no, 0)
+        let ok16 = der_read_tlv(cert_buf, cert_len, pos,
+                                ext_wrap_tag, ext_wrap_ln, ext_wrap_vo, ext_wrap_no)
+        if ok16 == DER_ERR { return DER_ERR }
+        if ext_wrap_tag[0] == DER_CONTEXT_3 {
+            // Extensions [3] EXPLICIT SEQUENCE OF Extension.
+            let exts_vo = list_new()
+            push(exts_vo, 0)
+            let exts_ln = list_new()
+            push(exts_ln, 0)
+            let exts_no = list_new()
+            push(exts_no, 0)
+            let ok17 = der_expect_tag(cert_buf, cert_len, ext_wrap_vo[0],
+                                      DER_SEQUENCE, exts_vo, exts_ln, exts_no)
+            if ok17 == DER_ERR { return DER_ERR }
+            let ok18 = _x509_walk_extensions(cert_buf, cert_len,
+                                             exts_vo[0], exts_ln[0])
+            if ok18 == DER_ERR { return DER_ERR }
+            if exts_no[0] != ext_wrap_vo[0] + ext_wrap_ln[0] { return DER_ERR }
+        } else {
+            // issuerUniqueID / subjectUniqueID are permitted by RFC 5280
+            // but R92 refuses them defensively (never seen in Ed25519
+            // profile in practice).
+            return DER_ERR
+        }
+        pos = ext_wrap_no[0]
+    }
+    if pos != tbs_body_end { return DER_ERR }
+
+    // --- outer signatureAlgorithm (must be Ed25519 and, defensively,
+    // must byte-equal the inner one -- RFC 5280 §4.1.1.2).
+    let sigalg_outer_vo = list_new()
+    push(sigalg_outer_vo, 0)
+    let sigalg_outer_ln = list_new()
+    push(sigalg_outer_ln, 0)
+    let sigalg_outer_no = list_new()
+    push(sigalg_outer_no, 0)
+    let ok19 = der_expect_tag(cert_buf, cert_len, tbs_end, DER_SEQUENCE,
+                              sigalg_outer_vo, sigalg_outer_ln, sigalg_outer_no)
+    if ok19 == DER_ERR { return DER_ERR }
+    let sig_alg_ok = _x509_alg_is_ed25519(cert_buf, cert_len,
+                                          sigalg_outer_vo[0], sigalg_outer_ln[0])
+    list_set(out_parsed, X509_IDX_SIG_ALG_OK, sig_alg_ok)
+    if sig_alg_ok == 0 { return DER_ERR }
+    // Byte-equal inner and outer alg SEQUENCEs (whole TLV):
+    let inner_full_len = sigalg_inner_no[0] - (pos - 0)  // unused; kept for readability
+    if sigalg_outer_ln[0] != sigalg_inner_ln[0] { return DER_ERR }
+    let bi = 0
+    while bi < sigalg_outer_ln[0] {
+        if cert_buf[sigalg_outer_vo[0] + bi] != cert_buf[sigalg_inner_vo[0] + bi] {
+            return DER_ERR
+        }
+        bi = bi + 1
+    }
+
+    // --- signatureValue BIT STRING -- 64 raw Ed25519 signature bytes.
+    let sig_bs_vo = list_new()
+    push(sig_bs_vo, 0)
+    let sig_bs_ln = list_new()
+    push(sig_bs_ln, 0)
+    let sig_bs_no = list_new()
+    push(sig_bs_no, 0)
+    let ok20 = der_expect_tag(cert_buf, cert_len, sigalg_outer_no[0],
+                              DER_BIT_STRING, sig_bs_vo, sig_bs_ln, sig_bs_no)
+    if ok20 == DER_ERR { return DER_ERR }
+    let sig_off = list_new()
+    push(sig_off, 0)
+    let sig_ln = list_new()
+    push(sig_ln, 0)
+    let ok21 = der_bitstring_content(cert_buf, sig_bs_vo[0], sig_bs_ln[0],
+                                     sig_off, sig_ln)
+    if ok21 == DER_ERR { return DER_ERR }
+    if sig_ln[0] != X509_ED25519_SIGNATURE_LEN { return DER_ERR }
+    list_set(out_parsed, X509_IDX_SIG_OFF, sig_off[0])
+    if sig_bs_no[0] != cert_body_end { return DER_ERR }
+    return DER_OK
+}
+
+// ---- verify primitives ---------------------------------------------------
+
+// Materialize a byte-list slice of `buf[off..off+ln]`. Ed25519_verify
+// takes byte lists; the parser holds offsets into the cert buf, so we
+// need a small copy at verify time. Certificates in TLS 1.3 are on the
+// order of hundreds to low thousands of bytes; the copy is negligible.
+fn _x509_slice(buf, off, ln) {
+    let out = list_new()
+    let i = 0
+    while i < ln {
+        push(out, buf[off + i])
+        i = i + 1
+    }
+    return out
+}
+
+// Verify a self-signed certificate: parsed.sig must be a valid
+// Ed25519 signature over cert_buf[parsed.tbs_off .. tbs_off + tbs_len]
+// under parsed.spki_pubkey (the SPKI Ed25519 pubkey).
+fn x509_verify_self_signed(cert_buf, parsed) {
+    if x509_parsed_spki_alg_ok(parsed) == 0 { return 0 }
+    if x509_parsed_sig_alg_ok(parsed) == 0 { return 0 }
+    let pk = _x509_slice(cert_buf, parsed[X509_IDX_SPKI_PUB_OFF],
+                         X509_ED25519_PUBKEY_LEN)
+    let sig = _x509_slice(cert_buf, parsed[X509_IDX_SIG_OFF],
+                          X509_ED25519_SIGNATURE_LEN)
+    let msg = _x509_slice(cert_buf, parsed[X509_IDX_TBS_OFF],
+                          parsed[X509_IDX_TBS_LEN])
+    return ed25519_verify(msg, sig, pk)
+}
+
+// Verify that child_parsed.sig is a valid Ed25519 signature over
+// child_buf[child.tbs_off .. tbs_end] under the parent's SPKI pubkey.
+// The parent's pubkey is passed as (buf, off) so callers can either
+// hand us a parsed root's SPKI slice or an already-materialized
+// pubkey list (via off=0, buf=the-list).
+fn x509_verify_signed_by(child_buf, child_parsed,
+                         parent_pubkey_buf, parent_pubkey_off) {
+    if x509_parsed_sig_alg_ok(child_parsed) == 0 { return 0 }
+    let pk = _x509_slice(parent_pubkey_buf, parent_pubkey_off,
+                         X509_ED25519_PUBKEY_LEN)
+    let sig = _x509_slice(child_buf, child_parsed[X509_IDX_SIG_OFF],
+                          X509_ED25519_SIGNATURE_LEN)
+    let msg = _x509_slice(child_buf, child_parsed[X509_IDX_TBS_OFF],
+                          child_parsed[X509_IDX_TBS_LEN])
+    return ed25519_verify(msg, sig, pk)
+}
+
+// Validity window check. Returns 1 iff notBefore <= now_unix <= notAfter.
+// Convention: inclusive both ends (matches RFC 5280 §4.1.2.5's
+// "notBefore ... notAfter" interpretation used by mainstream stacks).
+fn x509_check_validity(parsed, now_unix) {
+    if now_unix < parsed[X509_IDX_NOT_BEFORE] { return 0 }
+    if now_unix > parsed[X509_IDX_NOT_AFTER]  { return 0 }
+    return 1
+}
+
+// CN-only issuer check. Returns 1 iff child.issuer_cn is byte-equal
+// to parent.subject_cn AND both are non-empty. Empty CN on either
+// side is treated as a non-match (see _x509_extract_cn: empty CN is
+// the "no CN found" outcome, which must not silently succeed).
+fn x509_check_issuer(child_parsed, parent_parsed,
+                     child_buf, parent_buf) {
+    let cn_len = child_parsed[X509_IDX_ISSUER_CN_LEN]
+    if cn_len == 0 { return 0 }
+    if parent_parsed[X509_IDX_SUBJECT_CN_LEN] == 0 { return 0 }
+    return der_bytes_equal(child_buf,
+                           child_parsed[X509_IDX_ISSUER_CN_OFF],
+                           cn_len,
+                           parent_buf,
+                           parent_parsed[X509_IDX_SUBJECT_CN_OFF],
+                           parent_parsed[X509_IDX_SUBJECT_CN_LEN])
+}
+
+// Chain-verify a leaf + root pair. Steps:
+//   1. Parse leaf + root.
+//   2. Both alg-OK (Ed25519 sig + Ed25519 SPKI).
+//   3. Both inside their validity windows at now_unix.
+//   4. Root self-signature verifies.
+//   5. Leaf's signature verifies under root's SPKI pubkey.
+//   6. Leaf.issuer CN == root.subject CN (byte-equal).
+//   7. Leaf and root are not byte-identical (would be a self-signed
+//      leaf posing as a chain of 2).
+//
+// leaf_out / root_out are caller-supplied parsed structs; on success
+// they hold the parsed leaf / root. On failure their content is
+// undefined (the parse zeroes them, but chain checks after parse may
+// leave partial state).
+fn x509_chain_verify(leaf_buf, leaf_len, root_buf, root_len, now_unix,
+                     leaf_out, root_out) {
+    if leaf_len < 1 { return 0 }
+    if root_len < 1 { return 0 }
+    if leaf_len > len(leaf_buf) { return 0 }
+    if root_len > len(root_buf) { return 0 }
+    // (7) Refuse a chain where leaf and root are byte-identical --
+    // that is a self-signed leaf dressed up as a 2-cert chain.
+    if leaf_len == root_len {
+        let identical = 1
+        let i = 0
+        while i < leaf_len {
+            if leaf_buf[i] != root_buf[i] {
+                identical = 0
+                i = leaf_len   // break
+            }
+            i = i + 1
+        }
+        if identical == 1 { return 0 }
+    }
+    // (1) Parse.
+    if x509_parse(leaf_buf, leaf_len, leaf_out) == 0 { return 0 }
+    if x509_parse(root_buf, root_len, root_out) == 0 { return 0 }
+    // (2) Algorithm rigidity: x509_parse already enforces Ed25519 in
+    // both slots (SPKI + sig), returning 0 on any other alg. Belt +
+    // suspenders re-check here so a future refactor cannot regress
+    // this without also failing an obvious test.
+    if x509_parsed_spki_alg_ok(leaf_out) == 0 { return 0 }
+    if x509_parsed_sig_alg_ok(leaf_out) == 0 { return 0 }
+    if x509_parsed_spki_alg_ok(root_out) == 0 { return 0 }
+    if x509_parsed_sig_alg_ok(root_out) == 0 { return 0 }
+    // (3) Validity windows.
+    if x509_check_validity(leaf_out, now_unix) == 0 { return 0 }
+    if x509_check_validity(root_out, now_unix) == 0 { return 0 }
+    // (4) Root self-signature.
+    if x509_verify_self_signed(root_buf, root_out) == 0 { return 0 }
+    // (5) Leaf signature under root pubkey.
+    if x509_verify_signed_by(leaf_buf, leaf_out,
+                             root_buf, root_out[X509_IDX_SPKI_PUB_OFF]) == 0 {
+        return 0
+    }
+    // (6) leaf.issuer CN == root.subject CN.
+    if x509_check_issuer(leaf_out, root_out, leaf_buf, root_buf) == 0 {
+        return 0
+    }
+    return 1
+}

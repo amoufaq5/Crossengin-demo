@@ -24,11 +24,13 @@ SELFCHECK   := examples/kernel_selfcheck.nova
 SPINE       := examples/companion_spine.nova
 DAEMON      := examples/crossengin_daemon.nova
 CHAT        := examples/crossengin_chat.nova
+RPC_DAEMON  := examples/crossengin_rpc_daemon.nova
 KGSYNC_PUB  := examples/crossengin_kg_publisher.nova
 KGSYNC_SUB  := examples/crossengin_kg_subscriber.nova
 FED_COORD   := examples/crossengin_fed_coordinator.nova
+FED_DAEMON  := examples/crossengin_fed_daemon.nova
 
-.PHONY: all build test benchmark coverage lint-ints install integration clean check-nova help cross-windows smoke-windows-ce
+.PHONY: all build test benchmark bench-nl bench-nl-compare bench-nl-baseline coverage lint-ints install integration clean check-nova help cross-windows smoke-windows-ce
 
 all: build
 
@@ -52,14 +54,17 @@ NOVA_COMPILE = $(NOVA_ROOT)/bin/nova
 #   crossengin_kg_publisher.nova     -> crossengin-kg-publisher.exe
 #   crossengin_kg_subscriber.nova    -> crossengin-kg-subscriber.exe
 #   crossengin_fed_coordinator.nova  -> crossengin-fed-coordinator.exe
+#   crossengin_fed_daemon.nova       -> crossengin-fed-daemon.exe     (Phase M R1 MVP federation daemon)
 CROSS_WIN_PAIRS = \
 	$(SELFCHECK)::crossengin-selfcheck \
 	$(SPINE)::crossengin-spine \
 	$(DAEMON)::crossengin \
 	$(CHAT)::crossengin-chat \
+	$(RPC_DAEMON)::crossengin-rpc-daemon \
 	$(KGSYNC_PUB)::crossengin-kg-publisher \
 	$(KGSYNC_SUB)::crossengin-kg-subscriber \
-	$(FED_COORD)::crossengin-fed-coordinator
+	$(FED_COORD)::crossengin-fed-coordinator \
+	$(FED_DAEMON)::crossengin-fed-daemon
 
 cross-windows: check-nova
 	@mkdir -p $(BIN)
@@ -215,6 +220,25 @@ benchmark: check-nova
 	  "$(NOVA)" run "$$b" 2>&1 | grep -v '^Compiled:'; \
 	done
 
+# R106 / Phase H -- NL-verb latency harness (ADR-0208). Three convenience
+# targets wrap scripts/bench_nl_verbs.sh:
+#   bench-nl           run and print the crossengin-bench-v1 JSON
+#   bench-nl-compare   run and diff against bench/latency_v1/baseline.json
+#                       exit 2 on regression (>50% slower on any phase)
+#   bench-nl-baseline  run and overwrite the baseline JSON
+# On a host with broken nanotime (see docs/NOVA_RUNTIME_GAPS.md R-2)
+# the harness gracefully skips and exits 0 -- these targets never
+# break `make test`.
+bench-nl:
+	@bash scripts/bench_nl_verbs.sh
+
+bench-nl-compare:
+	@bash scripts/bench_nl_verbs.sh --compare bench/latency_v1/baseline.json
+
+bench-nl-baseline:
+	@bash scripts/bench_nl_verbs.sh --json bench/latency_v1/baseline.json
+	@echo "Baseline written to bench/latency_v1/baseline.json"
+
 install: build
 	@mkdir -p $(BIN)
 	@if [ -f "$(SELFCHECK)" ]; then \
@@ -267,10 +291,26 @@ install: build
 	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
 	  fi; \
 	fi
+	@if [ -f "$(RPC_DAEMON)" ]; then \
+	  printf '  build %s ... ' "$(RPC_DAEMON)"; \
+	  if "$(NOVA)" build "$(RPC_DAEMON)" -o "$(BIN)/crossengin-rpc-daemon" >/tmp/ce_install.log 2>&1; then \
+	    echo "OK -> $(BIN)/crossengin-rpc-daemon"; \
+	  else \
+	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
+	  fi; \
+	fi
 	@if [ -f "$(FED_COORD)" ]; then \
 	  printf '  build %s ... ' "$(FED_COORD)"; \
 	  if "$(NOVA)" build "$(FED_COORD)" -o "$(BIN)/crossengin-fed-coordinator" >/tmp/ce_install.log 2>&1; then \
 	    echo "OK -> $(BIN)/crossengin-fed-coordinator"; \
+	  else \
+	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
+	  fi; \
+	fi
+	@if [ -f "$(FED_DAEMON)" ]; then \
+	  printf '  build %s ... ' "$(FED_DAEMON)"; \
+	  if "$(NOVA)" build "$(FED_DAEMON)" -o "$(BIN)/crossengin-fed-daemon" >/tmp/ce_install.log 2>&1; then \
+	    echo "OK -> $(BIN)/crossengin-fed-daemon"; \
 	  else \
 	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
 	  fi; \
@@ -301,9 +341,12 @@ help:
 	@echo "  build       compile every implemented NOVA module under src/"
 	@echo "  test        compile and run every unit test under tests/unit/"
 	@echo "  benchmark   run every benchmark under tests/benchmark/"
+	@echo "  bench-nl    R106/Phase H NL-verb latency harness (ADR-0208)"
+	@echo "  bench-nl-compare   run bench-nl and diff vs bench/latency_v1/baseline.json (exit 2 on regression)"
+	@echo "  bench-nl-baseline  run bench-nl and overwrite bench/latency_v1/baseline.json"
 	@echo "  coverage    report module-level unit-test coverage (static)"
 	@echo "  lint-ints   flag large-literal arithmetic at risk of codegen bug #11"
-	@echo "  install     build the self-check, companion-spine, unified daemon, kg-sync pub/sub, and fed-coordinator into ./bin/"
+	@echo "  install     build the self-check, companion-spine, unified daemon, kg-sync pub/sub, fed-coordinator, and fed-daemon into ./bin/"
 	@echo "  integration run every end-to-end scenario + admin-command script in tests/integration/"
 	@echo "  clean       remove build artifacts"
 	@echo "  check-nova  verify the NOVA toolchain is reachable"

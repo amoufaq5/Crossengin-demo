@@ -1,0 +1,326 @@
+// CrossEngin knowledge: GC observability metrics registry (ADR-0087, Phase L R2).
+//
+// Purpose
+//   The memory-lifecycle GC arc (ADR-0072..0086) reclaims atoms, sweeps
+//   collectables in two phases, protects operator/episodic/alias-referenced
+//   atoms, and (post-ADR-0086) auto-compacts a KG whose freelist has grown
+//   past a threshold. Until this module all of that machinery ran silently:
+//   an operator had no way to see how often anything ran, whether the alias
+//   gate was ever protecting anything, or what the freelist was doing over
+//   time. This module is the observability seam.
+//
+//   The registry is a per-agent side-table: `gc_metrics_new()` returns a fresh
+//   registry object that the counters increment into, and callers pass it as
+//   an OPTIONAL `metrics_reg` argument (0 == "no metrics", the back-compat
+//   default). The autonomous loop (ADR-0057) owns one per agent in its new
+//   `AG_GC_METRICS` slot, and threads it through `adm_sweep_ep`,
+//   `kg_reclaim_atom` and `kg_compact` -- so the `/gc-stats` chat command can
+//   read live counters back out via `gc_metrics_default()`.
+//
+//   Every counter is a parallel list, indexed by the KG's position in the
+//   registry's `GCM_KG_LABELS` list. Adding a new KG appends a fresh 0 to
+//   each counter list, keeping the parallel arrays in lockstep. Lookup is
+//   linear over the label list; the KG registry is small (a handful of KGs
+//   at boot, dozens even with learning) so O(n) label scan is fine.
+//
+// ADRs implemented: ADR-0087 (GC observability, Phase L part 2).
+// NOVA dependencies: builtins (list_new/push/list_set/len, str_eq_bytes).
+// CrossEngin dependencies: src/util/str_safe.nova (str_eq_bytes for the
+//   short-literal-safe KG-label comparison).
+
+import "../util/str_safe.nova"
+
+// ---- registry layout ------------------------------------------------------
+// Fixed-index parallel slots. Index 0 is the tag; every other slot is a list
+// that grows in lockstep with GCM_KG_LABELS when a new KG is seen.
+let GCM_OBJ_TAG                        = 2800
+let GCM_TAG                            = 0
+let GCM_KG_LABELS                      = 1
+let GCM_RECLAIMED_TOTAL                = 2
+let GCM_SWEPT_TOTAL                    = 3
+let GCM_SWEPT_EPISODIC_TOTAL           = 4
+let GCM_PROTECTED_OPERATOR_PREMISE     = 5
+let GCM_PROTECTED_OPERATOR_CONCLUSION  = 6
+let GCM_PROTECTED_EPISODIC_MEMBER      = 7
+let GCM_PROTECTED_ALIAS                = 8
+let GCM_COMPACT_RUNS_TOTAL             = 9
+let GCM_COMPACT_ATOMS_REMOVED_TOTAL    = 10
+let GCM_COMPACT_LAST_TICK              = 11
+let GCM_FREELIST_SIZE_SAMPLED          = 12
+let GCM_FREELIST_RATIO_PERMILLE_SAMPLED = 13
+let GCM_SLOTS                          = 14   // total slot count (for iteration)
+
+// The counter slot range [GCM_RECLAIMED_TOTAL .. GCM_SLOTS-1]; kept as a pair
+// so `_gcm_extend_all_counters` walks the exact parallel slots.
+let _GCM_FIRST_COUNTER = 2
+let _GCM_LAST_COUNTER  = 13
+
+// ---- constructor ----------------------------------------------------------
+// A fresh registry: empty label list; every counter list is empty. Every
+// counter list stays parallel to GCM_KG_LABELS; `gcm_ensure_kg` extends all
+// counters together when a new KG label is seen.
+fn gc_metrics_new() {
+    let r = list_new()
+    push(r, GCM_OBJ_TAG)         // [GCM_TAG]
+    push(r, list_new())          // [GCM_KG_LABELS]
+    push(r, list_new())          // [GCM_RECLAIMED_TOTAL]
+    push(r, list_new())          // [GCM_SWEPT_TOTAL]
+    push(r, list_new())          // [GCM_SWEPT_EPISODIC_TOTAL]
+    push(r, list_new())          // [GCM_PROTECTED_OPERATOR_PREMISE]
+    push(r, list_new())          // [GCM_PROTECTED_OPERATOR_CONCLUSION]
+    push(r, list_new())          // [GCM_PROTECTED_EPISODIC_MEMBER]
+    push(r, list_new())          // [GCM_PROTECTED_ALIAS]
+    push(r, list_new())          // [GCM_COMPACT_RUNS_TOTAL]
+    push(r, list_new())          // [GCM_COMPACT_ATOMS_REMOVED_TOTAL]
+    push(r, list_new())          // [GCM_COMPACT_LAST_TICK]
+    push(r, list_new())          // [GCM_FREELIST_SIZE_SAMPLED]
+    push(r, list_new())          // [GCM_FREELIST_RATIO_PERMILLE_SAMPLED]
+    return r
+}
+
+// ---- module-level "default" registry --------------------------------------
+// The chat REPL's `/gc-stats` handler has no `agent` in scope (the REPL runs
+// without the autonomous loop). Instead the autonomous loop's `agent_new`
+// installs its per-agent registry as the module-level default via
+// `gc_metrics_set_default(mreg)`; the REPL reads it back through
+// `gc_metrics_default()`. When no agent has installed one (a bare chat run
+// with no daemon) the accessor lazily mints an empty registry so the chat
+// handler still has a defined shape to iterate -- and prints "no GC activity
+// yet" because no counter has ever been incremented.
+let _gcm_default = 0
+
+fn gc_metrics_default() {
+    if _gcm_default == 0 { _gcm_default = gc_metrics_new() }
+    return _gcm_default
+}
+
+fn gc_metrics_set_default(reg) {
+    _gcm_default = reg
+    return 1
+}
+
+// Test-only: reset the module-level default so a fresh test starts with a
+// known-empty registry. The persistence across test functions in one process
+// (the module-level singleton) would otherwise leak state.
+fn gc_metrics_reset_default() {
+    _gcm_default = 0
+    return 1
+}
+
+// ---- kg-label lookup / auto-add -------------------------------------------
+// Find the position of `kg_label` in GCM_KG_LABELS, or -1 if unseen. Linear
+// scan (registry is small; dozens of KGs at most).
+fn _gcm_find_kg(reg, kg_label) {
+    if reg == 0 { return 0 - 1 }
+    let labels = reg[GCM_KG_LABELS]
+    let i = 0
+    while i < len(labels) {
+        if str_eq_bytes(labels[i], kg_label) == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Extend every counter list with a fresh 0, so the parallel-array invariant
+// (all counter lists have the same length as GCM_KG_LABELS) is preserved.
+// Called from `gcm_ensure_kg` immediately after appending the new label.
+fn _gcm_extend_all_counters(reg) {
+    let slot = _GCM_FIRST_COUNTER
+    while slot <= _GCM_LAST_COUNTER {
+        push(reg[slot], 0)
+        slot = slot + 1
+    }
+    return 1
+}
+
+// Get (or lazily add) the index of `kg_label` in the registry. Returns the
+// 0-based position. Second call with the same label is idempotent (returns
+// the same index). Callers pass this index to the per-slot increment helpers.
+fn gcm_ensure_kg(reg, kg_label) {
+    if reg == 0 { return 0 - 1 }
+    let idx = _gcm_find_kg(reg, kg_label)
+    if idx >= 0 { return idx }
+    push(reg[GCM_KG_LABELS], kg_label)
+    _gcm_extend_all_counters(reg)
+    return len(reg[GCM_KG_LABELS]) - 1
+}
+
+// ---- generic increment / set helpers (internal) ---------------------------
+// A no-op-on-0-registry pattern: every public counter accepts a `reg == 0`
+// (the "no metrics" back-compat sentinel) and returns 0 without touching
+// anything. This is what lets the wire-up remain additive: an old caller
+// that passes 0 gets today's behavior unchanged.
+fn _gcm_inc_slot(reg, kg_label, slot, delta) {
+    if reg == 0 { return 0 }
+    let idx = gcm_ensure_kg(reg, kg_label)
+    if idx < 0 { return 0 }
+    let cur = reg[slot][idx]
+    list_set(reg[slot], idx, cur + delta)
+    return cur + delta
+}
+
+fn _gcm_set_slot(reg, kg_label, slot, value) {
+    if reg == 0 { return 0 }
+    let idx = gcm_ensure_kg(reg, kg_label)
+    if idx < 0 { return 0 }
+    list_set(reg[slot], idx, value)
+    return value
+}
+
+// ---- public increment API -------------------------------------------------
+// One entry per counter. Each is a thin wrapper over _gcm_inc_slot so the
+// call sites read as the ADR's vocabulary rather than a slot-index poke.
+
+fn gcm_inc_reclaimed(reg, kg_label) {
+    return _gcm_inc_slot(reg, kg_label, GCM_RECLAIMED_TOTAL, 1)
+}
+
+fn gcm_inc_swept(reg, kg_label, n) {
+    if n <= 0 { return 0 }
+    return _gcm_inc_slot(reg, kg_label, GCM_SWEPT_TOTAL, n)
+}
+
+fn gcm_inc_swept_episodic(reg, kg_label, n) {
+    if n <= 0 { return 0 }
+    return _gcm_inc_slot(reg, kg_label, GCM_SWEPT_EPISODIC_TOTAL, n)
+}
+
+fn gcm_inc_protected_operator_premise(reg, kg_label) {
+    return _gcm_inc_slot(reg, kg_label, GCM_PROTECTED_OPERATOR_PREMISE, 1)
+}
+
+fn gcm_inc_protected_operator_conclusion(reg, kg_label) {
+    return _gcm_inc_slot(reg, kg_label, GCM_PROTECTED_OPERATOR_CONCLUSION, 1)
+}
+
+fn gcm_inc_protected_episodic_member(reg, kg_label) {
+    return _gcm_inc_slot(reg, kg_label, GCM_PROTECTED_EPISODIC_MEMBER, 1)
+}
+
+fn gcm_inc_protected_alias(reg, kg_label) {
+    return _gcm_inc_slot(reg, kg_label, GCM_PROTECTED_ALIAS, 1)
+}
+
+// Record a compact run: bumps compact_runs_total, adds atoms_removed to the
+// running compact_atoms_removed_total, and sets compact_last_tick (overwrite,
+// not accumulate) so it always reads the most recent compaction's tick.
+fn gcm_record_compact(reg, kg_label, atoms_removed, at_tick) {
+    if reg == 0 { return 0 }
+    _gcm_inc_slot(reg, kg_label, GCM_COMPACT_RUNS_TOTAL, 1)
+    if atoms_removed > 0 {
+        _gcm_inc_slot(reg, kg_label, GCM_COMPACT_ATOMS_REMOVED_TOTAL, atoms_removed)
+    }
+    _gcm_set_slot(reg, kg_label, GCM_COMPACT_LAST_TICK, at_tick)
+    return 1
+}
+
+// Sample the current freelist size + ratio. Overwrite (not accumulate) --
+// these are point-in-time snapshots, not counters, so /gc-stats reports the
+// most-recent sampled value.
+fn gcm_sample_freelist(reg, kg_label, size, ratio_permille) {
+    if reg == 0 { return 0 }
+    _gcm_set_slot(reg, kg_label, GCM_FREELIST_SIZE_SAMPLED, size)
+    _gcm_set_slot(reg, kg_label, GCM_FREELIST_RATIO_PERMILLE_SAMPLED, ratio_permille)
+    return 1
+}
+
+// ---- read-side API --------------------------------------------------------
+// The list of KG labels the registry currently knows about, in insertion
+// order (fresh list; callers may mutate their copy freely). Empty on a
+// fresh-minted registry that has seen no counter or ensure call.
+fn gcm_kg_names(reg) {
+    let out = list_new()
+    if reg == 0 { return out }
+    let labels = reg[GCM_KG_LABELS]
+    let i = 0
+    while i < len(labels) {
+        push(out, labels[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Read one counter slot for a KG. Returns 0 if the KG has never been seen,
+// which matches the "no activity yet" semantic (the slot literally does not
+// exist in the parallel array until `gcm_ensure_kg` extends it). Callers
+// that need to distinguish "not seen" from "seen with count 0" can check
+// `_gcm_find_kg(reg, label) >= 0` first.
+fn gcm_read_slot(reg, kg_label, slot) {
+    if reg == 0 { return 0 }
+    let idx = _gcm_find_kg(reg, kg_label)
+    if idx < 0 { return 0 }
+    return reg[slot][idx]
+}
+
+// Convenience one-liners over gcm_read_slot -- the /gc-stats renderer uses
+// these so the call sites read as the metric's name.
+fn gcm_reclaimed_total(reg, kg_label)               { return gcm_read_slot(reg, kg_label, GCM_RECLAIMED_TOTAL) }
+fn gcm_swept_total(reg, kg_label)                   { return gcm_read_slot(reg, kg_label, GCM_SWEPT_TOTAL) }
+fn gcm_swept_episodic_total(reg, kg_label)          { return gcm_read_slot(reg, kg_label, GCM_SWEPT_EPISODIC_TOTAL) }
+fn gcm_protected_operator_premise(reg, kg_label)    { return gcm_read_slot(reg, kg_label, GCM_PROTECTED_OPERATOR_PREMISE) }
+fn gcm_protected_operator_conclusion(reg, kg_label) { return gcm_read_slot(reg, kg_label, GCM_PROTECTED_OPERATOR_CONCLUSION) }
+fn gcm_protected_episodic_member(reg, kg_label)     { return gcm_read_slot(reg, kg_label, GCM_PROTECTED_EPISODIC_MEMBER) }
+fn gcm_protected_alias(reg, kg_label)               { return gcm_read_slot(reg, kg_label, GCM_PROTECTED_ALIAS) }
+fn gcm_compact_runs_total(reg, kg_label)            { return gcm_read_slot(reg, kg_label, GCM_COMPACT_RUNS_TOTAL) }
+fn gcm_compact_atoms_removed_total(reg, kg_label)   { return gcm_read_slot(reg, kg_label, GCM_COMPACT_ATOMS_REMOVED_TOTAL) }
+fn gcm_compact_last_tick(reg, kg_label)             { return gcm_read_slot(reg, kg_label, GCM_COMPACT_LAST_TICK) }
+fn gcm_freelist_size_sampled(reg, kg_label)         { return gcm_read_slot(reg, kg_label, GCM_FREELIST_SIZE_SAMPLED) }
+fn gcm_freelist_ratio_permille_sampled(reg, kg_label) { return gcm_read_slot(reg, kg_label, GCM_FREELIST_RATIO_PERMILLE_SAMPLED) }
+
+// Build a snapshot: a list of per-KG records, one entry per label the
+// registry has seen. Each record is a small list with a stable schema:
+//   [kg_label, reclaimed, swept, swept_episodic,
+//    prot_op_premise, prot_op_conclusion, prot_ep_member, prot_alias,
+//    compact_runs, compact_atoms_removed, compact_last_tick,
+//    freelist_size, freelist_ratio_permille]
+// The snapshot is a FRESH data structure, disconnected from the registry --
+// callers (renderer, tests) may hold it across further increments. This is
+// how the /gc-stats renderer reads: it snapshots once, then formats each
+// row, so a concurrent update by the autonomous loop cannot race the print.
+let GCM_SNAP_KG                        = 0
+let GCM_SNAP_RECLAIMED                 = 1
+let GCM_SNAP_SWEPT                     = 2
+let GCM_SNAP_SWEPT_EPISODIC            = 3
+let GCM_SNAP_PROT_OP_PREMISE           = 4
+let GCM_SNAP_PROT_OP_CONCLUSION        = 5
+let GCM_SNAP_PROT_EP_MEMBER            = 6
+let GCM_SNAP_PROT_ALIAS                = 7
+let GCM_SNAP_COMPACT_RUNS              = 8
+let GCM_SNAP_COMPACT_ATOMS_REMOVED     = 9
+let GCM_SNAP_COMPACT_LAST_TICK         = 10
+let GCM_SNAP_FREELIST_SIZE             = 11
+let GCM_SNAP_FREELIST_RATIO_PERMILLE   = 12
+let GCM_SNAP_FIELDS                    = 13
+
+fn gcm_snapshot(reg) {
+    let out = list_new()
+    if reg == 0 { return out }
+    let labels = reg[GCM_KG_LABELS]
+    let i = 0
+    while i < len(labels) {
+        let row = list_new()
+        push(row, labels[i])                                             // [GCM_SNAP_KG]
+        push(row, reg[GCM_RECLAIMED_TOTAL][i])                           // reclaimed
+        push(row, reg[GCM_SWEPT_TOTAL][i])                               // swept
+        push(row, reg[GCM_SWEPT_EPISODIC_TOTAL][i])                      // swept_episodic
+        push(row, reg[GCM_PROTECTED_OPERATOR_PREMISE][i])                // prot_op_premise
+        push(row, reg[GCM_PROTECTED_OPERATOR_CONCLUSION][i])             // prot_op_conclusion
+        push(row, reg[GCM_PROTECTED_EPISODIC_MEMBER][i])                 // prot_ep_member
+        push(row, reg[GCM_PROTECTED_ALIAS][i])                           // prot_alias
+        push(row, reg[GCM_COMPACT_RUNS_TOTAL][i])                        // compact_runs
+        push(row, reg[GCM_COMPACT_ATOMS_REMOVED_TOTAL][i])               // compact_atoms_removed
+        push(row, reg[GCM_COMPACT_LAST_TICK][i])                         // compact_last_tick
+        push(row, reg[GCM_FREELIST_SIZE_SAMPLED][i])                     // freelist_size
+        push(row, reg[GCM_FREELIST_RATIO_PERMILLE_SAMPLED][i])           // freelist_ratio_permille
+        push(out, row)
+        i = i + 1
+    }
+    return out
+}
+
+// Number of KGs the registry has metrics rows for. `gcm_snapshot` produces a
+// list of this length; a fresh registry returns 0. Test convenience.
+fn gcm_kg_count(reg) {
+    if reg == 0 { return 0 }
+    return len(reg[GCM_KG_LABELS])
+}

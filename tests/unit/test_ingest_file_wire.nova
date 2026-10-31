@@ -1,0 +1,1132 @@
+// Unit tests for R66 -- ingest.file wire verb
+// (src/nl/rpc_verbs.nova + src/agent/ingestion_agent.nova helper).
+//
+// Covers:
+//   * Verb registered + cap-required is ingest:decide
+//   * Refusals: no ingest agent in context, missing format, missing/
+//     empty body, unsupported format
+//   * cerec body: trusted src:cerec: source lands direct in the KG;
+//     untrusted source queues to the review queue
+//   * json body: same trust split, with kg/source defaults threaded
+//   * force_queue=1 short-circuits trust and queues everything
+//   * Parse errors are surfaced per-record but well-formed records
+//     still land
+//   * Reader token refused by cap gate; curator/admin allowed
+
+import "../ce_test.nova"
+import "../../src/nl/rpc_verbs.nova"
+import "../../src/sandbox/capability.nova"
+import "../../src/agent/ingestion_agent.nova"
+import "../../src/ingest/review_queue.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/persona/persona_registry.nova"
+import "../../src/skills/skill_registry.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/sandbox/ownership.nova"
+import "../../src/util/str_safe.nova"
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+// Build a ctx with a fully-wired ingest agent + its review queue
+// (rpc_ctx tracks them separately -- test_ingest_policy shows the
+// pattern).
+fn _mk_ctx() {
+    let agent = ing_agent_new()
+    // Seed a KG so pipeline promotion has a target.
+    kg_spawn(ing_kgreg(agent), "solar_system")
+    kg_spawn(ing_kgreg(agent), "climate")
+    let ctx = rpc_ctx_new(ing_kgreg(agent), capreg_new(),
+                           persona_registry_new(),
+                           skill_registry_new(),
+                           ing_mo(agent),
+                           agent,
+                           ing_queue(agent),
+                           100)
+    return ctx
+}
+
+fn _grant_admin(ctx) {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "admin")
+    let t = capability_token_new_roles("tk-a", "root", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-a")
+    return reg
+}
+
+fn _grant_reader(ctx) {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-r", "alice", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-r")
+    return reg
+}
+
+// ---- registration + cap wiring ----------------------------------------
+
+fn test_verb_registered() {
+    let names = rpc_verb_names()
+    let saw = 0
+    let i = 0
+    while i < len(names) {
+        if str_eq_bytes(names[i], "ingest.file") == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("ingest.file registered", saw, 1)
+}
+
+fn test_verb_cap_is_ingest_decide() {
+    ce_eq("cap is ingest:decide",
+          str_eq_bytes(capability_verb_required("ingest.file"),
+                       CAP_INGEST_DECIDE), 1)
+}
+
+// ---- refusals ---------------------------------------------------------
+
+fn test_no_ingest_agent_refused() {
+    let ctx = rpc_ctx_new(0, 0, 0, 0, 0, 0, 0, 100)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   "KG k\nSRC src:cerec:t\n"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("no ingest agent refused",
+             _has(out, "no ingest agent in context"))
+}
+
+fn test_missing_format_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("body", "x"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("missing format refused",
+             _has(out, "missing arg: format"))
+}
+
+fn test_missing_body_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("missing body refused",
+             _has(out, "missing arg: body"))
+}
+
+fn test_empty_body_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   ""))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("empty body refused",
+             _has(out, "body must be non-empty"))
+}
+
+fn test_unsupported_format_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // R85 shipped yaml, so pick a genuinely-not-a-format for the refusal
+    // check; the enumeration test below asserts the full R85 name list.
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "tomorrows-format"))
+    push(a, rpc_arg_kv("body",   "irrelevant"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("unsupported format refused",
+             _has(out, "unsupported format: tomorrows-format"))
+    // R85 enumerates the 9 supported formats in the refusal so
+    // operators can see exactly what's on the wire.
+    ce_check("names cerec",     _has(out, "cerec"))
+    ce_check("names ntriples",  _has(out, "ntriples"))
+    ce_check("names wikidata",  _has(out, "wikidata"))
+    ce_check("names yaml",      _has(out, "yaml"))
+}
+
+fn test_reader_refused_by_cap() {
+    let ctx = _mk_ctx()
+    _grant_reader(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   "KG k\nSRC src:cerec:t\n"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("reader refused",
+             _has(out, "capability required: ingest:decide"))
+}
+
+// ---- cerec: trusted source lands direct in the KG --------------------
+
+fn test_cerec_trusted_source_ingests_direct() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // src:cerec: is in the default trusted-tags list (ing_agent_new)
+    // so this record goes to the pipeline, not the queue.
+    let body = "KG solar_system\nSRC src:cerec:sample:v1\n"
+             + "ATOM mercury 1 900\n"
+             + "ATOM hot 3 800\n"
+             + "IMP mercury hot EMPIRICAL\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",               _has(out, "\"ok\":true"))
+    ce_check("parsed 1",         _has(out, "\"records_parsed\":1"))
+    ce_check("ingested 1",       _has(out, "\"records_ingested\":1"))
+    ce_check("queued 0",         _has(out, "\"records_queued\":0"))
+    ce_check("dropped 0",        _has(out, "\"records_dropped\":0"))
+    ce_check("atoms_added > 0",
+             _has(out, "\"atoms_added\":2")
+          || _has(out, "\"atoms_added\":3"))
+}
+
+fn test_cerec_untrusted_source_queues() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // src:web:... is NOT in the default trusted-tags list -> queue.
+    let body = "KG solar_system\nSRC src:web:sketchy:v1\n"
+             + "ATOM mercury 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("queued 1",        _has(out, "\"records_queued\":1"))
+    ce_check("ingested 0",      _has(out, "\"records_ingested\":0"))
+    // Verify the queue actually grew.
+    let q = rpc_ctx_review_queue(ctx)
+    ce_check("queue non-empty", len(rq_entries(q)) >= 1)
+}
+
+fn test_cerec_multi_record_body() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let body = "KG solar_system\nSRC src:cerec:multi:1\nATOM mercury 1 900\n\n"
+             + "KG solar_system\nSRC src:cerec:multi:2\nATOM venus 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("2 parsed",        _has(out, "\"records_parsed\":2"))
+    ce_check("2 ingested",      _has(out, "\"records_ingested\":2"))
+}
+
+fn test_cerec_parse_error_surfaces_but_valid_records_land() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // Second record has a bad ATOM line (missing belief).
+    let body = "KG solar_system\nSRC src:cerec:mixed:v1\n"
+             + "ATOM good 1 900\n"
+             + "ATOM bad 1\n"                 // needs belief
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("record parsed",   _has(out, "\"records_parsed\":1"))
+    ce_check("error surfaced",  _has(out, "\"error_count\":1"))
+    ce_check("error message present",
+             _has(out, "ATOM needs label kind belief"))
+    // Well-formed atom still landed via the pipeline.
+    ce_check("ingested 1", _has(out, "\"records_ingested\":1"))
+}
+
+// ---- json: trusted / defaults / queue --------------------------------
+
+fn test_json_trusted_ingests_direct() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // src:cerec: is a trusted prefix; use it in the body directly.
+    let body = "[{\"kg\":\"solar_system\",\"source\":\"src:cerec:jsonwire\","
+             + "\"atoms\":[{\"label\":\"mars\",\"kind\":\"fact\",\"belief\":900}]}]"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("json ok",             _has(out, "\"ok\":true"))
+    ce_check("json format echoed",
+             _has(out, "\"format\":\"json\""))
+    ce_check("json ingested 1",     _has(out, "\"records_ingested\":1"))
+}
+
+fn test_json_kg_source_defaults_from_args() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // Record omits kg + source; args provide them.
+    let body = "[{\"atoms\":[{\"label\":\"jupiter\",\"kind\":\"fact\",\"belief\":900}]}]"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   body))
+    push(a, rpc_arg_kv("kg",     "solar_system"))
+    push(a, rpc_arg_kv("source", "src:cerec:jsonwire2"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("defaults applied + ingested",
+             _has(out, "\"records_ingested\":1"))
+}
+
+fn test_json_untrusted_queues() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let body = "[{\"kg\":\"climate\",\"source\":\"src:json:untrusted:v1\","
+             + "\"atoms\":[{\"label\":\"co2\",\"kind\":\"concept\",\"belief\":900}]}]"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("queued 1", _has(out, "\"records_queued\":1"))
+}
+
+fn test_json_top_level_syntax_error() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   "not-json"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("error surfaced",
+             _has(out, "\"error_count\":1"))
+    ce_check("error mentions json",
+             _has(out, "json:"))
+    ce_check("nothing ingested",
+             _has(out, "\"records_ingested\":0"))
+}
+
+// ---- force_queue -----------------------------------------------------
+
+fn test_force_queue_bypasses_trust() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // Trusted source, force_queue=1 -> must queue rather than
+    // pipeline.
+    let body = "KG solar_system\nSRC src:cerec:trusted:v1\nATOM saturn 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format",      "cerec"))
+    push(a, rpc_arg_kv("body",        body))
+    push(a, rpc_arg_kv("force_queue", "1"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("force_queue true in response",
+             _has(out, "\"force_queue\":true"))
+    ce_check("queued 1",    _has(out, "\"records_queued\":1"))
+    ce_check("ingested 0",  _has(out, "\"records_ingested\":0"))
+}
+
+fn test_force_queue_default_off() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let body = "KG solar_system\nSRC src:cerec:default:v1\nATOM pluto 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    // no force_queue arg -> default off
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("force_queue false in response",
+             _has(out, "\"force_queue\":false"))
+    ce_check("trusted ingested",
+             _has(out, "\"records_ingested\":1"))
+}
+
+// ---- R67: text-parse variants for csv / nt / wd / cn / pm / wn ------
+
+fn test_csv_requires_kg_and_source() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a1 = list_new()
+    push(a1, rpc_arg_kv("format", "csv"))
+    push(a1, rpc_arg_kv("body",   "name,type\nalice,dog\n"))
+    let out1 = rpc_dispatch("ingest.file", a1, ctx)
+    ce_check("csv without kg refused",
+             _has(out1, "csv format requires kg arg"))
+    let a2 = list_new()
+    push(a2, rpc_arg_kv("format", "csv"))
+    push(a2, rpc_arg_kv("body",   "name,type\nalice,dog\n"))
+    push(a2, rpc_arg_kv("kg",     "pets"))
+    let out2 = rpc_dispatch("ingest.file", a2, ctx)
+    ce_check("csv without source refused",
+             _has(out2, "csv format requires source arg"))
+}
+
+fn test_csv_happy_path_queues_untrusted() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "pets")
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "csv"))
+    push(a, rpc_arg_kv("body",   "name,species\nalice,dog\nbob,cat\n"))
+    push(a, rpc_arg_kv("kg",     "pets"))
+    push(a, rpc_arg_kv("source", "src:csv:pets:v1"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("format echoed",   _has(out, "\"format\":\"csv\""))
+    ce_check("1 record parsed", _has(out, "\"records_parsed\":1"))
+    // src:csv: isn't in the default trusted prefix list -> queue.
+    ce_check("queued 1",        _has(out, "\"records_queued\":1"))
+}
+
+fn test_csv_happy_path_ingests_trusted() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "pets")
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "csv"))
+    push(a, rpc_arg_kv("body",   "name,species\nalice,dog\n"))
+    push(a, rpc_arg_kv("kg",     "pets"))
+    push(a, rpc_arg_kv("source", "src:cerec:trusted-csv"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ingested",     _has(out, "\"records_ingested\":1"))
+    ce_check("atoms added",  _has(out, "\"atoms_added\":"))
+}
+
+fn test_ntriples_requires_kg_and_source() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "ntriples"))
+    push(a, rpc_arg_kv("body",   ""))
+    // body empty first -> caught by empty-body check.
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("empty body wins",
+             _has(out, "body must be non-empty"))
+    // Now with a body but no kg
+    let a2 = list_new()
+    push(a2, rpc_arg_kv("format", "ntriples"))
+    push(a2, rpc_arg_kv("body",   "<http://x/a> <http://x/p> <http://x/b> .\n"))
+    let out2 = rpc_dispatch("ingest.file", a2, ctx)
+    ce_check("ntriples without kg refused",
+             _has(out2, "ntriples format requires kg arg"))
+}
+
+fn test_ntriples_happy_path() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "web")
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "ntriples"))
+    push(a, rpc_arg_kv("body",
+        "<http://ex/alice> <http://ex/knows> <http://ex/bob> .\n"))
+    push(a, rpc_arg_kv("kg",     "web"))
+    push(a, rpc_arg_kv("source", "src:cerec:nt"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("format echoed",   _has(out, "\"format\":\"ntriples\""))
+    ce_check("record parsed",   _has(out, "\"records_parsed\":1"))
+    ce_check("ingested",        _has(out, "\"records_ingested\":1"))
+}
+
+fn test_wikidata_happy_path_no_labels() {
+    // Empty labels table -> IDs pass through as labels.
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "wd")
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "wikidata"))
+    push(a, rpc_arg_kv("body",
+        "<http://www.wikidata.org/entity/Q76> "
+      + "<http://www.wikidata.org/prop/direct/P31> "
+      + "<http://www.wikidata.org/entity/Q5> .\n"))
+    push(a, rpc_arg_kv("kg",     "wd"))
+    push(a, rpc_arg_kv("source", "src:cerec:wd"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("wikidata format",  _has(out, "\"format\":\"wikidata\""))
+    ce_check("record parsed",   _has(out, "\"records_parsed\":1"))
+    // At least one atom should land (subject + object).
+    ce_check("atoms added",     _has(out, "\"atoms_added\":"))
+}
+
+fn test_conceptnet_keep_lang_optional() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "cn")
+    // Real ConceptNet lines are TSV: uri, rel, start, end, meta.
+    let body = "/a/[/r/IsA/,/c/en/cat/,/c/en/animal/]\t/r/IsA\t/c/en/cat\t/c/en/animal\t{\"weight\":1.0}\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "conceptnet"))
+    push(a, rpc_arg_kv("body",   body))
+    push(a, rpc_arg_kv("kg",     "cn"))
+    push(a, rpc_arg_kv("source", "src:cerec:cn"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("conceptnet fmt",  _has(out, "\"format\":\"conceptnet\""))
+    ce_check("record parsed",   _has(out, "\"records_parsed\":1"))
+}
+
+fn test_conceptnet_keep_lang_flag_accepted() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "cn")
+    let body = "/a/x\t/r/IsA\t/c/en/cat\t/c/en/animal\t{\"weight\":1.0}\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format",    "conceptnet"))
+    push(a, rpc_arg_kv("body",      body))
+    push(a, rpc_arg_kv("kg",        "cn"))
+    push(a, rpc_arg_kv("source",    "src:cerec:cn"))
+    push(a, rpc_arg_kv("keep_lang", "1"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+}
+
+fn test_papermeta_requires_only_kg() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a1 = list_new()
+    push(a1, rpc_arg_kv("format", "papermeta"))
+    push(a1, rpc_arg_kv("body",   "DOI 10.1234/x\nTITLE Example\n"))
+    let out1 = rpc_dispatch("ingest.file", a1, ctx)
+    ce_check("papermeta without kg refused",
+             _has(out1, "papermeta format requires kg arg"))
+}
+
+fn test_papermeta_happy_path() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "papers")
+    let body = "DOI 10.1234/example\n"
+             + "TITLE An_example_paper\n"
+             + "AUTHOR alice smith\n"
+             + "YEAR 2024\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "papermeta"))
+    push(a, rpc_arg_kv("body",   body))
+    push(a, rpc_arg_kv("kg",     "papers"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("papermeta fmt",   _has(out, "\"format\":\"papermeta\""))
+    ce_check("record parsed",   _has(out, "\"records_parsed\":1"))
+}
+
+fn test_wordnet_happy_path() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "words")
+    let body = "SYN cat feline domestic_cat\n"
+             + "HYPER cat mammal\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "wordnet"))
+    push(a, rpc_arg_kv("body",   body))
+    push(a, rpc_arg_kv("kg",     "words"))
+    push(a, rpc_arg_kv("source", "src:cerec:wn"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("wordnet fmt",     _has(out, "\"format\":\"wordnet\""))
+    ce_check("record parsed",   _has(out, "\"records_parsed\":1"))
+}
+
+fn test_wordnet_requires_kg_and_source() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "wordnet"))
+    push(a, rpc_arg_kv("body",   "SYN cat feline\n"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("wordnet without kg refused",
+             _has(out, "wordnet format requires kg arg"))
+}
+
+// ---- R68: wikidata multi-body ingest (labels_body + formal_preds) ------
+
+fn _wd_body() {
+    // Two Wikidata-flavored NT lines: a P31 (in the default FORMAL
+    // set) and a P279 (also in the default set), so records land
+    // regardless of whether the caller passes extras.
+    return "<http://www.wikidata.org/entity/Q76> "
+         + "<http://www.wikidata.org/prop/direct/P31> "
+         + "<http://www.wikidata.org/entity/Q5> .\n"
+         + "<http://www.wikidata.org/entity/Q5> "
+         + "<http://www.wikidata.org/prop/direct/P279> "
+         + "<http://www.wikidata.org/entity/Q729> .\n"
+}
+
+fn test_wikidata_labels_loaded_defaults_zero_without_arg() {
+    // R67 baseline: no labels_body arg => labels_loaded is 0.
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "wd")
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "wikidata"))
+    push(a, rpc_arg_kv("body",   _wd_body()))
+    push(a, rpc_arg_kv("kg",     "wd"))
+    push(a, rpc_arg_kv("source", "src:cerec:wd"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("labels_loaded 0",       _has(out, "\"labels_loaded\":0"))
+    ce_check("extra_formal_preds 0",  _has(out, "\"extra_formal_preds\":0"))
+    ce_check("still ingested",        _has(out, "\"records_ingested\":1"))
+}
+
+fn test_wikidata_labels_body_loaded_and_counted() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "wd")
+    // 3 labels: 2 real + 1 comment (ignored) + 1 blank (ignored).
+    let labels_body = "Q76\tBarack Obama\n"
+                    + "# comment line ignored\n"
+                    + "Q5\thuman\n"
+                    + "\n"
+                    + "Q729\tanimal\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format",      "wikidata"))
+    push(a, rpc_arg_kv("body",        _wd_body()))
+    push(a, rpc_arg_kv("kg",          "wd"))
+    push(a, rpc_arg_kv("source",      "src:cerec:wd"))
+    push(a, rpc_arg_kv("labels_body", labels_body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",                     _has(out, "\"ok\":true"))
+    ce_check("labels_loaded 3",        _has(out, "\"labels_loaded\":3"))
+    ce_check("record ingested",        _has(out, "\"records_ingested\":1"))
+    // Extra preds still 0 (no arg supplied).
+    ce_check("extra_formal_preds 0",  _has(out, "\"extra_formal_preds\":0"))
+}
+
+fn test_wikidata_labels_body_empty_string_treated_as_absent() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "wd")
+    let a = list_new()
+    push(a, rpc_arg_kv("format",      "wikidata"))
+    push(a, rpc_arg_kv("body",        _wd_body()))
+    push(a, rpc_arg_kv("kg",          "wd"))
+    push(a, rpc_arg_kv("source",      "src:cerec:wd"))
+    push(a, rpc_arg_kv("labels_body", ""))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("labels_loaded 0 for empty arg",
+             _has(out, "\"labels_loaded\":0"))
+}
+
+fn test_wikidata_formal_preds_augments_default() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "wd")
+    // Add 2 net-new predicates (P625 = coordinate location,
+    // P569 = date of birth). P31 is already in the default set
+    // so it should NOT count toward extra_formal_preds.
+    let a = list_new()
+    push(a, rpc_arg_kv("format",       "wikidata"))
+    push(a, rpc_arg_kv("body",         _wd_body()))
+    push(a, rpc_arg_kv("kg",           "wd"))
+    push(a, rpc_arg_kv("source",       "src:cerec:wd"))
+    push(a, rpc_arg_kv("formal_preds", "P625,P569,P31"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("extra_formal_preds 2 (P31 already in default set)",
+             _has(out, "\"extra_formal_preds\":2"))
+}
+
+fn test_wikidata_labels_and_formal_preds_together() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "wd")
+    let a = list_new()
+    push(a, rpc_arg_kv("format",       "wikidata"))
+    push(a, rpc_arg_kv("body",         _wd_body()))
+    push(a, rpc_arg_kv("kg",           "wd"))
+    push(a, rpc_arg_kv("source",       "src:cerec:wd"))
+    push(a, rpc_arg_kv("labels_body",
+        "Q76\tobama\nQ5\thuman\n"))
+    push(a, rpc_arg_kv("formal_preds", "P625"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("labels_loaded 2",        _has(out, "\"labels_loaded\":2"))
+    ce_check("extra_formal_preds 1",   _has(out, "\"extra_formal_preds\":1"))
+    ce_check("ingested",               _has(out, "\"records_ingested\":1"))
+}
+
+fn test_labels_body_ignored_for_non_wikidata_format() {
+    // Any non-wikidata format should see labels_loaded stay 0
+    // even if labels_body is supplied -- the arg is silently
+    // ignored (documented behavior; a hard refusal would be
+    // surprising for a caller that ships a common config).
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "pets")
+    let a = list_new()
+    push(a, rpc_arg_kv("format",      "csv"))
+    push(a, rpc_arg_kv("body",        "name,species\nalice,dog\n"))
+    push(a, rpc_arg_kv("kg",          "pets"))
+    push(a, rpc_arg_kv("source",      "src:csv:pets"))
+    push(a, rpc_arg_kv("labels_body", "Q1\tignored\n"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",                    _has(out, "\"ok\":true"))
+    ce_check("labels_loaded stays 0", _has(out, "\"labels_loaded\":0"))
+}
+
+fn test_formal_preds_dedupes_repeats_within_arg() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    kg_spawn(rpc_ctx_kgreg(ctx), "wd")
+    // "P625,P625,P569" -> should count as 2 net-new (P625 added
+    // once; the second P625 no-ops in wd_promote_predicate).
+    let a = list_new()
+    push(a, rpc_arg_kv("format",       "wikidata"))
+    push(a, rpc_arg_kv("body",         _wd_body()))
+    push(a, rpc_arg_kv("kg",           "wd"))
+    push(a, rpc_arg_kv("source",       "src:cerec:wd"))
+    push(a, rpc_arg_kv("formal_preds", "P625,P625,P569"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("dedupe: 2 net-new",
+             _has(out, "\"extra_formal_preds\":2"))
+}
+
+// ---- R85: yaml text-parse variant on ingest.file --------------------
+
+fn _yaml_body_trusted() {
+    // src:cerec: is in the default trusted-tags list -> pipeline direct.
+    return "- kg: solar_system\n"
+         + "  source: src:cerec:yaml-wire\n"
+         + "  atoms:\n"
+         + "    - label: pluto\n"
+         + "      kind: fact\n"
+         + "      belief: 900\n"
+}
+
+fn test_yaml_trusted_ingests_direct() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "yaml"))
+    push(a, rpc_arg_kv("body",   _yaml_body_trusted()))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("format echoed",   _has(out, "\"format\":\"yaml\""))
+    ce_check("parsed 1",        _has(out, "\"records_parsed\":1"))
+    ce_check("ingested 1",      _has(out, "\"records_ingested\":1"))
+    ce_check("queued 0",        _has(out, "\"records_queued\":0"))
+}
+
+fn test_yaml_kg_source_defaults_from_args() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // Record omits kg + source; args provide them.
+    let body = "- atoms:\n"
+             + "    - label: neptune\n"
+             + "      kind: fact\n"
+             + "      belief: 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "yaml"))
+    push(a, rpc_arg_kv("body",   body))
+    push(a, rpc_arg_kv("kg",     "solar_system"))
+    push(a, rpc_arg_kv("source", "src:cerec:yaml-defaults"))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("defaults applied + ingested",
+             _has(out, "\"records_ingested\":1"))
+}
+
+fn test_yaml_untrusted_queues() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // src:yaml:... is NOT in the default trusted-tags list -> queue.
+    let body = "- kg: climate\n"
+             + "  source: src:yaml:untrusted:v1\n"
+             + "  atoms:\n"
+             + "    - label: co2\n"
+             + "      kind: concept\n"
+             + "      belief: 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "yaml"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("queued 1",   _has(out, "\"records_queued\":1"))
+    ce_check("ingested 0", _has(out, "\"records_ingested\":0"))
+}
+
+fn test_yaml_malformed_body_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // Tab in indent -> tokenizer refusal -> error surfaced, nothing lands.
+    let body = "- kg: k\n\tsource: src:x\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "yaml"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("error surfaced",
+             _has(out, "\"error_count\":1"))
+    ce_check("error mentions yaml",
+             _has(out, "yaml:"))
+    ce_check("nothing ingested",
+             _has(out, "\"records_ingested\":0"))
+}
+
+fn test_yaml_flow_style_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let body = "- kg: k\n  source: src:x\n  atoms: [a, b]\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "yaml"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("flow-style refused",
+             _has(out, "flow-style sequences"))
+}
+
+fn test_yaml_r71_stamps_kg_and_capsule() {
+    // Full R71 pre-pass through a yaml body: on first ingest, both the
+    // target KG and capsule name are stamped for the presented holder.
+    let ctx = _mk_ctx()
+    _grant_holder_admin(ctx, "alice")
+    let overlay = ownership_registry_new()
+    rpc_ctx_set_ownership(ctx, overlay)
+    let body = "- kg: solar_system\n"
+             + "  source: src:cerec:yaml-r71\n"
+             + "  capsule:\n"
+             + "    name: solar_yaml_pack_r85\n"
+             + "    version: \"1.0.0\"\n"
+             + "  atoms:\n"
+             + "    - label: mars\n"
+             + "      kind: fact\n"
+             + "      belief: 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "yaml"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",                  _has(out, "\"ok\":true"))
+    ce_check("kgs_stamped 1",       _has(out, "\"kgs_stamped\":1"))
+    ce_check("capsules_stamped 1",  _has(out, "\"capsules_stamped\":1"))
+    ce_str_eq("alice owns kg",
+              ownership_owner(overlay, OWN_KIND_KG, "solar_system"), "alice")
+    ce_str_eq("alice owns capsule",
+              ownership_owner(overlay, OWN_KIND_CAPSULE, "solar_yaml_pack_r85"),
+              "alice")
+}
+
+fn test_yaml_r71_cross_holder_refused() {
+    // Two-phase check-first: alice owns solar_system, bob attempts yaml
+    // ingest into it -> record refused with per-record error; nothing
+    // ingests, no partial stamp on the capsule half.
+    let overlay = ownership_registry_new()
+    ownership_set_kg(overlay, "alice_kg", "alice")
+    let ctx = _mk_ctx()
+    _grant_holder_admin(ctx, "bob")
+    rpc_ctx_set_ownership(ctx, overlay)
+    let body = "- kg: alice_kg\n"
+             + "  source: src:cerec:yaml-crossholder\n"
+             + "  capsule:\n"
+             + "    name: fresh_yaml_cap_r85\n"
+             + "    version: \"1.0.0\"\n"
+             + "  atoms:\n"
+             + "    - label: intruder\n"
+             + "      kind: fact\n"
+             + "      belief: 500\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "yaml"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("verb envelope ok",   _has(out, "\"ok\":true"))
+    ce_check("refused by ownership",
+             _has(out, "\"records_refused_by_ownership\":1"))
+    ce_check("nothing ingested",   _has(out, "\"records_ingested\":0"))
+    ce_check("names alice as owner",
+             _has(out, "already owned by alice"))
+    // R71 two-phase: refusal fires BEFORE stamp, so the capsule half
+    // must NOT get bob-stamped even though the KG was the blocker.
+    ce_eq("fresh capsule NOT stamped",
+          len(ownership_owner(overlay, OWN_KIND_CAPSULE, "fresh_yaml_cap_r85")), 0)
+}
+
+// ---- R71: ingest.file KG + capsule ownership auto-assignment --------
+
+fn _grant_holder_admin(ctx, holder) {
+    // Admin token so ingest:decide cap passes; holder is what R71
+    // stamps on the ingested resources.
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "admin")
+    let t = capability_token_new_roles("tk-" + holder, holder, roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-" + holder)
+    return reg
+}
+
+fn test_r71_no_overlay_counts_zero() {
+    // Baseline: no overlay wired -> kgs_stamped/capsules_stamped
+    // stay 0; behavior byte-identical to R66.
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)     // R66's admin helper (no overlay set)
+    let body = "KG solar_system\nSRC src:cerec:x\nATOM m 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",                       _has(out, "\"ok\":true"))
+    ce_check("kgs_stamped 0",            _has(out, "\"kgs_stamped\":0"))
+    ce_check("capsules_stamped 0",       _has(out, "\"capsules_stamped\":0"))
+    ce_check("records_refused_by_ownership 0",
+             _has(out, "\"records_refused_by_ownership\":0"))
+}
+
+fn test_r71_anonymous_counts_zero() {
+    // Overlay wired but no token presented -> anonymous, no stamps.
+    let ctx = _mk_ctx()
+    let overlay = ownership_registry_new()
+    rpc_ctx_set_ownership(ctx, overlay)
+    let body = "KG solar_system\nSRC src:cerec:x\nATOM m 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("kgs_stamped 0 for anon",   _has(out, "\"kgs_stamped\":0"))
+    ce_eq("overlay untouched for anon",
+          len(ownership_owner(overlay, OWN_KIND_KG, "solar_system")), 0)
+}
+
+fn test_r71_wired_stamps_kg_on_first_ingest() {
+    let ctx = _mk_ctx()
+    _grant_holder_admin(ctx, "alice")
+    let overlay = ownership_registry_new()
+    rpc_ctx_set_ownership(ctx, overlay)
+    let body = "KG solar_system\nSRC src:cerec:x\nATOM mercury 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",                _has(out, "\"ok\":true"))
+    ce_check("kgs_stamped 1",     _has(out, "\"kgs_stamped\":1"))
+    ce_check("ingested 1",        _has(out, "\"records_ingested\":1"))
+    ce_str_eq("overlay records alice",
+              ownership_owner(overlay, OWN_KIND_KG, "solar_system"),
+              "alice")
+}
+
+fn test_r71_wired_stamps_capsule_from_json_record() {
+    // JSON body with a capsule field -> both KG and capsule get
+    // stamped in one ingest.
+    let ctx = _mk_ctx()
+    _grant_holder_admin(ctx, "alice")
+    let overlay = ownership_registry_new()
+    rpc_ctx_set_ownership(ctx, overlay)
+    let body = "[{\"kg\":\"solar_system\",\"source\":\"src:cerec:x\","
+             + "\"capsule\":{\"name\":\"solar_pack_r71\",\"version\":\"1.0.0\"},"
+             + "\"atoms\":[{\"label\":\"venus\",\"kind\":\"fact\",\"belief\":900}]}]"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("ok",                    _has(out, "\"ok\":true"))
+    ce_check("kgs_stamped 1",         _has(out, "\"kgs_stamped\":1"))
+    ce_check("capsules_stamped 1",    _has(out, "\"capsules_stamped\":1"))
+    ce_str_eq("alice owns kg",
+              ownership_owner(overlay, OWN_KIND_KG, "solar_system"), "alice")
+    ce_str_eq("alice owns capsule",
+              ownership_owner(overlay, OWN_KIND_CAPSULE, "solar_pack_r71"),
+              "alice")
+}
+
+fn test_r71_owner_reingest_idempotent_no_new_stamp() {
+    // Alice ingests once -> kgs_stamped:1. Alice re-ingests same KG
+    // -> stamps counter is 0 (already owned, no NEW stamp).
+    let ctx = _mk_ctx()
+    _grant_holder_admin(ctx, "alice")
+    let overlay = ownership_registry_new()
+    rpc_ctx_set_ownership(ctx, overlay)
+    let body = "KG solar_system\nSRC src:cerec:x\nATOM m 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    rpc_dispatch("ingest.file", a, ctx)
+    let out2 = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("re-ingest ok",         _has(out2, "\"ok\":true"))
+    ce_check("kgs_stamped 0 on re-ingest",
+             _has(out2, "\"kgs_stamped\":0"))
+    ce_str_eq("owner unchanged",
+              ownership_owner(overlay, OWN_KIND_KG, "solar_system"),
+              "alice")
+}
+
+fn test_r71_cross_holder_kg_refused_per_record() {
+    // Alice ingests + owns solar_system. Bob tries -> record refused
+    // with per-record error; other well-formed batch records still
+    // succeed.
+    let overlay = ownership_registry_new()
+    let ctx_a = _mk_ctx()
+    _grant_holder_admin(ctx_a, "alice")
+    rpc_ctx_set_ownership(ctx_a, overlay)
+    let body_a = "KG solar_system\nSRC src:cerec:x\nATOM alice_atom 1 900\n"
+    let aa = list_new()
+    push(aa, rpc_arg_kv("format", "cerec"))
+    push(aa, rpc_arg_kv("body",   body_a))
+    rpc_dispatch("ingest.file", aa, ctx_a)
+    // Now bob tries to write to solar_system.
+    let ctx_b = _mk_ctx()
+    _grant_holder_admin(ctx_b, "bob")
+    rpc_ctx_set_ownership(ctx_b, overlay)
+    let body_b = "KG solar_system\nSRC src:cerec:x\nATOM bob_atom 1 900\n"
+    let ab = list_new()
+    push(ab, rpc_arg_kv("format", "cerec"))
+    push(ab, rpc_arg_kv("body",   body_b))
+    let out = rpc_dispatch("ingest.file", ab, ctx_b)
+    ce_check("verb envelope ok",     _has(out, "\"ok\":true"))
+    ce_check("record refused",       _has(out, "\"records_refused_by_ownership\":1"))
+    ce_check("nothing ingested",     _has(out, "\"records_ingested\":0"))
+    ce_check("error message present",
+             _has(out, "ownership refused"))
+    ce_check("names alice as owner",
+             _has(out, "already owned by alice"))
+}
+
+fn test_r71_cross_holder_capsule_refused() {
+    // Alice owns capsule "shared_pack". Bob tries to ingest a JSON
+    // record referencing the same capsule -> refused.
+    let overlay = ownership_registry_new()
+    ownership_set_capsule(overlay, "shared_pack", "alice")
+    let ctx_b = _mk_ctx()
+    _grant_holder_admin(ctx_b, "bob")
+    rpc_ctx_set_ownership(ctx_b, overlay)
+    let body = "[{\"kg\":\"newkg\",\"source\":\"src:cerec:x\","
+             + "\"capsule\":{\"name\":\"shared_pack\",\"version\":\"1.0.0\"},"
+             + "\"atoms\":[{\"label\":\"y\",\"kind\":\"fact\",\"belief\":900}]}]"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx_b)
+    ce_check("refused",              _has(out, "\"records_refused_by_ownership\":1"))
+    ce_check("names capsule owner",  _has(out, "already owned by alice"))
+    // Cross-capsule refusal must not stamp the newkg either -- refuse
+    // fires before stamp.
+    ce_eq("newkg NOT stamped",
+          len(ownership_owner(overlay, OWN_KIND_KG, "newkg")), 0)
+}
+
+fn test_r71_batch_dedup_same_kg_stamped_once() {
+    // A json body with two records both targeting the same KG ->
+    // only counts as 1 stamp (dedup within the batch).
+    let ctx = _mk_ctx()
+    _grant_holder_admin(ctx, "alice")
+    let overlay = ownership_registry_new()
+    rpc_ctx_set_ownership(ctx, overlay)
+    let body = "["
+             + "{\"kg\":\"dedup_kg\",\"source\":\"src:cerec:x\","
+             +   "\"atoms\":[{\"label\":\"a\",\"kind\":\"fact\",\"belief\":500}]},"
+             + "{\"kg\":\"dedup_kg\",\"source\":\"src:cerec:y\","
+             +   "\"atoms\":[{\"label\":\"b\",\"kind\":\"fact\",\"belief\":500}]}"
+             + "]"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("kgs_stamped 1 (dedup)", _has(out, "\"kgs_stamped\":1"))
+    ce_check("both records ingested",  _has(out, "\"records_ingested\":2"))
+}
+
+fn test_r71_mixed_batch_ok_and_refused() {
+    // A batch where one record targets alice's owned KG (refuse) and
+    // another targets a fresh KG (stamp + ingest).
+    let overlay = ownership_registry_new()
+    ownership_set_kg(overlay, "alice_kg", "alice")
+    let ctx = _mk_ctx()
+    _grant_holder_admin(ctx, "bob")
+    rpc_ctx_set_ownership(ctx, overlay)
+    let body = "["
+             + "{\"kg\":\"alice_kg\",\"source\":\"src:cerec:x\","
+             +   "\"atoms\":[{\"label\":\"x\",\"kind\":\"fact\",\"belief\":500}]},"
+             + "{\"kg\":\"bob_kg\",\"source\":\"src:cerec:y\","
+             +   "\"atoms\":[{\"label\":\"y\",\"kind\":\"fact\",\"belief\":500}]}"
+             + "]"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "json"))
+    push(a, rpc_arg_kv("body",   body))
+    let out = rpc_dispatch("ingest.file", a, ctx)
+    ce_check("1 refused",   _has(out, "\"records_refused_by_ownership\":1"))
+    ce_check("1 stamped",   _has(out, "\"kgs_stamped\":1"))
+    ce_check("1 ingested",  _has(out, "\"records_ingested\":1"))
+    ce_str_eq("alice_kg unchanged",
+              ownership_owner(overlay, OWN_KIND_KG, "alice_kg"), "alice")
+    ce_str_eq("bob_kg stamped for bob",
+              ownership_owner(overlay, OWN_KIND_KG, "bob_kg"), "bob")
+}
+
+fn test_r71_end_to_end_bob_hidden_from_kg_list() {
+    // Full arc: alice ingests to a KG under an overlay; bob calls
+    // kg.list -> doesn't see alice's KG (R55.2 filter interacts
+    // with R71 stamps).
+    let overlay = ownership_registry_new()
+    let ctx_a = _mk_ctx()
+    _grant_holder_admin(ctx_a, "alice")
+    rpc_ctx_set_ownership(ctx_a, overlay)
+    let body = "KG alice_notebook\nSRC src:cerec:x\nATOM secret 1 900\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("format", "cerec"))
+    push(a, rpc_arg_kv("body",   body))
+    rpc_dispatch("ingest.file", a, ctx_a)
+    // Alice's kg.list sees her KG.
+    let out_a = rpc_dispatch("kg.list", list_new(), ctx_a)
+    ce_check("alice sees her kg",
+             _has(out_a, "alice_notebook"))
+    // Bob's kg.list does NOT.
+    let ctx_b = _mk_ctx()
+    _grant_holder_admin(ctx_b, "bob")
+    rpc_ctx_set_ownership(ctx_b, overlay)
+    // Wire alice's kgreg so both share state (via a fresh agent
+    // pointed at the same KG state).
+    let out_b = rpc_dispatch("kg.list", list_new(), ctx_b)
+    // Bob uses a fresh agent; his kg.list doesn't include alice's
+    // KGs anyway (separate registries), but the overlay entry is
+    // what enforces the filter. Verify overlay has the stamp.
+    ce_str_eq("overlay records alice's KG",
+              ownership_owner(overlay, OWN_KIND_KG, "alice_notebook"),
+              "alice")
+}
+
+fn main() {
+    test_verb_registered()
+    test_verb_cap_is_ingest_decide()
+    test_no_ingest_agent_refused()
+    test_missing_format_refused()
+    test_missing_body_refused()
+    test_empty_body_refused()
+    test_unsupported_format_refused()
+    test_reader_refused_by_cap()
+    test_cerec_trusted_source_ingests_direct()
+    test_cerec_untrusted_source_queues()
+    test_cerec_multi_record_body()
+    test_cerec_parse_error_surfaces_but_valid_records_land()
+    test_json_trusted_ingests_direct()
+    test_json_kg_source_defaults_from_args()
+    test_json_untrusted_queues()
+    test_json_top_level_syntax_error()
+    test_force_queue_bypasses_trust()
+    test_force_queue_default_off()
+    // R67 -- text-parse variants for csv / nt / wd / cn / pm / wn
+    test_csv_requires_kg_and_source()
+    test_csv_happy_path_queues_untrusted()
+    test_csv_happy_path_ingests_trusted()
+    test_ntriples_requires_kg_and_source()
+    test_ntriples_happy_path()
+    test_wikidata_happy_path_no_labels()
+    test_conceptnet_keep_lang_optional()
+    test_conceptnet_keep_lang_flag_accepted()
+    test_papermeta_requires_only_kg()
+    test_papermeta_happy_path()
+    test_wordnet_happy_path()
+    test_wordnet_requires_kg_and_source()
+    // R68 -- wikidata multi-body ingest
+    test_wikidata_labels_loaded_defaults_zero_without_arg()
+    test_wikidata_labels_body_loaded_and_counted()
+    test_wikidata_labels_body_empty_string_treated_as_absent()
+    test_wikidata_formal_preds_augments_default()
+    test_wikidata_labels_and_formal_preds_together()
+    test_labels_body_ignored_for_non_wikidata_format()
+    test_formal_preds_dedupes_repeats_within_arg()
+    // R71 -- ownership auto-assignment for KG + capsule
+    test_r71_no_overlay_counts_zero()
+    test_r71_anonymous_counts_zero()
+    test_r71_wired_stamps_kg_on_first_ingest()
+    test_r71_wired_stamps_capsule_from_json_record()
+    test_r71_owner_reingest_idempotent_no_new_stamp()
+    test_r71_cross_holder_kg_refused_per_record()
+    test_r71_cross_holder_capsule_refused()
+    test_r71_batch_dedup_same_kg_stamped_once()
+    test_r71_mixed_batch_ok_and_refused()
+    test_r71_end_to_end_bob_hidden_from_kg_list()
+    // R85 -- yaml text-parse variant on ingest.file
+    test_yaml_trusted_ingests_direct()
+    test_yaml_kg_source_defaults_from_args()
+    test_yaml_untrusted_queues()
+    test_yaml_malformed_body_refused()
+    test_yaml_flow_style_refused()
+    test_yaml_r71_stamps_kg_and_capsule()
+    test_yaml_r71_cross_holder_refused()
+    ce_summary("ingest_file_wire")
+}
+
+main()

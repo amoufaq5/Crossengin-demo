@@ -43,3 +43,17 @@ We refine each atom's belief into a **per-atom decaying Beta state with explicit
 - Testing: `fixture_belief_decay` (unreinforced belief drifts to ~0.5 over 180d; classical atom barely moves over same span), `fixture_weighted_evidence` (Tier-A vs Tier-C move confidence proportionally), `fixture_conflict` (balanced contradicting Tier-A sources -> CONTESTED flag + emitted curiosity signal, NOT a confident 0.5).
 - Dependencies: ADR-0016 (atoms own beliefs), ADR-0008 (evidential/curiosity/correction signals), ADR-0029 (source tiers/weights), ADR-0027 (user teaching weight), ADR-0026 (curiosity trigger), ADR-0030 (thresholds), ADR-0044 (override edits), ADR-0024 (prediction-error updates).
 - No new NOVA enhancement strictly required — closed-form arithmetic runs on existing `runtime/math.nova`; benefits from #12 (plasticity kernels) only if belief updates are later batched alongside synapse weights.
+
+## Implementation status
+
+**FORMAL decay exemption (landed, ADR-0088 increment 4).** The time decay this
+ADR specifies (an unreinforced belief drifts toward the Beta(1,1) prior) is now
+gated by `atom_decay_exempt(a)` (atom_store.nova): a verified FORMAL atom
+(ADR-0088) is exempt -- a theorem does not become less true while unobserved.
+The per-atom hook a future periodic decay sweep calls is `atom_decay_belief(a,
+retain)`, which skips exempt atoms and otherwise applies the standard geometric
+step (shared `bel_decay`). The exemption is grade-derived, so the proof
+kernel's unpin path automatically re-enables decay when a FORMAL grade is
+withdrawn. Verified: `decay_exemption` 13 checks. (The "classical atom barely
+moves" fixture intent of this ADR is the same idea, now realised for the
+proof-backed grade specifically.)

@@ -1,0 +1,237 @@
+// Unit tests for src/nl/nl_llm_sidecar.nova (R95, Phase B).
+//
+// Covers: env-var-driven availability, test-mode short-circuit (no
+// subprocess), wire-handoff to llm_parse_wire_verbose, malformed
+// wire refusal, and the shared nl_llm_try_fallback helper's contract
+// with the metrics registry (no-op for non-UNPARSED, no-inc when
+// unavailable, attempt+success on valid wire, attempt+failure on
+// malformed wire).
+//
+// NOVA has no setenv; env-driven scenarios are exercised via the
+// _test_force_* injectors on the sidecar module (documented as
+// test-only in the source).
+
+import "../ce_test.nova"
+import "../../src/nl/nl_llm_sidecar.nova"
+import "../../src/nl/nl_metrics.nova"
+import "../../src/nl/llm_parser.nova"
+import "../../src/nl/query_shape.nova"
+import "../../src/util/str_safe.nova"
+
+// ---- availability + test-mode readers -------------------------------------
+
+fn test_default_unavailable_no_env() {
+    // Cache resolves lazily from the real env; in the test environment
+    // CROSSENGIN_NL_LLM_* is unset so the sidecar should register OFF.
+    nl_llm_sidecar_reset_cache()
+    ce_eq("unavailable by default", nl_llm_sidecar_available(), 0)
+    ce_eq("testmode off",           nl_llm_sidecar_testmode(), 0)
+    ce_eq("fixture empty",          len(nl_llm_sidecar_testmode_fixture()), 0)
+}
+
+fn test_force_off_is_off() {
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_off()
+    ce_eq("forced off",     nl_llm_sidecar_available(), 0)
+    ce_eq("testmode off",   nl_llm_sidecar_testmode(), 0)
+}
+
+fn test_force_live_reports_available() {
+    nl_llm_sidecar_reset_cache()
+    // Point at the real script path so this asserts the availability
+    // computation, not filesystem I/O.
+    nl_llm_sidecar_test_force_live("scripts/nl_parse_llm.sh")
+    ce_eq("available",               nl_llm_sidecar_available(), 1)
+    ce_eq("script path threaded",
+        str_eq_bytes(nl_llm_sidecar_script_path(),
+                     "scripts/nl_parse_llm.sh"), 1)
+    ce_eq("model default",
+        str_eq_bytes(nl_llm_sidecar_model(), "local-small"), 1)
+    ce_eq("backend default",
+        str_eq_bytes(nl_llm_sidecar_backend(), "ollama"), 1)
+    ce_eq("testmode still off",     nl_llm_sidecar_testmode(), 0)
+}
+
+fn test_force_testmode_reports_testmode() {
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("KIND research\nARG cats\n")
+    ce_eq("available (testmode)", nl_llm_sidecar_available(), 1)
+    ce_eq("testmode on",          nl_llm_sidecar_testmode(), 1)
+    ce_eq("fixture round-trips",
+        str_eq_bytes(nl_llm_sidecar_testmode_fixture(),
+                     "KIND research\nARG cats\n"), 1)
+}
+
+// ---- sidecar_parse: test-mode short-circuit -------------------------------
+
+fn test_testmode_parse_returns_fixture() {
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("KIND research\nARG photosynthesis\n")
+    let side = nl_llm_sidecar_parse("what is photosynthesis")
+    ce_eq("ok flag",         nls_ok(side), 1)
+    ce_eq("err empty",       len(nls_err(side)), 0)
+    ce_eq("wire round-trips",
+        str_eq_bytes(nls_wire(side),
+                     "KIND research\nARG photosynthesis\n"), 1)
+}
+
+fn test_testmode_fixture_parses_to_valid_sq() {
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("KIND research\nARG photosynthesis\n")
+    let side = nl_llm_sidecar_parse("what is photosynthesis")
+    let vres = llm_parse_wire_verbose(nls_wire(side), "what is photosynthesis")
+    ce_eq("llmp ok",          llmp_ok(vres), 1)
+    ce_eq("err empty",        len(llmp_error(vres)), 0)
+    let q = llmp_query(vres)
+    ce_eq("kind=RESEARCH",    sq_kind(q), NLK_RESEARCH)
+    ce_eq("topic threaded",
+        str_eq_bytes(sq_research_topic(q), "photosynthesis"), 1)
+    ce_eq("parser=llm",
+        str_eq_bytes(sq_parser_used(q), "llm"), 1)
+}
+
+fn test_malformed_fixture_parses_to_llmp_error() {
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("garbage")
+    let side = nl_llm_sidecar_parse("any text")
+    // Sidecar transport is fine -- it delivered bytes.
+    ce_eq("transport ok", nls_ok(side), 1)
+    // But llm_parse_wire refuses it.
+    let vres = llm_parse_wire_verbose(nls_wire(side), "any text")
+    ce_eq("llmp refused",   llmp_ok(vres), 0)
+    ce_check("error diag",  len(llmp_error(vres)) > 0)
+}
+
+fn test_off_parse_returns_error() {
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_off()
+    let side = nl_llm_sidecar_parse("anything")
+    ce_eq("ok=0",            nls_ok(side), 0)
+    ce_check("err non-empty", len(nls_err(side)) > 0)
+    ce_eq("wire empty",      len(nls_wire(side)), 0)
+}
+
+// ---- nl_llm_try_fallback contract -----------------------------------------
+
+fn test_fallback_noop_on_non_unparsed() {
+    // grammar-parsed query -- fallback must not touch metrics and
+    // must return the query unchanged.
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("KIND research\nARG dogs\n")
+    let metrics = nl_metrics_new()
+    let q = sq_research("mars", "what is mars", "grammar")
+    let out = nl_llm_try_fallback(q, "what is mars", metrics, "alice")
+    ce_eq("same object (topic mars still)",
+        str_eq_bytes(sq_research_topic(out), "mars"), 1)
+    ce_eq("parser still grammar",
+        str_eq_bytes(sq_parser_used(out), "grammar"), 1)
+    ce_eq("no attempts", nl_metrics_llm_fallback_attempts(metrics, "alice"), 0)
+    ce_eq("no successes", nl_metrics_llm_fallback_successes(metrics, "alice"), 0)
+    ce_eq("no failures", nl_metrics_llm_fallback_failures(metrics, "alice"), 0)
+}
+
+fn test_fallback_unavailable_no_inc() {
+    // Sidecar disabled -- caller must get back the ORIGINAL UNPARSED
+    // and metrics must show ZERO fallback-attempt counts because we
+    // didn't try (the metric measures "we tried" -- unavailable is
+    // not an attempt).
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_off()
+    let metrics = nl_metrics_new()
+    let q = sq_unparsed("floof floof glorpity")
+    let out = nl_llm_try_fallback(q, "floof floof glorpity", metrics, "bob")
+    ce_eq("still UNPARSED", sq_kind(out), NLK_UNPARSED)
+    ce_eq("attempts=0", nl_metrics_llm_fallback_attempts(metrics, "bob"), 0)
+    ce_eq("successes=0", nl_metrics_llm_fallback_successes(metrics, "bob"), 0)
+    ce_eq("failures=0", nl_metrics_llm_fallback_failures(metrics, "bob"), 0)
+}
+
+fn test_fallback_success_inc_attempt_and_success() {
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("KIND research\nARG cats\n")
+    let metrics = nl_metrics_new()
+    let q = sq_unparsed("tell me cats")
+    let out = nl_llm_try_fallback(q, "tell me cats", metrics, "carol")
+    ce_eq("kind now RESEARCH",  sq_kind(out), NLK_RESEARCH)
+    ce_eq("topic cats",
+        str_eq_bytes(sq_research_topic(out), "cats"), 1)
+    ce_eq("parser=llm",
+        str_eq_bytes(sq_parser_used(out), "llm"), 1)
+    ce_eq("attempts=1", nl_metrics_llm_fallback_attempts(metrics, "carol"), 1)
+    ce_eq("successes=1", nl_metrics_llm_fallback_successes(metrics, "carol"), 1)
+    ce_eq("failures=0", nl_metrics_llm_fallback_failures(metrics, "carol"), 0)
+}
+
+fn test_fallback_malformed_wire_inc_attempt_and_failure() {
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("this is not wire format")
+    let metrics = nl_metrics_new()
+    let q = sq_unparsed("weird input")
+    let out = nl_llm_try_fallback(q, "weird input", metrics, "dave")
+    // Original UNPARSED returned so executor's refusal branch still
+    // fires -- caller must observe an SQ, never a null.
+    ce_eq("still UNPARSED", sq_kind(out), NLK_UNPARSED)
+    ce_eq("attempts=1", nl_metrics_llm_fallback_attempts(metrics, "dave"), 1)
+    ce_eq("successes=0", nl_metrics_llm_fallback_successes(metrics, "dave"), 0)
+    ce_eq("failures=1", nl_metrics_llm_fallback_failures(metrics, "dave"), 1)
+}
+
+fn test_fallback_empty_wire_treated_as_failure() {
+    // Testmode with empty fixture: transport is "ok" (fixture bytes
+    // delivered), but llm_parse_wire will refuse the empty wire, so
+    // the fallback counts as an attempt+failure.
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("")
+    let metrics = nl_metrics_new()
+    let q = sq_unparsed("silent")
+    let out = nl_llm_try_fallback(q, "silent", metrics, "erin")
+    ce_eq("still UNPARSED", sq_kind(out), NLK_UNPARSED)
+    ce_eq("attempts=1", nl_metrics_llm_fallback_attempts(metrics, "erin"), 1)
+    ce_eq("failures=1", nl_metrics_llm_fallback_failures(metrics, "erin"), 1)
+}
+
+fn test_fallback_null_query_returns_null() {
+    // Defensive: a 0/nil query must round-trip without crashing.
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("KIND research\nARG cats\n")
+    let metrics = nl_metrics_new()
+    let out = nl_llm_try_fallback(0, "irrelevant", metrics, "")
+    ce_eq("null in null out", out, 0)
+    ce_eq("no attempts",
+        nl_metrics_llm_fallback_attempts(metrics, ""), 0)
+}
+
+fn test_fallback_zero_metrics_still_dispatches() {
+    // Metrics registry may be 0 (daemon didn't wire counters); the
+    // fallback must still work AND must not crash on inc_*(0, ...).
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("KIND research\nARG dogs\n")
+    let q = sq_unparsed("about dogs")
+    let out = nl_llm_try_fallback(q, "about dogs", 0, "")
+    ce_eq("kind promoted",  sq_kind(out), NLK_RESEARCH)
+    ce_eq("topic dogs",
+        str_eq_bytes(sq_research_topic(out), "dogs"), 1)
+}
+
+// ---- runner ----------------------------------------------------------------
+
+fn main() {
+    test_default_unavailable_no_env()
+    test_force_off_is_off()
+    test_force_live_reports_available()
+    test_force_testmode_reports_testmode()
+    test_testmode_parse_returns_fixture()
+    test_testmode_fixture_parses_to_valid_sq()
+    test_malformed_fixture_parses_to_llmp_error()
+    test_off_parse_returns_error()
+    test_fallback_noop_on_non_unparsed()
+    test_fallback_unavailable_no_inc()
+    test_fallback_success_inc_attempt_and_success()
+    test_fallback_malformed_wire_inc_attempt_and_failure()
+    test_fallback_empty_wire_treated_as_failure()
+    test_fallback_null_query_returns_null()
+    test_fallback_zero_metrics_still_dispatches()
+    ce_summary("nl_llm_sidecar")
+}
+
+main()

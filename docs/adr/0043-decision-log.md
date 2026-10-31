@@ -36,3 +36,73 @@ A log entry is a tag-prefixed record: `[LOG_ENTRY, seq, timestamp, action_class,
 
 ## Implementation Notes
 `core/safety.nova` gains `decision_log_open`, `decision_log_append(entry)`, `decision_log_iter`, and `decision_log_verify` (re-checks the hash chain). Storage uses `runtime/db.nova` segment files with fsync; entries serialized via `runtime/json.nova` or a compact binary record. The `signal_trace` field is taken directly from the gating signal's `trace` per `core/signal.nova`. Hash chaining uses `runtime/crypto.nova`. Write ordering: append intent entry + fsync (for `REV_IRREVERSIBLE`, ADR-0042) -> run effector -> append outcome entry. Inspection surfaces through the self-model query API (ADR-0038) rendering log entries as language via pure substrate (ADR-0013) — explicitly NOT through `runtime/llm.nova`. Snapshot/rehydration (ADR-0048) treats the log as durable-but-separate (it is not rolled back by a substrate snapshot restore). DEPENDS ON: NOVA enhancement #9 — append-only, crash-safe (fsync) decision/audit log atop `runtime/db.nova` + `core/safety.nova`. Tests: kill-process-mid-action and assert no executed action lacks an entry; assert hash-chain verification fails on a mutated entry; assert AUTO actions still log.
+
+## Implementation Status
+
+**Increment 4 (landed): governed promotion is audited in the live ingest path.**
+`learn_pipeline.nova` gains a session-scoped audit-log register
+(`lp_set_audit_log`, `_lp_audit_log` -- the same 1-element-list handle idiom as
+the router's). `_lp_govern_audited` wraps `govern_fetched_atom`: it governs the
+freshly-minted atom (license gate -> PROMOTED / QUARANTINED, ADR-0092) and, when
+a log is wired, records the outcome as a `DREC_PROMOTION` entry (claim id =
+atom id, flag = terminal `cand_state`, outcome OK for PROMOTED / VETOED
+otherwise). The three `lp_ingest` mint sites (word loop + both triple endpoints)
+route through it. The recorder lives at the ingest layer, not in
+`promotion.nova`, because `decision_record` imports the debate engine which
+imports `promotion` -- recording from inside promotion would cycle.
+`examples/crossengin_chat` calls `lp_set_audit_log(_boot_log)` at boot beside
+`cr_set_audit_log`, so every governance decision on fetched knowledge lands in
+the same durable log as contested answers. Verified: `lp_audit` 15 checks
+(promotion -> OK entry; quarantine -> VETOED entry; no log wired -> governs but
+records nothing; multi-entry chain stays intact). `learn_pipeline`'s pre-
+existing at-scale segfault is unchanged (additive hook, confirmed via stash).
+
+**Increment 3 (landed): the chat path is audited.**
+`src/agent/cognitive_router.nova` gains a session-scoped audit-log register
+(`cr_set_audit_log`, `_cr_audit_log` — a 1-element list NOVA-idiomatic
+module-mutable handle, wired-or-not the way `dl_open` is). The NL-answer path
+in the router (yes/no + how-many) reads the register; if a log is wired, the
+call goes through `nlq_respond_audited` and CONTESTED replies leave a
+DLK_DECISION trail, otherwise the original unaudited `nlq_respond` runs. This
+bypasses the 6-arg passing limit that prevented threading the log down
+`router_reply` directly. `examples/crossengin_chat.nova` calls
+`cr_set_audit_log(_boot_log)` once at chat boot, right after `dl_open` -- so
+every contested answer in a real session writes through automatically. Verified:
+`router_audit` 6 checks (default off; wire/read round-trips; rewire replaces
+without leaking; unwire restores off). `cognitive_router` baseline is unchanged
+(no regression from the `_cr_nlq_answer` 3-arg signature).
+
+**Increment 2 (landed): the answer path is audited.**
+`src/language/nl_audit.nova` wraps `nlq_respond` as
+`nlq_respond_audited(kg, aliases, text, log, moment)`: when the answer comes
+back CONTESTED (the debate engine reported a multi-extension contention), the
+wrapper persists the debate trace for the same claim atom as one DLK_DECISION
+entry alongside the steelmanned reply the user sees. So every time the user is
+told "this is contested", `drec_render` on that entry can later reconstruct
+which arguments were weighed and what verdict the debate engine returned. The
+answer record carries the claim atom id out via a `nlq_claim` accessor (set by
+`_nlq_ans_set_claim` to sidestep NOVA's 6-arg passing limit). Non-contested
+answers don't write -- the per-effector audit (`audit_writer`) already covers
+the action surface, and this log is reserved for adjudications. Verified:
+`nl_audit` 12 checks.
+
+**Increment 1 (landed): reasoning adjudications persist to the decision log.**
+`src/parts/reasoning/decision_record.nova` bridges the truth-seeking engine
+(ADR-0089/0090/0092) to this log. The core gains a `DLK_DECISION` kind; a debate
+trace, a steelman position-set, or a governed-promotion outcome each appends one
+immutable, hash-chained `DLK_DECISION` entry. The reasoning semantics live in the
+recorder (the core stays domain-free, the way `audit_writer` owns the effector
+semantics): `goal` = the claim atom id, `desc = [ACLASS_REASONING, subtype,
+scalar, flag]` where subtype is debate/promotion/steelman, scalar is the
+adjudicated confidence / assigned grade / surviving-position count, and flag is
+the contested bit / terminal `cand_state`; `outcome` is OK for a decided/promoted
+claim, VETOED for a contested/failed one. The `trace` field holds the premise
+atom ids weighed (the field's flat-int contract — the full per-argument structure
+stays in the debate trace object, reconstructible from the snapshot, as this ADR
+already documents the trace to be). `drec_render` reconstructs each entry in
+plain language with no LLM (ADR-0014/0038). Verified via the bootstrap:
+`decision_record` 33 checks (decided debate → OK + premise trace; contested debate
+→ VETOED; promotion grade/state → OK vs VETOED; contested steelman → 2 positions;
+a mixed debate→promotion chain verifies and a field-tamper is caught). The
+durable file seam (`dl_open`/fsync) is unchanged and already covered by
+`decision_log` + `chat_state`.

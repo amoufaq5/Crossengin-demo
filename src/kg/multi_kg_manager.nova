@@ -39,6 +39,9 @@
 import "atom_store.nova"
 import "ann_index.nova"
 import "../safety/differential_privacy.nova"
+import "gc_metrics.nova"   // ADR-0087: optional GC counters for reclaim/compact.
+import "../util/str_safe.nova"
+import "cross_kg_references.nova"
 
 // ---- KG layout ------------------------------------------------------------
 let KG_TAG    = 0
@@ -72,6 +75,18 @@ let KG_FREELIST = 10   // P1.7 (ADR-0074): list of atom-ids reclaimed by
                        // kg_reclaim_atom. Observability/plumbing only for now --
                        // kg_add_atom does NOT yet reuse these ids (id reuse needs
                        // the handle-audit in ADR-0072). 0/absent on legacy KGs.
+
+// ADR-0093: per-domain flags. A bitfield carrying domain-level routing hints
+// the cognition layer reads (see kg_is_contested_domain). Lives at the KG --
+// not on individual atoms -- because the property is the DOMAIN's, not a fact's
+// (slice 4 / social-economic-political is value-laden by construction; even a
+// one-sided local KG should still route to steelman). Slot is grown lazily so
+// legacy KGs (no flags) default to 0 (no routing hints).
+let KG_DOMAIN_FLAGS = 11
+
+// Bits in KG_DOMAIN_FLAGS. Use powers of two so the field can carry more
+// future hints (e.g. KG_DFLAG_REGULATED for slice 3) without churn.
+let KG_DFLAG_CONTESTED = 1   // ADR-0093 slice 4 -> ADR-0090 steelman routing
 
 // ATOM_RULE is the highest kind code (= 6); add one for slot-0 padding so the
 // kind_index can be indexed directly by kind without subtracting.
@@ -238,7 +253,7 @@ fn kg_find(reg, label) {
     let kgs = reg[KREG_KGS]
     let i = 0
     while i < len(kgs) {
-        if str_eq(kgs[i][KG_LABEL], label) == 1 { return kgs[i] }
+        if str_eq_bytes(kgs[i][KG_LABEL], label) == 1 { return kgs[i] }
         i = i + 1
     }
     return 0
@@ -289,7 +304,7 @@ fn kgreg_has_label(reg, label) {
     let kgs = reg[KREG_KGS]
     let i = 0
     while i < len(kgs) {
-        if str_eq(kgs[i][KG_LABEL], label) == 1 { return 1 }
+        if str_eq_bytes(kgs[i][KG_LABEL], label) == 1 { return 1 }
         i = i + 1
     }
     return 0
@@ -300,6 +315,38 @@ fn kg_num_id(kg)   { return kg[KG_NUMID] }
 fn kg_is_alive(kg) { return kg[KG_ALIVE] }
 fn kg_atom_count(kg) { return len(kg[KG_ATOMS]) }
 fn kg_atoms(kg)    { return kg[KG_ATOMS] }
+
+// ADR-0093 per-domain flags. Read defaults to 0 (no flags) for KGs that
+// pre-date the slot. Write grows the list as needed (the same lazy pattern
+// _new_label_index uses). The flag bitfield is small and stable; setters and
+// readers are thin so callers can compose them naturally:
+//   kg_set_contested_domain(kg, 1)  -- mark a value-laden slice
+//   kg_is_contested_domain(kg)      -- routing predicate the answer path reads
+fn kg_domain_flags(kg) {
+    if len(kg) <= KG_DOMAIN_FLAGS { return 0 }
+    return kg[KG_DOMAIN_FLAGS]
+}
+
+fn _kg_set_domain_flag(kg, bit, on) {
+    while len(kg) <= KG_DOMAIN_FLAGS { push(kg, 0) }
+    let cur = kg[KG_DOMAIN_FLAGS]
+    if on == 1 {
+        list_set(kg, KG_DOMAIN_FLAGS, cur | bit)
+    } else {
+        // Clear via XOR if the bit was set; else no-op.
+        if (cur & bit) != 0 { list_set(kg, KG_DOMAIN_FLAGS, cur ^ bit) }
+    }
+    return 1
+}
+
+fn kg_set_contested_domain(kg, on) {
+    return _kg_set_domain_flag(kg, KG_DFLAG_CONTESTED, on)
+}
+
+fn kg_is_contested_domain(kg) {
+    if (kg_domain_flags(kg) & KG_DFLAG_CONTESTED) != 0 { return 1 }
+    return 0
+}
 
 // Append (label_hash, atom_id) to the bucket selected by `label`. Idempotent
 // for the same (hash, id) pair, so re-indexing the same atom is a no-op.
@@ -427,7 +474,7 @@ fn kg_find_atom(kg, label) {
                 if aid >= 0 {
                     if aid < len(atoms) {
                         let a = atoms[aid]
-                        if str_eq(atom_label(a), label) == 1 { return a }
+                        if str_eq_bytes(atom_label(a), label) == 1 { return a }
                     }
                 }
             }
@@ -441,7 +488,7 @@ fn kg_find_atom(kg, label) {
     // Backwards-compat: no index installed yet -- fall back to linear scan.
     let i = 0
     while i < len(atoms) {
-        if str_eq(atom_label(atoms[i]), label) == 1 { return atoms[i] }
+        if str_eq_bytes(atom_label(atoms[i]), label) == 1 { return atoms[i] }
         i = i + 1
     }
     return 0
@@ -529,6 +576,50 @@ fn _kg_freelist_push(kg, atom_id) {
 fn kg_freelist_count(kg) {
     if _kg_has_freelist(kg) == 0 { return 0 }
     return len(kg[KG_FREELIST])
+}
+
+// ADR-0086 (auto-compact trigger, Phase L R1): named helpers the autonomous
+// loop watcher uses to decide when to invoke `kg_compact`. `kg_freelist_size`
+// is the size of the reclaimed-slot free-list (a synonym for
+// `kg_freelist_count`, kept as a named surface so the trigger call sites read
+// as "watch the freelist size"). `kg_atoms_alive` walks KG_ATOMS and counts
+// only non-null slots (the definition kg_live_atom_count already computes;
+// exposed here under the ADR-0086 spelling so the auto-compact code path
+// speaks in the ADR's vocabulary rather than the internal one). The ratio is
+// (freelist / atoms_alive) in permille (1000 == 100%), guarded so an empty
+// KG returns 0 rather than dividing by zero.
+fn kg_freelist_size(kg)  { return kg_freelist_count(kg) }
+fn kg_atoms_alive(kg)    { return kg_live_atom_count(kg) }
+
+fn kg_freelist_ratio_permille(kg) {
+    let alive = kg_atoms_alive(kg)
+    if alive <= 0 { return 0 }
+    let fl = kg_freelist_size(kg)
+    // Ratio in permille: fl * 1000 / alive. Values stay small under normal
+    // operation (a KG at 20% freelist returns 200) so no bug-#11 concern --
+    // fl and alive are both bounded by len(KG_ATOMS), which stays well below
+    // the codegen threshold for any realistic KG.
+    return fl * 1000 / alive
+}
+
+// ADR-0087 (Phase L R2): metric-attributed reclaim wrapper. Same semantics as
+// `kg_reclaim_atom` -- the additional (metrics_reg, kg_label_arg) tail lets
+// the caller thread a GC-metrics registry so the reclaim is counted under the
+// KG the atom lived in. `metrics_reg == 0` disables attribution (byte-
+// equivalent to a bare `kg_reclaim_atom`); `kg_label_arg` is passed
+// explicitly so the caller (autonomous loop, tests) uses its own known
+// label rather than re-reading `kg_label(kg)` -- the two agree in practice,
+// but the explicit form is one lookup instead of two.
+//
+// The counter is incremented ONLY when a slot was actually reclaimed
+// (kg_reclaim_atom returned 1); a no-op reclaim (already-freed slot, out-of-
+// range id) is not counted so the metric tracks live reclamation events.
+fn kg_reclaim_atom_metric(kg, atom_id, metrics_reg, kg_label_arg) {
+    let ok = kg_reclaim_atom(kg, atom_id)
+    if ok == 1 {
+        if metrics_reg != 0 { gcm_inc_reclaimed(metrics_reg, kg_label_arg) }
+    }
+    return ok
 }
 
 // Hard-remove an atom: unindex (via kg_remove_atom), null the slot, record the
@@ -635,6 +726,31 @@ fn _remap_id(old_to_new, id) {
     return mapped
 }
 
+// ADR-0087 (Phase L R2): metric-attributed compact wrapper. Same semantics
+// as `kg_compact` -- the additional (metrics_reg, kg_label_arg, at_tick)
+// tail lets the caller thread a GC-metrics registry so the compaction run
+// is counted, along with the number of atoms removed (holes collapsed).
+// `metrics_reg == 0` disables attribution (byte-equivalent to a bare
+// `kg_compact`). `atoms_removed` is computed as `pre_count - post_count`
+// where `pre_count = len(kg_atoms(kg))` BEFORE the compact and `post_count`
+// is the dense post-compact length -- exactly the number of holes the
+// compactor collapsed. Also samples the (now-zero) freelist size + ratio so
+// /gc-stats reflects the post-compact steady state.
+fn kg_compact_metric(reg, kg, metrics_reg, kg_label_arg, at_tick) {
+    let pre_count = len(kg_atoms(kg))
+    let map = kg_compact(reg, kg)
+    if metrics_reg != 0 {
+        let post_count = len(kg_atoms(kg))
+        let removed = pre_count - post_count
+        if removed < 0 { removed = 0 }   // defensive: never negative
+        gcm_record_compact(metrics_reg, kg_label_arg, removed, at_tick)
+        gcm_sample_freelist(metrics_reg, kg_label_arg,
+                            kg_freelist_size(kg),
+                            kg_freelist_ratio_permille(kg))
+    }
+    return map
+}
+
 // In-place compactor (ADR-0079). Returns the old->new id map: a list indexed by
 // old_id giving the new dense id, or 0-1 for a dropped hole. Steps:
 //   1. assign dense new ids to live atoms in old-id order (order preserved);
@@ -698,10 +814,10 @@ fn kg_compact(reg, kg) {
                 let xi = 0
                 while xi < len(xs) {
                     let x = xs[xi]
-                    if str_eq(xref_src_kg(x), my_label) == 1 {
+                    if str_eq_bytes(xref_src_kg(x), my_label) == 1 {
                         list_set(x, XR_SRC_ATOM, _remap_id(old_to_new, xref_src_atom(x)))
                     }
-                    if str_eq(xref_dst_kg(x), my_label) == 1 {
+                    if str_eq_bytes(xref_dst_kg(x), my_label) == 1 {
                         list_set(x, XR_DST_ATOM, _remap_id(old_to_new, xref_dst_atom(x)))
                     }
                     xi = xi + 1

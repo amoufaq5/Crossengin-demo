@@ -1,0 +1,277 @@
+// CrossEngin ingestion: CSV tabular-facts importer.
+//
+// Turns a CSV with a header row into a curriculum record. Each data row
+// becomes an atom (label = value of the first column, kind = ATOM_FACT,
+// seed_belief = 800). Additional columns become EMPIRICAL implications
+// from the row atom to a per-column-value atom, one implication per
+// non-first, non-empty column. Columns that repeat values across rows
+// therefore surface as hubs -- the exact structural pattern that lets
+// cross-KG consistency scans notice "these ten atoms all imply the same
+// consequent, one probably contradicts the others".
+//
+// Example:
+//   CSV: name,species,habitat
+//        alice,dog,indoor
+//        bob,cat,indoor
+//   Produces:
+//     atoms: alice, bob, dog, cat, indoor  (all ATOM_FACT, belief 800)
+//     imps:  alice->dog, alice->indoor, bob->cat, bob->indoor  (EMPIRICAL)
+//
+// Quoting
+//   Fields with a comma, newline, or leading double-quote MAY be enclosed
+//   in double-quotes. Inside quotes, "" is an escaped double-quote. Trailing
+//   whitespace outside quotes is trimmed. This is the RFC 4180 subset.
+//
+// Return
+//   csv_parse(path, kg_name, source_tag, ...) -> [records_list, errors_list].
+//   Emits ONE record per call (all rows merge into one). Errors is a list of
+//   [row_number, msg] pairs for rows that couldn't be handled.
+//
+// NOVA dependencies: builtins (read_file, char_at, len, substr).
+// CrossEngin dependencies:
+//   src/ingest/curriculum.nova, src/util/str_safe.nova, src/kg/atom_store.nova.
+
+import "../curriculum.nova"
+import "../../util/str_safe.nova"
+import "../../kg/atom_store.nova"
+
+// ---- CSV lexer ------------------------------------------------------------
+
+// Parse a single CSV row starting at index `pos` in `text`. Returns
+// [fields, next_pos]. Handles double-quoted fields with "" escapes.
+// A row ends at an unquoted newline, an unquoted CRLF, or end of input.
+fn _csv_row(text, pos) {
+    let fields = list_new()
+    let n = len(text)
+    let cur = ""
+    let in_quotes = 0
+    let advancing = 1
+    let p = pos
+    while advancing == 1 {
+        if p >= n { advancing = 0 }
+        else {
+            let c = char_at(text, p)
+            if in_quotes == 1 {
+                if c == 34 {                        // '"'
+                    // "" -> literal "
+                    if p + 1 < n {
+                        if char_at(text, p + 1) == 34 {
+                            cur = cur + chr(34)
+                            p = p + 2
+                        } else {
+                            in_quotes = 0
+                            p = p + 1
+                        }
+                    } else {
+                        in_quotes = 0
+                        p = p + 1
+                    }
+                } else {
+                    cur = cur + chr(c)
+                    p = p + 1
+                }
+            } else {
+                if c == 34 {                        // '"' opens quotes only at field start
+                    if len(cur) == 0 {
+                        in_quotes = 1
+                        p = p + 1
+                    } else {
+                        // stray quote inside unquoted field; keep literally
+                        cur = cur + chr(c)
+                        p = p + 1
+                    }
+                } else {
+                    if c == 44 {                    // ','
+                        push(fields, cur)
+                        cur = ""
+                        p = p + 1
+                    } else {
+                        if c == 10 {                // '\n'
+                            push(fields, cur)
+                            let r = list_new() push(r, fields) push(r, p + 1)
+                            return r
+                        } else {
+                            if c == 13 {            // '\r'
+                                push(fields, cur)
+                                let np = p + 1
+                                if np < n { if char_at(text, np) == 10 { np = np + 1 } }
+                                let r = list_new() push(r, fields) push(r, np)
+                                return r
+                            } else {
+                                cur = cur + chr(c)
+                                p = p + 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // EOF: push whatever is in cur if we had any content or any fields.
+    if len(cur) > 0 { push(fields, cur) }
+    else { if len(fields) > 0 { push(fields, cur) } }
+    let r = list_new() push(r, fields) push(r, p)
+    return r
+}
+
+// Split `text` into rows. Returns list of field-lists.
+fn _csv_rows(text) {
+    let out = list_new()
+    let n = len(text)
+    let p = 0
+    while p < n {
+        let r = _csv_row(text, p)
+        push(out, r[0])
+        p = r[1]
+    }
+    return out
+}
+
+// ---- helpers --------------------------------------------------------------
+
+// Convert an arbitrary string to a safe atom label (letters/digits/-/_ kept;
+// spaces + other chars become underscore). Empty in -> empty out.
+fn _csv_label(s) {
+    let out = ""
+    let n = len(s)
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        let keep = 0
+        if c >= 65 { if c <= 90  { keep = 1 } }
+        if c >= 97 { if c <= 122 { keep = 1 } }
+        if c >= 48 { if c <= 57  { keep = 1 } }
+        if c == 45 { keep = 1 }        // '-'
+        if c == 95 { keep = 1 }        // '_'
+        if keep == 1 { out = out + chr(c) }
+        else { out = out + "_" }
+        i = i + 1
+    }
+    return out
+}
+
+// Trim leading/trailing whitespace (space, tab, CR).
+fn _csv_trim(s) {
+    let n = len(s)
+    let lo = 0
+    let more = 1
+    while more == 1 {
+        if lo >= n { more = 0 }
+        else {
+            let c = char_at(s, lo)
+            if c == 32 { lo = lo + 1 }
+            else { if c == 9 { lo = lo + 1 }
+            else { if c == 13 { lo = lo + 1 }
+            else { more = 0 } } }
+        }
+    }
+    let hi = n
+    let more2 = 1
+    while more2 == 1 {
+        if hi <= lo { more2 = 0 }
+        else {
+            let c = char_at(s, hi - 1)
+            if c == 32 { hi = hi - 1 }
+            else { if c == 9 { hi = hi - 1 }
+            else { if c == 13 { hi = hi - 1 }
+            else { more2 = 0 } } }
+        }
+    }
+    return substr(s, lo, hi - lo)
+}
+
+// Add an atom to record `r` only if a same-label atom is not already present.
+fn _csv_add_atom_once(r, seen, label) {
+    let i = 0
+    while i < len(seen) {
+        if str_eq_bytes(seen[i], label) == 1 { return 0 }
+        i = i + 1
+    }
+    push(seen, label)
+    cur_add_atom(r, label, ATOM_FACT, 800)
+    return 1
+}
+
+// ---- parser ---------------------------------------------------------------
+
+// Parse CSV `text` into a curriculum record. `kg_name` and `source_tag`
+// come from the caller (the CSV itself has no metadata). Returns
+// [ [record], errors ]. Header row is required; header cells become the
+// column names (currently only used for row bookkeeping -- values are used
+// as labels, not column-named predicates, keeping the model uniform).
+fn csv_parse_text(text, kg_name, source_tag) {
+    let out_records = list_new()
+    let errors = list_new()
+    let rows = _csv_rows(text)
+    if len(rows) == 0 {
+        let out = list_new() push(out, out_records) push(out, errors)
+        return out
+    }
+    let header = rows[0]
+    let n_cols = len(header)
+    if n_cols == 0 {
+        let e = list_new() push(e, 1) push(e, "empty header row")
+        push(errors, e)
+        let out = list_new() push(out, out_records) push(out, errors)
+        return out
+    }
+    let record = cur_new(kg_name, source_tag)
+    let seen = list_new()   // dedup labels within this record
+    let i = 1
+    while i < len(rows) {
+        let row = rows[i]
+        let row_no = i + 1
+        // Ignore fully-empty rows (all fields blank / whitespace).
+        let non_empty = 0
+        let ci = 0
+        while ci < len(row) {
+            if len(_csv_trim(row[ci])) > 0 { non_empty = 1 ci = len(row) }
+            else { ci = ci + 1 }
+        }
+        if non_empty == 1 {
+            if len(row) < 1 {
+                let e = list_new() push(e, row_no) push(e, "row has no columns")
+                push(errors, e)
+            } else {
+                let row_val = _csv_trim(row[0])
+                if len(row_val) == 0 {
+                    let e = list_new() push(e, row_no) push(e, "row has empty key column")
+                    push(errors, e)
+                } else {
+                    let row_label = _csv_label(row_val)
+                    _csv_add_atom_once(record, seen, row_label)
+                    let j = 1
+                    while j < len(row) {
+                        let col_val = _csv_trim(row[j])
+                        if len(col_val) > 0 {
+                            let col_label = _csv_label(col_val)
+                            _csv_add_atom_once(record, seen, col_label)
+                            cur_add_imp(record, row_label, col_label, "EMPIRICAL")
+                        }
+                        j = j + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    push(out_records, record)
+    let out = list_new() push(out, out_records) push(out, errors)
+    return out
+}
+
+fn csv_parse(path, kg_name, source_tag) {
+    let text = read_file(path)
+    if text == 0 {
+        let recs = list_new()
+        let errs = list_new()
+        let e = list_new() push(e, 0) push(e, "could not read file: " + path)
+        push(errs, e)
+        let out = list_new() push(out, recs) push(out, errs)
+        return out
+    }
+    return csv_parse_text(text, kg_name, source_tag)
+}
+
+fn csv_records(result) { return result[0] }
+fn csv_errors(result)  { return result[1] }

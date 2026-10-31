@@ -1,0 +1,502 @@
+// Chat federation slash-command helpers (Phase M R1, ADR-0089).
+//
+// Purpose
+//   The four gossip / kg-sync / distributed-query slash commands the
+//   REPL grew in R1 -- `/gossip_start`, `/gossip_peer add <addr>`,
+//   `/gossip_peers`, `/gossip_dq <query>` -- have a small pure core
+//   (arg parsing, output formatting) that used to be tangled inside
+//   `_try_admin` in `examples/crossengin_chat.nova`. This module lifts
+//   the pure surface so unit tests can call it directly without spinning
+//   up the whole chat process.
+//
+//   Each helper takes the OPAQUE gossip / dq state as an argument and
+//   returns a formatted output string; the caller (`crossengin_chat.nova`)
+//   is responsible for println'ing that string, allocating the state on
+//   the first `/gossip_start`, and threading it through subsequent
+//   commands via a module-level singleton.
+//
+// ADRs implemented: ADR-0049 (testing and benchmarks; the pure surface
+//   is what the unit tests target), ADR-0089 (federation daemon MVP;
+//   this file is one of R1's two entry points into the mesh).
+
+import "../federation/gossip.nova"
+import "../federation/distributed_query.nova"
+import "../federation/leader_election.nova"
+import "../federation/distributed_rules.nova"
+import "../federation/snapshot_attestation.nova"
+import "../federation/snapshot_replication.nova"
+
+// ---- /gossip_start [addr] ------------------------------------------------
+//
+// Parse the optional address argument (falls back to the R1 default
+// `127.0.0.1:8790` when arg is empty, matching the fed daemon's
+// CE_FED_LISTEN_ADDR default). Callers hold the "already started"
+// bit and dispatch on it -- this helper only formats the two possible
+// output lines and returns the effective listen addr so the caller
+// can hand it to gossip_init.
+
+let CE_CHAT_FED_DEFAULT_ADDR = "127.0.0.1:8790"
+
+// Return the effective listen address given the slash-command arg.
+// Empty arg -> default; non-empty arg -> arg (trimmed).
+fn chat_fed_pick_listen_addr(arg) {
+    if arg == 0 { return CE_CHAT_FED_DEFAULT_ADDR }
+    let t = str_trim(arg)
+    if len(t) == 0 { return CE_CHAT_FED_DEFAULT_ADDR }
+    return t
+}
+
+// Format the "already running" line (used when /gossip_start runs a
+// second time in the same session).
+fn chat_fed_gossip_already_running_line(addr) {
+    return "gossip: already running on " + addr
+}
+
+// Format the boot-success line (used after gossip_init + gossip_listen
+// return non-null).
+fn chat_fed_gossip_started_line(addr, fd) {
+    let base = "gossip: started on " + addr
+    if fd < 0 {
+        return base + " (WARN: listen bind failed; client-only mode)"
+    }
+    return base + " fd=" + int_to_str(fd)
+}
+
+// ---- /gossip_peer add <addr> ---------------------------------------------
+//
+// Parse the sub-command out of the arg string. R1 recognises only
+// `add <addr>`; the plan sketches `remove` / `list` for future rounds.
+// Returns a list [action, addr]; action is one of "add", "unknown".
+// A missing addr yields action="add", addr="".
+
+fn chat_fed_parse_peer_command(arg) {
+    let out = list_new()
+    if arg == 0 {
+        push(out, "unknown")
+        push(out, "")
+        return out
+    }
+    let t = str_trim(arg)
+    if len(t) == 0 {
+        push(out, "unknown")
+        push(out, "")
+        return out
+    }
+    // Split on first space.
+    let sp = 0 - 1
+    let i = 0
+    while i < len(t) {
+        if char_at(t, i) == 32 { sp = i i = len(t) }
+        i = i + 1
+    }
+    let head = t
+    let rest = ""
+    if sp >= 0 {
+        head = substr(t, 0, sp)
+        if sp + 1 < len(t) {
+            rest = str_trim(substr(t, sp + 1, len(t) - sp - 1))
+        }
+    }
+    if str_eq_bytes(head, "add") == 1 {
+        push(out, "add")
+        push(out, rest)
+        return out
+    }
+    push(out, "unknown")
+    push(out, rest)
+    return out
+}
+
+// "gossip: no state; /gossip_start first" -- unified "state missing" line.
+fn chat_fed_gossip_no_state_line() {
+    return "gossip: no state; run /gossip_start first"
+}
+
+// After a successful gossip_add_peer, format the confirmation line.
+fn chat_fed_peer_added_line(addr, peer_count) {
+    return "gossip_peer: add " + addr
+        + " (peers=" + int_to_str(peer_count) + ")"
+}
+
+// When the sub-command is unrecognised.
+fn chat_fed_peer_unknown_op_line() {
+    return "gossip_peer: usage -- /gossip_peer add <addr>"
+}
+
+// ---- /gossip_peers -------------------------------------------------------
+//
+// Render the peer table as one line per entry:
+//   "<addr> <status> last_seen=<ns>"
+// Status is the numeric enum -- ALIVE=0, SUSPECT=1, DEAD=2 -- rendered
+// as its symbolic name for readability. The caller prepends a header
+// line ("gossip_peers: N entries") and prints each row via println.
+
+fn chat_fed_status_label(status) {
+    if status == GOSSIP_STATUS_ALIVE   { return "ALIVE" }
+    if status == GOSSIP_STATUS_SUSPECT { return "SUSPECT" }
+    if status == GOSSIP_STATUS_DEAD    { return "DEAD" }
+    return "?"
+}
+
+// One row of the peer-listing output. Kept pure so tests can validate
+// the exact wire shape without walking the peer table.
+fn chat_fed_peer_row_line(addr, status, last_seen_ns) {
+    return "  " + addr
+        + " " + chat_fed_status_label(status)
+        + " last_seen=" + int_to_str(last_seen_ns)
+}
+
+fn chat_fed_peers_header_line(count) {
+    return "gossip_peers: " + int_to_str(count) + " entries"
+}
+
+// Render the full peer-table output as a list of lines, in-order,
+// starting with the header. Pure -- callers println each element.
+fn chat_fed_peers_render(gs) {
+    let out = list_new()
+    let peers = gossip_peer_table(gs)
+    push(out, chat_fed_peers_header_line(len(peers)))
+    let i = 0
+    while i < len(peers) {
+        let p = peers[i]
+        push(out, chat_fed_peer_row_line(gossip_peer_addr(p),
+                                         gossip_peer_status(p),
+                                         gossip_peer_last_seen(p)))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- /gossip_dq <query> --------------------------------------------------
+//
+// Parse the query text (arg after the slash command). Empty arg -> ""
+// (caller prints usage). Non-empty arg -> trimmed query text ready
+// for dq_query.
+
+fn chat_fed_pick_query_text(arg) {
+    if arg == 0 { return "" }
+    return str_trim(arg)
+}
+
+fn chat_fed_dq_usage_line() {
+    return "gossip_dq: usage -- /gossip_dq <query-text>"
+}
+
+fn chat_fed_dq_no_state_line() {
+    return "gossip_dq: no state; run /gossip_start first"
+}
+
+fn chat_fed_dq_result_header(row_count) {
+    return "gossip_dq: " + int_to_str(row_count) + " row(s)"
+}
+
+// ---- Phase M R2 (ADR-0090) -- leader election helpers -------------------
+//
+// `/leader` and `/leader elect` dispatch through these pure formatters
+// (argument parsing + line rendering). The chat REPL owns the module-
+// level `_chat_fed_le` singleton; these helpers only care about the
+// shape of the input and output, not the lifecycle.
+//
+// The plan's naming was `_fed_leader_status_line` etc.; here we keep
+// the `chat_fed_*` prefix used by the R1 helpers for API symmetry.
+
+// Line printed when the operator runs a /leader command before the
+// gossip / leader-election state has been allocated. Mirrors
+// chat_fed_gossip_no_state_line's shape.
+fn chat_fed_le_no_state_line() {
+    return "leader: no state; run /gossip_start first (le is allocated alongside gs)"
+}
+
+// Parse the /leader sub-command. R2 accepts "" (default -> status) and
+// "status" and "elect". Anything else routes to the usage line. Returns
+// a single string action label: "status" | "elect" | "usage".
+fn chat_fed_le_parse_arg(arg) {
+    if arg == 0 { return "status" }
+    let t = str_trim(arg)
+    if len(t) == 0 { return "status" }
+    if str_eq_bytes(t, "status") == 1 { return "status" }
+    if str_eq_bytes(t, "elect")  == 1 { return "elect"  }
+    return "usage"
+}
+
+fn chat_fed_le_usage_line() {
+    return "leader: usage -- /leader [status|elect]"
+}
+
+// Format the /leader status output. Delegates the "leader=... self_id=..."
+// substring to le_status_line (which is R19E's canonical formatter),
+// re-prefixed to the "/leader" chat convention. Kept pure so tests can
+// call it against a hand-built le state.
+fn chat_fed_le_status_line(le) {
+    // le_status_line already returns a "leader: ..." prefixed line -- we
+    // preserve that shape verbatim so downstream log-scrapers that grep
+    // for "leader:" in either the daemon or the chat REPL match with
+    // one regex.
+    return le_status_line(le)
+}
+
+// Format the /leader elect result. `ok` is 1 on a successful kick, 0
+// otherwise (currently le_start_election never refuses; the parameter
+// exists for symmetry with the /drule_add path and to give R3's leader-
+// affinity checks a place to hook a refusal reason).
+fn chat_fed_le_elect_result_line(le, ok) {
+    if ok == 0 {
+        return "leader_elect: refused (leader-election state is not initialized)"
+    }
+    return "leader_elect: started (elections=" + int_to_str(le_stats_elections(le))
+        + " state=electing)"
+}
+
+// ---- Phase M R2 (ADR-0090) -- distributed-rules helpers -----------------
+//
+// `/drule_add`, `/drule_run`, `/drule_fixpoint`. Same shape as the LE
+// helpers -- the chat REPL calls into dr_add_rule / dr_run_round /
+// dr_run_to_fixpoint and these helpers format the output line.
+
+fn chat_fed_drule_no_state_line() {
+    return "drule: no state; run /gossip_start first (dr is allocated alongside gs)"
+}
+
+fn chat_fed_drule_add_usage_line() {
+    return "drule_add: usage -- /drule_add RULE h(?a,?b) <- b1(?a,?b), b2(?b,?c)"
+}
+
+// Parse the /drule_add arg into the rule text. Empty arg -> "" (caller
+// prints usage). Non-empty arg -> trimmed rule text.
+fn chat_fed_drule_add_parse(arg) {
+    if arg == 0 { return "" }
+    return str_trim(arg)
+}
+
+// Format the /drule_add result. `ok` is 1 when dr_add_rule returned 1;
+// 0 when it returned an error tuple (e.g. malformed rule). On refusal,
+// the caller's optional `reason` is folded in verbatim for the operator.
+fn chat_fed_drule_add_result_line(rule_text, ok, reason) {
+    if ok == 1 {
+        return "drule_add: ok (rule=" + rule_text + ")"
+    }
+    let r = "malformed"
+    if reason != 0 {
+        if len(reason) > 0 { r = reason }
+    }
+    return "drule_add: refused (rule=" + rule_text + "; reason=" + r + ")"
+}
+
+// Format the /drule_run per-round output. `derived` is the count of new
+// atoms produced by this single round; the caller passes the value
+// returned by dr_run_round.
+fn chat_fed_drule_run_line(derived) {
+    return "drule_run: derived=" + int_to_str(derived) + " (one round)"
+}
+
+// Format the /drule_fixpoint output. Takes the [total, rounds] pair that
+// dr_run_to_fixpoint returns.
+fn chat_fed_drule_fixpoint_line(total, rounds) {
+    return "drule_fixpoint: derived=" + int_to_str(total)
+        + " rounds=" + int_to_str(rounds)
+        + " (cap=" + int_to_str(DR_DEFAULT_MAX_ROUNDS) + ")"
+}
+
+// ---- Phase M R3 (ADR-0091) -- attestation helpers -----------------------
+//
+// `/attest_log`, `/attest_verify <soul_id>`. R3 wires
+// snapshot_attestation.nova into the chat REPL: the module-level
+// `_chat_fed_att` singleton holds the local att_store that gossip's
+// ATTESTATION handler feeds via gossip_set_att_store. These helpers
+// pure-format the two output paths so the tests can validate the wire
+// shape without a live mesh. The store's own accessors
+// (att_store_recent, att_store_latest, att_verify) live in
+// snapshot_attestation.nova; here we only glue arg parsing + line
+// rendering.
+
+// Line printed when the operator runs `/attest_log` or `/attest_verify`
+// before `/gossip_start` has allocated `_chat_fed_att`. Mirrors the
+// R1/R2 no-state lines' shape so operators grep the same pattern.
+fn chat_fed_att_no_state_line() {
+    return "attest: no state; run /gossip_start first (att is allocated alongside gs)"
+}
+
+// Format the /attest_log output. Takes a list of attestation tuples
+// (from `att_store_recent(store, N)`), newest-last as walked, and
+// returns a list of one-line entries plus a header. The chat handler
+// println's each element. Empty list -> just the "0 entries" header,
+// so operators can distinguish "no state" (no gossip started) from
+// "state present but empty" (gossip started, no ATTESTATION lines
+// received yet).
+fn _attest_log_format(entries) {
+    let out = list_new()
+    let n = 0
+    if entries != 0 { n = len(entries) }
+    push(out, "attest_log: " + int_to_str(n) + " entries (newest last)")
+    if n == 0 { return out }
+    let i = 0
+    while i < n {
+        let a = entries[i]
+        // "  peer=<id> ts=<ns> root=<hex> sig=<hex16>..."
+        let root_hex = att_root_hex(a)
+        let sig_hex  = att_sig_hex(a)
+        let sig_short = sig_hex
+        if len(sig_hex) > 16 { sig_short = substr(sig_hex, 0, 16) + "..." }
+        push(out, "  peer=" + int_to_str(att_soul_id(a))
+            + " ts=" + int_to_str(att_ts_ns(a))
+            + " root=" + root_hex
+            + " sig=" + sig_short)
+        i = i + 1
+    }
+    return out
+}
+
+// Usage line for `/attest_verify` when the arg is missing.
+fn chat_fed_att_verify_usage_line() {
+    return "attest_verify: usage -- /attest_verify <soul_id> (integer)"
+}
+
+// Parse the /attest_verify arg into the soul_id integer. Returns the
+// int, or -1 when the arg is missing / not-digits. -1 signals "usage"
+// to the caller (soul_ids in the mesh are djb2-hashed to 24-bit
+// unsigned ints, so -1 is unambiguous). Accepts an optional leading
+// '-' for negative IDs (test convenience; the daemon never mints
+// negatives via _fed_soul_id_to_int).
+fn chat_fed_att_verify_parse_arg(arg) {
+    if arg == 0 { return 0 - 1 }
+    let t = str_trim(arg)
+    if len(t) == 0 { return 0 - 1 }
+    let neg = 0
+    let check = t
+    if char_at(t, 0) == 45 {
+        neg = 1
+        check = substr(t, 1, len(t) - 1)
+    }
+    if len(check) == 0 { return 0 - 1 }
+    let i = 0
+    while i < len(check) {
+        let c = char_at(check, i)
+        if c < 48 { return 0 - 1 }
+        if c > 57 { return 0 - 1 }
+        i = i + 1
+    }
+    let n = rt_str_to_int(check)
+    if neg == 1 { n = 0 - n }
+    return n
+}
+
+// Format the /attest_verify result. `ok` is 1 (verified), 0 (verify
+// failed or no pubkey), and `why` is a short reason ("" on success,
+// e.g. "no attestation for peer", "no pubkey registered", "signature
+// mismatch"). `soul_id` is the operator's requested peer.
+fn _attest_verify_result_line(ok, soul_id, why) {
+    if ok == 1 {
+        return "attest_verify: peer=" + int_to_str(soul_id) + " ok"
+    }
+    let reason = why
+    if reason == 0 { reason = "unknown" }
+    if len(reason) == 0 { reason = "unknown" }
+    return "attest_verify: peer=" + int_to_str(soul_id)
+        + " FAILED (" + reason + ")"
+}
+
+// ---- Phase M R3 (ADR-0091) -- snapshot-replication helpers --------------
+//
+// `/snap_fetch <root_hex>`, `/snap_serve on|off`. R3 wires
+// snapshot_replication.nova into the chat REPL: the module-level
+// `_chat_fed_sr` singleton holds the local sr_state; gossip's SNAP_*
+// dispatch already routes through gossip_set_sr_state. Serving is
+// opt-in via sr_set_serving; the /snap_serve toggle is the operator
+// surface.
+
+fn chat_fed_sr_no_state_line() {
+    return "snap_repl: no state; run /gossip_start first (sr is allocated alongside gs)"
+}
+
+fn chat_fed_snap_fetch_usage_line() {
+    return "snap_fetch: usage -- /snap_fetch <root_hex> (64-char lowercase hex)"
+}
+
+fn chat_fed_snap_serve_usage_line() {
+    return "snap_serve: usage -- /snap_serve on|off"
+}
+
+// Validate that `s` is a 64-char lowercase hex string. Used to
+// early-reject bad /snap_fetch args before we hit the wire. Returns
+// 1 on OK, 0 on any shape violation.
+fn chat_fed_is_root_hex(s) {
+    if s == 0 { return 0 }
+    if len(s) != 64 { return 0 }
+    let i = 0
+    while i < 64 {
+        let c = char_at(s, i)
+        let ok = 0
+        if c >= 48 {
+            if c <= 57 { ok = 1 }
+        }
+        if c >= 97 {
+            if c <= 102 { ok = 1 }
+        }
+        if ok == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Parse the /snap_serve arg. Returns "on", "off", or "usage" for the
+// three dispatch branches. Any leading/trailing whitespace is trimmed;
+// case must be exact (str_eq_bytes is byte-strict).
+fn chat_fed_snap_serve_parse_arg(arg) {
+    if arg == 0 { return "usage" }
+    let t = str_trim(arg)
+    if len(t) == 0 { return "usage" }
+    if str_eq_bytes(t, "on")  == 1 { return "on"  }
+    if str_eq_bytes(t, "off") == 1 { return "off" }
+    return "usage"
+}
+
+// Format the /snap_fetch result. `sent` is 1 on a stored+verified
+// fetch, 0 on refusal (unknown root, no alive peers, verify fail,
+// network error). `peer` is the peer addr the fetch resolved against
+// (empty when the root is unknown or the walk found no candidate).
+fn _snap_fetch_result_line(sent, root_hex, peer) {
+    if sent == 1 {
+        return "snap_fetch: ok root=" + root_hex + " peer=" + peer
+    }
+    let p = peer
+    if p == 0 { p = "" }
+    if len(p) == 0 {
+        return "snap_fetch: refused root=" + root_hex
+            + " (unknown root or no alive peers)"
+    }
+    return "snap_fetch: refused root=" + root_hex + " peer=" + p
+        + " (fetch failed or verify mismatch)"
+}
+
+// Format the /snap_serve toggle result. `on` is 1 (serving enabled)
+// or 0 (serving disabled). Mirrors the "confirmed the new state"
+// idiom the /leader elect + /drule_add lines use.
+fn _snap_serve_toggle_result_line(on) {
+    if on == 1 {
+        return "snap_serve: on (peer SNAP_FETCH requests will be served)"
+    }
+    return "snap_serve: off (peer SNAP_FETCH requests answered with SNAP_END miss)"
+}
+
+// ---- /gossip_transport (Phase O R3, ADR-0096) ----------------------------
+//
+// Pure formatter for the `/gossip_transport` REPL slash. The caller
+// resolves the transport mode ONCE at first `/gossip_start` (reading
+// `CE_FED_TRANSPORT` off the env), stashes the resulting "tcp" or
+// "dtls" string on a module-level singleton, and passes it here for
+// pretty-printing. The transport is env-driven; there is no mutation
+// entry -- an operator who wants to switch mid-run must restart the
+// daemon. This mirrors how R21E's `/gossip_noise` info-line reports
+// (rather than toggles) the noise mode.
+//
+// `mode` is the raw string; anything other than "dtls" (case-strict,
+// matching how the fed daemon's `_fed_transport_from_env` normalizes)
+// is reported as "tcp" -- garbage in the singleton renders as the
+// safe default rather than confusing the operator.
+fn _fed_transport_line(mode) {
+    if mode == 0 { return "transport=tcp" }
+    if str_eq_bytes(mode, "dtls") == 1 {
+        return "transport=dtls (ADR-0096 non-standard; not RFC-compliant)"
+    }
+    return "transport=tcp"
+}

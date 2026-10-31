@@ -1,0 +1,804 @@
+// CrossEngin federation daemon (Phase M R1 + R2 + R3, ADR-0089 + ADR-0090 + ADR-0091).
+//
+// Purpose
+//   The `src/federation/` tree ships 23 unit-tested modules -- gossip
+//   (R18E), kg_sync deltas (R6C/R7C v3), distributed query (R20E),
+//   distributed rules (R21B), leader election (R19E), snapshot
+//   attestation + replication (R20F/R23C), DTLS 1.2 (with R29B2 stubs),
+//   ICE/STUN/TURN/WebRTC, NAT traversal, gossip relays, Raft. Every
+//   one is unit-tested. None were wired into a runnable daemon until
+//   Phase M.
+//
+//   This binary composes the R1 subset -- gossip + kg_sync + distributed
+//   query -- and the R2 additions -- leader election (Bully over gossip)
+//   and distributed rules (mini-Datalog over gossip) -- into a single
+//   event-driven mesh peer, mirroring the shape of
+//   examples/crossengin_daemon.nova:250-517 (env-config -> alloc ->
+//   session-register -> tick loop). Snapshot attestation and replication
+//   land in R3 (ADR-0091). DTLS 1.2 stays out until the R29B2 cert-verify
+//   and SRTP EKM stubs at src/federation/dtls12.nova:137, 140 are
+//   filled in; the daemon runs plain TCP gossip until then.
+//
+//   Distinction from crossengin_daemon
+//   ----------------------------------
+//   crossengin_daemon runs the six cognitive loops over ONE soul; it
+//   does not need a mesh to be useful. This daemon runs the mesh over
+//   a soul-agnostic KG registry; it does not need the reasoning /
+//   emotion / goal loops to be useful. Two different concerns, two
+//   different lifecycles -- keeping them in separate binaries lets
+//   each shape its own tick loop and env-var namespace without
+//   colliding. A production deployment typically runs both, side by
+//   side, communicating over a Unix socket or via a shared snapshot
+//   directory (R3 wires the snapshot side).
+//
+//   Run with:  $NOVA_ROOT/nova run examples/crossengin_fed_daemon.nova
+//
+// Env-var contract (all optional; safe defaults for a local mesh):
+//   CE_FED_LISTEN_ADDR   default "127.0.0.1:8790"
+//                        The addr this daemon binds its gossip TCP
+//                        listener to. Format: HOST:PORT.
+//   CE_FED_PEERS         default "" -- falls back to CE_GOSSIP_PEERS
+//                        Comma-separated bootstrap peer addresses.
+//                        The daemon adds each to the gossip peer table
+//                        at boot; SWIM PINGs confirm / demote them.
+//   CE_FED_SOUL_ID       default: derived from listen addr
+//                        Stable identity for this node -- surfaced in
+//                        log lines and reserved for the leader-election
+//                        wiring in R2.
+//   CE_FED_TICK_MS       default 250
+//                        Milliseconds between gossip_step / accept /
+//                        input-poll ticks. Bounded [50, 10000].
+//   CE_FED_LEADER_ELECTION_ENABLED  default 1
+//                        Set to 0 to skip le_init at boot -- for hosts
+//                        that only want the gossip + kg_sync + dq slice
+//                        without paying the leader-election tick cost
+//                        or seeing /leader references in the shutdown
+//                        summary. Any non-"0" value is treated as
+//                        enabled.
+//   CE_FED_DR_ENABLED    default 1
+//                        Set to 0 to skip dr_init at boot. Same shape
+//                        as CE_FED_LEADER_ELECTION_ENABLED.
+//   CE_FED_ATTEST_ENABLED  default 1
+//                        Set to 0 to skip att_store_new + the
+//                        merkle_signing keypair load at boot. When
+//                        enabled but the key files are missing, the
+//                        daemon logs a WARN and disables attestation
+//                        without crashing (mesh peer is still useful).
+//   CE_FED_ATTEST_KEY_DIR  default $HOME/.crossengin/fed_keys
+//                        Directory holding this node's Ed25519 signer
+//                        keypair (`signer.priv` + `signer.pub`, 32
+//                        bytes each). merkle_signing_keypair_load
+//                        appends the ".priv" / ".pub" suffixes; the
+//                        daemon passes the "<dir>/signer" base path.
+//                        Falls back to ./crossengin_fed_keys/signer
+//                        when HOME is unset (container default).
+//   CE_FED_SNAP_REPLICATION_ENABLED  default 1
+//                        Set to 0 to skip sr_init at boot; /snap_fetch
+//                        and gossip's SNAP_FETCH inbound handler both
+//                        become no-ops (bare SNAP_END on the wire).
+//   CE_FED_SNAP_SERVE     default 0 (opt-in)
+//                        When 1, `sr_set_serving(sr, 1)` is called at
+//                        boot so the daemon answers peers' SNAP_FETCH
+//                        requests with replica bytes; when 0 (default)
+//                        the serve path returns 0 and gossip answers
+//                        with a bare SNAP_END so peers see "miss".
+//                        The chat REPL /snap_serve on|off toggles the
+//                        same flag at runtime. Reuses CE_SNAP_PATH for
+//                        the local replica dir when set.
+//   CE_SNAP_PATH          reused for sr_init's local_snap_dir. If unset
+//                        the daemon falls back to $HOME/.crossengin/snap
+//                        with a final ./crossengin_snap safety net.
+//   CE_FED_DTLS_TRUSTSTORE_PATH  default $HOME/.crossengin/fed_truststore
+//                        (Phase O R1, ADR-0094.) Directory that holds
+//                        this node's DTLS trust anchors. R1 uses the
+//                        manifest-file loader: a `manifest.txt` in the
+//                        directory lists one PEM cert filename per
+//                        line (empty lines + lines starting with `#`
+//                        are skipped); each is loaded via
+//                        `truststore_load_file` and merged into one
+//                        anchors list. R1 ONLY allocates the anchors at
+//                        boot and stashes them on the Session for R3
+//                        to consume -- no connection is gated on the
+//                        anchors yet.
+//   CE_FED_DTLS_HOSTNAME  default: `ce-<hash(SOUL_ID)>.fed`
+//                        (Phase O R1, ADR-0094.) Hostname this node
+//                        will advertise (via SAN) on its DTLS cert
+//                        and match against incoming certs' SANs.
+//                        Deterministic derivation from the soul_id
+//                        keeps self-signed test scenarios coherent
+//                        without any extra config file: both peers
+//                        derive the same hostname from the same
+//                        soul_id. R3 wires this into
+//                        `dtls_cert_verify_chain` at the transport
+//                        seam.
+//
+// ADRs exercised: ADR-0089 (R1 subset), ADR-0090 (R2 coordination +
+//   inference), ADR-0091 (R3 durability), ADR-0051 (Session shape),
+//   plus every federation-module ADR the composed primitives implement
+//   (ADR-0054 subset for the aggregator seam, R18E/R19E/R20E/R21B/R20F/R23C
+//   for the federation primitives).
+
+import "std/syscall"
+import "std/string"
+import "std/io"
+
+import "../src/kg/atom_store.nova"
+import "../src/kg/multi_kg_manager.nova"
+import "../src/parts/reasoning/reasoning_atoms.nova"
+import "../src/parts/meta/meta_observer.nova"
+import "../src/federation/gossip.nova"
+import "../src/federation/kg_sync.nova"
+import "../src/federation/distributed_query.nova"
+import "../src/federation/leader_election.nova"
+import "../src/federation/distributed_rules.nova"
+import "../src/federation/snapshot_attestation.nova"
+import "../src/federation/snapshot_replication.nova"
+import "../src/persistence/merkle_signing.nova"
+import "../src/kg/rule_inference.nova"
+import "../src/session/session.nova"
+// Phase O R1 (ADR-0094): DTLS trust-store loader. R1 only ALLOCATES
+// anchors at boot and stashes them on the Session for R3 to consume;
+// no connection is gated on the anchors yet (that lands in R3 when
+// the DTLS-over-TCP shim wraps gossip).
+import "../src/util/env_resolve.nova"
+import "../src/safety/pem_truststore.nova"
+// Phase O R3 (ADR-0096): non-standard DTLS-over-TCP shim + P-256
+// keypair loader. Both are conditionally exercised at boot when
+// CE_FED_TRANSPORT=dtls; a soul running with the (default) tcp
+// transport does not touch either.
+import "../src/safety/p256_keypair.nova"
+import "../src/federation/gossip_dtls_shim.nova"
+
+// ---- env-var config -------------------------------------------------------
+//
+// Each _cfg_* helper mirrors the canonical getenv guard used across the
+// rest of the tree: `env == 0 || len(env) == 0 -> default`. `str_to_int`
+// returns 0 for garbage, so int helpers additionally guard the fallback
+// via a positive-only check.
+
+let CE_FED_DEFAULT_LISTEN_ADDR = "127.0.0.1:8790"
+let CE_FED_DEFAULT_TICK_MS     = 250
+let CE_FED_MIN_TICK_MS         = 50
+let CE_FED_MAX_TICK_MS         = 10000
+
+// Listener addr resolution. CE_FED_LISTEN_ADDR wins; otherwise the
+// documented default 127.0.0.1:8790.
+fn _fed_listen_addr_from_env() {
+    return env_str("CE_FED_LISTEN_ADDR", CE_FED_DEFAULT_LISTEN_ADDR)
+}
+
+// Bootstrap-peer resolution. CE_FED_PEERS wins; if unset (or empty),
+// fall back to CE_GOSSIP_PEERS so operators who already have a mesh
+// bootstrap block in their environment do not need to duplicate it.
+// Both are comma-separated "host:port" lists (empty tokens dropped).
+// Tick-interval resolution. CE_FED_TICK_MS wins; bounded to
+// [CE_FED_MIN_TICK_MS, CE_FED_MAX_TICK_MS] so a fat-fingered
+// `CE_FED_TICK_MS=0` cannot livelock the loop and a giant value
+// cannot silently freeze it.
+fn _fed_tick_ms_from_env() {
+    let n = env_int("CE_FED_TICK_MS", CE_FED_DEFAULT_TICK_MS)
+    if n < CE_FED_MIN_TICK_MS { n = CE_FED_MIN_TICK_MS }
+    if n > CE_FED_MAX_TICK_MS { n = CE_FED_MAX_TICK_MS }
+    return n
+}
+
+// R2 (ADR-0090) enable-flag resolution. `CE_FED_LEADER_ELECTION_ENABLED`
+// and `CE_FED_DR_ENABLED` are opt-OUT: default is on, "0" turns off. Any
+// other non-empty value is treated as enabled so operators are not
+// tripped up by "true" / "yes" / "1" variance. NOVA has no setenv, so
+// the raw env value is what the pure resolver takes.
+fn _fed_le_enabled_from_env() {
+    return env_bool(getenv("CE_FED_LEADER_ELECTION_ENABLED"), 1)
+}
+
+fn _fed_dr_enabled_from_env() {
+    return env_bool(getenv("CE_FED_DR_ENABLED"), 1)
+}
+
+// R3 (ADR-0091) enable-flag resolvers. Attestation + replication default
+// on; only literal "0" disables. `/snap_serve` defaults OFF (opt-in per
+// ADR-0091 sec "Trust model") to avoid shipping local replica bytes to
+// peers before the operator has reviewed which roots would be served.
+fn _fed_att_enabled_from_env() {
+    return env_bool(getenv("CE_FED_ATTEST_ENABLED"), 1)
+}
+
+fn _fed_sr_enabled_from_env() {
+    return env_bool(getenv("CE_FED_SNAP_REPLICATION_ENABLED"), 1)
+}
+
+fn _fed_snap_serve_from_env() {
+    // Opposite default: OFF unless the operator explicitly opts in.
+    return env_bool(getenv("CE_FED_SNAP_SERVE"), 0)
+}
+
+// Phase O R1 (ADR-0094): DTLS truststore-path resolution. Mirrors the
+// `_fed_attest_key_base_from_env` shape: CE_FED_DTLS_TRUSTSTORE_PATH
+// wins; else `$HOME/.crossengin/fed_truststore/`; else the
+// container-safe fallback `./crossengin_fed_truststore/`. Returns the
+// directory path WITHOUT a trailing "/" (the truststore loader
+// appends "/manifest.txt" itself).
+fn _fed_dtls_truststore_path_from_env() {
+    let v = getenv("CE_FED_DTLS_TRUSTSTORE_PATH")
+    if v != 0 {
+        if len(v) > 0 { return v }
+    }
+    let home = getenv("HOME")
+    if home != 0 {
+        if len(home) > 0 { return home + "/.crossengin/fed_truststore" }
+    }
+    return "./crossengin_fed_truststore"
+}
+
+// Phase O R3 (ADR-0096): transport selector. CE_FED_TRANSPORT defaults
+// to "tcp" (byte-identical R18E behavior); the literal (case-insensitive)
+// value "dtls" flips the accept loop + dial helpers over to the DTLS-
+// over-TCP shim. Garbage / unset / empty / any other value falls through
+// to "tcp" (safe default matching the getenv guard idiom used
+// throughout this file). NOVA has no `str_lower`, so the resolver
+// checks both "dtls" and "DTLS" explicitly. Any other spelling
+// (including whitespace-padded or mixed-case variants like "Dtls")
+// resolves to "tcp".
+fn _fed_transport_from_env() {
+    let v = getenv("CE_FED_TRANSPORT")
+    if v == 0 { return "tcp" }
+    if len(v) == 0 { return "tcp" }
+    if str_eq_bytes(v, "dtls") == 1 { return "dtls" }
+    if str_eq_bytes(v, "DTLS") == 1 { return "dtls" }
+    // "tcp", "TCP", and every unrecognized value fall through here.
+    return "tcp"
+}
+
+// Phase O R3 (ADR-0096): DTLS cert directory resolution. Mirrors the
+// `_fed_attest_key_base_from_env` shape:
+// CE_FED_DTLS_CERT_DIR wins; else $HOME/.crossengin/fed_dtls_keys/;
+// else the container-safe fallback `./crossengin_fed_dtls_keys/`.
+// Returns the BASE path (without .priv/.pub extension) plus the
+// filename stem "signer" so `p256_keypair_load` can append the two
+// suffixes directly, matching the merkle_signing convention.
+fn _fed_dtls_cert_base_from_env() {
+    let v = getenv("CE_FED_DTLS_CERT_DIR")
+    if v != 0 {
+        if len(v) > 0 { return v + "/signer" }
+    }
+    let home = getenv("HOME")
+    if home != 0 {
+        if len(home) > 0 { return home + "/.crossengin/fed_dtls_keys/signer" }
+    }
+    return "./crossengin_fed_dtls_keys/signer"
+}
+
+// Phase O R1 (ADR-0094): DTLS hostname resolution. CE_FED_DTLS_HOSTNAME
+// wins verbatim; else derive a stable ASCII hostname from the
+// soul_id via `_fed_hostname_from_soul`. R3 will use this to feed
+// `dtls_cert_verify_chain` -- the SAN on the peer's self-signed
+// cert must cover it. For self-signed test scenarios the operator
+// mints the cert with the derived hostname as its SAN, so the two
+// derivations agree by construction.
+fn _fed_dtls_hostname_from_env(soul_id) {
+    let v = getenv("CE_FED_DTLS_HOSTNAME")
+    if v != 0 {
+        if len(v) > 0 { return v }
+    }
+    return _fed_hostname_from_soul(soul_id)
+}
+
+// Derive a stable ASCII hostname from a soul_id. NOVA has no `sprintf`
+// for hex, so we use the djb2-style `soul_id_to_int` mixer (from
+// src/util/env_resolve.nova) that already produces a small non-negative
+// int, then format as a decimal string with a "ce-" prefix so the
+// result is unambiguously a hostname (not confused with an IP). Empty
+// soul_id -> "ce-0" (matches soul_id_to_int's empty-input contract).
+// This is intentionally deterministic + reversible-ish: two daemons
+// with the same soul_id derive the same hostname (a mesh convention;
+// the SAN on their self-signed certs can be minted the same way).
+fn _fed_hostname_from_soul(soul_id) {
+    let h = soul_id_to_int(soul_id)
+    return "ce-" + int_to_str(h) + ".fed"
+}
+
+// ---- main ------------------------------------------------------------------
+
+fn line() { println("------------------------------------------------------------") }
+
+fn main() {
+    println("=== CrossEngin federation daemon (Phase M R1) ===")
+    println("mesh peer: gossip + kg_sync + distributed_query (ADR-0089)")
+    line()
+
+    // 1. BOOT: resolve env-config. Keep the four inputs adjacent so the
+    // banner reads like a compact deployment sheet.
+    let listen_addr = _fed_listen_addr_from_env()
+    let peer_list   = env_peers("CE_FED_PEERS", "CE_GOSSIP_PEERS")
+    let soul_id     = env_soul_id(listen_addr)
+    let tick_ms     = _fed_tick_ms_from_env()
+
+    println("config   : listen=" + listen_addr
+            + " peers=" + int_to_str(len(peer_list))
+            + " soul=" + soul_id
+            + " tick_ms=" + int_to_str(tick_ms))
+
+    // 2. COMPONENT ALLOC (order fixed by ADR-0089 sec "component alloc"):
+    //   kgreg      -- registry holding this node's shared KGs.
+    //   mo         -- meta-observer surface. R1 does not attribute
+    //                 mesh-received atoms yet (that lands with the
+    //                 R2 rule engine); constructed here so the
+    //                 Session shape holds it and R2 can wire it in
+    //                 without changing the boot.
+    //   fed_kg     -- one reasoning-shaped KG per node so kg_sync
+    //                 has a target for inbound ATOM lines. Named
+    //                 "reasoning" via reasoning_kg_init so the
+    //                 subscribe/publish path in gossip's DELTA
+    //                 branch (kg_sync.nova) can find it by label.
+    //   gs         -- gossip state, wired with self_addr + bootstrap
+    //                 peers. gossip_init takes (self_addr, peers)
+    //                 today; kgreg + mo are held on the Session and
+    //                 wired to gossip callbacks by R3 when the
+    //                 attestation store lands (see ADR-0091 preview).
+    //   listen_fd  -- server socket. gossip_listen binds the TCP
+    //                 listener and returns fd >= 0 on success.
+    //   kgd        -- kg-sync delta state. Not passed into gossip
+    //                 directly today (gossip's DELTA branch works
+    //                 off the raw KG), but constructed here so the
+    //                 Session carries it forward for R2's rule
+    //                 engine to consume.
+    //   dq         -- distributed-query state wired against gs so
+    //                 /gossip_dq (and the chat REPL wiring in
+    //                 examples/crossengin_chat.nova) can fan out
+    //                 SPARQL queries across the mesh.
+    let kgreg = kg_registry_new()
+    let mo    = mo_new()
+    let fed_kg = reasoning_kg_init(kgreg)
+    let gs = gossip_init(listen_addr, peer_list)
+    let listen_fd = gossip_listen(listen_addr)
+    let kgd = kgd_state_new()
+    let dq  = dq_init(gs)
+
+    // R2 (ADR-0090): leader election + distributed rules.
+    //   le  -- Bully leader-election state, self_id derived from
+    //          soul_id via _fed_soul_id_to_int (stable, small non-neg
+    //          int). Registered peers get their IDs the same way as the
+    //          daemon discovers them via gossip (deferred to the input
+    //          seam / operator wiring; R2 boots with self only). Skip
+    //          allocation when CE_FED_LEADER_ELECTION_ENABLED=0.
+    //   dr_engine, dr  -- distributed-rules state paired with a fresh
+    //          rule_engine. dr_init also installs itself on `gs` via
+    //          gossip_set_dr_state so inbound RULE / DERIVATION lines
+    //          route to this dr without a callback dance. Skip when
+    //          CE_FED_DR_ENABLED=0.
+    let le_enabled = _fed_le_enabled_from_env()
+    let dr_enabled = _fed_dr_enabled_from_env()
+    let self_id_int = soul_id_to_int(soul_id)
+    let le = 0
+    let dr_engine = 0
+    let dr = 0
+    if le_enabled == 1 {
+        le = le_init(gs, self_id_int)
+    }
+    if dr_enabled == 1 {
+        dr_engine = rule_engine_new()
+        dr = dr_init(gs, dr_engine)
+    }
+
+    // R3 (ADR-0091): snapshot attestation + replication.
+    //   att -- per-peer attestation store (att_store_new(); the
+    //          low-level constructor takes NO args in this codebase --
+    //          soul_id is carried per-tuple via att_make). Wired into
+    //          gossip via gossip_set_att_store so the ATTESTATION
+    //          parser branch enqueues verified tuples on inbound.
+    //          Signer identity is a merkle_signing Ed25519 keypair
+    //          loaded from CE_FED_ATTEST_KEY_DIR (falls back to
+    //          $HOME/.crossengin/fed_keys, then ./crossengin_fed_keys).
+    //          Missing key files => WARN + disable attestation for
+    //          this run (mesh peer is still useful without it).
+    //          Own pubkey is registered under self's peer_id so a
+    //          same-node round-trip verifies the local signer.
+    //   sr  -- snapshot-replication state. sr_init(gs, local_dir)
+    //          per R23C's live signature. Wired via
+    //          gossip_set_sr_state so inbound SNAP_FETCH lands here.
+    //          Serving is opt-in: CE_FED_SNAP_SERVE=1 flips
+    //          sr_set_serving(sr, 1) at boot; default OFF so a fresh
+    //          node observes attestations + records known roots but
+    //          does NOT ship its own replicas to peers until the
+    //          operator has reviewed. The chat REPL /snap_serve
+    //          on|off toggles the same flag at runtime.
+    let att_enabled = _fed_att_enabled_from_env()
+    let sr_enabled  = _fed_sr_enabled_from_env()
+    let snap_serve  = _fed_snap_serve_from_env()
+    let att = 0
+    let att_key_loaded = 0
+    let att_key_base   = ""
+    if att_enabled == 1 {
+        att_key_base = env_attest_key_base()
+        let pair = merkle_signing_keypair_load(att_key_base)
+        if pair == 0 {
+            println("attest   : WARN -- keypair load failed at "
+                    + att_key_base + ".{priv,pub}; disabling attestation"
+                    + " for this run (generate with examples/snap_keygen.nova"
+                    + " or point CE_FED_ATTEST_KEY_DIR at an existing dir)")
+        } else {
+            att = att_store_new()
+            gossip_set_att_store(gs, att)
+            // Register OWN pubkey under own peer_id so a same-node
+            // round-trip verifies (integration scenarios then add
+            // other peers' pubkeys via gossip_register_att_pubkey
+            // out of band, same shape as R7C Noise XK auth).
+            gossip_register_att_pubkey(gs, self_id_int, pair[1])
+            att_key_loaded = 1
+        }
+    }
+    // Local snapshot directory. Reuse CE_SNAP_PATH if the daemon-shared
+    // env is set; otherwise a $HOME-rooted default; final container
+    // fallback is ./crossengin_snap. sys_open on /tmp aborts inside the
+    // container per the NOVA quirks doc, so we never fall back to /tmp.
+    let local_snap_dir = getenv("CE_SNAP_PATH")
+    if local_snap_dir == 0 { local_snap_dir = "" }
+    if len(local_snap_dir) == 0 {
+        let home2 = getenv("HOME")
+        if home2 != 0 {
+            if len(home2) > 0 {
+                local_snap_dir = home2 + "/.crossengin/snap"
+            }
+        }
+    }
+    if len(local_snap_dir) == 0 { local_snap_dir = "./crossengin_snap" }
+    let sr = 0
+    if sr_enabled == 1 {
+        sr = sr_init(gs, local_snap_dir)
+        gossip_set_sr_state(gs, sr)
+        if snap_serve == 1 {
+            sr_set_serving(sr, 1)
+        }
+    }
+
+    // Phase O R1 (ADR-0094): DTLS trust-anchor allocation. Resolve the
+    // truststore directory, hostname, and load anchors via
+    // `truststore_load_dir` (manifest-based; NOVA lacks readdir).
+    //   * Missing dir / missing manifest -> empty anchors list. That
+    //     is the SAFE default: an empty truststore rejects every
+    //     chain via XV_NOT_PINNED, so a mis-configured operator
+    //     fails closed rather than silently trusting everything.
+    //   * R1 does NOT gate any connection on `dtls_anchors`. R3 wires
+    //     the load-bearing check when the DTLS-over-TCP shim lands.
+    let dtls_truststore_path = _fed_dtls_truststore_path_from_env()
+    let dtls_hostname        = _fed_dtls_hostname_from_env(soul_id)
+    let dtls_anchors         = truststore_load_dir(dtls_truststore_path)
+    if len(dtls_anchors) > 0 {
+        println("dtls     : truststore loaded from " + dtls_truststore_path
+                + " (" + int_to_str(len(dtls_anchors)) + " anchor(s));"
+                + " hostname=" + dtls_hostname
+                + " (CE_FED_DTLS_TRUSTSTORE_PATH; ADR-0094 R1)")
+    } else {
+        println("dtls     : truststore empty at " + dtls_truststore_path
+                + " (no manifest.txt or empty manifest); hostname="
+                + dtls_hostname
+                + " -- R1 tolerates empty anchors, R3 will fail closed")
+    }
+
+    // Phase O R3 (ADR-0096): transport gate. Default "tcp" (byte-identical
+    // R18E gossip). "dtls" loads a P-256 keypair via `p256_keypair_load`
+    // and refuses to start when the keypair is missing (fail-closed: an
+    // operator who asked for DTLS but did not mint keys gets a clear
+    // error, not a silent fallback to plaintext). Truststore stays as
+    // R1 loaded it -- an empty anchors list means every peer chain is
+    // rejected (XV_NOT_PINNED via the R1 mapping), which is the SAFE
+    // default. `dtls_hs_ok` + `dtls_hs_failed` counters live on the
+    // fed daemon (module-local ints below); every handshake attempt
+    // in the accept loop / dial helper bumps exactly one.
+    let dtls_transport   = _fed_transport_from_env()
+    let dtls_cert_base   = ""
+    let dtls_priv_bn     = 0
+    let dtls_pub_point   = 0
+    let dtls_ready       = 0
+    let dtls_hs_ok       = 0
+    let dtls_hs_failed   = 0
+    if str_eq_bytes(dtls_transport, "dtls") == 1 {
+        dtls_cert_base = _fed_dtls_cert_base_from_env()
+        let dtls_pair = p256_keypair_load(dtls_cert_base)
+        if dtls_pair == 0 {
+            println("transport: ERROR -- CE_FED_TRANSPORT=dtls but P-256 keypair"
+                    + " load failed at " + dtls_cert_base + ".{priv,pub};"
+                    + " refusing to start DTLS (mint with"
+                    + " p256_keypair_save or point CE_FED_DTLS_CERT_DIR at"
+                    + " an existing dir). Falling back to tcp for this run.")
+            dtls_transport = "tcp"
+        } else {
+            dtls_priv_bn   = dtls_pair[0]
+            dtls_pub_point = dtls_pair[1]
+            dtls_ready     = 1
+        }
+    }
+    if str_eq_bytes(dtls_transport, "dtls") == 1 {
+        println("transport: DTLS 1.2 over TCP (ADR-0096 non-standard;"
+                + " NOT RFC-compliant, mesh-only). cert=" + dtls_cert_base
+                + ".{priv,pub}"
+                + " hostname=" + dtls_hostname
+                + " anchors=" + int_to_str(len(dtls_anchors)))
+        if len(dtls_anchors) == 0 {
+            println("transport: WARN -- empty truststore means every peer"
+                    + " chain fails XV_NOT_PINNED. Populate"
+                    + " " + dtls_truststore_path + "/manifest.txt to"
+                    + " accept peer certs.")
+        }
+    } else {
+        println("transport: tcp (unencrypted; CE_FED_TRANSPORT unset or 'tcp')")
+    }
+
+    if listen_fd < 0 {
+        println("gossip   : WARN -- listen bind failed on " + listen_addr
+                + " (port taken, or address unresolvable); running client-only")
+    } else {
+        println("gossip   : listening on " + listen_addr
+                + " fd=" + int_to_str(listen_fd))
+    }
+    println("kg       : one reasoning KG registered as 'reasoning' (atoms="
+            + int_to_str(kg_atom_count(fed_kg)) + ")")
+    println("dq       : distributed-query wired against gossip; peers seed="
+            + int_to_str(gossip_peer_count(gs)))
+    if le_enabled == 1 {
+        println("leader   : bully leader-election wired; self_id="
+                + int_to_str(self_id_int)
+                + " (CE_FED_LEADER_ELECTION_ENABLED=1)")
+    } else {
+        println("leader   : DISABLED (CE_FED_LEADER_ELECTION_ENABLED=0)")
+    }
+    if dr_enabled == 1 {
+        println("drules   : distributed-rules wired against gossip; rules=0"
+                + " (CE_FED_DR_ENABLED=1)")
+    } else {
+        println("drules   : DISABLED (CE_FED_DR_ENABLED=0)")
+    }
+    // R3 (ADR-0091) attestation + replication banners.
+    if att_enabled == 1 {
+        if att_key_loaded == 1 {
+            println("attest   : signed-attestation store wired; key="
+                    + att_key_base + ".{priv,pub}"
+                    + " (CE_FED_ATTEST_ENABLED=1)")
+        } else {
+            println("attest   : DISABLED (keypair missing at "
+                    + att_key_base + ")")
+        }
+    } else {
+        println("attest   : DISABLED (CE_FED_ATTEST_ENABLED=0)")
+    }
+    if sr_enabled == 1 {
+        let serve_lbl = "off"
+        if snap_serve == 1 { serve_lbl = "on" }
+        println("snap_repl: sr_state wired; local_dir=" + local_snap_dir
+                + " serving=" + serve_lbl
+                + " (CE_FED_SNAP_REPLICATION_ENABLED=1)")
+    } else {
+        println("snap_repl: DISABLED (CE_FED_SNAP_REPLICATION_ENABLED=0)")
+    }
+    line()
+
+    // 3. Session tie-in. R1 does not need multi-tenant driving, but
+    // registering under a Session gives R3's snapshot / attestation
+    // wiring the seam it needs -- att_store_new + sr_init both live
+    // on the Session, and the chat REPL's `/save` path already speaks
+    // the Session contract. Cognitive slots (soul, lang, ikg, refl_kg,
+    // ctx, log, engine, hs) stay 0 -- this daemon carries the mesh
+    // half of the shape.
+    let sreg = sreg_new()
+    let sess = session_make(soul_id, soul_id, 0,
+                            0,       // sl
+                            kgreg,
+                            fed_kg,
+                            0,       // lang
+                            0,       // ikg
+                            0,       // refl_kg
+                            0,       // ctx
+                            0,       // log
+                            0,       // engine
+                            mo,
+                            0)       // hs
+    sreg_register(sreg, sess)
+    println("session  : registered '" + soul_id + "' in sreg (mesh half)")
+
+    // 4. INPUT SEAM: mirror crossengin_daemon.nova:470-480. A scripted
+    // driver writes one command per invocation to /tmp/crossengin_fed_input;
+    // the tick loop drains it as ONE command line. Recognized commands:
+    //   EXIT       -- clean shutdown
+    //   PEER <a>   -- register bootstrap peer at runtime
+    //   PING       -- force one gossip_step tick regardless of clock
+    // Anything else is logged and ignored.
+    let fed_input_path = "/tmp/crossengin_fed_input"
+
+    // 5. TICK LOOP. Advance one gossip step, drain any accept-pending
+    // conns, then poll the input file. Loop bound `CE_FED_MAXSTEP` for
+    // scripted tests; unset (or 0) -> run until EXIT / EOF. The default
+    // is unbounded so `nova run` sits at the mesh until interrupted.
+    let loop_cap = 0
+    let mx = getenv("CE_FED_MAXSTEP")
+    if mx != 0 {
+        if len(mx) > 0 {
+            let mv = str_to_int(mx)
+            if mv > 0 { loop_cap = mv }
+        }
+    }
+    let step = 0
+    let keep_running = 1
+    let total_accepts = 0
+    let total_ticks = 0
+    while keep_running == 1 {
+        if loop_cap > 0 {
+            if step >= loop_cap { keep_running = 0 }
+        }
+        if keep_running == 1 {
+            // (a) Advance the SWIM clock. gossip_step runs one PING /
+            // DELTA tick against the registered KG (fed_kg). The
+            // return is state (mutated in place); the assignment is
+            // stylistic.
+            gs = gossip_step(gs, fed_kg)
+            total_ticks = total_ticks + 1
+
+            // (a.1) R2 (ADR-0090): advance the leader-election tick.
+            // le_step (no `now` arg -- reads nanotime() internally)
+            // checks whether an in-flight election has timed out,
+            // whether the current leader is still gossip-alive, and
+            // whether a higher-ID non-dead peer has surfaced. It is
+            // cheap: a couple of list walks over the alive-peer set.
+            // Distributed rules (dr) do not tick continuously -- they
+            // run on explicit /drule_run + /drule_fixpoint invocation
+            // via the input seam / chat REPL -- so no per-tick call
+            // for dr here.
+            if le != 0 {
+                le_step(le)
+            }
+
+            // (b) Drain accept-pending conns. gossip_try_accept
+            // returns -1 (EAGAIN) when the listen fd has nothing
+            // buffered, so this is a cheap poll. When a peer dials
+            // in, hand the conn to gossip_handle_conn_kg so the
+            // DELTA branch can serve ATOMs against fed_kg.
+            if listen_fd >= 0 {
+                let accepted = gossip_try_accept(listen_fd)
+                if accepted >= 0 {
+                    // Phase O R3 (ADR-0096): when the transport gate is
+                    // "dtls" we run the server-side handshake before
+                    // handing the fd to the KG-aware handler. On
+                    // handshake failure we close the fd + bump the
+                    // module-local counter; on success we invoke the
+                    // DTLS variant (`gossip_handle_conn_kg_dtls`) so
+                    // the line loop reads + writes via the length-
+                    // prefixed record framing. Under "tcp" the call
+                    // stays byte-identical to R18E.
+                    if dtls_ready == 1 {
+                        let st_srv = dtls_init()
+                        let hs_srv = gds_handshake_server(accepted, st_srv,
+                                                          dtls_priv_bn,
+                                                          dtls_pub_point, 0)
+                        if hs_srv[0] == 1 {
+                            gs = gossip_handle_conn_kg_dtls(gs, accepted,
+                                                             hs_srv[1], fed_kg)
+                            dtls_hs_ok = dtls_hs_ok + 1
+                        } else {
+                            gds_close(accepted, hs_srv[1])
+                            dtls_hs_failed = dtls_hs_failed + 1
+                        }
+                    } else {
+                        gs = gossip_handle_conn_kg(gs, accepted, fed_kg)
+                    }
+                    total_accepts = total_accepts + 1
+                }
+            }
+
+            // (c) Scripted command drain. read_file returns 0 when
+            // the file is absent -- treat as "no command this tick".
+            // A single non-empty line is one command; multi-line files
+            // are handled one-per-tick (first line wins, driver
+            // rewrites for the next tick).
+            let input_text = read_file(fed_input_path)
+            if input_text != 0 {
+                if len(input_text) > 0 {
+                    let trimmed = str_trim(input_text)
+                    if len(trimmed) > 0 {
+                        if str_eq_bytes(trimmed, "EXIT") == 1 {
+                            println("input    : EXIT received; shutting down")
+                            keep_running = 0
+                        } else {
+                            if str_eq_bytes(trimmed, "PING") == 1 {
+                                println("input    : PING (extra gossip_step forced)")
+                                gs = gossip_step(gs, fed_kg)
+                            } else {
+                                // PEER <addr>
+                                let plen = len("PEER ")
+                                if len(trimmed) > plen {
+                                    let head = substr(trimmed, 0, plen)
+                                    if str_eq_bytes(head, "PEER ") == 1 {
+                                        let addr = substr(trimmed, plen,
+                                                          len(trimmed) - plen)
+                                        gossip_add_peer(gs, addr)
+                                        println("input    : PEER add "
+                                            + addr + " (peers="
+                                            + int_to_str(
+                                                gossip_peer_count(gs)) + ")")
+                                    } else {
+                                        println("input    : (ignored: "
+                                            + trimmed + ")")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            step = step + 1
+            // (d) Sleep to the next tick. sleep_ms is exposed by the
+            // gossip module's runtime (see src/federation/gossip.nova
+            // header). A 250ms default keeps the loop cheap while
+            // meeting SWIM's PING granularity.
+            sleep_ms(tick_ms)
+        }
+    }
+
+    // 6. SHUTDOWN SUMMARY. Print a one-line stats footer so a scripted
+    // integration harness can grep for it; mirrors the daemon's
+    // shutdown-summary shape (crossengin_daemon.nova:900+).
+    line()
+    println("fed-daemon summary:")
+    println("  ticks           = " + int_to_str(total_ticks))
+    println("  accepts         = " + int_to_str(total_accepts))
+    println("  peer_count      = " + int_to_str(gossip_peer_count(gs)))
+    println("  gossip_pings    = " + int_to_str(gossip_stats_pings(gs)))
+    println("  gossip_acks     = " + int_to_str(gossip_stats_acks(gs)))
+    println("  gossip_timeouts = " + int_to_str(gossip_stats_timeouts(gs)))
+    println("  gossip_deltas   = " + int_to_str(gossip_stats_deltas(gs)))
+    println("  dq_queries      = " + int_to_str(dq_stats_queries(dq)))
+    // R2 (ADR-0090) counters. Guarded on the enable-flag path so a
+    // daemon booted with the R2 primitives disabled still prints a
+    // recognisable footer (the disabled lines say so explicitly rather
+    // than printing 0s that look like "no activity").
+    if le != 0 {
+        println("  le_self_id      = " + int_to_str(self_id_int))
+        println("  le_leader       = " + int_to_str(le_current_leader(le)))
+        println("  le_elections    = " + int_to_str(le_stats_elections(le)))
+        println("  le_victories    = " + int_to_str(le_stats_victories(le)))
+        println("  le_deposed      = " + int_to_str(le_stats_deposed(le)))
+    } else {
+        println("  le_disabled     = 1")
+    }
+    if dr != 0 {
+        println("  dr_rules        = " + int_to_str(dr_rule_count(dr)))
+        println("  dr_derived      = " + int_to_str(dr_stats_derived(dr)))
+        println("  dr_rounds       = " + int_to_str(dr_stats_rounds(dr)))
+        println("  dr_rules_tx     = " + int_to_str(dr_stats_rules_tx(dr)))
+        println("  dr_derivs_tx    = " + int_to_str(dr_stats_derivs_tx(dr)))
+    } else {
+        println("  dr_disabled     = 1")
+    }
+    // R3 (ADR-0091) counters. Guarded on att / sr allocation so an
+    // env-disabled or key-missing run still prints an explicit line.
+    if att != 0 {
+        println("  att_count       = " + int_to_str(att_store_count(att)))
+        println("  att_rx          = " + int_to_str(gossip_stats_att_rx(gs)))
+        println("  att_bad         = " + int_to_str(gossip_stats_att_bad(gs)))
+    } else {
+        println("  att_disabled    = 1")
+    }
+    if sr != 0 {
+        println("  sr_known        = " + int_to_str(sr_known_root_count(sr)))
+        println("  sr_replicas     = " + int_to_str(sr_replica_count(sr)))
+        println("  sr_fetched      = " + int_to_str(sr_stats_fetched(sr)))
+        println("  sr_verify_fail  = " + int_to_str(sr_stats_verify_fail(sr)))
+        println("  sr_observed     = " + int_to_str(sr_stats_observed(sr)))
+        println("  sr_serving      = " + int_to_str(sr_is_serving(sr)))
+    } else {
+        println("  sr_disabled     = 1")
+    }
+    // Phase O R1 (ADR-0094) DTLS anchor telemetry. Prints even when
+    // the anchor list is empty so operators see the resolved path +
+    // hostname without a separate log dive.
+    println("  dtls_anchors    = " + int_to_str(len(dtls_anchors)))
+    println("  dtls_hostname   = " + dtls_hostname)
+    // Phase O R3 (ADR-0096) transport counters.
+    println("  transport       = " + dtls_transport)
+    println("  dtls_hs_ok      = " + int_to_str(dtls_hs_ok))
+    println("  dtls_hs_failed  = " + int_to_str(dtls_hs_failed))
+    println("  session_ids     = " + int_to_str(sreg_count(sreg)))
+    println("crossengin-fed: OK")
+    return 0
+}
+
+main()

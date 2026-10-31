@@ -1,0 +1,902 @@
+// Unit tests for R61 -- pattern-pack loader
+// (src/ingest/pattern_pack.nova).
+//
+// Covers:
+//   * Directive parsing: CAPSULE / VERSION / DESCRIPTION / LICENSE /
+//     SOURCE_TAG / PATTERN / TRIGGER / GUIDANCE
+//   * Multiple capsules in one file (boundaries)
+//   * Multiple patterns per capsule (auto-flush on next PATTERN)
+//   * Auto source_tag defaults from capsule name + version
+//   * Explicit SOURCE_TAG escape hatch overrides the default
+//   * Comment + blank-line handling
+//   * Confidence bounds (0..1000)
+//   * Lenient parser: partial patterns log errors but don't abort
+//   * pattern_pack_load registers into the process-wide registry so
+//     pattern_registry_match sees the loaded patterns
+//   * Loading a pack twice is idempotent-by-name (last-write-wins)
+
+import "../ce_test.nova"
+import "../../src/ingest/pattern_pack.nova"
+import "../../src/capsules/pattern_capsule.nova"
+import "../../src/nl/rpc_verbs.nova"
+import "../../src/sandbox/capability.nova"
+import "../../src/sandbox/ownership.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/persona/persona_registry.nova"
+import "../../src/skills/skill_registry.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/util/str_safe.nova"
+
+// ---- fixtures -----------------------------------------------------------
+
+fn _has(hay, needle) {
+    if find_bytes(hay, needle) >= 0 { return 1 }
+    return 0
+}
+
+// The canonical sample used by many tests.
+fn _sample_pack() {
+    let s = ""
+    s = s + "# security_review v1 test fixture\n"
+    s = s + "CAPSULE security_review\n"
+    s = s + "VERSION 1.0.0\n"
+    s = s + "DESCRIPTION security-focused review patterns\n"
+    s = s + "LICENSE Apache-2.0\n"
+    s = s + "\n"
+    s = s + "PATTERN 850\n"
+    s = s + "TRIGGER sql injection\n"
+    s = s + "GUIDANCE Prefer parameterized queries; never interpolate user input into SQL strings.\n"
+    s = s + "\n"
+    s = s + "PATTERN 800\n"
+    s = s + "TRIGGER xss cross-site\n"
+    s = s + "GUIDANCE Escape user-supplied HTML at the render boundary; do not trust upstream sanitization.\n"
+    s = s + "\n"
+    s = s + "PATTERN 700\n"
+    s = s + "TRIGGER hardcoded secret\n"
+    s = s + "GUIDANCE Extract to environment or secrets manager; check git history for prior commits of the same value.\n"
+    return s
+}
+
+// ---- basic shape -------------------------------------------------------
+
+fn test_parse_empty_returns_empty() {
+    let r = pattern_pack_parse_text("")
+    ce_eq("no capsules", len(pattern_pack_capsules(r)), 0)
+    ce_eq("no errors",   len(pattern_pack_errors(r)), 0)
+}
+
+fn test_parse_only_comments_returns_empty() {
+    let text = "# nothing here\n# just prose\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no capsules", len(pattern_pack_capsules(r)), 0)
+    ce_eq("no errors",   len(pattern_pack_errors(r)), 0)
+}
+
+fn test_parse_directive_before_capsule_errors() {
+    let text = "VERSION 1.0.0\nPATTERN 500\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no capsules produced", len(pattern_pack_capsules(r)), 0)
+    ce_check("at least one error", len(pattern_pack_errors(r)) >= 1)
+    let errs = pattern_pack_errors(r)
+    ce_check("error mentions CAPSULE opener",
+             _has(errs[0][1], "before any CAPSULE opener"))
+}
+
+// ---- happy path --------------------------------------------------------
+
+fn test_parse_sample_produces_one_capsule_three_patterns() {
+    let r = pattern_pack_parse_text(_sample_pack())
+    ce_eq("no errors",   len(pattern_pack_errors(r)), 0)
+    let caps = pattern_pack_capsules(r)
+    ce_eq("1 capsule", len(caps), 1)
+    let c = caps[0]
+    ce_str_eq("name",    pcapsule_name(c),    "security_review")
+    ce_str_eq("version", pcapsule_version(c), "1.0.0")
+    ce_eq("3 patterns", pcapsule_count(c), 3)
+    let pats = pcapsule_patterns(c)
+    // First pattern
+    let p0 = pats[0]
+    ce_eq("p0 confidence", pcap_confidence(p0), 850)
+    let t0 = pcap_triggers(p0)
+    ce_eq("p0 has 2 triggers", len(t0), 2)
+    ce_str_eq("p0 trig 0", t0[0], "sql")
+    ce_str_eq("p0 trig 1", t0[1], "injection")
+    ce_check("p0 guidance not empty", len(pcap_guidance(p0)) > 0)
+    // Second pattern
+    let p1 = pats[1]
+    ce_eq("p1 confidence", pcap_confidence(p1), 800)
+    ce_eq("p1 has 2 triggers", len(pcap_triggers(p1)), 2)
+    // Third pattern
+    let p2 = pats[2]
+    ce_eq("p2 confidence", pcap_confidence(p2), 700)
+}
+
+fn test_source_tag_defaults_from_name_version() {
+    let r = pattern_pack_parse_text(_sample_pack())
+    let c = pattern_pack_capsules(r)[0]
+    let pats = pcapsule_patterns(c)
+    // Auto-generated tag: src:pattern:<name>:v<version>
+    ce_str_eq("p0 source tag",
+              pcap_source_tag(pats[0]),
+              "src:pattern:security_review:v1.0.0")
+    ce_str_eq("p1 same tag",
+              pcap_source_tag(pats[1]),
+              "src:pattern:security_review:v1.0.0")
+}
+
+fn test_source_tag_explicit_overrides_default() {
+    let text = "CAPSULE t\nVERSION 1.0.0\nSOURCE_TAG src:pattern:custom\n"
+             + "PATTERN 500\nTRIGGER foo bar\nGUIDANCE do the thing\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors", len(pattern_pack_errors(r)), 0)
+    let c = pattern_pack_capsules(r)[0]
+    ce_str_eq("explicit tag wins",
+              pcap_source_tag(pcapsule_patterns(c)[0]),
+              "src:pattern:custom")
+}
+
+fn test_multiple_capsules_in_one_file() {
+    let text = ""
+             + "CAPSULE a\nVERSION 1.0.0\n"
+             + "PATTERN 500\nTRIGGER foo\nGUIDANCE a1 advice\n"
+             + "CAPSULE b\nVERSION 2.0.0\n"
+             + "PATTERN 600\nTRIGGER bar\nGUIDANCE b1 advice\n"
+             + "PATTERN 700\nTRIGGER baz\nGUIDANCE b2 advice\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors",   len(pattern_pack_errors(r)), 0)
+    let caps = pattern_pack_capsules(r)
+    ce_eq("2 capsules", len(caps), 2)
+    ce_str_eq("a name",    pcapsule_name(caps[0]),    "a")
+    ce_str_eq("a version", pcapsule_version(caps[0]), "1.0.0")
+    ce_eq("a 1 pattern",   pcapsule_count(caps[0]), 1)
+    ce_str_eq("b name",    pcapsule_name(caps[1]),    "b")
+    ce_str_eq("b version", pcapsule_version(caps[1]), "2.0.0")
+    ce_eq("b 2 patterns",  pcapsule_count(caps[1]), 2)
+    // Tag reflects each capsule's OWN name+version.
+    ce_str_eq("a tag",
+              pcap_source_tag(pcapsule_patterns(caps[0])[0]),
+              "src:pattern:a:v1.0.0")
+    ce_str_eq("b tag",
+              pcap_source_tag(pcapsule_patterns(caps[1])[0]),
+              "src:pattern:b:v2.0.0")
+}
+
+fn test_version_before_first_pattern_updates_tag() {
+    // If VERSION comes AFTER opening CAPSULE, source_tag reflects
+    // the updated version. (Test written to defend against a
+    // regression where tag is snapped at CAPSULE time only.)
+    let text = "CAPSULE p\nVERSION 3.1.4\n"
+             + "PATTERN 500\nTRIGGER x y\nGUIDANCE hi\n"
+    let r = pattern_pack_parse_text(text)
+    let c = pattern_pack_capsules(r)[0]
+    ce_str_eq("version updated in tag",
+              pcap_source_tag(pcapsule_patterns(c)[0]),
+              "src:pattern:p:v3.1.4")
+}
+
+// ---- confidence bounds -------------------------------------------------
+
+fn test_confidence_zero_ok() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN 0\nTRIGGER foo\nGUIDANCE g\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors",  len(pattern_pack_errors(r)), 0)
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("confidence 0", pcap_confidence(pcapsule_patterns(c)[0]), 0)
+}
+
+fn test_confidence_thousand_ok() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN 1000\nTRIGGER foo\nGUIDANCE g\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors",     len(pattern_pack_errors(r)), 0)
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("confidence 1000", pcap_confidence(pcapsule_patterns(c)[0]), 1000)
+}
+
+fn test_confidence_over_thousand_errors() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN 1500\nTRIGGER foo\nGUIDANCE g\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("at least one error", len(errs) >= 1)
+    ce_check("mentions bounds", _has(errs[0][1], "0..1000"))
+    // The capsule was opened but the invalid pattern was dropped.
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("no patterns", pcapsule_count(c), 0)
+}
+
+fn test_confidence_non_numeric_errors() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN high\nTRIGGER foo\nGUIDANCE g\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("at least one error", len(errs) >= 1)
+}
+
+// ---- lenient parsing ---------------------------------------------------
+
+fn test_partial_pattern_missing_trigger_errors_but_continues() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN 500\nGUIDANCE forgot trigger\n"
+             + "PATTERN 600\nTRIGGER goodone\nGUIDANCE this works\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("error recorded", len(errs) >= 1)
+    ce_check("error names TRIGGER",
+             _has(errs[0][1], "missing TRIGGER"))
+    // Second pattern still lands.
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("1 good pattern", pcapsule_count(c), 1)
+    ce_eq("second pattern's confidence",
+          pcap_confidence(pcapsule_patterns(c)[0]), 600)
+}
+
+fn test_partial_pattern_missing_guidance_errors_but_continues() {
+    let text = "CAPSULE t\nVERSION 1.0.0\n"
+             + "PATTERN 500\nTRIGGER forgot guidance\n"
+             + "PATTERN 600\nTRIGGER goodone\nGUIDANCE works\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("error recorded", len(errs) >= 1)
+    ce_check("error names GUIDANCE",
+             _has(errs[0][1], "missing GUIDANCE"))
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("1 good pattern", pcapsule_count(c), 1)
+}
+
+fn test_trigger_before_pattern_errors() {
+    let text = "CAPSULE t\nVERSION 1.0.0\nTRIGGER lone rider\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("error recorded", len(errs) >= 1)
+    ce_check("error text",
+             _has(errs[0][1], "TRIGGER without an open PATTERN"))
+}
+
+fn test_unknown_directive_errors() {
+    let text = "CAPSULE t\nVERSION 1.0.0\nWEIRD stuff here\n"
+    let r = pattern_pack_parse_text(text)
+    let errs = pattern_pack_errors(r)
+    ce_check("error recorded", len(errs) >= 1)
+    ce_check("error text",
+             _has(errs[0][1], "unknown directive: WEIRD"))
+}
+
+// ---- comment + blank handling ------------------------------------------
+
+fn test_comment_lines_ignored() {
+    let text = "# leading\nCAPSULE t\n# after CAPSULE\nVERSION 1.0.0\n"
+             + "# empty section\nPATTERN 500\n"
+             + "# comment inside pattern (blank + comments are noise)\n"
+             + "TRIGGER foo bar\nGUIDANCE guidance line\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors", len(pattern_pack_errors(r)), 0)
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("1 pattern", pcapsule_count(c), 1)
+}
+
+fn test_blank_lines_dont_close_pattern() {
+    let text = "CAPSULE t\nVERSION 1.0.0\nPATTERN 500\n\n\nTRIGGER foo\n\nGUIDANCE bar\n"
+    let r = pattern_pack_parse_text(text)
+    ce_eq("no errors", len(pattern_pack_errors(r)), 0)
+    let c = pattern_pack_capsules(r)[0]
+    ce_eq("1 pattern", pcapsule_count(c), 1)
+}
+
+// ---- guidance rest-of-line ---------------------------------------------
+
+fn test_guidance_captures_full_rest_of_line() {
+    let text = "CAPSULE t\nVERSION 1.0.0\nPATTERN 500\nTRIGGER x\n"
+             + "GUIDANCE   this is a multi word sentence with punctuation, dashes -- and quotes 'like this'.\n"
+    let r = pattern_pack_parse_text(text)
+    let c = pattern_pack_capsules(r)[0]
+    let g = pcap_guidance(pcapsule_patterns(c)[0])
+    ce_check("has 'multi word'", _has(g, "multi word sentence"))
+    ce_check("has quotes",       _has(g, "'like this'"))
+    ce_check("no leading ws",    char_at(g, 0) != 32)
+}
+
+// ---- registry integration ----------------------------------------------
+
+fn test_load_registers_capsules_and_registry_finds_them() {
+    let before = pattern_registry_count()
+    let text = "CAPSULE r61_test_pack\nVERSION 1.0.0\n"
+             + "PATTERN 900\nTRIGGER r61 special\nGUIDANCE the R61 patterns are here\n"
+    let r = pattern_pack_load_text(text)
+    ce_eq("1 registered", r[0], 1)
+    ce_eq("no errors",    len(r[1]), 0)
+    let after = pattern_registry_count()
+    ce_check("registry grew",
+             after > before || after == before)     // last-write-wins may not grow
+    ce_check("lookup finds it",
+             pattern_registry_lookup("r61_test_pack") != 0)
+}
+
+fn test_registered_pattern_matches_via_registry() {
+    let text = "CAPSULE r61_match_pack\nVERSION 1.0.0\n"
+             + "PATTERN 800\nTRIGGER quantum entanglement\n"
+             + "GUIDANCE consult a physicist before making claims about non-locality\n"
+    pattern_pack_load_text(text)
+    let toks = pcap_tokenize("what should i know about quantum entanglement")
+    let matches = pattern_registry_match_all(toks)
+    let saw = 0
+    let i = 0
+    while i < len(matches) {
+        if _has(pcap_guidance(matches[i]), "non-locality") == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("loaded pattern matched", saw, 1)
+}
+
+fn test_load_twice_is_last_write_wins() {
+    // First load: confidence 500.
+    pattern_pack_load_text(
+        "CAPSULE r61_lww\nVERSION 1.0.0\n"
+      + "PATTERN 500\nTRIGGER onlyone\nGUIDANCE first\n")
+    // Second load: same name, confidence 700, different guidance.
+    pattern_pack_load_text(
+        "CAPSULE r61_lww\nVERSION 1.0.1\n"
+      + "PATTERN 700\nTRIGGER onlyone\nGUIDANCE second\n")
+    let c = pattern_registry_lookup("r61_lww")
+    ce_check("registered", c != 0)
+    ce_str_eq("version reflects second load",
+              pcapsule_version(c), "1.0.1")
+    ce_eq("confidence reflects second load",
+          pcap_confidence(pcapsule_patterns(c)[0]), 700)
+    ce_str_eq("guidance reflects second load",
+              pcap_guidance(pcapsule_patterns(c)[0]), "second")
+}
+
+fn test_read_missing_file_errors_cleanly() {
+    let r = pattern_pack_parse("data/patterns/does_not_exist.cerec")
+    ce_eq("no capsules", len(pattern_pack_capsules(r)), 0)
+    let errs = pattern_pack_errors(r)
+    ce_check("one error",   len(errs) == 1)
+    ce_eq("line 0",         errs[0][0], 0)
+    ce_check("error text mentions file",
+             _has(errs[0][1], "could not read file"))
+}
+
+// ---- shipped pack: data/patterns/security_review.cerec ----------------
+
+fn test_shipped_security_review_pack_parses() {
+    let r = pattern_pack_parse("data/patterns/security_review.cerec")
+    let errs = pattern_pack_errors(r)
+    ce_eq("no parse errors", len(errs), 0)
+    let caps = pattern_pack_capsules(r)
+    ce_eq("1 capsule", len(caps), 1)
+    let c = caps[0]
+    ce_str_eq("name",    pcapsule_name(c),    "security_review")
+    ce_str_eq("version", pcapsule_version(c), "1.0.0")
+    // Sanity floor: OWASP-derived pack should have plenty of patterns.
+    ce_check("has >= 20 patterns", pcapsule_count(c) >= 20)
+}
+
+fn test_shipped_pack_registers_and_matches_owasp_topic() {
+    pattern_pack_load("data/patterns/security_review.cerec")
+    let c = pattern_registry_lookup("security_review")
+    ce_check("registered", c != 0)
+    // A user asking about SQL injection should hit our sql/injection
+    // pattern from the shipped pack.
+    let toks = pcap_tokenize("how do i prevent sql injection in django")
+    let matches = pattern_registry_match_all(toks)
+    let saw_sql = 0
+    let i = 0
+    while i < len(matches) {
+        if _has(pcap_source_tag(matches[i]),
+                "src:pattern:security_review") == 1 {
+            saw_sql = 1
+        }
+        i = i + 1
+    }
+    ce_eq("shipped pack matched sql-injection query", saw_sql, 1)
+}
+
+// ---- R62: pattern.list / pattern.install wire verbs ------------------
+
+fn _mk_ctx() {
+    return rpc_ctx_new(0, capreg_new(), persona_registry_new(),
+                        skill_registry_new(), mo_new(), 0, 0, 100)
+}
+
+fn _grant_admin(ctx) {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "admin")
+    let t = capability_token_new_roles("tk-admin", "root", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-admin")
+    return reg
+}
+
+fn _grant_reader(ctx) {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "reader")
+    let t = capability_token_new_roles("tk-r", "alice", roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-r")
+    return reg
+}
+
+fn test_verbs_registered() {
+    let names = rpc_verb_names()
+    let saw_list = 0
+    let saw_install = 0
+    let i = 0
+    while i < len(names) {
+        if str_eq_bytes(names[i], "pattern.list")    == 1 { saw_list    = 1 }
+        if str_eq_bytes(names[i], "pattern.install") == 1 { saw_install = 1 }
+        i = i + 1
+    }
+    ce_eq("pattern.list registered",    saw_list,    1)
+    ce_eq("pattern.install registered", saw_install, 1)
+}
+
+fn test_verbs_capped_correctly() {
+    ce_eq("list cap is capsule:read",
+          str_eq_bytes(capability_verb_required("pattern.list"),
+                       CAP_CAPSULE_READ), 1)
+    ce_eq("install cap is capsule:install",
+          str_eq_bytes(capability_verb_required("pattern.install"),
+                       CAP_CAPSULE_INSTALL), 1)
+}
+
+fn test_pattern_list_shows_builtins() {
+    // Built-in capsules are lazy-loaded on first access to the
+    // registry; pattern.list triggers that lazy path.
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let out = rpc_dispatch("pattern.list", list_new(), ctx)
+    ce_check("ok",                     _has(out, "\"ok\":true"))
+    ce_check("debug_common named",     _has(out, "\"name\":\"debug_common\""))
+    ce_check("research_hygiene named", _has(out, "\"name\":\"research_hygiene\""))
+    // Every capsule fragment carries version + pattern_count + source_tag.
+    ce_check("version 1.0.0 shown",    _has(out, "\"version\":\"1.0.0\""))
+    ce_check("has pattern_count",      _has(out, "\"pattern_count\":"))
+    ce_check("has source_tag",         _has(out, "\"source_tag\":\"src:pattern:"))
+    // R107: paginated shape -- {patterns:[...], next_after:"..."}.
+    ce_check("patterns field",         _has(out, "\"patterns\":["))
+    ce_check("next_after present",     _has(out, "\"next_after\":"))
+}
+
+fn test_pattern_install_admin_happy_path() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let body = "CAPSULE wire_test_r62\nVERSION 1.0.0\n"
+             + "PATTERN 750\nTRIGGER wire test\n"
+             + "GUIDANCE the R62 wire path installed this capsule\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("body", body))
+    let out = rpc_dispatch("pattern.install", a, ctx)
+    ce_check("ok",             _has(out, "\"ok\":true"))
+    ce_check("registered 1",   _has(out, "\"registered\":1"))
+    ce_check("error_count 0",  _has(out, "\"error_count\":0"))
+    ce_check("empty errors",   _has(out, "\"errors\":[]"))
+    ce_check("name echoed",    _has(out, "\"names\":[\"wire_test_r62\"]"))
+    // Registry actually got the new capsule.
+    ce_check("registry has capsule",
+             pattern_registry_lookup("wire_test_r62") != 0)
+    // pattern.list now shows it.
+    let out2 = rpc_dispatch("pattern.list", list_new(), ctx)
+    ce_check("list now includes new capsule",
+             _has(out2, "\"name\":\"wire_test_r62\""))
+}
+
+fn test_pattern_install_multi_capsule_body() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let body = "CAPSULE r62_multi_a\nVERSION 1.0.0\n"
+             + "PATTERN 500\nTRIGGER alpha\nGUIDANCE a1\n"
+             + "CAPSULE r62_multi_b\nVERSION 1.0.0\n"
+             + "PATTERN 600\nTRIGGER beta\nGUIDANCE b1\n"
+             + "PATTERN 700\nTRIGGER gamma\nGUIDANCE b2\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("body", body))
+    let out = rpc_dispatch("pattern.install", a, ctx)
+    ce_check("registered 2",           _has(out, "\"registered\":2"))
+    ce_check("both names echoed a",    _has(out, "\"r62_multi_a\""))
+    ce_check("both names echoed b",    _has(out, "\"r62_multi_b\""))
+    ce_eq("capsule b has 2 patterns",
+          pcapsule_count(pattern_registry_lookup("r62_multi_b")), 2)
+}
+
+fn test_pattern_install_partial_body_reports_errors() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    // Two capsules, first has one bad pattern + one good; second all good.
+    let body = "CAPSULE r62_partial\nVERSION 1.0.0\n"
+             + "PATTERN 500\nGUIDANCE missing-trigger\n"
+             + "PATTERN 600\nTRIGGER real trigger\nGUIDANCE recoverable\n"
+    let a = list_new()
+    push(a, rpc_arg_kv("body", body))
+    let out = rpc_dispatch("pattern.install", a, ctx)
+    ce_check("still registered 1 capsule", _has(out, "\"registered\":1"))
+    ce_check("error_count 1",               _has(out, "\"error_count\":1"))
+    ce_check("error message present",
+             _has(out, "missing TRIGGER"))
+    // The capsule got the RECOVERABLE pattern.
+    ce_eq("1 good pattern landed",
+          pcapsule_count(pattern_registry_lookup("r62_partial")), 1)
+}
+
+fn test_pattern_install_missing_body_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let out = rpc_dispatch("pattern.install", list_new(), ctx)
+    ce_check("missing body refused",
+             _has(out, "missing arg: body"))
+}
+
+fn test_pattern_install_empty_body_refused() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("body", ""))
+    let out = rpc_dispatch("pattern.install", a, ctx)
+    ce_check("empty body refused",
+             _has(out, "body must be non-empty"))
+}
+
+fn test_pattern_install_reader_refused_by_cap() {
+    let ctx = _mk_ctx()
+    _grant_reader(ctx)
+    let a = list_new()
+    push(a, rpc_arg_kv("body", "CAPSULE x\nVERSION 1.0.0\n"))
+    let out = rpc_dispatch("pattern.install", a, ctx)
+    ce_check("cap-refused",
+             _has(out, "capability required: capsule:install"))
+}
+
+fn test_pattern_list_reader_allowed() {
+    // reader has capsule:read, so pattern.list should work.
+    let ctx = _mk_ctx()
+    _grant_reader(ctx)
+    let out = rpc_dispatch("pattern.list", list_new(), ctx)
+    ce_check("reader can list",
+             _has(out, "\"ok\":true"))
+}
+
+fn test_pattern_install_last_write_wins_over_wire() {
+    let ctx = _mk_ctx()
+    _grant_admin(ctx)
+    let a1 = list_new()
+    push(a1, rpc_arg_kv("body",
+        "CAPSULE r62_lww_wire\nVERSION 1.0.0\n"
+      + "PATTERN 400\nTRIGGER only\nGUIDANCE first\n"))
+    rpc_dispatch("pattern.install", a1, ctx)
+    let a2 = list_new()
+    push(a2, rpc_arg_kv("body",
+        "CAPSULE r62_lww_wire\nVERSION 2.0.0\n"
+      + "PATTERN 900\nTRIGGER only\nGUIDANCE second\n"))
+    rpc_dispatch("pattern.install", a2, ctx)
+    let c = pattern_registry_lookup("r62_lww_wire")
+    ce_check("registered", c != 0)
+    ce_str_eq("version updated",  pcapsule_version(c), "2.0.0")
+    ce_eq("confidence updated",
+          pcap_confidence(pcapsule_patterns(c)[0]), 900)
+    ce_str_eq("guidance updated",
+              pcap_guidance(pcapsule_patterns(c)[0]), "second")
+}
+
+// ---- R63: holder-scoped pattern overlay -------------------------------
+
+fn _grant_holder(ctx, holder) {
+    let reg = capability_registry_new()
+    let roles = list_new() push(roles, "admin")
+    let t = capability_token_new_roles("tk-" + holder, holder, roles, 0, 0)
+    capability_registry_add(reg, t)
+    rpc_ctx_set_sandbox(ctx, reg, 1)
+    rpc_ctx_set_presented_token(ctx, "tk-" + holder)
+    return reg
+}
+
+// ---- ownership module surface -----------------------------------------
+
+fn test_pattern_kind_known() {
+    ce_eq("PATTERN kind is a known ownership kind",
+          ownership_is_known_kind(OWN_KIND_PATTERN), 1)
+    // 5 kinds now (kg + capsule + skill + pattern + agent).
+    ce_eq("5 kinds", len(ownership_kinds()), 5)
+}
+
+fn test_pattern_visible_null_overlay_is_public() {
+    ce_eq("null overlay -> visible",
+          ownership_pattern_visible(0, "anything", "anyone"), 1)
+}
+
+fn test_pattern_visible_unset_is_public() {
+    let reg = ownership_registry_new()
+    ce_eq("unset -> visible to alice",
+          ownership_pattern_visible(reg, "pack", "alice"), 1)
+    ce_eq("unset -> visible to anonymous",
+          ownership_pattern_visible(reg, "pack", ""), 1)
+}
+
+fn test_pattern_visible_owner_only() {
+    let reg = ownership_registry_new()
+    ownership_set_pattern(reg, "alices_pack", "alice")
+    ce_eq("alice sees own", ownership_pattern_visible(reg, "alices_pack", "alice"), 1)
+    ce_eq("bob refused",    ownership_pattern_visible(reg, "alices_pack", "bob"),   0)
+    ce_eq("anon refused",   ownership_pattern_visible(reg, "alices_pack", ""),      0)
+}
+
+// ---- pattern.list ownership-filtered ---------------------------------
+
+fn test_pattern_list_unfiltered_when_no_overlay() {
+    // Baseline: without a wired overlay the list is fully-visible
+    // (R62 behavior preserved).
+    let ctx = _mk_ctx()
+    _grant_holder(ctx, "carol")
+    let out = rpc_dispatch("pattern.list", list_new(), ctx)
+    ce_check("built-in visible",
+             _has(out, "\"name\":\"debug_common\""))
+}
+
+fn test_pattern_list_filters_by_holder_from_overlay() {
+    let ctx = _mk_ctx()
+    _grant_holder(ctx, "bob")
+    let overlay = ownership_registry_new()
+    // Mark debug_common as alice's; bob shouldn't see it.
+    ownership_set_pattern(overlay, "debug_common", "alice")
+    rpc_ctx_set_ownership(ctx, overlay)
+    let out = rpc_dispatch("pattern.list", list_new(), ctx)
+    ce_check("bob does NOT see debug_common",
+             _has(out, "\"name\":\"debug_common\"") == 0)
+    // Unset capsules still visible (research_hygiene isn't in overlay).
+    ce_check("bob still sees research_hygiene",
+             _has(out, "\"name\":\"research_hygiene\""))
+}
+
+fn test_pattern_list_owner_sees_owned() {
+    let ctx = _mk_ctx()
+    _grant_holder(ctx, "alice")
+    let overlay = ownership_registry_new()
+    ownership_set_pattern(overlay, "debug_common", "alice")
+    rpc_ctx_set_ownership(ctx, overlay)
+    let out = rpc_dispatch("pattern.list", list_new(), ctx)
+    ce_check("alice sees her owned pack",
+             _has(out, "\"name\":\"debug_common\""))
+}
+
+// ---- pattern.install auto-ownership ----------------------------------
+
+fn test_pattern_install_no_overlay_leaves_owner_empty() {
+    let ctx = _mk_ctx()
+    _grant_holder(ctx, "alice")
+    // No rpc_ctx_set_ownership -> no overlay -> no auto-assignment.
+    let a = list_new()
+    push(a, rpc_arg_kv("body",
+        "CAPSULE r63_no_overlay\nVERSION 1.0.0\n"
+      + "PATTERN 500\nTRIGGER x\nGUIDANCE g\n"))
+    let out = rpc_dispatch("pattern.install", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("owner is empty",  _has(out, "\"owners\":[\"\"]"))
+}
+
+fn test_pattern_install_wired_overlay_auto_assigns_holder() {
+    let ctx = _mk_ctx()
+    _grant_holder(ctx, "alice")
+    let overlay = ownership_registry_new()
+    rpc_ctx_set_ownership(ctx, overlay)
+    let a = list_new()
+    push(a, rpc_arg_kv("body",
+        "CAPSULE r63_alice_pack\nVERSION 1.0.0\n"
+      + "PATTERN 500\nTRIGGER x\nGUIDANCE g\n"))
+    let out = rpc_dispatch("pattern.install", a, ctx)
+    ce_check("ok",              _has(out, "\"ok\":true"))
+    ce_check("owners has alice",
+             _has(out, "\"owners\":[\"alice\"]"))
+    // Overlay actually got the entry.
+    ce_str_eq("overlay records alice",
+              ownership_owner(overlay, OWN_KIND_PATTERN, "r63_alice_pack"),
+              "alice")
+}
+
+fn test_pattern_install_anonymous_leaves_owner_empty() {
+    // Sandbox-off ctx (no token presented) -> presented_holder is ""
+    // -> no auto-assignment even if overlay wired.
+    let ctx = _mk_ctx()
+    let overlay = ownership_registry_new()
+    rpc_ctx_set_ownership(ctx, overlay)
+    let a = list_new()
+    push(a, rpc_arg_kv("body",
+        "CAPSULE r63_anon_pack\nVERSION 1.0.0\n"
+      + "PATTERN 500\nTRIGGER y\nGUIDANCE g\n"))
+    let out = rpc_dispatch("pattern.install", a, ctx)
+    ce_check("owner empty on anon install",
+             _has(out, "\"owners\":[\"\"]"))
+    ce_eq("overlay untouched for anon install",
+          len(ownership_owner(overlay, OWN_KIND_PATTERN, "r63_anon_pack")),
+          0)
+}
+
+fn test_pattern_install_multi_capsule_assigns_each() {
+    let ctx = _mk_ctx()
+    _grant_holder(ctx, "bob")
+    let overlay = ownership_registry_new()
+    rpc_ctx_set_ownership(ctx, overlay)
+    let a = list_new()
+    push(a, rpc_arg_kv("body",
+        "CAPSULE r63_bob_a\nVERSION 1.0.0\n"
+      + "PATTERN 500\nTRIGGER a\nGUIDANCE a\n"
+      + "CAPSULE r63_bob_b\nVERSION 1.0.0\n"
+      + "PATTERN 500\nTRIGGER b\nGUIDANCE b\n"))
+    rpc_dispatch("pattern.install", a, ctx)
+    ce_str_eq("a owned by bob",
+              ownership_owner(overlay, OWN_KIND_PATTERN, "r63_bob_a"), "bob")
+    ce_str_eq("b owned by bob",
+              ownership_owner(overlay, OWN_KIND_PATTERN, "r63_bob_b"), "bob")
+}
+
+fn test_pattern_install_then_bob_cant_see_alices() {
+    // End-to-end: alice installs a pack, bob calls pattern.list and
+    // doesn't see it. Proves install + list agree under the overlay.
+    let overlay = ownership_registry_new()
+    // Alice installs
+    let ctx_a = _mk_ctx()
+    _grant_holder(ctx_a, "alice")
+    rpc_ctx_set_ownership(ctx_a, overlay)
+    let arg_a = list_new()
+    push(arg_a, rpc_arg_kv("body",
+        "CAPSULE r63_e2e_alice\nVERSION 1.0.0\n"
+      + "PATTERN 900\nTRIGGER x\nGUIDANCE alice's advice\n"))
+    rpc_dispatch("pattern.install", arg_a, ctx_a)
+    // Bob lists
+    let ctx_b = _mk_ctx()
+    _grant_holder(ctx_b, "bob")
+    rpc_ctx_set_ownership(ctx_b, overlay)
+    let out_b = rpc_dispatch("pattern.list", list_new(), ctx_b)
+    ce_check("bob does NOT see alice's pack",
+             _has(out_b, "\"name\":\"r63_e2e_alice\"") == 0)
+    // Alice lists -- she sees it.
+    let out_a = rpc_dispatch("pattern.list", list_new(), ctx_a)
+    ce_check("alice sees her own pack",
+             _has(out_a, "\"name\":\"r63_e2e_alice\""))
+}
+
+// ---- pattern_registry_match_scoped API -----------------------------
+
+fn test_match_scoped_no_overlay_matches_like_match_all() {
+    // Load a fixture pack so the scoped API has something to hit.
+    pattern_pack_load_text(
+        "CAPSULE r63_scoped_basic\nVERSION 1.0.0\n"
+      + "PATTERN 800\nTRIGGER scoped basic\nGUIDANCE basic advice\n")
+    let toks = pcap_tokenize("please give me some scoped basic tips")
+    let unscoped = pattern_registry_match_all(toks)
+    let scoped   = pattern_registry_match_scoped(toks, list_new(), 0, "")
+    ce_eq("scoped == unscoped when overlay=0",
+          len(scoped), len(unscoped))
+}
+
+fn test_match_scoped_hides_capsule_from_non_owner() {
+    pattern_pack_load_text(
+        "CAPSULE r63_scoped_alice\nVERSION 1.0.0\n"
+      + "PATTERN 900\nTRIGGER scoped alice\nGUIDANCE alice's secret sauce\n")
+    let overlay = ownership_registry_new()
+    ownership_set_pattern(overlay, "r63_scoped_alice", "alice")
+    let toks = pcap_tokenize("scoped alice pattern lookup")
+    // Alice sees it.
+    let m_alice = pattern_registry_match_scoped(toks, list_new(),
+                                                 overlay, "alice")
+    let saw_a = 0
+    let i = 0
+    while i < len(m_alice) {
+        if _has(pcap_guidance(m_alice[i]), "alice's secret sauce") == 1 {
+            saw_a = 1
+        }
+        i = i + 1
+    }
+    ce_eq("alice matches", saw_a, 1)
+    // Bob does not.
+    let m_bob = pattern_registry_match_scoped(toks, list_new(),
+                                               overlay, "bob")
+    let saw_b = 0
+    let j = 0
+    while j < len(m_bob) {
+        if _has(pcap_guidance(m_bob[j]), "alice's secret sauce") == 1 {
+            saw_b = 1
+        }
+        j = j + 1
+    }
+    ce_eq("bob doesn't match owned capsule", saw_b, 0)
+}
+
+fn test_match_scoped_anonymous_denied_owned_capsule() {
+    pattern_pack_load_text(
+        "CAPSULE r63_scoped_anon\nVERSION 1.0.0\n"
+      + "PATTERN 900\nTRIGGER scoped anon\nGUIDANCE private guidance\n")
+    let overlay = ownership_registry_new()
+    ownership_set_pattern(overlay, "r63_scoped_anon", "alice")
+    let toks = pcap_tokenize("scoped anon test path")
+    let m = pattern_registry_match_scoped(toks, list_new(), overlay, "")
+    let saw = 0
+    let i = 0
+    while i < len(m) {
+        if _has(pcap_guidance(m[i]), "private guidance") == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("anon can't see owned patterns", saw, 0)
+}
+
+fn test_match_scoped_public_capsule_visible_to_all() {
+    pattern_pack_load_text(
+        "CAPSULE r63_scoped_public\nVERSION 1.0.0\n"
+      + "PATTERN 500\nTRIGGER scoped public\nGUIDANCE public advice\n")
+    let overlay = ownership_registry_new()
+    // Only mark some OTHER capsule; the public one stays unset.
+    ownership_set_pattern(overlay, "some_other", "alice")
+    let toks = pcap_tokenize("scoped public advice")
+    let m_bob = pattern_registry_match_scoped(toks, list_new(),
+                                               overlay, "bob")
+    let saw = 0
+    let i = 0
+    while i < len(m_bob) {
+        if _has(pcap_guidance(m_bob[i]), "public advice") == 1 { saw = 1 }
+        i = i + 1
+    }
+    ce_eq("public capsule reaches bob", saw, 1)
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    test_parse_empty_returns_empty()
+    test_parse_only_comments_returns_empty()
+    test_parse_directive_before_capsule_errors()
+    test_parse_sample_produces_one_capsule_three_patterns()
+    test_source_tag_defaults_from_name_version()
+    test_source_tag_explicit_overrides_default()
+    test_multiple_capsules_in_one_file()
+    test_version_before_first_pattern_updates_tag()
+    test_confidence_zero_ok()
+    test_confidence_thousand_ok()
+    test_confidence_over_thousand_errors()
+    test_confidence_non_numeric_errors()
+    test_partial_pattern_missing_trigger_errors_but_continues()
+    test_partial_pattern_missing_guidance_errors_but_continues()
+    test_trigger_before_pattern_errors()
+    test_unknown_directive_errors()
+    test_comment_lines_ignored()
+    test_blank_lines_dont_close_pattern()
+    test_guidance_captures_full_rest_of_line()
+    test_load_registers_capsules_and_registry_finds_them()
+    test_registered_pattern_matches_via_registry()
+    test_load_twice_is_last_write_wins()
+    test_read_missing_file_errors_cleanly()
+    test_shipped_security_review_pack_parses()
+    test_shipped_pack_registers_and_matches_owasp_topic()
+    // R62 wire verbs
+    test_verbs_registered()
+    test_verbs_capped_correctly()
+    test_pattern_list_shows_builtins()
+    test_pattern_install_admin_happy_path()
+    test_pattern_install_multi_capsule_body()
+    test_pattern_install_partial_body_reports_errors()
+    test_pattern_install_missing_body_refused()
+    test_pattern_install_empty_body_refused()
+    test_pattern_install_reader_refused_by_cap()
+    test_pattern_list_reader_allowed()
+    test_pattern_install_last_write_wins_over_wire()
+    // R63 holder-scoped pattern overlay
+    test_pattern_kind_known()
+    test_pattern_visible_null_overlay_is_public()
+    test_pattern_visible_unset_is_public()
+    test_pattern_visible_owner_only()
+    test_pattern_list_unfiltered_when_no_overlay()
+    test_pattern_list_filters_by_holder_from_overlay()
+    test_pattern_list_owner_sees_owned()
+    test_pattern_install_no_overlay_leaves_owner_empty()
+    test_pattern_install_wired_overlay_auto_assigns_holder()
+    test_pattern_install_anonymous_leaves_owner_empty()
+    test_pattern_install_multi_capsule_assigns_each()
+    test_pattern_install_then_bob_cant_see_alices()
+    test_match_scoped_no_overlay_matches_like_match_all()
+    test_match_scoped_hides_capsule_from_non_owner()
+    test_match_scoped_anonymous_denied_owned_capsule()
+    test_match_scoped_public_capsule_visible_to_all()
+    ce_summary("pattern_pack")
+}
+
+main()

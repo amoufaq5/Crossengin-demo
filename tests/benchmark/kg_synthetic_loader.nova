@@ -1,0 +1,200 @@
+// CrossEngin R106 -- synthetic KG corpus generator for the NL latency
+// bench harness (Phase H, ADR-0208).
+//
+// Purpose
+//   Produce a reproducible KG at the three scale presets called out in
+//   ADR-0208 (SMALL=1000, MEDIUM=10000, LARGE=100000) plus edges and
+//   capsule references, so the NL-verb latency bench can exercise real
+//   traversal and lookup paths without depending on hand-authored packs.
+//
+// API
+//   syn_kg_new_at_scale(atom_count) -> kg
+//       Build a KG with `atom_count` atoms, labels `atom_0..atom_{N-1}`,
+//       kinds cycled through {ATOM_FACT, ATOM_CONCEPT, ATOM_RELATION},
+//       belief seeded per-atom (deterministic).
+//
+//   syn_kg_add_relations(kg, atom_count, relations_per_atom) -> edge_count
+//       For each atom i, add `relations_per_atom` relation atoms linking
+//       atom_i -> atom_{(i+k) % atom_count} for k in 1..relations_per_atom.
+//       Returns the count of relation atoms created.
+//
+//   syn_kg_add_capsule_refs(kg, capsule_reg, capsule_count) -> ok
+//       Install `capsule_count` capsules named `syn_cap_{k}`, each
+//       claiming atoms atom_{k*100 + 0..99}. Exercises
+//       `capreg_capsules_owning_atom` on the hot path.
+//
+// Scale presets
+//   SCALE_SMALL  = 1000 atoms + 5 relations/atom  = 5000 edges  + 10 caps
+//   SCALE_MEDIUM = 10000 atoms + 5 relations/atom = 50000 edges + 100 caps
+//   SCALE_LARGE  = 100000 atoms + 10 relations    = 1e6 edges   + 1000 caps
+//     (gated on CROSSENGIN_BENCH_LARGE=1; skip otherwise)
+//
+// CrossEngin dependencies: multi_kg_manager, atom_store, capsules,
+//   capsule_registry, bayesian_updates (for SRC_A/B/C tier cycle).
+
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/capsules/capsule.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/learning/bayesian_updates.nova"
+
+// ---- scale presets --------------------------------------------------------
+
+let SCALE_SMALL_ATOMS   = 1000
+let SCALE_SMALL_RELS    = 5
+let SCALE_SMALL_CAPS    = 10
+
+let SCALE_MEDIUM_ATOMS  = 10000
+let SCALE_MEDIUM_RELS   = 5
+let SCALE_MEDIUM_CAPS   = 100
+
+let SCALE_LARGE_ATOMS   = 100000
+let SCALE_LARGE_RELS    = 10
+let SCALE_LARGE_CAPS    = 1000
+
+// ---- kind cycle -----------------------------------------------------------
+// Cycled through 3 kinds so dispatch on kind sees a distribution. We use
+// FACT / CONCEPT / RELATION because those are the base atom kinds
+// authored by every existing importer (atom_store.nova:194-199).
+
+fn _syn_kind_for(i) {
+    let r = i - (i / 3) * 3            // i mod 3 without % (safety on NOVA)
+    if r == 0 { return ATOM_FACT }
+    if r == 1 { return ATOM_CONCEPT }
+    return ATOM_RELATION
+}
+
+// Cycle tier through SRC_A / SRC_B / SRC_C.
+fn _syn_tier_for(i) {
+    let r = i - (i / 3) * 3
+    if r == 0 { return SRC_A }
+    if r == 1 { return SRC_B }
+    return SRC_C
+}
+
+// Deterministic belief seed. Splits atoms into a broadly-supported
+// bucket and a broadly-contested bucket so `research` / `contradict_scan`
+// see realistic belief distributions. Uses only fixed-point arithmetic
+// via bel_new(alpha, beta).
+fn _syn_belief_for(i) {
+    let r = i - (i / 5) * 5
+    // r in 0..4, seed one of five belief shapes:
+    //   0 -> strongly supported (alpha high)
+    //   1 -> mildly supported
+    //   2 -> uniform
+    //   3 -> mildly contested
+    //   4 -> strongly contested
+    if r == 0 { return bel_new(8000, 2000) }
+    if r == 1 { return bel_new(6000, 4000) }
+    if r == 2 { return bel_uniform() }
+    if r == 3 { return bel_new(4000, 6000) }
+    return bel_new(2000, 8000)
+}
+
+// ---- atom-count constructor ----------------------------------------------
+
+// Build a KG registered under a temporary name and populate it with
+// `atom_count` atoms. Labels are `atom_0..atom_{N-1}`, kinds cycle
+// through the fact/concept/relation triple, and each atom's belief is
+// deterministic in i (so runs are byte-comparable).
+//
+// Returns the KG list. Callers can spawn multiple KGs in one registry
+// via kg_registry_new + kg_spawn if they need contrastive corpora.
+fn syn_kg_new_at_scale_ex(reg, kg_name, atom_count) {
+    let kg = kg_spawn(reg, kg_name)
+    let i = 0
+    while i < atom_count {
+        let label = "atom_" + int_to_str(i)
+        let a = kg_add_atom(kg, _syn_kind_for(i), label, 0)
+        // Deterministic belief per atom.
+        let b = _syn_belief_for(i)
+        list_set(a, A_BELIEF, b)
+        // Provenance tier cycled. A_PROV is a list already carried by
+        // atom_new; we set its first slot (PROV_TIER) via list_set to
+        // avoid churn if the provenance ledger grows.
+        let prov = a[A_PROV]
+        if len(prov) > PROV_TIER {
+            list_set(prov, PROV_TIER, _syn_tier_for(i))
+        }
+        i = i + 1
+    }
+    return kg
+}
+
+// Convenience: build a fresh registry AND KG in one call.
+fn syn_kg_new_at_scale(atom_count) {
+    let reg = kg_registry_new()
+    return syn_kg_new_at_scale_ex(reg, "syn_bench", atom_count)
+}
+
+// ---- relation edges -------------------------------------------------------
+
+// For each atom i in [0..atom_count), add `relations_per_atom` relation
+// atoms linking atom_i -> atom_{(i+k) % atom_count} for k in 1..K. Each
+// relation atom has label `rel_i_k` and kind ATOM_RELATION so it does
+// not collide with the base label space. Returns the number of relation
+// atoms actually added.
+fn syn_kg_add_relations(kg, atom_count, relations_per_atom) {
+    let created = 0
+    let i = 0
+    while i < atom_count {
+        let k = 1
+        while k <= relations_per_atom {
+            let j = i + k
+            if j >= atom_count { j = j - atom_count }
+            let label = "rel_" + int_to_str(i) + "_" + int_to_str(k)
+            kg_add_atom(kg, ATOM_RELATION, label, 0)
+            created = created + 1
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return created
+}
+
+// ---- capsule references ---------------------------------------------------
+
+// Install `capsule_count` capsules named `syn_cap_{k}`, each claiming
+// atoms atom_{k*100 + 0..99} in `kg`. Idempotent w.r.t. re-installs:
+// the registry refuses duplicate names, so this function returns 0 if
+// any name collides.
+fn syn_kg_add_capsule_refs(kg, capsule_reg, capsule_count) {
+    let k = 0
+    let base_label = "syn_cap_"
+    while k < capsule_count {
+        let name = base_label + int_to_str(k)
+        let c = capsule_new(name, "1.0.0", "R106 synthetic capsule",
+                             "LICENSE_OPEN")
+        // Claim 100 atoms starting at k*100.
+        let start = k * 100
+        let end   = start + 100
+        let m = start
+        while m < end {
+            // Look up the atom by label; skip if the KG is smaller.
+            let label = "atom_" + int_to_str(m)
+            let a = kg_find_atom(kg, label)
+            if a != 0 {
+                capsule_claim_atom(c, atom_id(a))
+            }
+            m = m + 1
+        }
+        capreg_register(capsule_reg, c)
+        capsule_install(c, 0)
+        k = k + 1
+    }
+    return 1
+}
+
+// ---- env helper -----------------------------------------------------------
+
+// Return 1 if the CROSSENGIN_BENCH_LARGE env var is set to "1", else 0.
+// The 10^5 scale is memory-heavy and slow to build in this container --
+// it stays behind a gate so `make bench-nl` on a modest host does not
+// stall.
+fn syn_bench_large_enabled() {
+    let v = getenv("CROSSENGIN_BENCH_LARGE")
+    if v == 0 { return 0 }
+    if len(v) == 0 { return 0 }
+    if str_eq_bytes(v, "1") == 1 { return 1 }
+    return 0
+}

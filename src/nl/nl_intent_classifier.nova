@@ -1,0 +1,1129 @@
+// CrossEngin NL Surface: HDC prototype-vector intent classifier
+// (R98, Phase C part 3).
+//
+// The third rung of the ADR-0211 pipeline
+//   grammar -> HDC classifier -> sidecar LLM (fallback)
+//
+// When the deterministic grammar parser (src/nl/grammar_parser.nova)
+// returns NLK_UNPARSED but the utterance is "close enough" to a known
+// pattern, this module classifies it into an SQ_KIND by computing
+// cosine similarity between an HDC bundle of the utterance's tokens
+// and a per-kind PROTOTYPE VECTOR pre-bundled from hand-authored
+// training examples. A hit skips the (expensive, network-touching)
+// LLM sidecar entirely; a miss falls through unchanged.
+//
+// Public API
+// ----------
+//   nl_ic_init()
+//       Idempotent + lazy. Compiles the embedded training corpus
+//       (_NLIC_CORPUS) into a per-kind prototype registry. Called
+//       automatically on the first nl_ic_try_classify. Returns the
+//       registry (also cached in the module-level singleton).
+//
+//   nl_ic_try_classify(raw_text, metrics_reg, holder)
+//     -> [ok, sq_out, similarity_bp]
+//       Tokenize + strip preamble + bundle -> compare against every
+//       prototype -> pick the winner IF similarity > threshold. On
+//       hit: build the corresponding sq_* with slot-fill; validate;
+//       return [1, sq, bp]. On miss (or on a validator failure after
+//       slot-fill): [0, sq_unparsed(raw_text), 0]. Metrics: always
+//       inc `classifier_attempt`; inc `classifier_hit` on 1, else
+//       `classifier_miss`.
+//
+//   nl_ic_prototype_count() -> int
+//       Number of KIND blocks the registry knows. Reads only.
+//
+//   nl_ic_threshold_bp() -> int
+//       Threshold in basis points (0-10000; 5000 == 50% cosine).
+//       Resolved once at init from CROSSENGIN_NL_IC_THRESHOLD_BP,
+//       default 3000 bp (30%). Chosen empirically: HDC token-bundles
+//       score ~2000-4000 bp for on-topic paraphrases when bundling
+//       depths differ, so 3000 balances hit-rate vs mis-classification.
+//
+//   nl_ic_reset_cache()
+//       Test-only: drop the singleton so the next call re-inits.
+//
+// Threshold math
+// --------------
+// src/kg/hdc_embed.nova::hdc_cosine returns milli (-1000..1000). We
+// convert to basis points (bp = milli * 10; clamped to >=0 so a
+// negative correlation is treated as a miss, not a hit).
+//
+// Slot fill
+// ---------
+// The classifier recognizes INTENT, not full structure. For kinds that
+// need arguments:
+//   * research / retract / capsule_install / skill_install:
+//       arg = utterance minus preamble minus that kind's "signal words"
+//       (the tokens that identify the intent), joined with spaces.
+//   * capsule_list / skill_list: no args.
+//   * relate / is_a / contradict_scan (2 topics): split on a known
+//       connector ("and", "vs", "versus", "to", "between", ...).
+//       When no clean split is found we DROP the classification and
+//       return unparsed -- misclassifying is worse than letting the
+//       sidecar try.
+//   * skill_run (2 args, skill + arg): split on "on", "with",
+//       "using", "to". Same fall-through if ambiguous.
+//
+// After slot-fill the constructed SQ is passed to sq_validate; any
+// SQ_ERR_* aborts the classification and returns sq_unparsed. This
+// keeps the executor's invariants intact even when the corpus grows
+// to shapes the slot-filler under-supports.
+//
+// Determinism
+// -----------
+// * hdc_symbol(label) is a pure function of the label (FNV-1a seed +
+//   bounded LCG). Same corpus -> byte-identical prototype vectors.
+// * The registry is a plain list so tests can walk it deterministically.
+// * The threshold read is env-cached; tests that toggle it must call
+//   nl_ic_reset_cache between scenarios.
+//
+// Embedded corpus vs. on-disk file
+// --------------------------------
+// data/nl_intent/prototypes.txt ships the same corpus for operator
+// inspection, but the CLASSIFIER embeds it as a string constant
+// (_NLIC_CORPUS) so no file I/O is needed at daemon boot. sys_open on
+// /tmp under the sandbox container aborts (docs/NOVA_RUNTIME_GAPS.md);
+// reading a data file at every start would inherit the same risk.
+// Keep the two in sync when adding utterances (a later round can
+// unify the two).
+//
+// NOVA quirks handled
+// -------------------
+// * str_eq flaky on short literals -> use str_eq_bytes everywhere.
+// * str_to_int returns 0 for garbage -> env-parse rejects non-digits
+//   explicitly.
+// * No floats -> similarity in integer basis points.
+// * len(0) crashes -> null-guard every list read.
+//
+// Dependencies
+// ------------
+// NOVA builtins: getenv, list_new, push, list_set, str_eq_bytes,
+//   char_at, chr, len, int_to_str, println, int_mul, int_div.
+// CrossEngin: src/nl/query_shape.nova (SQ constructors + validator),
+//   src/kg/hdc_embed.nova (hdc_symbol / hdc_bundle / hdc_cosine),
+//   src/util/str_safe.nova (str_eq_bytes, find_bytes, find_char).
+
+import "./query_shape.nova"
+import "./nl_metrics.nova"
+import "../kg/hdc_embed.nova"
+import "../util/str_safe.nova"
+
+// ---- embedded training corpus -----------------------------------------
+//
+// Semantics mirror data/nl_intent/prototypes.txt: a list of blocks,
+// each block a [kind_name, utterances[]] pair; the classifier bundles
+// each utterance's token-vectors, then bundles those utterance-vectors
+// into a per-kind prototype. Names are the lowercase suffix of the
+// NLK_* constants (see _nlic_name_to_kind).
+//
+// The corpus is built into a NOVA list at init time rather than a
+// giant string literal so the compiler stays fast (a several-KB
+// left-associative concat literal made the NOVA front-end quadratic
+// on early R98 drafts). Keep this list and the .txt file in sync when
+// adding utterances.
+fn _nlic_utts_research() {
+    let l = list_new()
+    push(l, "what do you know about photosynthesis")
+    push(l, "tell me about the cell cycle")
+    push(l, "explain quantum entanglement")
+    push(l, "describe the pancreas")
+    push(l, "i want to know about black holes")
+    push(l, "give me info on the roman empire")
+    push(l, "facts about world war two")
+    push(l, "history of the printing press")
+    push(l, "overview of machine learning")
+    push(l, "summary of the french revolution")
+    push(l, "background on climate change")
+    push(l, "key points about mitochondria")
+    push(l, "information on newton laws")
+    push(l, "details on the industrial revolution")
+    push(l, "what is dna")
+    push(l, "define enzyme")
+    push(l, "origin of the universe")
+    push(l, "how does gravity work")
+    push(l, "why is the moon important")
+    push(l, "what does osmosis mean")
+    return l
+}
+
+fn _nlic_utts_relate() {
+    let l = list_new()
+    push(l, "how does photosynthesis relate to respiration")
+    push(l, "what is the relationship between dna and rna")
+    push(l, "connection between gravity and mass")
+    push(l, "link between diet and health")
+    push(l, "similarities between cats and dogs")
+    push(l, "difference between weather and climate")
+    push(l, "how are neurons and synapses related")
+    push(l, "compare python and rust")
+    push(l, "comparison of tcp and udp")
+    push(l, "socialism vs capitalism")
+    push(l, "atoms versus molecules")
+    push(l, "relate rome to greece")
+    push(l, "how does inflation relate to unemployment")
+    push(l, "ties between exercise and mood")
+    push(l, "contrast fascism and democracy")
+    return l
+}
+
+fn _nlic_utts_contradict_scan() {
+    let l = list_new()
+    push(l, "find contradictions in the medical pack")
+    push(l, "scan for contradictions about vaccines")
+    push(l, "contradictions in the physics kg")
+    push(l, "conflicts about global warming")
+    push(l, "disagreements about diet plans")
+    push(l, "inconsistencies in the history record")
+    push(l, "where does economics conflict")
+    push(l, "are there contradictions about evolution")
+    push(l, "scan physics for contradictions")
+    push(l, "disagreements in the political dataset")
+    return l
+}
+
+fn _nlic_utts_is_a() {
+    let l = list_new()
+    push(l, "is a whale a mammal")
+    push(l, "is water a compound")
+    push(l, "is python a language")
+    push(l, "is einstein a person")
+    push(l, "is a tomato a fruit")
+    push(l, "is a virus alive")
+    push(l, "does a bat count as a bird")
+    push(l, "is oxygen a gas")
+    push(l, "is bitcoin a currency")
+    push(l, "is a whale a fish")
+    push(l, "is fascism an ideology")
+    push(l, "is a spider an insect")
+    return l
+}
+
+fn _nlic_utts_retract() {
+    let l = list_new()
+    push(l, "retract the claim that mars has life")
+    push(l, "retract fact water boils at fifty")
+    push(l, "forget about the eiffel tower fact")
+    push(l, "forget the mars canal claim")
+    push(l, "remove the outdated pluto record")
+    push(l, "delete the wrong newton quote")
+    push(l, "unlearn the old astrology claim")
+    push(l, "withdraw the retracted study")
+    push(l, "retract the earlier statement about jupiter")
+    push(l, "forget everything about phlogiston")
+    return l
+}
+
+fn _nlic_utts_capsule_install() {
+    let l = list_new()
+    push(l, "install capsule biology")
+    push(l, "install pack medical")
+    push(l, "add capsule solar_system")
+    push(l, "load capsule chemistry")
+    push(l, "import capsule world_history")
+    push(l, "enable capsule physics")
+    push(l, "install the religion capsule")
+    push(l, "install the ancient rome pack")
+    push(l, "install pack economics")
+    push(l, "add the biology capsule")
+    return l
+}
+
+fn _nlic_utts_skill_install() {
+    let l = list_new()
+    push(l, "install skill echo")
+    push(l, "add skill research")
+    push(l, "load skill coding_helper")
+    push(l, "enable skill sorter")
+    push(l, "activate skill parser")
+    push(l, "install a new debugger skill")
+    push(l, "install skill grammar_check")
+    push(l, "add skill summariser")
+    push(l, "install the calculator skill")
+    push(l, "install skill translator")
+    return l
+}
+
+fn _nlic_utts_capsule_list() {
+    let l = list_new()
+    push(l, "list capsules")
+    push(l, "list all capsules")
+    push(l, "show capsules")
+    push(l, "show all capsules")
+    push(l, "what capsules are installed")
+    push(l, "which capsules do i have")
+    push(l, "installed capsules")
+    push(l, "available capsules")
+    push(l, "list every capsule")
+    push(l, "what packs are loaded")
+    return l
+}
+
+fn _nlic_utts_skill_list() {
+    let l = list_new()
+    push(l, "list skills")
+    push(l, "list all skills")
+    push(l, "show skills")
+    push(l, "show all skills")
+    push(l, "what skills are available")
+    push(l, "which skills do i have")
+    push(l, "installed skills")
+    push(l, "available skills")
+    push(l, "list every skill")
+    push(l, "what skills are loaded")
+    return l
+}
+
+fn _nlic_utts_skill_run() {
+    let l = list_new()
+    push(l, "run skill echo on hello")
+    push(l, "run echo on hello world")
+    push(l, "execute research on gravity")
+    push(l, "use skill sorter on the list")
+    push(l, "use research on quantum mechanics")
+    push(l, "invoke echo on ping")
+    push(l, "apply sorter to numbers")
+    push(l, "run parser with input text")
+    push(l, "execute grammar_check on the essay")
+    push(l, "run summariser on the article")
+    return l
+}
+
+// Build the flat corpus as list of [kind_int, utterance_list].
+fn _nlic_corpus_blocks() {
+    let out = list_new()
+    let e1 = list_new() push(e1, NLK_RESEARCH)         push(e1, _nlic_utts_research())         push(out, e1)
+    let e2 = list_new() push(e2, NLK_RELATE)           push(e2, _nlic_utts_relate())           push(out, e2)
+    let e3 = list_new() push(e3, NLK_CONTRADICT_SCAN)  push(e3, _nlic_utts_contradict_scan())  push(out, e3)
+    let e4 = list_new() push(e4, NLK_IS_A)             push(e4, _nlic_utts_is_a())             push(out, e4)
+    let e5 = list_new() push(e5, NLK_RETRACT)          push(e5, _nlic_utts_retract())          push(out, e5)
+    let e6 = list_new() push(e6, NLK_CAPSULE_INSTALL)  push(e6, _nlic_utts_capsule_install())  push(out, e6)
+    let e7 = list_new() push(e7, NLK_SKILL_INSTALL)    push(e7, _nlic_utts_skill_install())    push(out, e7)
+    let e8 = list_new() push(e8, NLK_CAPSULE_LIST)     push(e8, _nlic_utts_capsule_list())     push(out, e8)
+    let e9 = list_new() push(e9, NLK_SKILL_LIST)       push(e9, _nlic_utts_skill_list())       push(out, e9)
+    let e10 = list_new() push(e10, NLK_SKILL_RUN)      push(e10, _nlic_utts_skill_run())       push(out, e10)
+    return out
+}
+
+// ---- constants --------------------------------------------------------
+
+// Empirically tuned. HDC token-bundles for on-topic paraphrases against
+// the shipped 10-kind corpus score 4000..6000 bp; clearly-off inputs
+// score < 2500 bp. 3500 bp sits above the "generic noise" band (a
+// two-word non-sense query typically lands around 3000-3200 bp against
+// the RESEARCH prototype) while staying below the on-topic paraphrase
+// floor. Operators override with CROSSENGIN_NL_IC_THRESHOLD_BP.
+let _NLIC_DEFAULT_THRESHOLD_BP = 3500
+
+// Registry row slot layout: each row is
+//   [kind_int, prototype_vector, signal_words_list]
+// where signal_words is a token list used at slot-fill time to strip
+// the tokens that carry the intent from the topic string.
+let _NLIC_R_KIND    = 0
+let _NLIC_R_VEC     = 1
+let _NLIC_R_SIGNAL  = 2
+let _NLIC_R_SLOTS   = 3
+
+// ---- module-level singleton ------------------------------------------
+
+let _nlic_reg = 0            // list of prototype rows (or 0 pre-init)
+let _nlic_threshold_bp = 0   // resolved threshold in bp
+let _nlic_init_logged = 0    // one-shot boot log
+
+// ---- helpers: env, ascii, integer parsing ----------------------------
+
+fn _nlic_env_or(name, dfl) {
+    let e = getenv(name)
+    if e == 0 { return dfl }
+    if len(e) == 0 { return dfl }
+    return e
+}
+
+fn _nlic_is_digit(c) {
+    if c >= 48 { if c <= 57 { return 1 } }
+    return 0
+}
+
+// Parse an ASCII decimal integer, refusing empty / non-digit / negative
+// inputs. Returns -1 on rejection so a caller can fall back to a
+// default (str_to_int would silently coerce garbage to 0 -- a bad
+// value would look like "threshold=0", which is a hazard, not a hint).
+fn _nlic_parse_uint(s) {
+    if len(s) == 0 { return 0 - 1 }
+    let i = 0
+    let n = len(s)
+    let acc = 0
+    while i < n {
+        let c = char_at(s, i)
+        if _nlic_is_digit(c) == 0 { return 0 - 1 }
+        acc = acc * 10 + (c - 48)
+        i = i + 1
+    }
+    return acc
+}
+
+fn _nlic_resolve_threshold() {
+    let env = _nlic_env_or("CROSSENGIN_NL_IC_THRESHOLD_BP", "")
+    if len(env) == 0 { return _NLIC_DEFAULT_THRESHOLD_BP }
+    let n = _nlic_parse_uint(env)
+    if n < 0 { return _NLIC_DEFAULT_THRESHOLD_BP }
+    if n > 10000 { return 10000 }
+    return n
+}
+
+// ---- private tokenizer (mirrors grammar_parser _gp_tokenize) ---------
+//
+// Duplicated (not imported) so this module is a leaf that doesn't drag
+// the grammar parser into every dependency graph. Byte-identical
+// semantics: lowercase ASCII letters + digits + '_' + '-' run into
+// tokens; everything else is a boundary. Callers should have already
+// removed the R97 preamble via _nlic_strip_preamble.
+
+fn _nlic_is_ws(c) {
+    if c == 32 { return 1 }
+    if c == 9  { return 1 }
+    if c == 13 { return 1 }
+    if c == 10 { return 1 }
+    return 0
+}
+
+fn _nlic_is_wordchar(c) {
+    if c >= 65 { if c <= 90  { return 1 } }
+    if c >= 97 { if c <= 122 { return 1 } }
+    if c >= 48 { if c <= 57  { return 1 } }
+    if c == 95 { return 1 }
+    if c == 45 { return 1 }
+    return 0
+}
+
+fn _nlic_lower_char(c) {
+    if c >= 65 { if c <= 90 { return c + 32 } }
+    return c
+}
+
+fn _nlic_lower_slice(text, from, to) {
+    let out = ""
+    let i = from
+    while i < to {
+        out = out + chr(_nlic_lower_char(char_at(text, i)))
+        i = i + 1
+    }
+    return out
+}
+
+fn _nlic_tokenize(text) {
+    let out = list_new()
+    let n = len(text)
+    let start = 0 - 1
+    let i = 0
+    while i < n {
+        let c = char_at(text, i)
+        if _nlic_is_wordchar(c) == 1 {
+            if start < 0 { start = i }
+        } else {
+            if start >= 0 {
+                push(out, _nlic_lower_slice(text, start, i))
+                start = 0 - 1
+            }
+        }
+        i = i + 1
+    }
+    if start >= 0 { push(out, _nlic_lower_slice(text, start, n)) }
+    return out
+}
+
+// ---- preamble strip (subset of R97 _gp_strip_preamble) ---------------
+//
+// A small, focused strip -- the goal is to remove the most common
+// polite / filler prefixes that could otherwise dilute the utterance
+// bundle. The R97 grammar has a much larger stripper because it's
+// pattern-matching; the classifier only cares about *not carrying*
+// those tokens into the bundled vector.
+
+fn _nlic_is_filler_tok(tok) {
+    if str_eq_bytes(tok, "please") == 1 { return 1 }
+    if str_eq_bytes(tok, "thanks") == 1 { return 1 }
+    if str_eq_bytes(tok, "hey")    == 1 { return 1 }
+    if str_eq_bytes(tok, "hi")     == 1 { return 1 }
+    if str_eq_bytes(tok, "hello")  == 1 { return 1 }
+    if str_eq_bytes(tok, "there")  == 1 { return 1 }
+    if str_eq_bytes(tok, "um")     == 1 { return 1 }
+    if str_eq_bytes(tok, "uh")     == 1 { return 1 }
+    if str_eq_bytes(tok, "hmm")    == 1 { return 1 }
+    return 0
+}
+
+fn _nlic_strip_preamble(tokens) {
+    let start = 0
+    let end = len(tokens)
+    let changed = 1
+    while changed == 1 {
+        changed = 0
+        // 4-token: "i would like to" / "i d like to"
+        if start + 4 <= end {
+            let t0 = tokens[start]
+            let t1 = tokens[start + 1]
+            let t2 = tokens[start + 2]
+            let t3 = tokens[start + 3]
+            if str_eq_bytes(t0, "i") == 1 {
+                if str_eq_bytes(t2, "like") == 1 {
+                    if str_eq_bytes(t3, "to") == 1 {
+                        if str_eq_bytes(t1, "would") == 1 { start = start + 4  changed = 1 }
+                        if changed == 0 {
+                            if str_eq_bytes(t1, "d") == 1 { start = start + 4  changed = 1 }
+                        }
+                    }
+                }
+            }
+        }
+        // 3-token: "i want to" / "may i ask"
+        if changed == 0 {
+            if start + 3 <= end {
+                let u0 = tokens[start]
+                let u1 = tokens[start + 1]
+                let u2 = tokens[start + 2]
+                if str_eq_bytes(u0, "i") == 1 {
+                    if str_eq_bytes(u1, "want") == 1 {
+                        if str_eq_bytes(u2, "to") == 1 { start = start + 3  changed = 1 }
+                    }
+                }
+                if changed == 0 {
+                    if str_eq_bytes(u0, "may") == 1 {
+                        if str_eq_bytes(u1, "i") == 1 {
+                            if str_eq_bytes(u2, "ask") == 1 { start = start + 3  changed = 1 }
+                        }
+                    }
+                }
+            }
+        }
+        // 2-token: "can|could|would|will you"
+        if changed == 0 {
+            if start + 2 <= end {
+                let v0 = tokens[start]
+                let v1 = tokens[start + 1]
+                if str_eq_bytes(v1, "you") == 1 {
+                    if str_eq_bytes(v0, "can")    == 1 { start = start + 2  changed = 1 }
+                    if str_eq_bytes(v0, "could")  == 1 { start = start + 2  changed = 1 }
+                    if str_eq_bytes(v0, "would")  == 1 { start = start + 2  changed = 1 }
+                    if str_eq_bytes(v0, "will")   == 1 { start = start + 2  changed = 1 }
+                }
+            }
+        }
+        // 1-token filler
+        if changed == 0 {
+            if start < end {
+                if _nlic_is_filler_tok(tokens[start]) == 1 {
+                    start = start + 1  changed = 1
+                }
+            }
+        }
+    }
+    // Trailing: please / thanks / thank you
+    let tchanged = 1
+    while tchanged == 1 {
+        tchanged = 0
+        if end > start {
+            let last = tokens[end - 1]
+            if str_eq_bytes(last, "please") == 1 { end = end - 1  tchanged = 1 }
+            if tchanged == 0 {
+                if str_eq_bytes(last, "thanks") == 1 { end = end - 1  tchanged = 1 }
+            }
+        }
+        if tchanged == 0 {
+            if end - start >= 2 {
+                let l1 = tokens[end - 1]
+                let l2 = tokens[end - 2]
+                if str_eq_bytes(l2, "thank") == 1 {
+                    if str_eq_bytes(l1, "you") == 1 { end = end - 2  tchanged = 1 }
+                }
+            }
+        }
+    }
+    let out = list_new()
+    let i = start
+    while i < end { push(out, tokens[i])  i = i + 1 }
+    return out
+}
+
+// ---- signal-word lists (per kind) -------------------------------------
+//
+// These are the "intent words" that identify each kind. We do NOT
+// bundle them into prototypes' argument-recovery step at slot-fill --
+// keeping them in the PROTOTYPE bundle is fine (they raise similarity
+// for on-topic paraphrases), but stripping them from the RECOVERED
+// slot string leaves the topic tokens the executor actually needs.
+
+fn _nlic_signal_words_research() {
+    let l = list_new()
+    push(l, "tell")  push(l, "me")  push(l, "about")  push(l, "explain")
+    push(l, "describe")  push(l, "define")  push(l, "what")  push(l, "is")
+    push(l, "the")  push(l, "meaning")  push(l, "of")  push(l, "give")
+    push(l, "info")  push(l, "on")  push(l, "know")  push(l, "facts")
+    push(l, "history")  push(l, "overview")  push(l, "summary")
+    push(l, "background")  push(l, "key")  push(l, "points")
+    push(l, "information")  push(l, "details")  push(l, "origin")
+    push(l, "how")  push(l, "does")  push(l, "work")  push(l, "why")
+    push(l, "important")  push(l, "mean")  push(l, "do")  push(l, "you")
+    push(l, "know")  push(l, "can")  push(l, "say")
+    return l
+}
+
+fn _nlic_signal_words_retract() {
+    let l = list_new()
+    push(l, "retract")  push(l, "forget")  push(l, "remove")  push(l, "delete")
+    push(l, "unlearn")  push(l, "withdraw")  push(l, "about")  push(l, "fact")
+    push(l, "the")  push(l, "everything")
+    return l
+}
+
+fn _nlic_signal_words_capsule_install() {
+    let l = list_new()
+    push(l, "install")  push(l, "add")  push(l, "load")  push(l, "import")
+    push(l, "enable")  push(l, "capsule")  push(l, "pack")  push(l, "the")
+    push(l, "a")  push(l, "new")
+    return l
+}
+
+fn _nlic_signal_words_skill_install() {
+    let l = list_new()
+    push(l, "install")  push(l, "add")  push(l, "load")  push(l, "enable")
+    push(l, "activate")  push(l, "skill")  push(l, "the")  push(l, "a")
+    push(l, "new")
+    return l
+}
+
+fn _nlic_signal_words_none() {
+    return list_new()
+}
+
+fn _nlic_signal_words_for(kind) {
+    if kind == NLK_RESEARCH        { return _nlic_signal_words_research() }
+    if kind == NLK_RETRACT         { return _nlic_signal_words_retract() }
+    if kind == NLK_CAPSULE_INSTALL { return _nlic_signal_words_capsule_install() }
+    if kind == NLK_SKILL_INSTALL   { return _nlic_signal_words_skill_install() }
+    return _nlic_signal_words_none()
+}
+
+fn _nlic_token_in_list(tok, words) {
+    let i = 0
+    while i < len(words) {
+        if str_eq_bytes(tok, words[i]) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- corpus parser ----------------------------------------------------
+
+// (Retained for possible external corpus loads; unused by the R98
+// init path, which consumes the code-embedded blocks directly.)
+fn _nlic_name_to_kind(name) {
+    if str_eq_bytes(name, "research")        == 1 { return NLK_RESEARCH }
+    if str_eq_bytes(name, "relate")          == 1 { return NLK_RELATE }
+    if str_eq_bytes(name, "contradict_scan") == 1 { return NLK_CONTRADICT_SCAN }
+    if str_eq_bytes(name, "is_a")            == 1 { return NLK_IS_A }
+    if str_eq_bytes(name, "retract")         == 1 { return NLK_RETRACT }
+    if str_eq_bytes(name, "capsule_install") == 1 { return NLK_CAPSULE_INSTALL }
+    if str_eq_bytes(name, "skill_install")   == 1 { return NLK_SKILL_INSTALL }
+    if str_eq_bytes(name, "capsule_list")    == 1 { return NLK_CAPSULE_LIST }
+    if str_eq_bytes(name, "skill_list")      == 1 { return NLK_SKILL_LIST }
+    if str_eq_bytes(name, "skill_run")       == 1 { return NLK_SKILL_RUN }
+    return 0 - 1
+}
+
+// Strip leading whitespace and trailing whitespace from a raw line.
+fn _nlic_trim_line(line) {
+    let n = len(line)
+    let a = 0
+    let go = 1
+    while go == 1 {
+        if a >= n { go = 0 }
+        else {
+            if _nlic_is_ws(char_at(line, a)) == 0 { go = 0 }
+            else { a = a + 1 }
+        }
+    }
+    if a >= n { return "" }
+    let b = n
+    let go2 = 1
+    while go2 == 1 {
+        if b <= a { go2 = 0 }
+        else {
+            if _nlic_is_ws(char_at(line, b - 1)) == 0 { go2 = 0 }
+            else { b = b - 1 }
+        }
+    }
+    let out = ""
+    let i = a
+    while i < b { out = out + chr(char_at(line, i))  i = i + 1 }
+    return out
+}
+
+// Return 1 iff the trimmed line starts with "KIND ".
+fn _nlic_is_kind_header(trimmed) {
+    if len(trimmed) < 5 { return 0 }
+    if char_at(trimmed, 0) != 75 { return 0 }        // 'K'
+    if char_at(trimmed, 1) != 73 { return 0 }        // 'I'
+    if char_at(trimmed, 2) != 78 { return 0 }        // 'N'
+    if char_at(trimmed, 3) != 68 { return 0 }        // 'D'
+    if char_at(trimmed, 4) != 32 { return 0 }        // ' '
+    return 1
+}
+
+// Split the corpus string into a list of lines (LF-separated, LF
+// dropped). Trailing content without a final newline is kept.
+fn _nlic_split_lines(text) {
+    let out = list_new()
+    let n = len(text)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(text, i) == 10 {           // '\n'
+            let s = ""
+            let j = start
+            while j < i { s = s + chr(char_at(text, j))  j = j + 1 }
+            push(out, s)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        let s = ""
+        let j = start
+        while j < n { s = s + chr(char_at(text, j))  j = j + 1 }
+        push(out, s)
+    }
+    return out
+}
+
+// Parse the embedded corpus into a per-kind list of utterance-token
+// lists: returns [[kind, [tokens...], ...], ...]. Utterances are
+// preamble-stripped at PARSE time so the prototype vector is built
+// from the same shape the classifier compares against later.
+fn _nlic_parse_corpus(corpus_text) {
+    let out = list_new()
+    let lines = _nlic_split_lines(corpus_text)
+    let cur_kind = 0 - 1
+    let cur_utterances = 0
+    let i = 0
+    while i < len(lines) {
+        let trimmed = _nlic_trim_line(lines[i])
+        if len(trimmed) > 0 {
+            if char_at(trimmed, 0) != 35 {           // not a '#' comment
+                if _nlic_is_kind_header(trimmed) == 1 {
+                    // Flush any in-progress block.
+                    if cur_kind >= 0 {
+                        let row = list_new()
+                        push(row, cur_kind)
+                        push(row, cur_utterances)
+                        push(out, row)
+                    }
+                    // Start a new block. Name is trimmed[5..].
+                    let name = ""
+                    let k = 5
+                    while k < len(trimmed) {
+                        name = name + chr(char_at(trimmed, k))
+                        k = k + 1
+                    }
+                    cur_kind = _nlic_name_to_kind(name)
+                    cur_utterances = list_new()
+                } else {
+                    if cur_kind >= 0 {
+                        let raw_toks = _nlic_tokenize(trimmed)
+                        let toks = _nlic_strip_preamble(raw_toks)
+                        if len(toks) > 0 {
+                            push(cur_utterances, toks)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if cur_kind >= 0 {
+        let row = list_new()
+        push(row, cur_kind)
+        push(row, cur_utterances)
+        push(out, row)
+    }
+    return out
+}
+
+// ---- HDC prototype construction --------------------------------------
+//
+// One utterance -> bundle of its token-vectors. One kind's prototype ->
+// bundle of every utterance-vector under that kind. Bundling twice
+// is fine (bundle is majority-clip on element-wise sum), and it lets
+// each utterance contribute EQUAL weight regardless of token count --
+// otherwise a 3-token utterance and a 12-token one would land wildly
+// different magnitudes in the accumulator.
+
+fn _nlic_bundle_tokens(tokens) {
+    let vecs = list_new()
+    let i = 0
+    while i < len(tokens) {
+        push(vecs, hdc_symbol(tokens[i]))
+        i = i + 1
+    }
+    return hdc_bundle(vecs)
+}
+
+fn _nlic_build_prototype(utterance_list) {
+    let utt_vecs = list_new()
+    let i = 0
+    while i < len(utterance_list) {
+        let uv = _nlic_bundle_tokens(utterance_list[i])
+        if len(uv) > 0 { push(utt_vecs, uv) }
+        i = i + 1
+    }
+    if len(utt_vecs) == 0 { return list_new() }
+    return hdc_bundle(utt_vecs)
+}
+
+// ---- init -------------------------------------------------------------
+
+// Idempotent + lazy. Compiles the corpus into a prototype registry,
+// resolves the threshold from env, and prints a one-shot boot line
+// for operator visibility (only the first init emits it).
+fn nl_ic_init() {
+    if _nlic_reg != 0 { return _nlic_reg }
+    _nlic_threshold_bp = _nlic_resolve_threshold()
+    let blocks = _nlic_corpus_blocks()
+    let reg = list_new()
+    let i = 0
+    while i < len(blocks) {
+        let row = blocks[i]
+        let kind = row[0]
+        let utts_raw = row[1]
+        // Preamble-strip + tokenize every utterance up front so the
+        // prototype is bundled from the same token shape the classifier
+        // will compare against later.
+        let utts_tok = list_new()
+        let j = 0
+        while j < len(utts_raw) {
+            let raw_toks = _nlic_tokenize(utts_raw[j])
+            let toks = _nlic_strip_preamble(raw_toks)
+            if len(toks) > 0 { push(utts_tok, toks) }
+            j = j + 1
+        }
+        let proto = _nlic_build_prototype(utts_tok)
+        if len(proto) > 0 {
+            let entry = list_new()
+            push(entry, kind)
+            push(entry, proto)
+            push(entry, _nlic_signal_words_for(kind))
+            push(reg, entry)
+        }
+        i = i + 1
+    }
+    _nlic_reg = reg
+    if _nlic_init_logged == 0 {
+        println("[nl-ic] classifier init: "
+            + int_to_str(len(reg))
+            + " prototypes, threshold_bp="
+            + int_to_str(_nlic_threshold_bp))
+        _nlic_init_logged = 1
+    }
+    return _nlic_reg
+}
+
+fn nl_ic_prototype_count() {
+    if _nlic_reg == 0 { return 0 }
+    return len(_nlic_reg)
+}
+
+fn nl_ic_threshold_bp() {
+    if _nlic_reg == 0 { nl_ic_init() }
+    return _nlic_threshold_bp
+}
+
+fn nl_ic_reset_cache() {
+    _nlic_reg = 0
+    _nlic_threshold_bp = 0
+    _nlic_init_logged = 0
+    return 1
+}
+
+// ---- slot fill helpers -----------------------------------------------
+//
+// Rejoin tokens (from -> to) with a single space. Empty range -> "".
+
+fn _nlic_join(tokens, from, to) {
+    if from >= to { return "" }
+    if from < 0 { return "" }
+    if to > len(tokens) { to = len(tokens) }
+    let out = tokens[from]
+    let i = from + 1
+    while i < to {
+        out = out + " " + tokens[i]
+        i = i + 1
+    }
+    return out
+}
+
+// Return a new token list with every signal-word occurrence dropped.
+fn _nlic_strip_signals(tokens, signal_words) {
+    let out = list_new()
+    let i = 0
+    while i < len(tokens) {
+        if _nlic_token_in_list(tokens[i], signal_words) == 0 {
+            push(out, tokens[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Find the FIRST occurrence of any connector word; return index or -1.
+fn _nlic_find_first_of(tokens, connectors) {
+    let i = 0
+    while i < len(tokens) {
+        let j = 0
+        while j < len(connectors) {
+            if str_eq_bytes(tokens[i], connectors[j]) == 1 { return i }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- classification --------------------------------------------------
+//
+// Convert milli cosine to basis points, clamped to [0, 10000]. Negative
+// correlation is treated as a miss (a hard negative on a bipolar
+// bundle would be an anti-classifier and we don't want to promote
+// that to a positive intent hit).
+fn _nlic_milli_to_bp(m) {
+    if m <= 0 { return 0 }
+    let bp = m * 10
+    if bp > 10000 { bp = 10000 }
+    return bp
+}
+
+// Build the SQ for a classified kind + utterance tokens + winning row.
+// Returns 0 when slot-fill fails (caller then returns unparsed).
+fn _nlic_build_sq(kind, utterance_tokens, signal_words, raw_text) {
+    if kind == NLK_CAPSULE_LIST { return sq_capsule_list(raw_text, "grammar") }
+    if kind == NLK_SKILL_LIST   { return sq_skill_list(raw_text, "grammar") }
+
+    // Single-arg kinds: strip signal words, join the remainder as the topic.
+    if kind == NLK_RESEARCH {
+        let rest = _nlic_strip_signals(utterance_tokens, signal_words)
+        let topic = _nlic_join(rest, 0, len(rest))
+        if len(topic) == 0 { return 0 }
+        return sq_research(topic, raw_text, "grammar")
+    }
+    if kind == NLK_RETRACT {
+        let rest = _nlic_strip_signals(utterance_tokens, signal_words)
+        let label = _nlic_join(rest, 0, len(rest))
+        if len(label) == 0 { return 0 }
+        return sq_retract(label, raw_text, "grammar")
+    }
+    if kind == NLK_CAPSULE_INSTALL {
+        let rest = _nlic_strip_signals(utterance_tokens, signal_words)
+        let name = _nlic_join(rest, 0, len(rest))
+        if len(name) == 0 { return 0 }
+        return sq_capsule_install(name, raw_text, "grammar")
+    }
+    if kind == NLK_SKILL_INSTALL {
+        let rest = _nlic_strip_signals(utterance_tokens, signal_words)
+        let name = _nlic_join(rest, 0, len(rest))
+        if len(name) == 0 { return 0 }
+        return sq_skill_install(name, raw_text, "grammar")
+    }
+
+    // 2-topic kinds: split on a connector.
+    if kind == NLK_RELATE {
+        let conns = list_new()
+        push(conns, "and") push(conns, "to") push(conns, "vs")
+        push(conns, "versus") push(conns, "with")
+        let idx = _nlic_find_first_of(utterance_tokens, conns)
+        if idx <= 0 { return 0 }
+        if idx >= len(utterance_tokens) - 1 { return 0 }
+        // Prune leading signal-ish words from the left side.
+        let left_stops = list_new()
+        push(left_stops, "how") push(left_stops, "does") push(left_stops, "is")
+        push(left_stops, "the") push(left_stops, "relationship") push(left_stops, "between")
+        push(left_stops, "connection") push(left_stops, "link") push(left_stops, "similarities")
+        push(left_stops, "difference") push(left_stops, "differences") push(left_stops, "association")
+        push(left_stops, "ties") push(left_stops, "relate") push(left_stops, "compare")
+        push(left_stops, "comparison") push(left_stops, "of") push(left_stops, "contrast")
+        push(left_stops, "what") push(left_stops, "are")
+        let l_start = 0
+        let l_go = 1
+        while l_go == 1 {
+            if l_start >= idx { l_go = 0 }
+            else {
+                if _nlic_token_in_list(utterance_tokens[l_start], left_stops) == 1 {
+                    l_start = l_start + 1
+                } else { l_go = 0 }
+            }
+        }
+        // Right side: prune trailing "related"
+        let r_end = len(utterance_tokens)
+        if r_end > idx + 1 {
+            if str_eq_bytes(utterance_tokens[r_end - 1], "related") == 1 {
+                r_end = r_end - 1
+            }
+        }
+        let a = _nlic_join(utterance_tokens, l_start, idx)
+        let b = _nlic_join(utterance_tokens, idx + 1, r_end)
+        if len(a) == 0 { return 0 }
+        if len(b) == 0 { return 0 }
+        return sq_relate(a, b, raw_text, "grammar")
+    }
+    if kind == NLK_CONTRADICT_SCAN {
+        // Contradict-scan takes 2 args in the SQ but is often used with
+        // one topic (both slots = topic). We look for a token like
+        // "in|about|for" and take the rest as topic.
+        let stops = list_new()
+        push(stops, "find") push(stops, "scan") push(stops, "for")
+        push(stops, "contradictions") push(stops, "conflicts")
+        push(stops, "disagreements") push(stops, "inconsistencies")
+        push(stops, "about") push(stops, "in") push(stops, "the")
+        push(stops, "where") push(stops, "does") push(stops, "are")
+        push(stops, "there") push(stops, "conflict")
+        let rest = _nlic_strip_signals(utterance_tokens, stops)
+        let topic = _nlic_join(rest, 0, len(rest))
+        if len(topic) == 0 { return 0 }
+        return sq_contradict_scan(topic, topic, raw_text, "grammar")
+    }
+    if kind == NLK_IS_A {
+        // "is X (a|an) Y" -> split on "a" / "an" (the last one before
+        // the tail, so `is a whale a mammal` splits at the second
+        // "a" and X == "a whale").
+        // Skip a leading "is" / "does" so `is X a Y` splits cleanly.
+        let scan_start = 0
+        if len(utterance_tokens) > 0 {
+            if str_eq_bytes(utterance_tokens[0], "is") == 1 { scan_start = 1 }
+            if str_eq_bytes(utterance_tokens[0], "does") == 1 { scan_start = 1 }
+        }
+        // A leading article ("a X ..." after `is`) should not itself
+        // be the splitter; skip it too.
+        let x_start = scan_start
+        if x_start < len(utterance_tokens) {
+            if str_eq_bytes(utterance_tokens[x_start], "a")  == 1 { x_start = x_start + 1 }
+            if x_start < len(utterance_tokens) {
+                if str_eq_bytes(utterance_tokens[x_start], "an") == 1 { x_start = x_start + 1 }
+            }
+        }
+        // Scan for the split AT OR AFTER x_start+1 so X is non-empty.
+        let split = 0 - 1
+        let ii = x_start + 1
+        while ii < len(utterance_tokens) {
+            if str_eq_bytes(utterance_tokens[ii], "a") == 1 { split = ii  ii = len(utterance_tokens) }
+            else {
+                if str_eq_bytes(utterance_tokens[ii], "an") == 1 { split = ii  ii = len(utterance_tokens) }
+                else { ii = ii + 1 }
+            }
+        }
+        if split < 0 { return 0 }
+        if split <= x_start { return 0 }
+        if split >= len(utterance_tokens) - 1 { return 0 }
+        let x = _nlic_join(utterance_tokens, x_start, split)
+        let y = _nlic_join(utterance_tokens, split + 1, len(utterance_tokens))
+        if len(x) == 0 { return 0 }
+        if len(y) == 0 { return 0 }
+        return sq_is_a(x, y, raw_text, "grammar")
+    }
+    if kind == NLK_SKILL_RUN {
+        // Look for "on" | "with" | "using" | "to" splitter.
+        let conns = list_new()
+        push(conns, "on") push(conns, "with") push(conns, "using") push(conns, "to")
+        let idx = _nlic_find_first_of(utterance_tokens, conns)
+        if idx <= 0 { return 0 }
+        if idx >= len(utterance_tokens) - 1 { return 0 }
+        // Strip leading verb ("run" / "execute" / "use" / "invoke" / "apply")
+        // and the optional "skill" article.
+        let left_stops = list_new()
+        push(left_stops, "run") push(left_stops, "execute") push(left_stops, "use")
+        push(left_stops, "invoke") push(left_stops, "apply") push(left_stops, "skill")
+        push(left_stops, "the") push(left_stops, "a")
+        let l_start = 0
+        let keep_going = 1
+        while keep_going == 1 {
+            if l_start >= idx { keep_going = 0 }
+            else {
+                if _nlic_token_in_list(utterance_tokens[l_start], left_stops) == 1 {
+                    l_start = l_start + 1
+                } else { keep_going = 0 }
+            }
+        }
+        let skill_name = _nlic_join(utterance_tokens, l_start, idx)
+        let arg = _nlic_join(utterance_tokens, idx + 1, len(utterance_tokens))
+        if len(skill_name) == 0 { return 0 }
+        if len(arg) == 0 { return 0 }
+        return sq_skill_run(skill_name, arg, raw_text, "grammar")
+    }
+    return 0
+}
+
+// Return [ok, sq, sim_bp].
+fn _nlic_result(ok, sq, bp) {
+    let r = list_new()
+    push(r, ok) push(r, sq) push(r, bp)
+    return r
+}
+
+// Public classification entry point.
+fn nl_ic_try_classify(raw_text, metrics_reg, holder) {
+    // Metrics: always inc attempt; hit / miss decided below.
+    nl_metrics_inc_ic_attempt(metrics_reg, holder)
+    let reg = nl_ic_init()
+    if len(reg) == 0 {
+        nl_metrics_inc_ic_miss(metrics_reg, holder)
+        return _nlic_result(0, sq_unparsed(raw_text), 0)
+    }
+    let raw_tokens = _nlic_tokenize(raw_text)
+    if len(raw_tokens) == 0 {
+        nl_metrics_inc_ic_miss(metrics_reg, holder)
+        return _nlic_result(0, sq_unparsed(raw_text), 0)
+    }
+    let tokens = _nlic_strip_preamble(raw_tokens)
+    if len(tokens) == 0 {
+        nl_metrics_inc_ic_miss(metrics_reg, holder)
+        return _nlic_result(0, sq_unparsed(raw_text), 0)
+    }
+    let uv = _nlic_bundle_tokens(tokens)
+    if len(uv) == 0 {
+        nl_metrics_inc_ic_miss(metrics_reg, holder)
+        return _nlic_result(0, sq_unparsed(raw_text), 0)
+    }
+    let best_bp = 0 - 1
+    let best_row = 0
+    let i = 0
+    while i < len(reg) {
+        let row = reg[i]
+        let m = hdc_cosine(uv, row[_NLIC_R_VEC])
+        let bp = _nlic_milli_to_bp(m)
+        if bp > best_bp { best_bp = bp  best_row = row }
+        i = i + 1
+    }
+    if best_row == 0 {
+        nl_metrics_inc_ic_miss(metrics_reg, holder)
+        return _nlic_result(0, sq_unparsed(raw_text), 0)
+    }
+    if best_bp < _nlic_threshold_bp {
+        nl_metrics_inc_ic_miss(metrics_reg, holder)
+        return _nlic_result(0, sq_unparsed(raw_text), best_bp)
+    }
+    let sq = _nlic_build_sq(best_row[_NLIC_R_KIND], tokens,
+                             best_row[_NLIC_R_SIGNAL], raw_text)
+    if sq == 0 {
+        nl_metrics_inc_ic_miss(metrics_reg, holder)
+        return _nlic_result(0, sq_unparsed(raw_text), best_bp)
+    }
+    if sq_validate(sq) != SQ_OK {
+        nl_metrics_inc_ic_miss(metrics_reg, holder)
+        return _nlic_result(0, sq_unparsed(raw_text), best_bp)
+    }
+    nl_metrics_inc_ic_hit(metrics_reg, holder)
+    return _nlic_result(1, sq, best_bp)
+}
+
+// ---- result accessors -------------------------------------------------
+
+fn nl_ic_result_ok(r)         { return r[0] }
+fn nl_ic_result_sq(r)         { return r[1] }
+fn nl_ic_result_similarity(r) { return r[2] }

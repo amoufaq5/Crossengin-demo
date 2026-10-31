@@ -1,0 +1,304 @@
+// CrossEngin meta: gaps register -- "what the daemon knows it doesn't know."
+//
+// Purpose (R103, Phase F part 1; ADR-0206 cognitive layer as first-class).
+//   Every substantive refusal along the NL / skill / execution path is a
+//   micro-signal about the boundary of the daemon's competence. Today
+//   those refusals surface once at the wire (as ExecutionResult.OK=0 or
+//   ProposalResult.REFUSED) and vanish. The gaps register captures them
+//   in a bounded ring-buffer so a caller can later ask "what have you
+//   been unable to answer for me, and why?" via the R103 `self.gaps`
+//   wire verb.
+//
+//   The register is DELIBERATELY read-only from the caller side (no
+//   `gaps_remove`, no ordering fiddles) -- it is a diagnostic
+//   introspection surface, not an executor input. `gaps_clear` exists
+//   for the audit-hand-off shape (mirrors dp_query_log_clear).
+//
+//   The ring-buffer shape is copied verbatim from
+//   src/safety/differential_privacy.nova's DP_QUERY_LOG: append, and
+//   when len exceeds the cap, trim the oldest by rebuilding a fresh
+//   list without the head entry. Same reason: NOVA has no in-place
+//   deque primitive, and the linear rebuild cost is negligible against
+//   the (bounded) cap.
+//
+// Gap-reason enum -- kept small and stable so wire clients can rely on
+// the mapping. The `reason_int -> reason_name` bijection is documented
+// in the R103 wire response for `self.gaps`.
+//
+// Storage model.
+//   In-memory only. R103 is READ-ONLY on the KG; the register lives
+//   for the lifetime of the daemon process. A later round can add a
+//   snapshot round-trip if operators want post-restart introspection;
+//   R103 explicitly does not include one (the gap events themselves
+//   are low-value across restart -- what matters is the STANDING
+//   inability, and the daemon rediscovers it on the next attempt).
+//
+// ADRs implemented: ADR-0206 (cognitive layer). Composes with
+//   src/parts/reasoning/epistemic_status.nova and
+//   src/kg/atom_store.nova (via the `self.confidence` verb) to give
+//   the daemon both an "I believe X to degree D" surface and an
+//   "I don't know Y" surface.
+// NOVA dependencies: builtins.
+// CrossEngin dependencies: src/util/str_safe.nova (str_eq_bytes for the
+//   holder + reason-name comparisons; NOVA's `str_eq` is environmentally
+//   flaky on short literals -- see the standing-constraints note).
+
+import "../../util/str_safe.nova"
+
+// ---- gap-reason enum ------------------------------------------------------
+// Kept small + stable. New reasons append; existing values NEVER shift.
+let GAP_NO_MATCH        = 1  // KG lookup returned nothing (self.confidence
+                              //   with 0 matches; nl.ask when the executor's
+                              //   downstream policy produced 0 touched atoms)
+let GAP_LOW_CONFIDENCE  = 2  // KG lookup matched but aggregate confidence
+                              //   is below the CROSSENGIN_GAP_CONFIDENCE_MIN
+                              //   threshold (default 400 milli = 40%)
+let GAP_REFUSED         = 3  // executor refused for a substantive reason
+                              //   (skill registry missing, KG registry
+                              //   missing, ownership/preference block,
+                              //   unknown query kind, invalid query)
+let GAP_UNPARSED        = 4  // grammar + HDC + LLM sidecar all failed to
+                              //   produce a StructuredQuery
+let GAP_SKILL_REFUSED   = 5  // skill supervisor set PR_REFUSAL_REASON
+                              //   (persona-missing, kg-empty,
+                              //   capsule-uninstalled, min-confidence)
+
+// ---- ring-buffer defaults -----------------------------------------------
+// Default per-daemon capacity. Each entry is 5 slots + a small string
+// payload; 1024 entries at ~300 bytes each is ~300 KB peak, well
+// inside the "cheap" band.
+let GAPS_DEFAULT_CAP = 1024
+
+// Disambiguating tag so gaps_entries handed a rogue list explodes
+// early (mirrors DP_OBJ_TAG).
+let _GAPS_TAG = 1902
+
+// ---- register slot layout -----------------------------------------------
+let _GR_TAG      = 0   // = _GAPS_TAG
+let _GR_CAP      = 1   // int max entries
+let _GR_TOTAL    = 2   // total append count across the register's life
+                        //   (survives ring-buffer trim; useful for
+                        //   telemetry "N events since boot").
+let _GR_ENTRIES  = 3   // list<gap_event>
+
+// ---- gap-event slot layout ----------------------------------------------
+let GAP_TIMESTAMP = 0  // int nanos (nanotime() or caller `now`)
+let GAP_HOLDER    = 1  // string; presented holder id, "" for anonymous
+let GAP_TOPIC     = 2  // string; raw topic / question text (may be "")
+let GAP_REASON    = 3  // int (GAP_NO_MATCH..GAP_SKILL_REFUSED)
+let GAP_DETAIL    = 4  // string; short human-readable note
+
+// ---- constructor --------------------------------------------------------
+// Build a fresh register with `cap` entry capacity. `cap <= 0` falls
+// back to GAPS_DEFAULT_CAP; a caller who passes 0 gets a "please use
+// the default" register (matching the DP_STATE ergonomic).
+fn gaps_register_new(cap) {
+    let real_cap = cap
+    if real_cap <= 0 { real_cap = GAPS_DEFAULT_CAP }
+    let r = list_new()
+    push(r, _GAPS_TAG)
+    push(r, real_cap)
+    push(r, 0)              // total
+    push(r, list_new())     // entries
+    return r
+}
+
+// ---- accessors ----------------------------------------------------------
+fn gaps_cap(reg)    { return reg[_GR_CAP] }
+fn gaps_count(reg)  { return len(reg[_GR_ENTRIES]) }
+fn gaps_total(reg)  { return reg[_GR_TOTAL] }
+
+// Return the raw entries list (oldest first). CALLER MUST NOT MUTATE:
+// mutating the returned list mutates the register's state directly
+// (mirrors dp_query_log's contract). Callers who need a snapshot copy
+// build one themselves; the R103 self.gaps handler does.
+fn gaps_entries(reg) { return reg[_GR_ENTRIES] }
+
+// ---- gap-event constructor / accessors ---------------------------------
+fn _gaps_event_new(holder, topic, reason, detail, ts_ns) {
+    let e = list_new()
+    push(e, ts_ns)
+    push(e, holder)
+    push(e, topic)
+    push(e, reason)
+    push(e, detail)
+    return e
+}
+
+fn gap_event_timestamp(e) { return e[GAP_TIMESTAMP] }
+fn gap_event_holder(e)    { return e[GAP_HOLDER] }
+fn gap_event_topic(e)     { return e[GAP_TOPIC] }
+fn gap_event_reason(e)    { return e[GAP_REASON] }
+fn gap_event_detail(e)    { return e[GAP_DETAIL] }
+
+// ---- recording ----------------------------------------------------------
+// Append a gap event. Returns 1 on success, 0 if `reg` is 0 (no-op:
+// the "reg not wired" backwards-compat sentinel -- every call site can
+// hand 0 through and the record simply does nothing).
+//
+// Ring-buffer trim: when len(entries) exceeds cap, rebuild a shorter
+// list omitting the oldest entry. Same shape as DP_QUERY_LOG's trim
+// in src/safety/differential_privacy.nova.
+fn gaps_record(reg, holder, topic, reason, detail, now_ns) {
+    if reg == 0 { return 0 }
+    let entries = reg[_GR_ENTRIES]
+    let evt = _gaps_event_new(holder, topic, reason, detail, now_ns)
+    push(entries, evt)
+    list_set(reg, _GR_TOTAL, reg[_GR_TOTAL] + 1)
+    let cap = reg[_GR_CAP]
+    if len(entries) > cap {
+        // Trim the oldest by rebuilding. Ring-buffer trim: drop entry 0,
+        // preserve every subsequent entry in insertion order.
+        let trimmed = list_new()
+        let i = 1
+        while i < len(entries) {
+            push(trimmed, entries[i])
+            i = i + 1
+        }
+        list_set(reg, _GR_ENTRIES, trimmed)
+    }
+    return 1
+}
+
+// ---- filtered snapshots -------------------------------------------------
+// Return a FRESH list of entries whose holder matches `holder` exactly
+// (byte-equal). Empty holder ("") matches only anonymous events. Never
+// returns the internal entries list -- the caller can mutate the result
+// freely.
+fn gaps_entries_for_holder(reg, holder) {
+    let out = list_new()
+    if reg == 0 { return out }
+    let entries = reg[_GR_ENTRIES]
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        if str_eq_bytes(e[GAP_HOLDER], holder) == 1 {
+            push(out, e)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Return a FRESH list of entries whose reason matches `reason`.
+fn gaps_entries_by_reason(reg, reason) {
+    let out = list_new()
+    if reg == 0 { return out }
+    let entries = reg[_GR_ENTRIES]
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        if e[GAP_REASON] == reason {
+            push(out, e)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- summary rollup -----------------------------------------------------
+// Return a 3-slot list: [total, by_reason, by_holder] where
+//   by_reason is list of [reason_int, count]
+//   by_holder is list of [holder_string, count]
+// Both inner lists are ordered by first-occurrence -- deterministic,
+// easy for a wire response to serialize. The R103 self.gaps `summary=1`
+// mode emits directly from this.
+fn gaps_summary(reg) {
+    let out = list_new()
+    let by_reason = list_new()
+    let by_holder = list_new()
+    if reg == 0 {
+        push(out, 0)
+        push(out, by_reason)
+        push(out, by_holder)
+        return out
+    }
+    let entries = reg[_GR_ENTRIES]
+    let total = len(entries)
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let r = e[GAP_REASON]
+        // Bump reason bucket (find-or-append).
+        let j = 0
+        let found_r = 0
+        while j < len(by_reason) {
+            if by_reason[j][0] == r {
+                list_set(by_reason[j], 1, by_reason[j][1] + 1)
+                found_r = 1
+                j = len(by_reason)
+            }
+            j = j + 1
+        }
+        if found_r == 0 {
+            let row = list_new()
+            push(row, r)
+            push(row, 1)
+            push(by_reason, row)
+        }
+        // Bump holder bucket (find-or-append).
+        let h = e[GAP_HOLDER]
+        let k = 0
+        let found_h = 0
+        while k < len(by_holder) {
+            if str_eq_bytes(by_holder[k][0], h) == 1 {
+                list_set(by_holder[k], 1, by_holder[k][1] + 1)
+                found_h = 1
+                k = len(by_holder)
+            }
+            k = k + 1
+        }
+        if found_h == 0 {
+            let row2 = list_new()
+            push(row2, h)
+            push(row2, 1)
+            push(by_holder, row2)
+        }
+        i = i + 1
+    }
+    push(out, total)
+    push(out, by_reason)
+    push(out, by_holder)
+    return out
+}
+
+fn gaps_summary_total(s)     { return s[0] }
+fn gaps_summary_by_reason(s) { return s[1] }
+fn gaps_summary_by_holder(s) { return s[2] }
+
+// ---- clear --------------------------------------------------------------
+// Replace the entries list with an empty one. Returns the number of
+// entries that were cleared. DOES NOT reset the running total counter
+// (audit aid: an operator who scrubs the log still sees the lifetime
+// count via gaps_total).
+fn gaps_clear(reg) {
+    if reg == 0 { return 0 }
+    let entries = reg[_GR_ENTRIES]
+    let n = len(entries)
+    list_set(reg, _GR_ENTRIES, list_new())
+    return n
+}
+
+// ---- reason-name mapping ------------------------------------------------
+// Bijection for wire serialization. Never change existing names --
+// wire clients switch on them.
+fn gaps_reason_name(reason) {
+    if reason == GAP_NO_MATCH       { return "no_match" }
+    if reason == GAP_LOW_CONFIDENCE { return "low_confidence" }
+    if reason == GAP_REFUSED        { return "refused" }
+    if reason == GAP_UNPARSED       { return "unparsed" }
+    if reason == GAP_SKILL_REFUSED  { return "skill_refused" }
+    return "unknown"
+}
+
+// Reverse mapping: "no_match" -> 1, etc. Returns 0 for unknown names.
+// Wire clients pass a name in `self.gaps`'s `reason` arg; the handler
+// maps it here before filtering.
+fn gaps_reason_from_name(name) {
+    if str_eq_bytes(name, "no_match")       == 1 { return GAP_NO_MATCH }
+    if str_eq_bytes(name, "low_confidence") == 1 { return GAP_LOW_CONFIDENCE }
+    if str_eq_bytes(name, "refused")        == 1 { return GAP_REFUSED }
+    if str_eq_bytes(name, "unparsed")       == 1 { return GAP_UNPARSED }
+    if str_eq_bytes(name, "skill_refused")  == 1 { return GAP_SKILL_REFUSED }
+    return 0
+}

@@ -140,8 +140,9 @@ EOF
 
 ### Do NOT include a model identifier
 Commits, code comments, ADRs, and any file in the repo must NOT
-include a model identifier (e.g. claude-opus-4-7 etc.). The footer
-URL is sufficient provenance.
+include a model identifier for the model in use (no vendor SKU,
+no version string, no dated model id). The footer URL is sufficient
+provenance.
 
 ## Branches
 

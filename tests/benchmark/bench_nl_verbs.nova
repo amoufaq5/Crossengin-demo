@@ -1,0 +1,426 @@
+// CrossEngin R106 -- NL-verb latency benchmark harness (Phase H, ADR-0208).
+//
+// Purpose
+//   Time each stage of the natural-language pipeline against a synthetic
+//   KG at SCALE_SMALL (see kg_synthetic_loader.nova) and emit a
+//   `crossengin-bench-v1` JSON payload compatible with the compare mode
+//   of scripts/bench_nl_verbs.sh.
+//
+//   Phases measured, each with its own N iterations, median and p99
+//   reported in nanoseconds:
+//
+//     grammar_parse          -- N=1000 * 100 varied phrasings
+//     nl_ic_try_classify     -- N=1000 * 100 UNPARSED inputs (HDC path)
+//     nl_llm_try_fallback    -- N=1000 with sidecar in test-mode
+//     nl_execute_scoped_ex   -- N=100  research over "atom_42"
+//     templater_render       -- N=1000 over a fixed ExecutionResult
+//     rpc_nl_ask_<kind>      -- N=100  per query kind (research /
+//                                       relate / contradict_scan /
+//                                       is_a / skill_run:echo)
+//
+// Nanotime graceful-skip
+//   docs/NOVA_RUNTIME_GAPS.md R-2 (HIGH severity) documents that
+//   nanotime() returns 0 or segfaults in this container. If that shape
+//   is detected at start-of-main the harness prints a single
+//   "SKIP: nanotime not functional..." line and exits 0 -- the bench
+//   file must NOT break `make test` on a broken-clock host.
+//
+// CrossEngin dependencies: multi_kg_manager, atom_store, capsules,
+//   grammar_parser, nl_intent_classifier, nl_llm_sidecar,
+//   nl_pipeline, executor, templater, rpc_verbs, meta_observer,
+//   persona_registry, skill_registry, skill_dispatch, echo_skill,
+//   research_skill.
+
+import "std/io"
+import "./kg_synthetic_loader.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/capsules/capsule.nova"
+import "../../src/capsules/capsule_registry.nova"
+import "../../src/nl/query_shape.nova"
+import "../../src/nl/grammar_parser.nova"
+import "../../src/nl/nl_intent_classifier.nova"
+import "../../src/nl/nl_llm_sidecar.nova"
+import "../../src/nl/nl_pipeline.nova"
+import "../../src/nl/nl_metrics.nova"
+import "../../src/nl/executor.nova"
+import "../../src/nl/templater.nova"
+import "../../src/nl/rpc_verbs.nova"
+import "../../src/parts/meta/meta_observer.nova"
+import "../../src/persona/persona_registry.nova"
+import "../../src/skills/skill_registry.nova"
+import "../../src/skills/skills/echo_skill.nova"
+import "../../src/skills/skills/research_skill.nova"
+
+// ---- constants ------------------------------------------------------------
+
+let BENCH_N_COMPONENT   = 1000    // fast component iterations
+let BENCH_N_EXECUTOR    = 100     // executor iterations (slower)
+let BENCH_N_END_TO_END  = 100     // full nl.ask per kind
+
+// ---- nanotime sanity ------------------------------------------------------
+// Returns 1 when nanotime is usable, 0 when broken. Pattern from
+// tests/unit/test_ed25519.nova:498-513 -- if both samples come back 0
+// or t1 <= t0, treat as broken.
+fn _bench_nanotime_ok() {
+    let t0 = nanotime()
+    let t1 = nanotime()
+    if t0 == 0 {
+        if t1 == 0 { return 0 }
+    }
+    if t1 <= t0 { return 0 }
+    return 1
+}
+
+// ---- sorted-insert median / p99 -------------------------------------------
+
+// Insertion sort into `sorted` (ascending). O(n) per insert; fine at
+// N=1000 given the timing loops are the hot part, not the tabulation.
+fn _bench_sorted_insert(sorted, v) {
+    let n = len(sorted)
+    let i = 0
+    while i < n {
+        if v < sorted[i] {
+            push(sorted, 0)
+            let j = n
+            while j > i {
+                list_set(sorted, j, sorted[j - 1])
+                j = j - 1
+            }
+            list_set(sorted, i, v)
+            return 1
+        }
+        i = i + 1
+    }
+    push(sorted, v)
+    return 1
+}
+
+fn _bench_median(sorted) {
+    let n = len(sorted)
+    if n == 0 { return 0 }
+    return sorted[n / 2]
+}
+
+// nearest-rank p99: index = ceil(0.99*n) - 1, clamped.
+fn _bench_p99(sorted) {
+    let n = len(sorted)
+    if n == 0 { return 0 }
+    let idx = (99 * n) / 100
+    if idx >= n { idx = n - 1 }
+    if idx < 0  { idx = 0 }
+    return sorted[idx]
+}
+
+// ---- diverse-input corpus -------------------------------------------------
+// A small rotating list of grammar-parseable phrasings drawn from the
+// R97 pattern set. The grammar bench cycles through these.
+
+fn _bench_grammar_corpus() {
+    let c = list_new()
+    push(c, "what is atom_1")
+    push(c, "tell me about atom_2")
+    push(c, "how does atom_3 relate to atom_4")
+    push(c, "is atom_5 a atom_6")
+    push(c, "does atom_7 contradict atom_8")
+    push(c, "research atom_9")
+    push(c, "explain atom_10")
+    push(c, "is there a link between atom_11 and atom_12")
+    push(c, "compare atom_13 and atom_14")
+    push(c, "list capsules")
+    return c
+}
+
+// Deliberately-unparseable inputs so the HDC classifier is exercised on
+// the intended (post-grammar-miss) code path.
+fn _bench_unparsed_corpus() {
+    let c = list_new()
+    push(c, "flooble bax quux")
+    push(c, "zorp nax kibble")
+    push(c, "wibble wobble atom_1")
+    push(c, "glorpity glop")
+    push(c, "muxx wuxx")
+    push(c, "kablooie plort")
+    push(c, "yerp derp herp")
+    push(c, "spork tank haze")
+    push(c, "kluggle bluggle")
+    push(c, "orbit vibe crush")
+    return c
+}
+
+// ---- rpc_ctx setup for the end-to-end bench -------------------------------
+
+fn _bench_mk_ctx(kg_reg, capreg) {
+    let mo = mo_new()
+    let sr = skill_registry_new()
+    skill_registry_register(sr, echo_skill_manifest())
+    skill_registry_register(sr, research_skill_manifest())
+    let preg = persona_registry_new()
+    persona_registry_ensure(preg, "bench_user", 100)
+    let ctx = rpc_ctx_new(kg_reg, capreg, preg, sr, mo, 0, 0, 100)
+    rpc_ctx_set_nl_metrics(ctx, nl_metrics_new())
+    return ctx
+}
+
+fn _bench_args2(k1, v1, k2, v2) {
+    let a = list_new()
+    push(a, rpc_arg_kv(k1, v1))
+    push(a, rpc_arg_kv(k2, v2))
+    return a
+}
+
+// ---- phase runners --------------------------------------------------------
+
+// Time N iterations of `grammar_parse` cycling through the corpus.
+fn _run_grammar_parse(sorted) {
+    let corpus = _bench_grammar_corpus()
+    let cn = len(corpus)
+    let i = 0
+    while i < BENCH_N_COMPONENT {
+        let t0 = nanotime()
+        let _q = grammar_parse(corpus[i - (i / cn) * cn])
+        let dt = nanotime() - t0
+        _bench_sorted_insert(sorted, dt)
+        i = i + 1
+    }
+    return 1
+}
+
+fn _run_ic_classify(sorted) {
+    let corpus = _bench_unparsed_corpus()
+    let cn = len(corpus)
+    let metrics = nl_metrics_new()
+    let i = 0
+    while i < BENCH_N_COMPONENT {
+        let t0 = nanotime()
+        let _q = nl_ic_try_classify(corpus[i - (i / cn) * cn], metrics, "")
+        let dt = nanotime() - t0
+        _bench_sorted_insert(sorted, dt)
+        i = i + 1
+    }
+    return 1
+}
+
+// Times the plumbing-only cost of nl_llm_try_fallback with the sidecar
+// in test-mode. No real fork happens; measures the pre/post around the
+// sidecar wire.
+fn _run_llm_try_fallback(sorted) {
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("KIND research\nARG atom_42\n")
+    let corpus = _bench_unparsed_corpus()
+    let cn = len(corpus)
+    let metrics = nl_metrics_new()
+    let i = 0
+    while i < BENCH_N_COMPONENT {
+        let raw = corpus[i - (i / cn) * cn]
+        // Build an UNPARSED query -- that's what triggers the fallback
+        // per nl_pipeline_try_fallback_rungs.
+        let q = sq_unparsed(raw)
+        let t0 = nanotime()
+        let _r = nl_llm_try_fallback(q, raw, metrics, "")
+        let dt = nanotime() - t0
+        _bench_sorted_insert(sorted, dt)
+        i = i + 1
+    }
+    return 1
+}
+
+fn _run_executor(sorted, kg_reg, capreg, persona_reg, skill_reg, mo) {
+    let i = 0
+    while i < BENCH_N_EXECUTOR {
+        // Rotate the topic so the label-index doesn't always cache-hit
+        // the same atom.
+        let topic = "atom_" + int_to_str(i - (i / 500) * 500)
+        let q = sq_research(topic, "research " + topic, "grammar")
+        let t0 = nanotime()
+        let _r = nl_execute_scoped_ex(q, kg_reg, capreg, persona_reg,
+                                       skill_reg, mo, "bench_user", 100,
+                                       0, 0, "bench_user", 0)
+        let dt = nanotime() - t0
+        _bench_sorted_insert(sorted, dt)
+        i = i + 1
+    }
+    return 1
+}
+
+fn _run_templater(sorted, kg_reg, capreg, persona_reg, skill_reg, mo, persona) {
+    // Build one ExecutionResult and time the templater over it. Re-
+    // rendering after the first pass hits the cached-templated path,
+    // which is by design -- users see the templated answer once per
+    // request, so the median-of-many measurement captures typical wire
+    // response-shaping cost.
+    let q = sq_research("atom_1", "research atom_1", "grammar")
+    let er = nl_execute_scoped_ex(q, kg_reg, capreg, persona_reg,
+                                    skill_reg, mo, "bench_user", 100,
+                                    0, 0, "bench_user", 0)
+    let i = 0
+    while i < BENCH_N_COMPONENT {
+        let t0 = nanotime()
+        let _s = templater_render(er, persona)
+        let dt = nanotime() - t0
+        _bench_sorted_insert(sorted, dt)
+        i = i + 1
+    }
+    return 1
+}
+
+fn _run_nl_ask_kind(sorted, ctx, verb, args) {
+    let i = 0
+    while i < BENCH_N_END_TO_END {
+        let t0 = nanotime()
+        let _out = rpc_dispatch(verb, args, ctx)
+        let dt = nanotime() - t0
+        _bench_sorted_insert(sorted, dt)
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- JSON emission --------------------------------------------------------
+// crossengin-bench-v1 shape; a single per-phase record per phase.
+
+fn _emit_json_header() {
+    println("{")
+    println("  \"schema\": \"crossengin-bench-v1\",")
+    println("  \"bench\": \"nl_verb_latency\",")
+    println("  \"scale\": \"SMALL\",")
+    println("  \"results\": [")
+    return 1
+}
+
+fn _emit_json_row(name, iters, sorted, is_last) {
+    let med = _bench_median(sorted)
+    let p99 = _bench_p99(sorted)
+    let med_ms = med / 1000000
+    let line = "    {\"name\": \"" + name
+             + "\", \"iterations\": " + int_to_str(iters)
+             + ", \"median_ns\": " + int_to_str(med)
+             + ", \"p99_ns\": " + int_to_str(p99)
+             + ", \"time_ms\": " + int_to_str(med_ms)
+             + "}"
+    if is_last == 1 {
+        println(line)
+    } else {
+        println(line + ",")
+    }
+    return 1
+}
+
+fn _emit_json_footer() {
+    println("  ]")
+    println("}")
+    return 1
+}
+
+// ---- main ----------------------------------------------------------------
+
+fn main() {
+    if _bench_nanotime_ok() == 0 {
+        println("SKIP: nanotime not functional in this environment")
+        println("(see docs/NOVA_RUNTIME_GAPS.md R-2; harness graceful-skip)")
+        return 0
+    }
+
+    println("=== CrossEngin bench_nl_verbs (R106 / Phase H / ADR-0208) ===")
+
+    // Build the SCALE_SMALL corpus.
+    let kg_reg = kg_registry_new()
+    let kg = syn_kg_new_at_scale_ex(kg_reg, "bench_small", SCALE_SMALL_ATOMS)
+    let edges = syn_kg_add_relations(kg, SCALE_SMALL_ATOMS, SCALE_SMALL_RELS)
+    let capreg = capreg_new()
+    syn_kg_add_capsule_refs(kg, capreg, SCALE_SMALL_CAPS)
+    println("  atoms       : " + int_to_str(SCALE_SMALL_ATOMS))
+    println("  relations   : " + int_to_str(edges))
+    println("  capsules    : " + int_to_str(SCALE_SMALL_CAPS))
+
+    // Optional gate: if CROSSENGIN_BENCH_LARGE=1 we could stack MEDIUM
+    // / LARGE. For R106 we ship SMALL to keep the harness fast and
+    // predictable on modest hosts; the loader supports the larger
+    // scales for permissive-host baseline capture.
+    if syn_bench_large_enabled() == 1 {
+        println("  note: CROSSENGIN_BENCH_LARGE=1 gate visible (loader "
+             + "supports MEDIUM/LARGE; SMALL still used for bench "
+             + "core to keep results comparable).")
+    }
+
+    // Common wiring for the end-to-end phases.
+    let mo = mo_new()
+    let sr = skill_registry_new()
+    skill_registry_register(sr, echo_skill_manifest())
+    skill_registry_register(sr, research_skill_manifest())
+    let preg = persona_registry_new()
+    persona_registry_ensure(preg, "bench_user", 100)
+
+    // Header out; results follow.
+    _emit_json_header()
+
+    // Phase 1: grammar_parse.
+    let s1 = list_new()
+    _run_grammar_parse(s1)
+    _emit_json_row("grammar_parse", BENCH_N_COMPONENT, s1, 0)
+
+    // Phase 2: HDC classifier.
+    let s2 = list_new()
+    _run_ic_classify(s2)
+    _emit_json_row("nl_ic_try_classify", BENCH_N_COMPONENT, s2, 0)
+
+    // Phase 3: LLM sidecar test-mode fallback plumbing.
+    let s3 = list_new()
+    _run_llm_try_fallback(s3)
+    _emit_json_row("nl_llm_try_fallback", BENCH_N_COMPONENT, s3, 0)
+
+    // Phase 4: executor (research over "atom_i mod 500").
+    let s4 = list_new()
+    _run_executor(s4, kg_reg, capreg, preg, sr, mo)
+    _emit_json_row("nl_execute_scoped_ex", BENCH_N_EXECUTOR, s4, 0)
+
+    // Phase 5: templater over a fixed ExecutionResult.
+    let persona = persona_registry_lookup(preg, "bench_user")
+    let s5 = list_new()
+    _run_templater(s5, kg_reg, capreg, preg, sr, mo, persona)
+    _emit_json_row("templater_render", BENCH_N_COMPONENT, s5, 0)
+
+    // Full nl.ask, one per query kind. Sidecar stays in test-mode so
+    // any UNPARSED path returns wire deterministically.
+    let ctx = _bench_mk_ctx(kg_reg, capreg)
+    nl_llm_sidecar_reset_cache()
+    nl_llm_sidecar_test_force_testmode("KIND research\nARG atom_42\n")
+
+    // research
+    let s6 = list_new()
+    _run_nl_ask_kind(s6, ctx, "nl.ask",
+        _bench_args2("text", "research atom_42", "user_id", "bench_user"))
+    _emit_json_row("rpc_nl_ask_research", BENCH_N_END_TO_END, s6, 0)
+
+    // relate
+    let s7 = list_new()
+    _run_nl_ask_kind(s7, ctx, "nl.ask",
+        _bench_args2("text", "how does atom_1 relate to atom_2",
+                      "user_id", "bench_user"))
+    _emit_json_row("rpc_nl_ask_relate", BENCH_N_END_TO_END, s7, 0)
+
+    // contradict_scan
+    let s8 = list_new()
+    _run_nl_ask_kind(s8, ctx, "nl.ask",
+        _bench_args2("text", "does atom_3 contradict atom_4",
+                      "user_id", "bench_user"))
+    _emit_json_row("rpc_nl_ask_contradict_scan", BENCH_N_END_TO_END, s8, 0)
+
+    // is_a
+    let s9 = list_new()
+    _run_nl_ask_kind(s9, ctx, "nl.ask",
+        _bench_args2("text", "is atom_5 a atom_6", "user_id", "bench_user"))
+    _emit_json_row("rpc_nl_ask_is_a", BENCH_N_END_TO_END, s9, 0)
+
+    // skill_run:echo (final; no trailing comma).
+    let s10 = list_new()
+    _run_nl_ask_kind(s10, ctx, "nl.ask",
+        _bench_args2("text", "run echo with hello", "user_id", "bench_user"))
+    _emit_json_row("rpc_nl_ask_skill_run_echo", BENCH_N_END_TO_END, s10, 1)
+
+    _emit_json_footer()
+    println("bench_nl_verbs complete")
+    return 0
+}
+
+main()

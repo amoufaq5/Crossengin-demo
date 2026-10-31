@@ -1,0 +1,283 @@
+// CrossEngin persona: the ADVISE-ONLY projection function (ADR-0102).
+//
+// Given a persona and a proposed action (a text description + optional
+// atom labels the proposal touches), returns a Projection record that
+// callers (skills, chat REPL, future JSON-RPC clients) present TO THE
+// USER alongside the proposal. The projection NEVER blocks, cancels,
+// or modifies the proposal -- the hard-gate layer (constitutional
+// filter, reversibility classifier, capability gate) keeps sole
+// enforcement authority (ADR-0102 §"The advise-only contract").
+//
+// Contract (from ADR-0102):
+//   persona_project(p, proposal) -> {
+//     predicted_valence_shift:   int (-1000..+1000 milli),
+//     predicted_arousal_shift:   int (-1000..+1000 milli),
+//     risk_score:                int (0..1000 milli),
+//     similar_past_decisions:    list<DecisionRec>,
+//     matching_preferences:      list<PrefRec>,
+//     reasoning_trace:           list<string>
+//   }
+//
+// Similarity metric (v1, deliberately simple + deterministic): a
+// proposal is "similar" to a past decision when their descriptions
+// share at least one non-trivial word (>= 3 chars, common stopwords
+// removed). Preference matching: any preference label that appears as
+// a word in the proposal contributes matching_preferences and shifts
+// predicted valence in proportion to the preference weight.
+//
+// Deliberate reservation (ADR-0102): projection returns raw factors,
+// NOT a single "recommendation score." Callers combine on their own.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies: src/persona/persona.nova, src/util/str_safe.nova.
+
+import "./persona.nova"
+import "../util/str_safe.nova"
+
+// ---- Projection slot layout -----------------------------------------------
+let PROJ_VALENCE_SHIFT   = 0
+let PROJ_AROUSAL_SHIFT   = 1
+let PROJ_RISK_SCORE      = 2
+let PROJ_SIMILAR         = 3    // list<DecisionRec>
+let PROJ_MATCHING_PREFS  = 4    // list<PrefRec>
+let PROJ_TRACE           = 5    // list<string>
+let PROJ_SLOT_COUNT      = 6
+
+// ---- lightweight tokenizer (ASCII lowercase words) ------------------------
+
+// Return 1 if `c` is an ASCII letter (A..Z or a..z) or digit.
+fn _proj_is_wordchar(c) {
+    if c >= 65  { if c <= 90  { return 1 } }     // A..Z
+    if c >= 97  { if c <= 122 { return 1 } }     // a..z
+    if c >= 48  { if c <= 57  { return 1 } }     // 0..9
+    if c == 95  { return 1 }                     // '_'
+    return 0
+}
+
+// Lowercase an ASCII byte in place.
+fn _proj_lower(c) {
+    if c >= 65 { if c <= 90 { return c + 32 } }
+    return c
+}
+
+// Simple stopword filter: skip tiny/common words that give false-positive
+// similarity. The list intentionally short -- goal is not perfect NLP but
+// "don't call 'a proposal to X' and 'a proposal to Y' similar just because
+// they both use the word 'to'."
+fn _proj_is_stopword(w) {
+    if len(w) < 3 { return 1 }
+    if str_eq_bytes(w, "the") == 1 { return 1 }
+    if str_eq_bytes(w, "and") == 1 { return 1 }
+    if str_eq_bytes(w, "for") == 1 { return 1 }
+    if str_eq_bytes(w, "with") == 1 { return 1 }
+    if str_eq_bytes(w, "from") == 1 { return 1 }
+    if str_eq_bytes(w, "into") == 1 { return 1 }
+    if str_eq_bytes(w, "onto") == 1 { return 1 }
+    if str_eq_bytes(w, "that") == 1 { return 1 }
+    if str_eq_bytes(w, "this") == 1 { return 1 }
+    if str_eq_bytes(w, "will") == 1 { return 1 }
+    if str_eq_bytes(w, "would") == 1 { return 1 }
+    if str_eq_bytes(w, "should") == 1 { return 1 }
+    return 0
+}
+
+// Split `s` into lowercase non-stopword tokens. Returns list<string>.
+fn _proj_tokenize(s) {
+    let out = list_new()
+    let n = len(s)
+    let start = 0 - 1
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if _proj_is_wordchar(c) == 1 {
+            if start < 0 { start = i }
+        } else {
+            if start >= 0 {
+                let w = _proj_lower_str(substr(s, start, i - start))
+                if _proj_is_stopword(w) == 0 { push(out, w) }
+                start = 0 - 1
+            }
+        }
+        i = i + 1
+    }
+    if start >= 0 {
+        let w = _proj_lower_str(substr(s, start, n - start))
+        if _proj_is_stopword(w) == 0 { push(out, w) }
+    }
+    return out
+}
+
+// Lowercase every byte in `s`. Non-letters unchanged.
+fn _proj_lower_str(s) {
+    let out = ""
+    let n = len(s)
+    let i = 0
+    while i < n {
+        out = out + chr(_proj_lower(char_at(s, i)))
+        i = i + 1
+    }
+    return out
+}
+
+// Set-membership: does `token` appear in `token_list`?
+fn _proj_has_token(token_list, token) {
+    let i = 0
+    while i < len(token_list) {
+        if str_eq_bytes(token_list[i], token) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Count how many tokens from `a` also appear in `b`.
+fn _proj_shared_count(a, b) {
+    let n = 0
+    let i = 0
+    while i < len(a) {
+        if _proj_has_token(b, a[i]) == 1 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// ---- risk scoring ---------------------------------------------------------
+
+// Risk score for a proposal, given the persona's risk profile.
+// Deliberately simple v1: base score derived from the persona's inverse
+// risk tolerance, shifted by the presence of high-uncertainty markers
+// in the proposal (words like "delete", "remove", "destroy", "permanent").
+// Returns 0..1000 milli. Higher = higher perceived risk.
+fn _proj_risk_score(p, proposal_tokens) {
+    let tolerance = persona_risk_tolerance(p)
+    // Base: lower tolerance -> higher perceived risk. Neutral tolerance
+    // (500) yields base 500. Tolerance 800 (adventurous) yields 200; 200
+    // (cautious) yields 800.
+    let base = 1000 - tolerance
+    // Uncertainty bumps.
+    let bumps = 0
+    if _proj_has_token(proposal_tokens, "delete")    == 1 { bumps = bumps + 100 }
+    if _proj_has_token(proposal_tokens, "remove")    == 1 { bumps = bumps + 100 }
+    if _proj_has_token(proposal_tokens, "destroy")   == 1 { bumps = bumps + 150 }
+    if _proj_has_token(proposal_tokens, "permanent") == 1 { bumps = bumps + 100 }
+    if _proj_has_token(proposal_tokens, "irreversible") == 1 { bumps = bumps + 200 }
+    let score = base + bumps
+    if score < 0 { score = 0 }
+    if score > 1000 { score = 1000 }
+    return score
+}
+
+// ---- projection entry point -----------------------------------------------
+
+// Produce a projection record for a proposal. `proposal` is a free-text
+// description (from a skill, from the user, from an effector). Returns
+// a Projection list; see slot layout above.
+fn persona_project(p, proposal) {
+    let proj = list_new()
+    push(proj, 0)                  // VALENCE_SHIFT
+    push(proj, 0)                  // AROUSAL_SHIFT
+    push(proj, 0)                  // RISK_SCORE
+    push(proj, list_new())         // SIMILAR
+    push(proj, list_new())         // MATCHING_PREFS
+    push(proj, list_new())         // TRACE
+    let trace = proj[PROJ_TRACE]
+    if p == 0 {
+        push(trace, "no persona supplied; returning neutral projection")
+        return proj
+    }
+    if len(proposal) == 0 {
+        push(trace, "empty proposal description; returning neutral projection")
+        return proj
+    }
+    let tokens = _proj_tokenize(proposal)
+    push(trace, "tokenized proposal to " + int_to_str(len(tokens)) + " content words")
+    // ---- similar past decisions --------------------------------------
+    let history = persona_history(p)
+    let sum_valence = 0
+    let similar_count = 0
+    let h = 0
+    while h < len(history) {
+        let dec = history[h]
+        // Skip retracted records -- they carry the audit but shouldn't
+        // shape projections.
+        if dec[PER_DEC_RETRACTED] == 0 {
+            let past_tokens = _proj_tokenize(dec[PER_DEC_PROPOSAL])
+            let shared = _proj_shared_count(tokens, past_tokens)
+            if shared >= 1 {
+                push(proj[PROJ_SIMILAR], dec)
+                similar_count = similar_count + 1
+                // Use the ACTUAL outcome if we have it, else the predicted.
+                let contribution = dec[PER_DEC_ACTUAL]
+                if contribution == 0 {
+                    contribution = dec[PER_DEC_PRED_VALENCE]
+                }
+                sum_valence = sum_valence + contribution
+            }
+        }
+        h = h + 1
+    }
+    if similar_count > 0 {
+        list_set(proj, PROJ_VALENCE_SHIFT, sum_valence / similar_count)
+        push(trace, "found " + int_to_str(similar_count)
+            + " similar past decisions; avg valence contribution "
+            + int_to_str(sum_valence / similar_count))
+    } else {
+        push(trace, "no similar past decisions in history")
+    }
+    // ---- matching preferences ---------------------------------------
+    let prefs = persona_preferences(p)
+    let pref_valence_sum = 0
+    let pref_matches = 0
+    let pi = 0
+    while pi < len(prefs) {
+        let pr = prefs[pi]
+        let pref_tokens = _proj_tokenize(pr[PER_PREF_LABEL])
+        if _proj_shared_count(tokens, pref_tokens) >= 1 {
+            push(proj[PROJ_MATCHING_PREFS], pr)
+            pref_valence_sum = pref_valence_sum + pr[PER_PREF_WEIGHT]
+            pref_matches = pref_matches + 1
+        }
+        pi = pi + 1
+    }
+    if pref_matches > 0 {
+        // Add pref-driven shift to whatever the history contributed.
+        let existing = proj[PROJ_VALENCE_SHIFT]
+        // Weight pref contribution at 1/2 the average so preferences
+        // don't wholly dominate history when both apply.
+        let pref_avg = pref_valence_sum / pref_matches
+        list_set(proj, PROJ_VALENCE_SHIFT, existing + pref_avg / 2)
+        push(trace, "matched " + int_to_str(pref_matches)
+            + " preferences; avg weight " + int_to_str(pref_avg))
+    } else {
+        push(trace, "no matching preferences")
+    }
+    // ---- arousal shift (v1: proportional to abs valence shift) ------
+    let v = proj[PROJ_VALENCE_SHIFT]
+    let arousal = v
+    if arousal < 0 { arousal = 0 - arousal }
+    // Cap arousal shift at 500 (moderate).
+    if arousal > 500 { arousal = 500 }
+    list_set(proj, PROJ_AROUSAL_SHIFT, arousal / 2)
+    // ---- risk score ------------------------------------------------
+    let rs = _proj_risk_score(p, tokens)
+    list_set(proj, PROJ_RISK_SCORE, rs)
+    push(trace, "risk score " + int_to_str(rs)
+        + " (from tolerance " + int_to_str(persona_risk_tolerance(p))
+        + " and proposal risk-word bumps)")
+    // ---- clamp final valence shift ---------------------------------
+    let final_v = proj[PROJ_VALENCE_SHIFT]
+    if final_v < 0 - 1000 { final_v = 0 - 1000 }
+    if final_v > 1000     { final_v = 1000 }
+    list_set(proj, PROJ_VALENCE_SHIFT, final_v)
+    return proj
+}
+
+// ---- accessors on the projection record -----------------------------------
+
+fn proj_valence_shift(proj)   { return proj[PROJ_VALENCE_SHIFT] }
+fn proj_arousal_shift(proj)   { return proj[PROJ_AROUSAL_SHIFT] }
+fn proj_risk_score(proj)      { return proj[PROJ_RISK_SCORE] }
+fn proj_similar(proj)         { return proj[PROJ_SIMILAR] }
+fn proj_matching_prefs(proj)  { return proj[PROJ_MATCHING_PREFS] }
+fn proj_trace(proj)           { return proj[PROJ_TRACE] }
+fn proj_similar_count(proj)   { return len(proj[PROJ_SIMILAR]) }
+fn proj_pref_match_count(proj){ return len(proj[PROJ_MATCHING_PREFS]) }

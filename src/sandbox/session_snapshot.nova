@@ -1,0 +1,1689 @@
+// CrossEngin sandbox: session snapshot serialize / deserialize
+// (R55.3, ADR-0105 §Multi-user).
+//
+// Wraps four registries the daemon owns into one line-oriented text
+// dump the wire's session.save/session.load verbs read + write:
+//
+//   * persona_registry     -- per-user personas (delegates to
+//                              persona_export / persona_import)
+//   * capability_registry  -- live tokens (holder + caps + expiry +
+//                              revoked; token_id ONLY when
+//                              include_secrets = 1)
+//   * trust_anchor_registry (R54.2) -- ed25519 pubkeys, hex-encoded
+//   * ownership_registry (R55.2)    -- (kind, name, owner) triples
+//
+// The snapshot is a DAEMON-SHAPED state dump, not a full chat REPL
+// snapshot (that lives in src/persistence/snapshot_disk.nova and
+// integrates cognition-loop state the daemon doesn't own). What the
+// daemon does own, it persists; a chat REPL running alongside keeps
+// its own separate snapshots.
+//
+// SECURITY NOTE: token_ids are BEARER SECRETS. When
+// include_secrets = 1, the snapshot text contains live token_ids
+// verbatim and the file MUST be 0600-permissioned. When
+// include_secrets = 0 (the "shape only" mode), tokens are dumped
+// WITHOUT their ids; a session.load in that mode re-mints fresh
+// ids and returns holder -> new_id pairs for the operator to
+// redistribute. R55.3 ships the include_secrets=1 default; the
+// shape-only mode is available via the load-side "rekey" toggle.
+//
+// The format is versioned: `#CROSSENGIN-SESSION v1` on line 1.
+// Adding fields = new lines / directives; changing shape = bump
+// version to v2 with a parallel parser (v1 always readable).
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/persona/persona.nova, src/persona/persona_registry.nova,
+//   src/persona/persona_export.nova,
+//   src/sandbox/capability.nova, src/sandbox/skill_signature.nova,
+//   src/sandbox/ownership.nova, src/util/str_safe.nova.
+
+import "../persona/persona.nova"
+import "../persona/persona_registry.nova"
+import "../persona/persona_export.nova"
+import "./capability.nova"
+import "./skill_signature.nova"
+import "./ownership.nova"
+import "../ingest/policy.nova"
+import "../capsules/pattern_capsule.nova"
+import "../skills/skill_manifest.nova"
+import "../skills/skill_registry.nova"
+import "../preference/user_preference.nova"
+import "../agents/agent_manifest.nova"
+import "../agents/agent_registry.nova"
+import "../util/str_safe.nova"
+
+// ---- version constant --------------------------------------------------
+
+let SNAP_VERSION_LINE = "#CROSSENGIN-SESSION v1"
+
+// ---- byte -> hex + hex -> byte helpers ---------------------------------
+
+fn _snap_hex_nibble(n) {
+    if n < 10 { return chr(48 + n) }         // 0..9
+    return chr(87 + n)                        // a..f
+}
+
+fn _snap_bytes_to_hex(b) {
+    if b == 0 { return "" }
+    let out = ""
+    let i = 0
+    while i < len(b) {
+        let x = b[i]
+        out = out + _snap_hex_nibble(x / 16)
+                   + _snap_hex_nibble(x - (x / 16) * 16)
+        i = i + 1
+    }
+    return out
+}
+
+fn _snap_hex_nibble_val(c) {
+    if c >= 48 { if c <= 57  { return c - 48 } }       // 0-9
+    if c >= 97 { if c <= 102 { return c - 87 } }       // a-f
+    if c >= 65 { if c <= 70  { return c - 55 } }       // A-F
+    return 0 - 1
+}
+
+// Hex string -> byte list. Returns 0 on odd length or non-hex chars.
+fn _snap_hex_to_bytes(s) {
+    let n = len(s)
+    if n == 0 { return 0 }
+    if (n / 2) * 2 != n { return 0 }
+    let out = list_new()
+    let i = 0
+    while i < n {
+        let hi = _snap_hex_nibble_val(char_at(s, i))
+        let lo = _snap_hex_nibble_val(char_at(s, i + 1))
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        push(out, hi * 16 + lo)
+        i = i + 2
+    }
+    return out
+}
+
+// ---- caps CSV encoder/decoder -----------------------------------------
+
+fn _snap_caps_csv(caps) {
+    let s = ""
+    let i = 0
+    while i < len(caps) {
+        if i > 0 { s = s + "," }
+        s = s + caps[i]
+        i = i + 1
+    }
+    return s
+}
+
+// Split "a,b,c" -> list<string>. Empty pieces dropped.
+fn _snap_split_csv(s) {
+    let out = list_new()
+    let n = len(s)
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(s, i) == 44 { boundary = 1 } }
+        if boundary == 1 {
+            let piece = substr(s, start, i - start)
+            if len(piece) > 0 { push(out, piece) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- section builders --------------------------------------------------
+
+fn _snap_persona_section(persona_reg) {
+    if persona_reg == 0 { return "" }
+    let out = ""
+    let ps = persona_registry_personas(persona_reg)
+    let i = 0
+    while i < len(ps) {
+        out = out + "\n" + persona_export(ps[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _snap_ownership_section(overlay) {
+    if overlay == 0 { return "" }
+    let entries = ownership_entries(overlay)
+    if len(entries) == 0 { return "" }
+    let out = "\n#OWNERSHIP v1\n"
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        out = out + e[OWN_ENTRY_KIND] + " " + e[OWN_ENTRY_NAME]
+                  + " " + e[OWN_ENTRY_OWNER] + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+fn _snap_trust_section(trust_reg) {
+    if trust_reg == 0 { return "" }
+    let anchors = trust_anchor_registry_anchors(trust_reg)
+    if len(anchors) == 0 { return "" }
+    let out = "\n#TRUST v1\n"
+    let i = 0
+    while i < len(anchors) {
+        out = out + "ANCHOR " + _snap_bytes_to_hex(anchors[i]) + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+// Serialize tokens. `include_secrets`: 1 -> write token_id; 0 -> omit.
+// R56: qps_max appended as the 7th field so a snapshot round-trips
+// the rate limit alongside the other token state.
+fn _snap_caps_section(cap_reg, include_secrets) {
+    if cap_reg == 0 { return "" }
+    let tokens = capability_registry_tokens(cap_reg)
+    if len(tokens) == 0 { return "" }
+    let out = "\n#CAPS v1\n"
+    if include_secrets == 0 {
+        out = out + "# shape-only: token_ids omitted; loader mints fresh ids\n"
+    }
+    let i = 0
+    while i < len(tokens) {
+        let t = tokens[i]
+        let id_field = "-"
+        if include_secrets == 1 { id_field = token_id(t) }
+        let revoked_str = "0"
+        if token_revoked(t) == 1 { revoked_str = "1" }
+        out = out + "TOKEN " + id_field + " " + token_holder(t)
+                  + " " + _snap_caps_csv(token_caps(t))
+                  + " " + int_to_str(token_issued_at(t))
+                  + " " + int_to_str(token_expires_at(t))
+                  + " " + revoked_str
+                  + " " + int_to_str(token_qps_max(t)) + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+// ---- R73: policy registry section builder ------------------------------
+//
+// Serialize the R58 ingest.policy registry (list of Policy records).
+// Each policy is emitted as:
+//
+//   POLICY <name> <action_name>
+//   PRED <op_name> <arg>
+//   PRED <op_name> <arg>
+//   ...
+//
+// The action name uses policy_action_to_name (APPROVE today).
+// For each predicate:
+//   * ANY:            arg is written as "0" (parser ignores)
+//   * SOURCE_PREFIX / KG_EQUALS: arg is the string value, kept
+//                                verbatim (may contain colons or
+//                                other chars up to end-of-line)
+//   * LICENSE_EQ / MAX_ATOMS: arg is int_to_str(int_value)
+//
+// Split rule at parse time: `PRED <op> <rest-of-line>` so string
+// args with spaces (unusual but tolerated) round-trip cleanly.
+fn _snap_policy_section(policy_reg) {
+    if policy_reg == 0 { return "" }
+    let pols = policy_registry_policies(policy_reg)
+    if len(pols) == 0 { return "" }
+    let out = "\n#POLICY v1\n"
+    let i = 0
+    while i < len(pols) {
+        let p = pols[i]
+        out = out + "POLICY " + policy_name(p)
+                  + " " + policy_action_to_name(policy_action(p)) + "\n"
+        let preds = policy_predicates(p)
+        let j = 0
+        while j < len(preds) {
+            let pr = preds[j]
+            let op = pr[POL_PRED_OP]
+            let arg = pr[POL_PRED_ARG]
+            let arg_str = ""
+            if policy_op_arg_is_int(op) == 1 {
+                arg_str = int_to_str(arg)
+            } else {
+                if op == POL_OP_ANY { arg_str = "0" }
+                else                { arg_str = arg }
+            }
+            out = out + "PRED " + policy_op_to_name(op)
+                      + " " + arg_str + "\n"
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- R74: pattern registry section builder -----------------------------
+//
+// The R53/R61/R62 pattern registry is a PROCESS-WIDE SINGLETON
+// (unlike ownership/policy which are passed-in registries). No
+// registry arg -- serializer walks the global; loader replaces by
+// name (matches R53's `pattern_registry_register` last-write-wins
+// semantics).
+//
+// Format mirrors R61's .cerec pattern-pack authoring shape so an
+// operator can eyeball a snapshot and hand-edit if needed:
+//
+//   #PATTERN v1
+//   CAPSULE <name> <version>
+//   PATTERN <confidence> <source_tag>
+//   TRIGGER <t1> <t2> ...
+//   GUIDANCE <text-rest-of-line>
+//   PATTERN <confidence> <source_tag>
+//   ...
+//   CAPSULE <next_name> <next_version>
+//   ...
+//
+// Emitted UNCONDITIONALLY -- the registry always has at least the
+// two built-ins (debug_common + research_hygiene) after lazy-init,
+// so we always have something worth emitting. On load, re-registering
+// the built-ins over themselves is a no-op (last-write-wins on same
+// name + same version).
+fn _snap_pattern_section() {
+    let names = pattern_registry_names()
+    if len(names) == 0 { return "" }
+    let out = "\n#PATTERN v1\n"
+    let i = 0
+    while i < len(names) {
+        let cap = pattern_registry_lookup(names[i])
+        if cap != 0 {
+            out = out + "CAPSULE " + pcapsule_name(cap)
+                      + " " + pcapsule_version(cap) + "\n"
+            let pats = pcapsule_patterns(cap)
+            let j = 0
+            while j < len(pats) {
+                let p = pats[j]
+                out = out + "PATTERN " + int_to_str(pcap_confidence(p))
+                          + " " + pcap_source_tag(p) + "\n"
+                let trigs = pcap_triggers(p)
+                out = out + "TRIGGER"
+                let k = 0
+                while k < len(trigs) {
+                    out = out + " " + trigs[k]
+                    k = k + 1
+                }
+                out = out + "\n"
+                out = out + "GUIDANCE " + pcap_guidance(p) + "\n"
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- R75: skill registry section builder -------------------------------
+//
+// Serialize every registered skill's manifest identity + install
+// state. Compile-time built-ins (echo/research/coding_helper) survive
+// the round-trip too -- last-write-wins on name at load means
+// re-registering the same identity is a no-op.
+//
+// Format:
+//   #SKILL v1
+//   SKILL <name> <version> <policy_id> <tier> <installed_flag>
+//   DESC <description-rest-of-line>
+//   EFFECTOR <name>                  (0+)
+//   DEP <capsule_name>:<min_version> (0+)
+//   REFUSAL <kind_int>:<arg>         (0+)
+//   SKILL <next> ...
+//
+// Note: supervisor state is NOT serialized -- supervisors hold live
+// refs to kg registry / capsule registry / meta observer / persona.
+// The install_flag tells the wire session.load which manifests to
+// re-supervise; that happens outside this module.
+fn _snap_skill_section(skill_reg) {
+    if skill_reg == 0 { return "" }
+    let names = skill_registry_names(skill_reg)
+    if len(names) == 0 { return "" }
+    let out = "\n#SKILL v1\n"
+    let i = 0
+    while i < len(names) {
+        let m = skill_registry_manifest(skill_reg, names[i])
+        if m != 0 {
+            let installed = skill_registry_is_installed(skill_reg, names[i])
+            out = out + "SKILL " + skill_manifest_name(m)
+                      + " " + skill_manifest_version(m)
+                      + " " + int_to_str(skill_manifest_policy_id(m))
+                      + " " + int_to_str(skill_manifest_capability_tier(m))
+                      + " " + int_to_str(installed) + "\n"
+            let desc = skill_manifest_description(m)
+            if len(desc) > 0 {
+                out = out + "DESC " + desc + "\n"
+            }
+            let effs = skill_manifest_effectors(m)
+            let ei = 0
+            while ei < len(effs) {
+                out = out + "EFFECTOR " + effs[ei] + "\n"
+                ei = ei + 1
+            }
+            let deps = skill_manifest_required_capsules(m)
+            let di = 0
+            while di < len(deps) {
+                out = out + "DEP " + deps[di][0]
+                          + ":" + deps[di][1] + "\n"
+                di = di + 1
+            }
+            let refs = skill_manifest_refusal_conds(m)
+            let ri = 0
+            while ri < len(refs) {
+                out = out + "REFUSAL " + int_to_str(refs[ri][0])
+                          + ":" + refs[ri][1] + "\n"
+                ri = ri + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- R101: preference section builder ----------------------------------
+//
+// Serialize the R101 user-preference registry as a #PREFERENCE v1 block.
+// Each entry emits one directive:
+//
+//   PREF <holder> <kind> <name> <enabled>
+//
+// where `enabled` is 0 or 1. Wildcard "*" names round-trip unchanged
+// (parser treats them as literals; the visibility check in
+// user_preference.nova does the wildcard interpretation). Holders are
+// treated as opaque single-word tokens; a holder with spaces would
+// confuse the split-on-32 parser, so we forbid space-bearing holders
+// at PREFERENCE_SET time (an empty/whitespace holder never reaches
+// here because the wire verb refuses it earlier).
+//
+// Section is OMITTED entirely when pref_reg == 0 (backward compat with
+// R55.3-R100 snapshots; the loader treats missing #PREFERENCE as "no
+// preferences to restore"). Section header is always present when at
+// least one entry exists (a preference registry with zero entries emits
+// no header, again for round-trip parity with a fresh boot).
+fn _snap_preference_section(pref_reg) {
+    if pref_reg == 0 { return "" }
+    let entries = preference_entries(pref_reg)
+    if len(entries) == 0 { return "" }
+    let out = "\n#PREFERENCE v1\n"
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let enabled_str = "0"
+        if e[PREF_ENTRY_ENABLED] == 1 { enabled_str = "1" }
+        out = out + "PREF " + e[PREF_ENTRY_HOLDER]
+                  + " " + e[PREF_ENTRY_KIND]
+                  + " " + e[PREF_ENTRY_NAME]
+                  + " " + enabled_str + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+// ---- R109: agent registry section builder ------------------------------
+//
+// Serialize every registered agent's manifest + install / retired
+// flags. Mirrors R75's #SKILL v1 shape (manifest identity + per-slot
+// directives). Recompute-friendly on load: the loader re-registers
+// the manifest and calls agent_registry_install / retire against the
+// live skill_reg so the flags round-trip.
+//
+// Format:
+//   #AGENT v1
+//   AGENT <name> <version> <installed_flag> <retired_flag>
+//   DESC <description-rest-of-line>
+//   CAPSULE_DEP <name>              (0+)
+//   SKILL_DEP <name>                (0+; order preserved)
+//   PATTERN_DEP <name>              (0+)
+//   STYLE_PIN <capsule_name>        (0 or 1)
+//   PERSONA_PIN <user_id>           (0 or 1)
+//   MIN_CONFIDENCE_MILLI <int>
+//   ATTRIBUTION_PREF <tag>
+//   LICENSE <license>
+//   AGENT <next> ...
+fn _snap_agent_emit_entry(entry) {
+    let m = entry[AR_MANIFEST]
+    let installed = entry[AR_INSTALLED]
+    let retired = 0
+    if entry[AR_RETIRED_AT] > 0 { retired = 1 }
+    let s = "AGENT " + agent_manifest_name(m)
+              + " " + agent_manifest_version(m)
+              + " " + int_to_str(installed)
+              + " " + int_to_str(retired) + "\n"
+    let desc = agent_manifest_description(m)
+    if len(desc) > 0 { s = s + "DESC " + desc + "\n" }
+    let cdeps = agent_manifest_capsule_deps(m)
+    let ci = 0
+    while ci < len(cdeps) {
+        s = s + "CAPSULE_DEP " + cdeps[ci] + "\n"
+        ci = ci + 1
+    }
+    let sdeps = agent_manifest_skill_deps(m)
+    let si = 0
+    while si < len(sdeps) {
+        s = s + "SKILL_DEP " + sdeps[si] + "\n"
+        si = si + 1
+    }
+    let pdeps = agent_manifest_pattern_deps(m)
+    let pi = 0
+    while pi < len(pdeps) {
+        s = s + "PATTERN_DEP " + pdeps[pi] + "\n"
+        pi = pi + 1
+    }
+    let sp = agent_manifest_style_pin(m)
+    if len(sp) > 0 { s = s + "STYLE_PIN " + sp + "\n" }
+    let pp = agent_manifest_persona_pin(m)
+    if len(pp) > 0 { s = s + "PERSONA_PIN " + pp + "\n" }
+    s = s + "MIN_CONFIDENCE_MILLI "
+              + int_to_str(agent_manifest_min_confidence_milli(m)) + "\n"
+    let attr = agent_manifest_attribution(m)
+    if len(attr) > 0 { s = s + "ATTRIBUTION_PREF " + attr + "\n" }
+    let lic = agent_manifest_license(m)
+    if len(lic) > 0 { s = s + "LICENSE " + lic + "\n" }
+    return s
+}
+
+fn _snap_agent_section(agent_reg) {
+    if agent_reg == 0 { return "" }
+    let entries = agent_registry_entries(agent_reg)
+    if len(entries) == 0 { return "" }
+    let out = "\n#AGENT v1\n"
+    let i = 0
+    while i < len(entries) {
+        out = out + _snap_agent_emit_entry(entries[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ---- R99: scoped section serializers (bake_child filter) ---------------
+//
+// The whole-daemon serializers above emit EVERY entry in the registry;
+// R99's bake pipeline needs FILTERED variants that emit only entries
+// whose name / user_id is in a supplied allowlist. The scoped variants
+// mirror the whole-daemon shape byte-for-byte so a child bundle can be
+// loaded by the existing session_snapshot_apply_ex parser without any
+// changes.
+//
+// Every scoped variant returns "" for an empty result (matches the
+// whole-daemon convention). The section HEADER (e.g. "#PERSONA v1") is
+// always emitted when the section is called even if the body is empty --
+// callers that want to elide an empty section check the return before
+// concatenating. The bake pipeline ALWAYS emits every section header
+// so a child bundle has a deterministic shape (persona-scoped tests
+// walk the bundle and count section markers).
+
+// Small helper: does `lst` contain `name`? Byte-exact match.
+fn _snap_list_has(lst, name) {
+    let i = 0
+    while i < len(lst) {
+        if str_eq_bytes(lst[i], name) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Filtered persona section. Emits only personas whose user_id is in
+// `uid_allowlist`. Header always present so a child bundle carries
+// a canonical shape. Returns "\n#PERSONA v1\n" plus per-persona
+// export bodies (via persona_export which already includes the header
+// line -- so we strip that when composing).
+fn _snap_persona_section_scoped(persona_reg, uid_allowlist) {
+    if persona_reg == 0 { return "" }
+    let out = ""
+    let ps = persona_registry_personas(persona_reg)
+    let i = 0
+    while i < len(ps) {
+        let p = ps[i]
+        if _snap_list_has(uid_allowlist, persona_user_id(p)) == 1 {
+            out = out + "\n" + persona_export(p)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Filtered ownership section. `kind_allowlists` is a struct-shaped
+// list built by _snap_kind_allowlists_new; each per-kind slot holds
+// the ALLOWED list of names for that ownership kind. An entry passes
+// iff its (kind, name) pair matches the corresponding allowlist.
+let SNAP_KA_CAPSULES = 0
+let SNAP_KA_SKILLS   = 1
+let SNAP_KA_PATTERNS = 2
+let SNAP_KA_KGS      = 3
+let SNAP_KA_SLOTS    = 4
+
+fn _snap_kind_allowlists_new(capsules, skills, patterns, kgs) {
+    let ka = list_new()
+    push(ka, capsules)
+    push(ka, skills)
+    push(ka, patterns)
+    push(ka, kgs)
+    return ka
+}
+
+fn _snap_ownership_section_scoped(overlay, kind_allowlists) {
+    if overlay == 0 { return "" }
+    let entries = ownership_entries(overlay)
+    if len(entries) == 0 { return "" }
+    let out = "\n#OWNERSHIP v1\n"
+    let emitted = 0
+    let i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let kind = e[OWN_ENTRY_KIND]
+        let name = e[OWN_ENTRY_NAME]
+        let allow = 0
+        if str_eq_bytes(kind, OWN_KIND_CAPSULE) == 1 {
+            if _snap_list_has(kind_allowlists[SNAP_KA_CAPSULES], name) == 1 { allow = 1 }
+        }
+        if str_eq_bytes(kind, OWN_KIND_SKILL) == 1 {
+            if _snap_list_has(kind_allowlists[SNAP_KA_SKILLS], name) == 1 { allow = 1 }
+        }
+        if str_eq_bytes(kind, OWN_KIND_PATTERN) == 1 {
+            if _snap_list_has(kind_allowlists[SNAP_KA_PATTERNS], name) == 1 { allow = 1 }
+        }
+        if str_eq_bytes(kind, OWN_KIND_KG) == 1 {
+            if _snap_list_has(kind_allowlists[SNAP_KA_KGS], name) == 1 { allow = 1 }
+        }
+        if allow == 1 {
+            out = out + kind + " " + name + " " + e[OWN_ENTRY_OWNER] + "\n"
+            emitted = emitted + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Filtered policy section. Emits only policies whose name is in
+// `name_allowlist`.
+fn _snap_policy_section_scoped(policy_reg, name_allowlist) {
+    if policy_reg == 0 { return "" }
+    let pols = policy_registry_policies(policy_reg)
+    if len(pols) == 0 { return "" }
+    let out = "\n#POLICY v1\n"
+    let i = 0
+    while i < len(pols) {
+        let p = pols[i]
+        if _snap_list_has(name_allowlist, policy_name(p)) == 1 {
+            out = out + "POLICY " + policy_name(p)
+                      + " " + policy_action_to_name(policy_action(p)) + "\n"
+            let preds = policy_predicates(p)
+            let j = 0
+            while j < len(preds) {
+                let pr = preds[j]
+                let op = pr[POL_PRED_OP]
+                let arg = pr[POL_PRED_ARG]
+                let arg_str = ""
+                if policy_op_arg_is_int(op) == 1 {
+                    arg_str = int_to_str(arg)
+                } else {
+                    if op == POL_OP_ANY { arg_str = "0" }
+                    else                { arg_str = arg }
+                }
+                out = out + "PRED " + policy_op_to_name(op)
+                          + " " + arg_str + "\n"
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Filtered pattern section. Walks the process-wide singleton pattern
+// registry; emits only capsules whose name is in `name_allowlist`.
+fn _snap_pattern_section_scoped(name_allowlist) {
+    let names = pattern_registry_names()
+    if len(names) == 0 { return "" }
+    let out = "\n#PATTERN v1\n"
+    let i = 0
+    while i < len(names) {
+        if _snap_list_has(name_allowlist, names[i]) == 1 {
+            let cap = pattern_registry_lookup(names[i])
+            if cap != 0 {
+                out = out + "CAPSULE " + pcapsule_name(cap)
+                          + " " + pcapsule_version(cap) + "\n"
+                let pats = pcapsule_patterns(cap)
+                let j = 0
+                while j < len(pats) {
+                    let p = pats[j]
+                    out = out + "PATTERN " + int_to_str(pcap_confidence(p))
+                              + " " + pcap_source_tag(p) + "\n"
+                    let trigs = pcap_triggers(p)
+                    out = out + "TRIGGER"
+                    let k = 0
+                    while k < len(trigs) {
+                        out = out + " " + trigs[k]
+                        k = k + 1
+                    }
+                    out = out + "\n"
+                    out = out + "GUIDANCE " + pcap_guidance(p) + "\n"
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Filtered skill section. Emits only skills whose name is in
+// `name_allowlist`.
+fn _snap_skill_section_scoped(skill_reg, name_allowlist) {
+    if skill_reg == 0 { return "" }
+    let names = skill_registry_names(skill_reg)
+    if len(names) == 0 { return "" }
+    let out = "\n#SKILL v1\n"
+    let i = 0
+    while i < len(names) {
+        if _snap_list_has(name_allowlist, names[i]) == 1 {
+            let m = skill_registry_manifest(skill_reg, names[i])
+            if m != 0 {
+                let installed = skill_registry_is_installed(skill_reg, names[i])
+                out = out + "SKILL " + skill_manifest_name(m)
+                          + " " + skill_manifest_version(m)
+                          + " " + int_to_str(skill_manifest_policy_id(m))
+                          + " " + int_to_str(skill_manifest_capability_tier(m))
+                          + " " + int_to_str(installed) + "\n"
+                let desc = skill_manifest_description(m)
+                if len(desc) > 0 {
+                    out = out + "DESC " + desc + "\n"
+                }
+                let effs = skill_manifest_effectors(m)
+                let ei = 0
+                while ei < len(effs) {
+                    out = out + "EFFECTOR " + effs[ei] + "\n"
+                    ei = ei + 1
+                }
+                let deps = skill_manifest_required_capsules(m)
+                let di = 0
+                while di < len(deps) {
+                    out = out + "DEP " + deps[di][0]
+                              + ":" + deps[di][1] + "\n"
+                    di = di + 1
+                }
+                let refs = skill_manifest_refusal_conds(m)
+                let ri = 0
+                while ri < len(refs) {
+                    out = out + "REFUSAL " + int_to_str(refs[ri][0])
+                              + ":" + refs[ri][1] + "\n"
+                    ri = ri + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// R109: filtered #AGENT v1 section for bake_child. Emits only agents
+// whose name is in `name_allowlist`.
+fn _snap_agent_section_scoped(agent_reg, name_allowlist) {
+    if agent_reg == 0 { return "" }
+    let entries = agent_registry_entries(agent_reg)
+    if len(entries) == 0 { return "" }
+    let out = "\n#AGENT v1\n"
+    let i = 0
+    while i < len(entries) {
+        let m = entries[i][AR_MANIFEST]
+        if _snap_list_has(name_allowlist, agent_manifest_name(m)) == 1 {
+            out = out + _snap_agent_emit_entry(entries[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- public serialize --------------------------------------------------
+//
+// Compose one text dump of every registry passed. Any registry arg
+// that's 0 contributes no section (the version banner + timestamp
+// always render). `now` is the moment stamped on the header.
+//
+// R73 note: the 6-arg signature is preserved for every existing
+// caller (backward-compat with R55.3-R72). Use
+// session_snapshot_serialize_ex when the R58 policy registry needs
+// to round-trip too.
+//
+// R74 note: pattern-registry serialization is UNCONDITIONAL because
+// the pattern registry is a process-wide singleton (no reg param
+// needed). Every serialize call now emits a #PATTERN v1 section
+// covering the built-ins and any R62-installed authored packs. An
+// R73-shape snapshot without the section still parses; a new-shape
+// snapshot loaded by an old daemon (no #PATTERN v1 handler) drops
+// the section silently (unknown-section already the case pre-R74).
+fn session_snapshot_serialize(persona_reg, cap_reg, trust_reg,
+                              overlay, include_secrets, now) {
+    return session_snapshot_serialize_ex(persona_reg, cap_reg, trust_reg,
+                                          overlay, 0, 0, 0, 0,
+                                          include_secrets, now)
+}
+
+// R73 extended serializer: policy_reg (may be 0) round-trips as
+// a #POLICY v1 section. R75 added skill_reg (may be 0) -> #SKILL v1.
+// R74: also emits #PATTERN v1 (unconditional; no reg param).
+// R101: preference_reg (may be 0) round-trips as #PREFERENCE v1.
+// It is inserted BEFORE include_secrets (positional convention: every
+// new "may be 0" registry appended to the registry list before the
+// trailing knob args). Callers that don't have a preference registry
+// pass 0 for byte-identical R100 behavior.
+// R109: agent_reg (may be 0) round-trips as #AGENT v1. Inserted AFTER
+// preference_reg per the R101 positional convention (every new "may
+// be 0" registry appended to the registry list before the trailing
+// knob args). Callers that don't have an agent registry pass 0 for
+// byte-identical R101 behavior.
+fn session_snapshot_serialize_ex(persona_reg, cap_reg, trust_reg,
+                                  overlay, policy_reg, skill_reg,
+                                  preference_reg, agent_reg,
+                                  include_secrets, now) {
+    let out = SNAP_VERSION_LINE + "\n"
+    out = out + "#saved-at " + int_to_str(now) + "\n"
+    if include_secrets == 0 {
+        out = out + "#include-secrets 0\n"
+    } else {
+        out = out + "#include-secrets 1\n"
+    }
+    out = out + _snap_persona_section(persona_reg)
+    out = out + _snap_ownership_section(overlay)
+    out = out + _snap_trust_section(trust_reg)
+    out = out + _snap_caps_section(cap_reg, include_secrets)
+    out = out + _snap_policy_section(policy_reg)
+    out = out + _snap_pattern_section()
+    out = out + _snap_skill_section(skill_reg)
+    out = out + _snap_preference_section(preference_reg)
+    out = out + _snap_agent_section(agent_reg)
+    return out
+}
+
+// ---- deserialize --------------------------------------------------------
+//
+// Parse the text back and apply to the passed-in registries IN PLACE.
+// Every registry arg that's 0 causes its section to be SKIPPED (a
+// snapshot with a persona section but no persona registry to load
+// into is a partial-load; caller supplies whichever registries they
+// have). `now` is the moment stamped on any newly-minted tokens
+// when the snapshot loaded shape-only tokens (include_secrets=0).
+//
+// Returns a result record:
+//   [ok, err_str, personas_loaded, anchors_loaded, tokens_loaded,
+//    ownership_entries_loaded, rekeyed_tokens (list of [holder,new_id])]
+//
+// A malformed line does NOT abort the whole parse; it counts as
+// dropped and the parse continues (returns ok=1 with a warning field).
+// Only a completely bad header (wrong version) yields ok=0.
+
+let SNAPRES_OK          = 0
+let SNAPRES_ERR         = 1
+let SNAPRES_PERSONAS    = 2
+let SNAPRES_ANCHORS     = 3
+let SNAPRES_TOKENS      = 4
+let SNAPRES_OWNERSHIP   = 5
+let SNAPRES_REKEYED     = 6
+let SNAPRES_POLICIES    = 7    // R73
+let SNAPRES_PATTERNS    = 8    // R74
+let SNAPRES_SKILLS      = 9    // R75 (manifests registered)
+let SNAPRES_SKILL_INSTALL_NAMES = 10  // R75 (installed-flag names, for
+                                       //       the caller's supervisor
+                                       //       rebuild loop)
+let SNAPRES_PREFERENCES = 11   // R101 (per-user preference entries loaded)
+let SNAPRES_AGENTS      = 12   // R109 (agent manifests registered)
+let SNAPRES_SLOTS       = 13
+
+fn _snap_result_new() {
+    let r = list_new()
+    push(r, 0)                  // OK
+    push(r, "")                 // ERR
+    push(r, 0)                  // PERSONAS
+    push(r, 0)                  // ANCHORS
+    push(r, 0)                  // TOKENS
+    push(r, 0)                  // OWNERSHIP
+    push(r, list_new())         // REKEYED (holder, new_id pairs)
+    push(r, 0)                  // POLICIES (R73)
+    push(r, 0)                  // PATTERNS (R74)
+    push(r, 0)                  // SKILLS (R75)
+    push(r, list_new())         // SKILL_INSTALL_NAMES (R75)
+    push(r, 0)                  // PREFERENCES (R101)
+    push(r, 0)                  // AGENTS (R109)
+    return r
+}
+
+fn snap_result_ok(r)                 { return r[SNAPRES_OK] }
+fn snap_result_err(r)                { return r[SNAPRES_ERR] }
+fn snap_result_personas(r)           { return r[SNAPRES_PERSONAS] }
+fn snap_result_anchors(r)            { return r[SNAPRES_ANCHORS] }
+fn snap_result_tokens(r)             { return r[SNAPRES_TOKENS] }
+fn snap_result_ownership(r)          { return r[SNAPRES_OWNERSHIP] }
+fn snap_result_rekeyed(r)            { return r[SNAPRES_REKEYED] }
+fn snap_result_policies(r)           { return r[SNAPRES_POLICIES] }
+fn snap_result_patterns(r)           { return r[SNAPRES_PATTERNS] }
+fn snap_result_skills(r)             { return r[SNAPRES_SKILLS] }
+fn snap_result_skill_install_names(r) {
+    return r[SNAPRES_SKILL_INSTALL_NAMES]
+}
+fn snap_result_preferences(r)        { return r[SNAPRES_PREFERENCES] }
+fn snap_result_agents(r)             { return r[SNAPRES_AGENTS] }
+
+// Split the whole dump into individual sections keyed by their header
+// marker (#PERSONA v1 / #OWNERSHIP v1 / #TRUST v1 / #CAPS v1). Returns
+// a list of [marker, body] pairs in the ORDER they appear.
+fn _snap_split_sections(text) {
+    let sections = list_new()
+    let n = len(text)
+    let cur_marker = ""
+    let cur_body = ""
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(text, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(text, start, i - start)
+            // A line starting with "#" AND matching one of our
+            // section markers begins a new section.
+            let is_marker = 0
+            if len(line) > 0 {
+                if char_at(line, 0) == 35 {         // '#'
+                    if str_eq_bytes(line, "#PERSONA v1")   == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#OWNERSHIP v1") == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#TRUST v1")     == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#CAPS v1")      == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#POLICY v1")    == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#PATTERN v1")   == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#SKILL v1")     == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#PREFERENCE v1") == 1 { is_marker = 1 }
+                    if str_eq_bytes(line, "#AGENT v1")      == 1 { is_marker = 1 }
+                }
+            }
+            if is_marker == 1 {
+                // Flush current section (if any) into the list.
+                if len(cur_marker) > 0 {
+                    let pair = list_new()
+                    push(pair, cur_marker) push(pair, cur_body)
+                    push(sections, pair)
+                }
+                cur_marker = line
+                cur_body = ""
+            } else {
+                if len(cur_marker) > 0 {
+                    if len(cur_body) > 0 { cur_body = cur_body + "\n" }
+                    cur_body = cur_body + line
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if len(cur_marker) > 0 {
+        let pair = list_new()
+        push(pair, cur_marker) push(pair, cur_body)
+        push(sections, pair)
+    }
+    return sections
+}
+
+fn _snap_apply_persona(body, persona_reg) {
+    if persona_reg == 0 { return 0 }
+    // persona_import expects a full #PERSONA v1 block including the
+    // header (persona_export writes that shape). We drop back to the
+    // header + body.
+    let full = "#PERSONA v1\n" + body
+    let p = persona_import(full)
+    if p == 0 { return 0 }
+    // Register (last-write-wins for a duplicate user_id).
+    persona_registry_register(persona_reg, p)
+    return 1
+}
+
+fn _snap_apply_ownership(body, overlay) {
+    if overlay == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 {
+                if char_at(line, 0) != 35 {         // skip comments
+                    // Format: "<kind> <name> <owner>"
+                    let sp1 = find_char(line, 32)
+                    if sp1 > 0 {
+                        let kind = substr(line, 0, sp1)
+                        let rest = substr(line, sp1 + 1, len(line) - sp1 - 1)
+                        let sp2 = find_char(rest, 32)
+                        if sp2 > 0 {
+                            let name  = substr(rest, 0, sp2)
+                            let owner = substr(rest, sp2 + 1, len(rest) - sp2 - 1)
+                            if ownership_set(overlay, kind, name, owner) == 1 {
+                                applied = applied + 1
+                            }
+                        }
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return applied
+}
+
+fn _snap_apply_trust(body, trust_reg) {
+    if trust_reg == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 {
+                if char_at(line, 0) != 35 {
+                    // Format: "ANCHOR <hex64>"
+                    let sp = find_char(line, 32)
+                    if sp > 0 {
+                        let head = substr(line, 0, sp)
+                        if str_eq_bytes(head, "ANCHOR") == 1 {
+                            let hex = substr(line, sp + 1, len(line) - sp - 1)
+                            let pk = _snap_hex_to_bytes(hex)
+                            if pk != 0 {
+                                if trust_anchor_add(trust_reg, pk) == 1 {
+                                    applied = applied + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return applied
+}
+
+// Parse a TOKEN line:
+//   "TOKEN <id-or-'-'> <holder> <caps-csv> <issued> <expires> <revoked> [<qps_max>]"
+// The qps_max field is R56; snapshots written before R56 are still
+// readable (qps_max defaults to 0 = unlimited when absent).
+// Returns [id_str, holder, caps_list, issued, expires, revoked, qps_max]
+// or 0.
+fn _snap_parse_token_line(line) {
+    let toks = list_new()
+    let n = len(line)
+    let start = 0
+    let i = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(line, i) == 32 { boundary = 1 } }
+        if boundary == 1 {
+            push(toks, substr(line, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if len(toks) < 7 { return 0 }
+    if str_eq_bytes(toks[0], "TOKEN") == 0 { return 0 }
+    let qps_max = 0
+    if len(toks) >= 8 { qps_max = str_to_int(toks[7]) }
+    let out = list_new()
+    push(out, toks[1])                      // id
+    push(out, toks[2])                      // holder
+    push(out, _snap_split_csv(toks[3]))     // caps
+    push(out, str_to_int(toks[4]))          // issued
+    push(out, str_to_int(toks[5]))          // expires
+    push(out, str_to_int(toks[6]))          // revoked
+    push(out, qps_max)                       // qps_max (R56; 0 if absent)
+    return out
+}
+
+fn _snap_apply_caps(body, cap_reg, now, result) {
+    if cap_reg == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 {
+                if char_at(line, 0) != 35 {
+                    let parts = _snap_parse_token_line(line)
+                    if parts != 0 {
+                        let raw_id = parts[0]
+                        let holder = parts[1]
+                        let caps   = parts[2]
+                        let issued = parts[3]
+                        let expires = parts[4]
+                        let revoked = parts[5]
+                        let qps_max = parts[6]
+                        let tid = raw_id
+                        // "-" placeholder means the snapshot was
+                        // saved with include_secrets=0; mint a fresh
+                        // id and record the rekey.
+                        if str_eq_bytes(raw_id, "-") == 1 {
+                            tid = capability_token_id_mint()
+                            let rk = list_new()
+                            push(rk, holder) push(rk, tid)
+                            push(result[SNAPRES_REKEYED], rk)
+                        }
+                        let t = capability_token_new(tid, holder, caps,
+                                                     issued, expires)
+                        if revoked == 1 { list_set(t, TOK_REVOKED, 1) }
+                        if qps_max > 0 { token_set_qps_max(t, qps_max) }
+                        capability_registry_add(cap_reg, t)
+                        applied = applied + 1
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return applied
+}
+
+// R73 policy loader. Walks a #POLICY v1 body line by line:
+//   POLICY <name> <action_name>    opens a new policy
+//   PRED   <op_name> <arg-rest>    appends a predicate to the CURRENT
+//                                  open policy
+// A malformed PRED line is skipped (lenient parser); a PRED before any
+// POLICY is dropped; unknown op or action name causes the line to be
+// skipped without aborting the parse. Returns the count of REGISTERED
+// policies (a policy with 0 predicates still registers -- matches R58's
+// "empty predicates matches everything" semantics).
+fn _snap_apply_policy(body, policy_reg) {
+    if policy_reg == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    let cur = 0                 // currently-open Policy, or 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 { if char_at(line, 0) != 35 {  // skip # comments
+                let sp1 = find_char(line, 32)
+                if sp1 > 0 {
+                    let head = substr(line, 0, sp1)
+                    let rest = substr(line, sp1 + 1, len(line) - sp1 - 1)
+                    if str_eq_bytes(head, "POLICY") == 1 {
+                        // Flush any previous policy to the registry.
+                        if cur != 0 {
+                            policy_registry_register(policy_reg, cur)
+                            applied = applied + 1
+                            cur = 0
+                        }
+                        // Parse "<name> <action>".
+                        let sp2 = find_char(rest, 32)
+                        if sp2 > 0 {
+                            let name = substr(rest, 0, sp2)
+                            let act_name = substr(rest, sp2 + 1,
+                                                   len(rest) - sp2 - 1)
+                            let act = policy_action_from_name(act_name)
+                            if act >= 0 {
+                                if len(name) > 0 {
+                                    cur = policy_new(name, act)
+                                }
+                            }
+                        }
+                    } else { if str_eq_bytes(head, "PRED") == 1 {
+                        if cur != 0 {
+                            let sp3 = find_char(rest, 32)
+                            if sp3 > 0 {
+                                let op_name = substr(rest, 0, sp3)
+                                let arg_str = substr(rest, sp3 + 1,
+                                                      len(rest) - sp3 - 1)
+                                let op = policy_op_from_name(op_name)
+                                if op >= 0 {
+                                    let arg = arg_str
+                                    if policy_op_arg_is_int(op) == 1 {
+                                        arg = str_to_int(arg_str)
+                                    } else {
+                                        if op == POL_OP_ANY { arg = 0 }
+                                    }
+                                    push(cur[POL_PREDICATES],
+                                          pol_pred(op, arg))
+                                }
+                            }
+                        }
+                    } }
+                }
+            } }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    // Flush the final open policy.
+    if cur != 0 {
+        policy_registry_register(policy_reg, cur)
+        applied = applied + 1
+    }
+    return applied
+}
+
+// R74 pattern loader. Walks a #PATTERN v1 body line by line:
+//   CAPSULE  <name> <version>            opens/switches capsule
+//   PATTERN  <confidence> <source_tag>   opens a pattern in the
+//                                        current capsule
+//   TRIGGER  <t1> <t2> ...               triggers for the pattern
+//   GUIDANCE <text>                      pattern guidance
+//
+// Registers each capsule via pattern_registry_register when the
+// capsule boundary is reached (or at end-of-body). Last-write-wins
+// on name matches R53's semantics -- re-loading a snapshot that
+// contains debug_common overwrites the built-in with the snapshot's
+// version (which is safe when it's the same content, and desired
+// when an operator edited the snapshot to tweak a built-in).
+//
+// Lenient: a malformed PATTERN / TRIGGER / GUIDANCE line drops that
+// pattern; other patterns in the capsule still register. A CAPSULE
+// with no valid PATTERNs registers as an empty capsule (harmless
+// placeholder -- matches R61's tolerance).
+//
+// Returns the count of REGISTERED capsules.
+fn _snap_apply_pattern(body) {
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    // Currently-open capsule state.
+    let cur_cap = 0                 // pattern capsule handle, or 0
+    // Currently-open pattern state (accumulates across PATTERN/
+    // TRIGGER/GUIDANCE lines; flushed at next PATTERN / next CAPSULE
+    // / end-of-body).
+    let cur_pat_open = 0
+    let cur_pat_conf = 0
+    let cur_pat_src  = ""
+    let cur_pat_trig = list_new()
+    let cur_pat_guid = ""
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 { if char_at(line, 0) != 35 {
+                let sp1 = find_char(line, 32)
+                if sp1 > 0 {
+                    let head = substr(line, 0, sp1)
+                    let rest = substr(line, sp1 + 1, len(line) - sp1 - 1)
+                    if str_eq_bytes(head, "CAPSULE") == 1 {
+                        // Flush any open pattern into the current capsule.
+                        if cur_pat_open == 1 { if cur_cap != 0 {
+                            if len(cur_pat_trig) > 0 { if len(cur_pat_guid) > 0 {
+                                pcapsule_add(cur_cap,
+                                    pcap_new(cur_pat_trig, cur_pat_guid,
+                                              cur_pat_src, cur_pat_conf))
+                            } }
+                        } }
+                        cur_pat_open = 0
+                        cur_pat_trig = list_new()
+                        cur_pat_guid = ""
+                        // Flush previous capsule to the registry.
+                        if cur_cap != 0 {
+                            pattern_registry_register(cur_cap)
+                            applied = applied + 1
+                            cur_cap = 0
+                        }
+                        // Parse "<name> <version>".
+                        let sp2 = find_char(rest, 32)
+                        if sp2 > 0 {
+                            let name = substr(rest, 0, sp2)
+                            let ver  = substr(rest, sp2 + 1,
+                                               len(rest) - sp2 - 1)
+                            if len(name) > 0 {
+                                cur_cap = pcapsule_new(name, ver)
+                            }
+                        }
+                    } else { if str_eq_bytes(head, "PATTERN") == 1 {
+                        // Flush any prior open pattern first.
+                        if cur_pat_open == 1 { if cur_cap != 0 {
+                            if len(cur_pat_trig) > 0 { if len(cur_pat_guid) > 0 {
+                                pcapsule_add(cur_cap,
+                                    pcap_new(cur_pat_trig, cur_pat_guid,
+                                              cur_pat_src, cur_pat_conf))
+                            } }
+                        } }
+                        cur_pat_open = 0
+                        cur_pat_trig = list_new()
+                        cur_pat_guid = ""
+                        // Parse "<confidence> <source_tag>".
+                        let sp2 = find_char(rest, 32)
+                        if sp2 > 0 {
+                            let conf_str = substr(rest, 0, sp2)
+                            let src      = substr(rest, sp2 + 1,
+                                                   len(rest) - sp2 - 1)
+                            // Reject non-numeric conf (str_to_int
+                            // silently returns 0 for garbage, which
+                            // would mask a typo).
+                            let is_numeric = 1
+                            if len(conf_str) == 0 { is_numeric = 0 }
+                            let ni = 0
+                            while ni < len(conf_str) {
+                                let cc = char_at(conf_str, ni)
+                                if cc < 48 { is_numeric = 0 }
+                                if cc > 57 { is_numeric = 0 }
+                                ni = ni + 1
+                            }
+                            if is_numeric == 1 {
+                                let c = str_to_int(conf_str)
+                                if c >= 0 { if c <= 1000 {
+                                    cur_pat_open = 1
+                                    cur_pat_conf = c
+                                    cur_pat_src  = src
+                                } }
+                            }
+                        }
+                    } else { if str_eq_bytes(head, "TRIGGER") == 1 {
+                        if cur_pat_open == 1 {
+                            // Split rest on spaces.
+                            cur_pat_trig = split_char(rest, 32)
+                        }
+                    } else { if str_eq_bytes(head, "GUIDANCE") == 1 {
+                        if cur_pat_open == 1 {
+                            cur_pat_guid = rest
+                        }
+                    } } } }
+                }
+            } }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    // Final flush.
+    if cur_pat_open == 1 { if cur_cap != 0 {
+        if len(cur_pat_trig) > 0 { if len(cur_pat_guid) > 0 {
+            pcapsule_add(cur_cap,
+                pcap_new(cur_pat_trig, cur_pat_guid,
+                          cur_pat_src, cur_pat_conf))
+        } }
+    } }
+    if cur_cap != 0 {
+        pattern_registry_register(cur_cap)
+        applied = applied + 1
+    }
+    return applied
+}
+
+// R75 skill loader. Walks a #SKILL v1 body with a per-skill state
+// machine:
+//   SKILL <name> <version> <policy_id> <tier> <installed_flag>
+//                                    opens/switches skill
+//   DESC     <text>                  sets description
+//   EFFECTOR <name>                  appends to effectors
+//   DEP      <capsule_name>:<version> appends to required_capsules
+//   REFUSAL  <kind_int>:<arg>        appends to refusal_conds
+//
+// Registers the manifest via skill_registry_register at each SKILL
+// boundary (or end-of-body). The `install_flag` value ("1" for
+// installed, anything else for not) is captured into
+// SNAPRES_SKILL_INSTALL_NAMES so the wire caller can rebuild
+// supervisors + call skill_registry_install itself (supervisor
+// construction needs live refs the snapshot module doesn't own).
+//
+// Lenient: malformed SKILL line drops that skill; unknown directives
+// inside a skill are skipped without aborting the parse.
+//
+// Returns count of REGISTERED manifests.
+fn _snap_apply_skill(body, skill_reg, result) {
+    if skill_reg == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    let cur = 0                     // manifest handle, or 0
+    let cur_name = ""
+    let cur_installed = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 { if char_at(line, 0) != 35 {
+                let sp1 = find_char(line, 32)
+                if sp1 > 0 {
+                    let head = substr(line, 0, sp1)
+                    let rest = substr(line, sp1 + 1, len(line) - sp1 - 1)
+                    if str_eq_bytes(head, "SKILL") == 1 {
+                        // Flush prior skill.
+                        if cur != 0 {
+                            skill_registry_register(skill_reg, cur)
+                            applied = applied + 1
+                            if cur_installed == 1 {
+                                push(result[SNAPRES_SKILL_INSTALL_NAMES],
+                                      cur_name)
+                            }
+                            cur = 0
+                        }
+                        // Parse "<name> <version> <policy_id> <tier> <install_flag>".
+                        let parts = split_char(rest, 32)
+                        if len(parts) >= 5 {
+                            let name = parts[0]
+                            let ver  = parts[1]
+                            let pid  = str_to_int(parts[2])
+                            let tier = str_to_int(parts[3])
+                            let inst = str_to_int(parts[4])
+                            if len(name) > 0 {
+                                cur = skill_manifest_new(name, ver, "", pid)
+                                skill_manifest_set_tier(cur, tier)
+                                cur_name = name
+                                cur_installed = inst
+                            }
+                        }
+                    } else { if str_eq_bytes(head, "DESC") == 1 {
+                        if cur != 0 { list_set(cur, SM_DESCRIPTION, rest) }
+                    } else { if str_eq_bytes(head, "EFFECTOR") == 1 {
+                        if cur != 0 { skill_manifest_add_effector(cur, rest) }
+                    } else { if str_eq_bytes(head, "DEP") == 1 {
+                        if cur != 0 {
+                            let colon = find_char(rest, 58)
+                            if colon > 0 {
+                                let cn = substr(rest, 0, colon)
+                                let cv = substr(rest, colon + 1,
+                                                 len(rest) - colon - 1)
+                                skill_manifest_add_capsule_dep(cur, cn, cv)
+                            }
+                        }
+                    } else { if str_eq_bytes(head, "REFUSAL") == 1 {
+                        if cur != 0 {
+                            let colon = find_char(rest, 58)
+                            if colon > 0 {
+                                let k_str = substr(rest, 0, colon)
+                                let arg   = substr(rest, colon + 1,
+                                                    len(rest) - colon - 1)
+                                let kind = str_to_int(k_str)
+                                skill_manifest_add_refusal(cur, kind, arg)
+                            }
+                        }
+                    } } } } }
+                }
+            } }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    // Final flush.
+    if cur != 0 {
+        skill_registry_register(skill_reg, cur)
+        applied = applied + 1
+        if cur_installed == 1 {
+            push(result[SNAPRES_SKILL_INSTALL_NAMES], cur_name)
+        }
+    }
+    return applied
+}
+
+// R101 preference loader. Walks a #PREFERENCE v1 body line by line:
+//
+//   PREF <holder> <kind> <name> <enabled>
+//
+// Applies each row via preference_set. Malformed lines (short of 5
+// fields, unknown kind, non-numeric enabled) are dropped silently
+// (lenient parse -- matches the R73/R74/R75 shape). Wildcard "*"
+// names pass through unchanged; the wildcard interpretation happens
+// at read time in preference_visible.
+//
+// Returns the count of PREFERENCES successfully registered.
+fn _snap_apply_preference(body, pref_reg) {
+    if pref_reg == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 { if char_at(line, 0) != 35 {
+                let parts = split_char(line, 32)
+                if len(parts) >= 5 {
+                    if str_eq_bytes(parts[0], "PREF") == 1 {
+                        let holder  = parts[1]
+                        let kind    = parts[2]
+                        let name    = parts[3]
+                        let en_str  = parts[4]
+                        let enabled = 0
+                        if str_eq_bytes(en_str, "1") == 1 { enabled = 1 }
+                        else { if str_eq_bytes(en_str, "0") == 1 { enabled = 0 }
+                               else { enabled = 0 - 1 } }
+                        if enabled >= 0 {
+                            if preference_set(pref_reg, holder, kind,
+                                               name, enabled) == 1 {
+                                applied = applied + 1
+                            }
+                        }
+                    }
+                }
+            } }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return applied
+}
+
+// R109 agent loader. Walks a #AGENT v1 body with a per-agent state
+// machine:
+//   AGENT <name> <version> <installed_flag> <retired_flag>
+//                                       opens/switches agent
+//   DESC     <text>                     sets description
+//   CAPSULE_DEP <name>                  appends to capsule_deps
+//   SKILL_DEP <name>                    appends to skill_deps
+//   PATTERN_DEP <name>                  appends to pattern_deps
+//   STYLE_PIN <capsule_name>            sets style pin
+//   PERSONA_PIN <user_id>               sets persona pin
+//   MIN_CONFIDENCE_MILLI <int>          sets threshold
+//   ATTRIBUTION_PREF <tag>              sets attribution
+//   LICENSE <license>                   sets license
+//
+// Registers the manifest via agent_registry_register at each AGENT
+// boundary (or end-of-body). Post-register, applies installed_flag +
+// retired_flag against the live registry -- installed=1 calls
+// agent_registry_install (skill_reg=0 so dep-existence is not
+// re-checked; the caller has already provided a snapshot from a
+// working configuration), retired=1 calls agent_registry_retire.
+//
+// Lenient: malformed AGENT line drops that agent; unknown directives
+// inside an agent are skipped without aborting the parse.
+//
+// Returns count of REGISTERED manifests.
+fn _snap_apply_agent(body, agent_reg, now) {
+    if agent_reg == 0 { return 0 }
+    let n = len(body)
+    let start = 0
+    let i = 0
+    let applied = 0
+    let cur = 0                     // manifest handle, or 0
+    let cur_name = ""
+    let cur_installed = 0
+    let cur_retired = 0
+    while i <= n {
+        let boundary = 0
+        if i == n { boundary = 1 }
+        else { if char_at(body, i) == 10 { boundary = 1 } }
+        if boundary == 1 {
+            let line = substr(body, start, i - start)
+            if len(line) > 0 { if char_at(line, 0) != 35 {
+                let sp1 = find_char(line, 32)
+                if sp1 > 0 {
+                    let head = substr(line, 0, sp1)
+                    let rest = substr(line, sp1 + 1, len(line) - sp1 - 1)
+                    if str_eq_bytes(head, "AGENT") == 1 {
+                        // Flush prior agent.
+                        if cur != 0 {
+                            if agent_registry_register(agent_reg, cur) == 1 {
+                                applied = applied + 1
+                                if cur_installed == 1 {
+                                    agent_registry_install(agent_reg,
+                                                            cur_name,
+                                                            0, now)
+                                }
+                                if cur_retired == 1 {
+                                    agent_registry_retire(agent_reg,
+                                                            cur_name, now)
+                                }
+                            }
+                            cur = 0
+                        }
+                        // Parse "<name> <version> <installed> <retired>".
+                        let parts = split_char(rest, 32)
+                        if len(parts) >= 4 {
+                            let name = parts[0]
+                            let ver  = parts[1]
+                            let inst = str_to_int(parts[2])
+                            let ret  = str_to_int(parts[3])
+                            if len(name) > 0 {
+                                cur = agent_manifest_new(name, ver, "")
+                                cur_name = name
+                                cur_installed = inst
+                                cur_retired = ret
+                            }
+                        }
+                    } else { if str_eq_bytes(head, "DESC") == 1 {
+                        if cur != 0 { list_set(cur, AM_DESCRIPTION, rest) }
+                    } else { if str_eq_bytes(head, "CAPSULE_DEP") == 1 {
+                        if cur != 0 { agent_manifest_add_capsule_dep(cur, rest) }
+                    } else { if str_eq_bytes(head, "SKILL_DEP") == 1 {
+                        if cur != 0 { agent_manifest_add_skill_dep(cur, rest) }
+                    } else { if str_eq_bytes(head, "PATTERN_DEP") == 1 {
+                        if cur != 0 { agent_manifest_add_pattern_dep(cur, rest) }
+                    } else { if str_eq_bytes(head, "STYLE_PIN") == 1 {
+                        if cur != 0 { agent_manifest_set_style_pin(cur, rest) }
+                    } else { if str_eq_bytes(head, "PERSONA_PIN") == 1 {
+                        if cur != 0 { agent_manifest_set_persona_pin(cur, rest) }
+                    } else { if str_eq_bytes(head, "MIN_CONFIDENCE_MILLI") == 1 {
+                        if cur != 0 {
+                            agent_manifest_set_min_confidence(cur,
+                                                                str_to_int(rest))
+                        }
+                    } else { if str_eq_bytes(head, "ATTRIBUTION_PREF") == 1 {
+                        if cur != 0 { agent_manifest_set_attribution(cur, rest) }
+                    } else { if str_eq_bytes(head, "LICENSE") == 1 {
+                        if cur != 0 { list_set(cur, AM_LICENSE, rest) }
+                    } } } } } } } } } }
+                }
+            } }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    // Final flush.
+    if cur != 0 {
+        if agent_registry_register(agent_reg, cur) == 1 {
+            applied = applied + 1
+            if cur_installed == 1 {
+                agent_registry_install(agent_reg, cur_name, 0, now)
+            }
+            if cur_retired == 1 {
+                agent_registry_retire(agent_reg, cur_name, now)
+            }
+        }
+    }
+    return applied
+}
+
+// The public deserialize entry point. Consumes `text`, applies each
+// section to its matching (non-null) registry. `now` is used for
+// freshly-minted token ids on shape-only snapshots.
+//
+// R73: preserved as a thin wrapper. Use session_snapshot_apply_ex
+// when the policy or skill registry needs to be populated.
+// R101: adds `preference_reg` (may be 0) so per-user preferences
+// round-trip through the snapshot alongside the other registries.
+fn session_snapshot_apply(text, persona_reg, cap_reg, trust_reg,
+                          overlay, now) {
+    return session_snapshot_apply_ex(text, persona_reg, cap_reg, trust_reg,
+                                      overlay, 0, 0, 0, 0, now)
+}
+
+// R109: adds `agent_reg` (may be 0) so composed agents round-trip
+// through the snapshot alongside the other registries. Inserted AFTER
+// preference_reg per the R101 positional convention. Every existing
+// caller updated to pass `0` for byte-identical behavior.
+fn session_snapshot_apply_ex(text, persona_reg, cap_reg, trust_reg,
+                              overlay, policy_reg, skill_reg,
+                              preference_reg, agent_reg, now) {
+    let r = _snap_result_new()
+    if len(text) == 0 {
+        list_set(r, SNAPRES_ERR, "empty snapshot text")
+        return r
+    }
+    // Version banner MUST be the first line.
+    let nl = find_char(text, 10)
+    if nl < 0 {
+        list_set(r, SNAPRES_ERR, "no newline in snapshot")
+        return r
+    }
+    let first_line = substr(text, 0, nl)
+    if str_eq_bytes(first_line, SNAP_VERSION_LINE) == 0 {
+        list_set(r, SNAPRES_ERR, "bad version banner (want " + SNAP_VERSION_LINE + ")")
+        return r
+    }
+    // Walk sections and apply each to its target registry.
+    let sections = _snap_split_sections(text)
+    let i = 0
+    while i < len(sections) {
+        let s = sections[i]
+        let marker = s[0]
+        let body   = s[1]
+        if str_eq_bytes(marker, "#PERSONA v1") == 1 {
+            let a = _snap_apply_persona(body, persona_reg)
+            list_set(r, SNAPRES_PERSONAS, r[SNAPRES_PERSONAS] + a)
+        }
+        if str_eq_bytes(marker, "#OWNERSHIP v1") == 1 {
+            let a = _snap_apply_ownership(body, overlay)
+            list_set(r, SNAPRES_OWNERSHIP, r[SNAPRES_OWNERSHIP] + a)
+        }
+        if str_eq_bytes(marker, "#TRUST v1") == 1 {
+            let a = _snap_apply_trust(body, trust_reg)
+            list_set(r, SNAPRES_ANCHORS, r[SNAPRES_ANCHORS] + a)
+        }
+        if str_eq_bytes(marker, "#CAPS v1") == 1 {
+            let a = _snap_apply_caps(body, cap_reg, now, r)
+            list_set(r, SNAPRES_TOKENS, r[SNAPRES_TOKENS] + a)
+        }
+        if str_eq_bytes(marker, "#POLICY v1") == 1 {
+            let a = _snap_apply_policy(body, policy_reg)
+            list_set(r, SNAPRES_POLICIES, r[SNAPRES_POLICIES] + a)
+        }
+        if str_eq_bytes(marker, "#PATTERN v1") == 1 {
+            let a = _snap_apply_pattern(body)
+            list_set(r, SNAPRES_PATTERNS, r[SNAPRES_PATTERNS] + a)
+        }
+        if str_eq_bytes(marker, "#SKILL v1") == 1 {
+            let a = _snap_apply_skill(body, skill_reg, r)
+            list_set(r, SNAPRES_SKILLS, r[SNAPRES_SKILLS] + a)
+        }
+        if str_eq_bytes(marker, "#PREFERENCE v1") == 1 {
+            let a = _snap_apply_preference(body, preference_reg)
+            list_set(r, SNAPRES_PREFERENCES, r[SNAPRES_PREFERENCES] + a)
+        }
+        if str_eq_bytes(marker, "#AGENT v1") == 1 {
+            let a = _snap_apply_agent(body, agent_reg, now)
+            list_set(r, SNAPRES_AGENTS, r[SNAPRES_AGENTS] + a)
+        }
+        i = i + 1
+    }
+    list_set(r, SNAPRES_OK, 1)
+    return r
+}

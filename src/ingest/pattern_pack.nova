@@ -1,0 +1,493 @@
+// CrossEngin ingest: pattern-pack loader (R61, ADR-0107 + SHIP_AS_APP R61).
+//
+// Parses a .cerec-shaped pattern pack file into pattern capsules and
+// (via `pattern_pack_load`) registers them with the process-wide
+// pattern registry (src/capsules/pattern_capsule.nova). This is what
+// turns "R53 built-ins are the only patterns" into "operators can
+// ship their own pattern capsules as authored files."
+//
+// The .cerec conventions from src/ingest/importers/records.nova stay
+// intact -- '#' comment lines, whitespace-separated tokens, blank
+// lines are noise inside a record. What's different: pattern packs
+// don't produce curriculum records + never go through the review
+// queue. Patterns are ADVICE, not truth-claims -- there's nothing to
+// ingest into a KG, no atom to promote, and the ADR-0101 "no atom
+// without a traceable decision" invariant simply doesn't apply.
+// Trust flows through the pack's manifest (author + version +
+// source_tag) and the operator's decision to call `pattern_pack_load`
+// at all.
+//
+// Directive grammar (line-based, order matters):
+//
+//   # comment                           -- discarded
+//   CAPSULE     <name>                  -- opens/switches capsule
+//   VERSION     <semver>                -- semver string (required)
+//   DESCRIPTION <text>                  -- free-form (optional)
+//   LICENSE     <id>                    -- SPDX id (optional)
+//
+//   PATTERN     <confidence 0..1000>    -- opens a pattern
+//   TRIGGER     <t1> <t2> [<t3> ...]    -- required; whitespace-split
+//   GUIDANCE    <text>                  -- required; rest-of-line
+//
+// A new PATTERN closes the previous one. A new CAPSULE closes the
+// previous capsule and its open pattern. EOF closes everything.
+// Blank lines are ignored inside a pattern (they DON'T close it) --
+// this matches the .cerec record-based convention. A CAPSULE with
+// zero patterns registers cleanly (harmless placeholder); a PATTERN
+// missing TRIGGER or GUIDANCE is skipped with a parse error.
+//
+// Auto-attributed source_tag: every pattern in a pack gets
+// `src:pattern:<capsule_name>:v<version>` unless the file explicitly
+// specifies one via SOURCE_TAG (undocumented escape hatch for
+// migration cases). This keeps meta_observer output uniform.
+//
+// Return shape:
+//   pattern_pack_parse_text(text) -> [capsules, errors]
+//     capsules is a list<PatternCapsule>; empty on total-parse
+//     failure. errors is a list of [line_number, message]. Lenient
+//     parser: one bad line does NOT abort the file.
+//
+//   pattern_pack_parse(path) -> same, or errors=[[0,"read failed:..."]]
+//     when the file can't be opened.
+//
+//   pattern_pack_load(path) -> [n_registered, errors]
+//     side-effecting: registers every parsed capsule via
+//     pattern_registry_register (last-write-wins on name collision).
+//
+// NOVA dependencies: builtins (read_file, char_at, len, substr).
+// CrossEngin dependencies:
+//   src/capsules/pattern_capsule.nova
+//   src/util/str_safe.nova.
+
+import "../capsules/pattern_capsule.nova"
+import "../util/str_safe.nova"
+
+// ---- line + token helpers (private) -------------------------------------
+//
+// Kept LOCAL rather than pulled from records.nova to avoid a
+// cross-importer dependency for two-hundred lines of shared shape.
+// The convention (whitespace tokenization, # comments, blank line
+// ignored) matches records.nova by design.
+
+fn _pp_is_ws(c) {
+    if c == 32 { return 1 }        // ' '
+    if c == 9  { return 1 }        // '\t'
+    if c == 13 { return 1 }        // '\r'
+    return 0
+}
+
+fn _pp_trim(s) {
+    let n = len(s)
+    let lo = 0
+    let more = 1
+    while more == 1 {
+        if lo >= n { more = 0 }
+        else {
+            if _pp_is_ws(char_at(s, lo)) == 0 { more = 0 }
+            else { lo = lo + 1 }
+        }
+    }
+    let hi = n
+    let more2 = 1
+    while more2 == 1 {
+        if hi <= lo { more2 = 0 }
+        else {
+            if _pp_is_ws(char_at(s, hi - 1)) == 0 { more2 = 0 }
+            else { hi = hi - 1 }
+        }
+    }
+    return substr(s, lo, hi - lo)
+}
+
+fn _pp_is_blank(line) {
+    let n = len(line)
+    let i = 0
+    while i < n {
+        if _pp_is_ws(char_at(line, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _pp_is_comment(line) {
+    let t = _pp_trim(line)
+    if len(t) == 0 { return 0 }
+    if char_at(t, 0) == 35 { return 1 }   // '#'
+    return 0
+}
+
+fn _pp_lines(text) {
+    let out = list_new()
+    let n = len(text)
+    let start = 0
+    let i = 0
+    while i < n {
+        if char_at(text, i) == 10 {
+            push(out, substr(text, start, i - start))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    push(out, substr(text, start, n - start))
+    return out
+}
+
+fn _pp_tokens(line) {
+    let out = list_new()
+    let n = len(line)
+    let start = 0 - 1
+    let i = 0
+    while i < n {
+        if _pp_is_ws(char_at(line, i)) == 1 {
+            if start >= 0 {
+                push(out, substr(line, start, i - start))
+                start = 0 - 1
+            }
+        } else {
+            if start < 0 { start = i }
+        }
+        i = i + 1
+    }
+    if start >= 0 { push(out, substr(line, start, n - start)) }
+    return out
+}
+
+fn _pp_uint(tok) {
+    let n = len(tok)
+    if n == 0 { return 0 - 1 }
+    let i = 0
+    let v = 0
+    while i < n {
+        let c = char_at(tok, i)
+        if c < 48 { return 0 - 1 }
+        if c > 57 { return 0 - 1 }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    return v
+}
+
+// Everything after the first whitespace-run on the line.
+fn _pp_rest_after_head(line) {
+    let n = len(line)
+    let i = 0
+    // skip leading ws
+    let m = 1
+    while m == 1 {
+        if i >= n { m = 0 }
+        else { if _pp_is_ws(char_at(line, i)) == 1 { i = i + 1 } else { m = 0 } }
+    }
+    // skip head token
+    let m2 = 1
+    while m2 == 1 {
+        if i >= n { m2 = 0 }
+        else { if _pp_is_ws(char_at(line, i)) == 1 { m2 = 0 } else { i = i + 1 } }
+    }
+    // skip ws after head
+    let m3 = 1
+    while m3 == 1 {
+        if i >= n { m3 = 0 }
+        else { if _pp_is_ws(char_at(line, i)) == 1 { i = i + 1 } else { m3 = 0 } }
+    }
+    if i >= n { return "" }
+    return _pp_trim(substr(line, i, n - i))
+}
+
+fn _pp_err(errors, line_no, msg) {
+    let e = list_new()
+    push(e, line_no)
+    push(e, msg)
+    push(errors, e)
+}
+
+// ---- pending-pattern buffer --------------------------------------------
+//
+// A partially-built pattern accumulates state across three separate
+// directive lines (PATTERN, TRIGGER, GUIDANCE), so the parser buffers
+// it between visits and flushes on the boundary events (next PATTERN /
+// next CAPSULE / EOF).
+
+let _PP_HAS_OPEN   = 0    // 0/1 -- has an open pattern
+let _PP_CONFIDENCE = 1
+let _PP_TRIGGERS   = 2    // list<string>; empty until TRIGGER seen
+let _PP_GUIDANCE   = 3    // string; "" until GUIDANCE seen
+let _PP_LINE_OPEN  = 4    // line-number the PATTERN opened on (for errors)
+
+fn _pp_pending_new() {
+    let p = list_new()
+    push(p, 0)              // HAS_OPEN
+    push(p, 0)              // CONFIDENCE
+    push(p, list_new())     // TRIGGERS
+    push(p, "")             // GUIDANCE
+    push(p, 0)              // LINE_OPEN
+    return p
+}
+
+fn _pp_pending_clear(p) {
+    list_set(p, _PP_HAS_OPEN, 0)
+    list_set(p, _PP_CONFIDENCE, 0)
+    list_set(p, _PP_TRIGGERS, list_new())
+    list_set(p, _PP_GUIDANCE, "")
+    list_set(p, _PP_LINE_OPEN, 0)
+}
+
+// Flush the pending pattern into `cap` if complete. On a partial
+// pattern (missing TRIGGER or GUIDANCE) records an error and drops
+// the fragment. Returns 1 if a pattern was actually pushed, 0
+// otherwise.
+fn _pp_flush(cap, pending, source_tag, errors) {
+    if pending[_PP_HAS_OPEN] == 0 { return 0 }
+    let triggers = pending[_PP_TRIGGERS]
+    let guidance = pending[_PP_GUIDANCE]
+    let line_open = pending[_PP_LINE_OPEN]
+    if len(triggers) == 0 {
+        _pp_err(errors, line_open,
+            "PATTERN opened but missing TRIGGER before boundary")
+        _pp_pending_clear(pending)
+        return 0
+    }
+    if len(guidance) == 0 {
+        _pp_err(errors, line_open,
+            "PATTERN opened but missing GUIDANCE before boundary")
+        _pp_pending_clear(pending)
+        return 0
+    }
+    let pat = pcap_new(triggers, guidance, source_tag,
+                        pending[_PP_CONFIDENCE])
+    pcapsule_add(cap, pat)
+    _pp_pending_clear(pending)
+    return 1
+}
+
+fn _pp_default_source_tag(name, version) {
+    return "src:pattern:" + name + ":v" + version
+}
+
+// ---- parser -----------------------------------------------------------
+
+// Parse `text`. Returns [capsules, errors].
+fn pattern_pack_parse_text(text) {
+    let capsules = list_new()
+    let errors   = list_new()
+    let lines    = _pp_lines(text)
+    // Capsule-in-progress state. Nothing is finalized until either the
+    // next CAPSULE fires or the loop ends.
+    let cap = 0
+    let cap_name = ""
+    let cap_version = ""
+    let cap_source_tag = ""             // computed on first PATTERN
+    let pending = _pp_pending_new()
+    let i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        let line_no = i + 1
+        if _pp_is_comment(line) == 1 { i = i + 1 }
+        else {
+            if _pp_is_blank(line) == 1 { i = i + 1 }
+            else {
+                let toks = _pp_tokens(line)
+                let head = toks[0]
+                // ---- capsule boundary ---------------------------------
+                if str_eq_bytes(head, "CAPSULE") == 1 {
+                    // Flush + push the outgoing capsule first.
+                    if cap != 0 {
+                        _pp_flush(cap, pending, cap_source_tag, errors)
+                        push(capsules, cap)
+                    }
+                    if len(toks) < 2 {
+                        _pp_err(errors, line_no, "CAPSULE needs a name")
+                        cap = 0
+                        cap_name = ""
+                        cap_version = ""
+                        cap_source_tag = ""
+                        i = i + 1
+                        continue
+                    }
+                    cap_name = toks[1]
+                    cap_version = "0.0.0"          // caller SHOULD set VERSION
+                    cap_source_tag = _pp_default_source_tag(cap_name, cap_version)
+                    cap = pcapsule_new(cap_name, cap_version)
+                    _pp_pending_clear(pending)
+                    i = i + 1
+                    continue
+                }
+                // Every directive after this needs an open capsule.
+                if cap == 0 {
+                    _pp_err(errors, line_no,
+                        "directive before any CAPSULE opener: " + head)
+                    i = i + 1
+                    continue
+                }
+                if str_eq_bytes(head, "VERSION") == 1 {
+                    if len(toks) < 2 {
+                        _pp_err(errors, line_no, "VERSION needs a semver value")
+                    } else {
+                        cap_version = toks[1]
+                        // Mutate the pcapsule's version slot in place.
+                        list_set(cap, PCAPSULE_VERSION, cap_version)
+                        cap_source_tag = _pp_default_source_tag(cap_name, cap_version)
+                    }
+                    i = i + 1
+                    continue
+                }
+                if str_eq_bytes(head, "DESCRIPTION") == 1 {
+                    // DESCRIPTION is currently ignored at the pattern-capsule
+                    // shape (v1 has no description slot). Parsed for forward
+                    // compatibility so a pack file authored today doesn't
+                    // silently break when the slot is added.
+                    i = i + 1
+                    continue
+                }
+                if str_eq_bytes(head, "LICENSE") == 1 {
+                    // Same: LICENSE is metadata not stored in v1.
+                    i = i + 1
+                    continue
+                }
+                if str_eq_bytes(head, "SOURCE_TAG") == 1 {
+                    if len(toks) < 2 {
+                        _pp_err(errors, line_no, "SOURCE_TAG needs a value")
+                    } else {
+                        cap_source_tag = toks[1]
+                    }
+                    i = i + 1
+                    continue
+                }
+                // ---- pattern boundary --------------------------------
+                if str_eq_bytes(head, "PATTERN") == 1 {
+                    // Flush any previous pattern before opening a new one.
+                    _pp_flush(cap, pending, cap_source_tag, errors)
+                    if len(toks) < 2 {
+                        _pp_err(errors, line_no, "PATTERN needs a confidence 0..1000")
+                        i = i + 1
+                        continue
+                    }
+                    let conf = _pp_uint(toks[1])
+                    if conf < 0 {
+                        _pp_err(errors, line_no,
+                            "PATTERN confidence must be an unsigned integer 0..1000")
+                        i = i + 1
+                        continue
+                    }
+                    if conf > 1000 {
+                        _pp_err(errors, line_no,
+                            "PATTERN confidence must be 0..1000 (got " + int_to_str(conf) + ")")
+                        i = i + 1
+                        continue
+                    }
+                    list_set(pending, _PP_HAS_OPEN, 1)
+                    list_set(pending, _PP_CONFIDENCE, conf)
+                    list_set(pending, _PP_LINE_OPEN, line_no)
+                    i = i + 1
+                    continue
+                }
+                if str_eq_bytes(head, "TRIGGER") == 1 {
+                    if pending[_PP_HAS_OPEN] == 0 {
+                        _pp_err(errors, line_no,
+                            "TRIGGER without an open PATTERN")
+                        i = i + 1
+                        continue
+                    }
+                    if len(toks) < 2 {
+                        _pp_err(errors, line_no,
+                            "TRIGGER needs at least one token")
+                        i = i + 1
+                        continue
+                    }
+                    let ts = list_new()
+                    let ti = 1
+                    while ti < len(toks) {
+                        push(ts, toks[ti])
+                        ti = ti + 1
+                    }
+                    list_set(pending, _PP_TRIGGERS, ts)
+                    i = i + 1
+                    continue
+                }
+                if str_eq_bytes(head, "GUIDANCE") == 1 {
+                    if pending[_PP_HAS_OPEN] == 0 {
+                        _pp_err(errors, line_no,
+                            "GUIDANCE without an open PATTERN")
+                        i = i + 1
+                        continue
+                    }
+                    let g = _pp_rest_after_head(line)
+                    if len(g) == 0 {
+                        _pp_err(errors, line_no,
+                            "GUIDANCE needs non-empty text")
+                    } else {
+                        list_set(pending, _PP_GUIDANCE, g)
+                    }
+                    i = i + 1
+                    continue
+                }
+                _pp_err(errors, line_no, "unknown directive: " + head)
+                i = i + 1
+            }
+        }
+    }
+    // Final flush.
+    if cap != 0 {
+        _pp_flush(cap, pending, cap_source_tag, errors)
+        push(capsules, cap)
+    }
+    let out = list_new()
+    push(out, capsules)
+    push(out, errors)
+    return out
+}
+
+// Parse the file at `path`. Returns [capsules, errors]. Failure to
+// read yields empty capsules + a single error at line 0.
+fn pattern_pack_parse(path) {
+    let text = read_file(path)
+    if text == 0 {
+        let capsules = list_new()
+        let errors = list_new()
+        let e = list_new() push(e, 0) push(e, "could not read file: " + path)
+        push(errors, e)
+        let out = list_new()
+        push(out, capsules)
+        push(out, errors)
+        return out
+    }
+    return pattern_pack_parse_text(text)
+}
+
+fn pattern_pack_capsules(result) { return result[0] }
+fn pattern_pack_errors(result)   { return result[1] }
+
+// Side-effecting loader: parse + register every capsule via
+// pattern_registry_register. Returns [n_registered, errors].
+// Last-write-wins on name collisions (matches pattern_registry
+// R53 semantics).
+fn pattern_pack_load(path) {
+    let r = pattern_pack_parse(path)
+    let caps = pattern_pack_capsules(r)
+    let errors = pattern_pack_errors(r)
+    let i = 0
+    while i < len(caps) {
+        pattern_registry_register(caps[i])
+        i = i + 1
+    }
+    let out = list_new()
+    push(out, len(caps))
+    push(out, errors)
+    return out
+}
+
+// Same, but from an in-memory string (used by tests + a future wire
+// verb `pattern.install` that ships a pack body in-band).
+fn pattern_pack_load_text(text) {
+    let r = pattern_pack_parse_text(text)
+    let caps = pattern_pack_capsules(r)
+    let errors = pattern_pack_errors(r)
+    let i = 0
+    while i < len(caps) {
+        pattern_registry_register(caps[i])
+        i = i + 1
+    }
+    let out = list_new()
+    push(out, len(caps))
+    push(out, errors)
+    return out
+}

@@ -5,6 +5,12 @@ your machine. For deep references see [`docs/runbook/`](./docs/runbook/) and
 [`docs/adr/`](./docs/adr/); for project status see
 [`NEXT_SESSION.md`](./NEXT_SESSION.md).
 
+**Looking for the user-facing operator's guide instead?**
+See [`docs/USING.md`](./docs/USING.md) — how to feed data (small
+scale + `.cerec` packs + importers + LLM-as-preprocessor), the
+slash-command reference, cross-KG conflict workflows, and an honest
+gap analysis vs. Claude/ChatGPT.
+
 ## 0. Zero-install quickstart (browser)
 
 The fastest way to try CrossEngin without installing anything:

@@ -61,6 +61,18 @@ import "../src/learning/source_authority.nova"
 import "../src/seed/first_atoms.nova"
 import "../src/session/session.nova"
 import "../src/safety/differential_privacy.nova"
+import "../src/util/env_resolve.nova"
+// Phase M R6 (ADR-0111 close-out): wire the Phase M R5 auto-broadcast hook
+// into the idle-checkpoint path. The imports below pull in only the
+// FEDERATION-side glue; the persistence/* chain stays dependency-free
+// of federation (ADR-0091:243). All active behavior is gated on
+// `CE_FED_AUTO_BROADCAST_ON_SAVE=1`; with the flag unset the hook branch
+// is never taken and emitted bytes are identical to the pre-R6 daemon.
+import "../src/federation/snapshot_broadcast_hook.nova"
+import "../src/federation/gossip.nova"
+import "../src/federation/snapshot_attestation.nova"
+import "../src/persistence/merkle_signing.nova"
+import "../src/util/str_safe.nova"
 
 let CE_CAP    = 128
 let CE_FIRST  = 8
@@ -77,7 +89,7 @@ fn _log_json_enabled() {
     let v = getenv("CE_LOG_JSON")
     if v == 0 { return 0 }
     if len(v) == 0 { return 0 }
-    if str_eq(v, "0") == 1 { return 0 }
+    if str_eq_bytes(v, "0") == 1 { return 0 }
     return 1
 }
 
@@ -136,7 +148,7 @@ fn _log_json(level, session_id, event, fields) {
     while i < len(fields) {
         let f = fields[i]
         line_buf = line_buf + ",\"" + _json_escape(f[0]) + "\":"
-        if str_eq(f[2], "i") == 1 {
+        if str_eq_bytes(f[2], "i") == 1 {
             line_buf = line_buf + int_to_str(f[1])
         } else {
             line_buf = line_buf + "\"" + _json_escape(f[1]) + "\""
@@ -246,6 +258,16 @@ fn _snap_path(session_id) {
 fn _dlog_path(session_id) {
     return session_dlog_path(session_id)
 }
+
+// ---- Phase M R6 (ADR-0111 close-out): federation env resolvers ----------
+//
+// The six env-reading helpers that this file previously defined with a
+// `_cd_` prefix (verbatim-semantic copies of fed_daemon's `_fed_*`
+// originals) now live in `src/util/env_resolve.nova` as `env_str`,
+// `env_int`, `env_bool`, `env_peers`, `env_soul_id_as_int`,
+// `env_attest_key_base`. Both daemons import that util; env-var names
+// and precedence are unchanged. See the module comment in
+// `src/util/env_resolve.nova` for the full API.
 
 fn main() {
     println("=== CrossEngin unified daemon (v1.0) ===")
@@ -398,6 +420,38 @@ fn main() {
     session_attach_dp(sess, dp_new(dp_budget_from_env()))
     sreg_register(sreg, sess)
 
+    // Phase M R6 (ADR-0111 close-out): auto-broadcast attestation on save.
+    // Gated on `CE_FED_AUTO_BROADCAST_ON_SAVE=1`; default off. On opt-in
+    // we boot an EMIT-ONLY gossip state (no listen loop) + an attestation
+    // store + load the Ed25519 keypair the fed_daemon already uses. On
+    // keypair-load failure we WARN and leave the fed slots at 0 so the
+    // hook branch at the idle-checkpoint stays skipped (byte-identical to
+    // flag-off). Env flags reused from fed_daemon: CE_FED_LISTEN_ADDR
+    // (default 127.0.0.1:0 since we never listen), CE_FED_PEERS /
+    // CE_GOSSIP_PEERS (comma-separated bootstrap list, may be empty),
+    // CE_FED_ATTEST_KEY_DIR + $HOME fallbacks, CE_FED_SOUL_ID. Zero live
+    // peers is normal here; the hook still records the attestation
+    // locally so a later peer-pull observes it.
+    let _ce_auto_bcast = env_bool(getenv("CE_FED_AUTO_BROADCAST_ON_SAVE"), 0)
+    if _ce_auto_bcast == 1 {
+        let _ce_fed_listen = env_str("CE_FED_LISTEN_ADDR", "127.0.0.1:0")
+        let _ce_fed_peers  = env_peers("CE_FED_PEERS", "CE_GOSSIP_PEERS")
+        let _ce_fed_kbase  = env_attest_key_base()
+        let _ce_fed_pair   = merkle_signing_keypair_load(_ce_fed_kbase)
+        if _ce_fed_pair == 0 {
+            println("[warn] CE_FED_AUTO_BROADCAST_ON_SAVE=1 but keypair not loadable at "
+                    + _ce_fed_kbase + ".{priv,pub}; auto-broadcast disabled")
+        } else {
+            let _ce_fed_gs      = gossip_init(_ce_fed_listen, _ce_fed_peers)
+            let _ce_fed_store   = att_store_new()
+            let _ce_fed_sidint  = env_soul_id_as_int(_ce_fed_listen)
+            gossip_set_att_store(_ce_fed_gs, _ce_fed_store)
+            gossip_register_att_pubkey(_ce_fed_gs, _ce_fed_sidint, _ce_fed_pair[1])
+            session_attach_fed(sess, _ce_fed_gs, _ce_fed_store,
+                               _ce_fed_pair[0], _ce_fed_pair[1], _ce_fed_sidint)
+        }
+    }
+
     sl     = session_soul(sess)
     kgreg  = session_kgreg(sess)
     kg     = session_kg(sess)
@@ -412,7 +466,7 @@ fn main() {
     let boot_line = "boot     : cold start (no prior snapshot); " + soul_name(sl)
         + ", " + int_to_str(registry_live_count(reg)) + " parts, "
         + int_to_str(kg_atom_count(kg)) + " concepts"
-    if str_eq(active_id, "default") == 0 {
+    if str_eq_bytes(active_id, "default") == 0 {
         boot_line = boot_line + " [session=" + active_id + "]"
     }
     println(boot_line)
@@ -791,6 +845,32 @@ fn main() {
                     let saved = snap_save(last_image, snap_path)
                     if saved == 0 {
                         println("  [warn] durable snap write to " + snap_path + " failed")
+                    } else {
+                        // Phase M R6 (ADR-0111 close-out): auto-broadcast the
+                        // just-saved Merkle root as a signed attestation. The
+                        // DUAL GUARD -- saved==1 (above) AND session_gs!=0
+                        // (below) -- preserves byte-identity for the default
+                        // flag-off case: without `CE_FED_AUTO_BROADCAST_ON_SAVE=1`
+                        // the fed slots were never attached, so session_gs
+                        // returns 0 and nothing fires. The hook itself is
+                        // defensive (empty / sentinel / malformed root =>
+                        // return 0; dedup => return 0; sign failure =>
+                        // return 0). Zero delivered peers is the normal case
+                        // in a solo deployment -- the attestation still lands
+                        // locally for a later peer-pull.
+                        let _ce_fed_gs_now = session_gs(sess)
+                        if _ce_fed_gs_now != 0 {
+                            let _ce_root_hex = snap_meta_merkle_root(last_image)
+                            snapshot_broadcast_hook(
+                                _ce_fed_gs_now,
+                                session_att_store(sess),
+                                session_signer_seed(sess),
+                                session_signer_pk(sess),
+                                session_soul_id_int(sess),
+                                _ce_root_hex,
+                                nanotime()
+                            )
+                        }
                     }
                     println("  [" + int_to_str(hs_rate(hs)) + "Hz] idle after "
                         + int_to_str(hs_idle_ticks(hs)) + " empty ticks -> imagine "
@@ -888,7 +968,7 @@ fn main() {
             restored = snap_parse(snap_serialize(last_image))
         }
         must("snapshot rehydrates in mandatory order", snap_rehydrate_valid(restored) == 1)
-        must("soul identity survived restart", str_eq(snap_section(restored, SEC_SOUL)[0], "Aurora") == 1)
+        must("soul identity survived restart", str_eq_bytes(snap_section(restored, SEC_SOUL)[0], "Aurora") == 1)
         println("reboot   : soul=\"" + snap_section(restored, SEC_SOUL)[0] + "\", "
             + int_to_str(snap_section(restored, SEC_KGS)[0]) + " concept atom(s) durable via "
             + snap_durable_steps()[0] + "->" + snap_durable_steps()[1] + "->" + snap_durable_steps()[2])

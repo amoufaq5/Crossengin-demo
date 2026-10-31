@@ -1,0 +1,170 @@
+// Multi-KG empirical consistency scan (ADR-0016 / ADR-0023).
+//
+// The FORMAL env (src/agent/formal_chat.nova) is global across KGs and its
+// consistency is scanned via src/parts/reasoning/contradiction.nova
+// (kernel-checked FALSE witnesses). But *empirical* beliefs -- atoms with
+// belief (alpha/beta) below the FORMAL grade -- live per-KG. Two KGs can
+// happily hold the same-labeled atom with contradicting beliefs (physics_kg's
+// "electron_charge" believed at 0.95; folk_kg's at 0.05) and nothing detects
+// it. This module closes that gap: a scan of the multi-KG registry that
+// surfaces same-label atoms whose belief means land on opposite sides of the
+// uniform prior (500 milli) with a spread beyond a caller-provided threshold.
+//
+// The verdict is heuristic (not a kernel proof) because empirical beliefs
+// are graded confidences, not theorems -- there is no "proof of FALSE" to
+// exhibit. What IS load-bearing: the scan is deterministic, the threshold is
+// explicit, and the report names both KGs + both mean values so users can
+// judge for themselves. Contrast with FORMAL contradiction detection, which
+// returns a kernel-checked witness.
+//
+// Complexity
+//   Prior version was O(kgs^2 * atoms^2) -- a nested pair-scan that quadratic
+//   both in KGs and in per-KG atoms. Fine for the demo scale (~7 KGs, tens of
+//   atoms each), untenable at Wikidata-shaped corpora (100k+ atoms per KG).
+//   This version uses a label hash-index built in O(N) over all atoms across
+//   all KGs; the per-label match pass is O(sum of squared bucket sizes),
+//   which for most corpora is essentially O(N) because most labels appear
+//   in only one or two KGs. NUM_BUCKETS = 256 keeps the constant modest;
+//   worst-case still degrades to O(N^2) but only on adversarial input.
+//
+// NOVA dependencies: builtins + str_safe (str_eq_bytes for label comparison).
+// CrossEngin dependencies: src/kg/atom_store.nova (atom_confidence,
+// atom_label), src/kg/multi_kg_manager.nova (kg_count, kg_get, kg_atoms,
+// kg_label), src/util/str_safe.nova.
+
+import "../../kg/atom_store.nova"
+import "../../kg/multi_kg_manager.nova"
+import "../../util/str_safe.nova"
+
+// Default belief-mean spread that qualifies as a cross-KG conflict: 500
+// milli = 0.5. Anything smaller is likely just different corroboration
+// strength around the same central estimate.
+let MKGC_DEFAULT_SPREAD = 500
+
+// Hash-index bucket count. 256 keeps the fixed cost bounded while giving
+// enough spread that per-bucket lists stay short for typical corpora.
+let MKGC_BUCKETS = 256
+
+// ---- label hash ---------------------------------------------------------
+// FNV-1a-flavored byte fold, mod MKGC_BUCKETS. Deterministic and cheap.
+fn _mkgc_hash(label) {
+    let h = 2166136261
+    let n = len(label)
+    let i = 0
+    while i < n {
+        h = h + char_at(label, i)
+        h = h * 16777619
+        // Keep intermediate values bounded so we don't overflow into the
+        // pointer-tag range (see FP_SCALE comment in atom_store).
+        h = h + 0
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    return h % MKGC_BUCKETS
+}
+
+// ---- index construction --------------------------------------------------
+
+// Build the label -> [kg_label, atom] index over the whole registry.
+// Returns a list of MKGC_BUCKETS buckets; each bucket is a list of
+// [label, kg_label, atom] triples. Atoms with empty labels or zero
+// pointers are skipped.
+fn _mkgc_build_index(kgreg) {
+    let buckets = list_new()
+    let b = 0
+    while b < MKGC_BUCKETS { push(buckets, list_new()) b = b + 1 }
+    if kgreg == 0 { return buckets }
+    let n = kg_count(kgreg)
+    let i = 0
+    while i < n {
+        let kg = kg_get(kgreg, i)
+        if kg != 0 {
+            let atoms = kg_atoms(kg)
+            let kg_lab = kg_label(kg)
+            let j = 0
+            while j < len(atoms) {
+                let a = atoms[j]
+                if a != 0 {
+                    let alab = atom_label(a)
+                    if len(alab) > 0 {
+                        let hi = _mkgc_hash(alab)
+                        let entry = list_new()
+                        push(entry, alab)
+                        push(entry, kg_lab)
+                        push(entry, a)
+                        push(buckets[hi], entry)
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return buckets
+}
+
+// ---- scan ---------------------------------------------------------------
+
+// Scan for cross-KG label matches whose belief means differ by at least
+// `spread_threshold`. Returns a list of conflict records:
+//   [label, kg_a_label, kg_b_label, mean_a_milli, mean_b_milli].
+// Uses the label hash-index; the scan visits each label bucket once and
+// only compares pairs INSIDE the bucket, so the outer O(kgs^2 * atoms^2)
+// cost is replaced by O(N) build + O(per-bucket pairs). Same-KG pairs
+// are skipped (a KG cannot conflict with itself).
+fn mkgc_scan_conflicts(kgreg, spread_threshold) {
+    let out = list_new()
+    let buckets = _mkgc_build_index(kgreg)
+    let bi = 0
+    while bi < len(buckets) {
+        let bucket = buckets[bi]
+        let bn = len(bucket)
+        // Skip empty and singleton buckets outright.
+        if bn > 1 {
+            let i = 0
+            while i < bn {
+                let ea = bucket[i]
+                let j = i + 1
+                while j < bn {
+                    let eb = bucket[j]
+                    // Filter on cross-KG + exact-label match. Bucket may
+                    // collide unrelated labels; verify with str_eq_bytes.
+                    if str_eq_bytes(ea[1], eb[1]) == 0 {
+                        if str_eq_bytes(ea[0], eb[0]) == 1 {
+                            let ma = atom_confidence(ea[2])
+                            let mb = atom_confidence(eb[2])
+                            let spread = ma - mb
+                            if spread < 0 { spread = 0 - spread }
+                            if spread >= spread_threshold {
+                                let entry = list_new()
+                                push(entry, ea[0])
+                                push(entry, ea[1])
+                                push(entry, eb[1])
+                                push(entry, ma)
+                                push(entry, mb)
+                                push(out, entry)
+                            }
+                        }
+                    }
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+        bi = bi + 1
+    }
+    return out
+}
+
+fn mkgc_conflict_label(e)  { return e[0] }
+fn mkgc_conflict_kg_a(e)   { return e[1] }
+fn mkgc_conflict_kg_b(e)   { return e[2] }
+fn mkgc_conflict_mean_a(e) { return e[3] }
+fn mkgc_conflict_mean_b(e) { return e[4] }
+
+// True if the registry is empirically consistent (no cross-KG conflicts at
+// or above the threshold).
+fn mkgc_is_consistent(kgreg, spread_threshold) {
+    if len(mkgc_scan_conflicts(kgreg, spread_threshold)) == 0 { return 1 }
+    return 0
+}

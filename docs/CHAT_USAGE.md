@@ -210,9 +210,119 @@ detailed in their per-round audit docs (`AUDIO_AUDIT.md`, `IMAGE_AUDIT.md`,
 ### Federation / DP
 
 `/dp_status`, `/dp_query`, `/dp <subcommand>` (status / log / warn / reset),
-`/fed_join`, `/fed_stats`, `/fed_leave`, `/leader`, `/attest_log`, `/nat`,
+`/fed_join`, `/fed_stats`, `/fed_leave`, `/gossip_start`, `/gossip_peer`,
+`/gossip_peers`, `/gossip_dq`, `/leader`, `/attest_log`, `/nat`,
 `/snap_replicas`, `/relay`, `/relay_secure`, `/webrtc`. See
 `FEDERATED_AUDIT.md` and `DP_AUDIT.md` for the per-round detail.
+
+#### `/gossip_*` -- MVP mesh commands (Phase M R1, ADR-0089)
+
+Before Phase M R1 these were stubs that printed `"REPL has no gossip daemon"`.
+R1 wires the four base commands to a lazy-allocated gossip state; the
+recommended production entry point is `examples/crossengin_fed_daemon.nova`
+(`make install && ./bin/crossengin-fed-daemon`), which does the same thing
+as a standalone binary.
+
+| Command                    | Effect                                                                                                                               |
+|----------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `/gossip_start [ADDR]`     | Allocate a gossip state + `dq_init`, bind a TCP listener on `ADDR` (default `127.0.0.1:8790`). Repeated call reports the addr in use. |
+| `/gossip_peer add ADDR`    | Register a bootstrap peer at runtime; reports the new peer count.                                                                    |
+| `/gossip_peers`            | Enumerate the peer table (`<addr> <ALIVE\|SUSPECT\|DEAD> last_seen=<ns>`).                                                          |
+| `/gossip_dq QUERY`         | Fan out `QUERY` (SPARQL) across the mesh via R20E distributed_query; renders each row's peer + bindings.                             |
+| `/gossip_transport`        | Phase O R3 (ADR-0096): report the resolved gossip transport (`tcp` or `dtls`). Env-driven at first `/gossip_start` via `CE_FED_TRANSPORT`; no in-REPL mutation -- restart to switch. |
+
+##### `/gossip_transport` -- DTLS-1.2-over-TCP shim status (Phase O R3, ADR-0096)
+
+Reports which transport the gossip mesh is using. Two possible outputs:
+
+- `transport=tcp` -- the default: byte-identical R18E gossip on
+  plaintext TCP.
+- `transport=dtls (ADR-0096 non-standard; not RFC-compliant)` -- the
+  DTLS-1.2-over-TCP shim from Phase O R3. This is NOT RFC 6347
+  compliant (the record layer is length-prefixed on TCP rather than
+  datagram-framed on UDP) and is CrossEngin-mesh-only; a standards-
+  compliant DTLS peer will not interop. See ADR-0096 for the full
+  trade + migration path.
+
+The transport is read ONCE from `CE_FED_TRANSPORT` at first
+`/gossip_start`; there is no in-REPL mutation entry. To switch mid-run
+restart the daemon or REPL. The recommended production entry point for
+DTLS is the fed daemon
+(`CE_FED_TRANSPORT=dtls nova run examples/crossengin_fed_daemon.nova`),
+which additionally loads a P-256 keypair via
+`p256_keypair_load(CE_FED_DTLS_CERT_DIR/signer)` and drives the
+server-side handshake on each accepted connection.
+
+Env vars introduced by Phase O R3:
+
+| Env var                    | Effect                                                               |
+|----------------------------|----------------------------------------------------------------------|
+| `CE_FED_TRANSPORT`         | `"dtls"` / `"DTLS"` enables the shim; anything else -> `"tcp"`.     |
+| `CE_FED_DTLS_CERT_DIR`     | Directory holding `signer.priv` (32B) + `signer.pub` (65B SEC1). Default `$HOME/.crossengin/fed_dtls_keys`. |
+
+R2 (ADR-0090) wires `/leader elect|status` and `/drule_add|run|fixpoint`
+into the same state (see subsection below); R3 (ADR-0091) wires
+`/attest_log`, `/attest_verify`, `/snap_fetch`, and `/snap_serve` (see
+the R3 subsection below). All four require `/gossip_start` first.
+
+#### `/leader` + `/drule_*` -- coordination + inference (Phase M R2, ADR-0090)
+
+R2 replaces the R19E `/leader` stub and the R21B `/drule_add`, `/drule_run`
+stubs with live handlers, and adds `/drule_fixpoint`. All five require
+`/gossip_start` first: the module-level lazy-init state
+(`_chat_fed_le`, `_chat_fed_dr`, `_chat_fed_dr_engine`) is allocated
+alongside the R1 gossip state so one `/gossip_start` boots the R1+R2 mesh
+surface. The recommended production entry point is the fed daemon
+(`nova run examples/crossengin_fed_daemon.nova`), which allocates the
+same state at boot; the chat REPL is for operators who want a live view
+without spawning a second process.
+
+| Command                    | Effect                                                                                                                               |
+|----------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `/leader` or `/leader status` | Print the current Bully leader-election status line -- `leader=<id> self_id=<n> is_leader=<yes\|no> state=<stable\|electing> peers=<n> elections=<n> victories=<n> deposed=<n>`. |
+| `/leader elect`            | Kick off a fresh Bully election on the local peer table. Prints `election started` with the new `elections` counter.               |
+| `/drule_add RULE`          | Register a mini-Datalog rule (e.g. `RULE ancestor(?a,?b) <- parent(?a,?b)`) with the federated engine and broadcast to alive peers. |
+| `/drule_run`               | Run ONE round of federated rule inference against the chat's KG (drains inbound RULE + DERIVATION queues too). Prints new-derivation count. |
+| `/drule_fixpoint`          | Run distributed rule inference to a bounded fixpoint (`DR_DEFAULT_MAX_ROUNDS=50`); reports `(derived, rounds)`.                    |
+
+Env vars added by R2 (both default on; only literal `"0"` disables):
+
+| Env var                              | Effect on `"0"`                                                       |
+|--------------------------------------|-----------------------------------------------------------------------|
+| `CE_FED_LEADER_ELECTION_ENABLED`     | Fed daemon skips `le_init`; `/leader` handler prints "no state".      |
+| `CE_FED_DR_ENABLED`                  | Fed daemon skips `dr_init`; `/drule_*` handlers print "no state".     |
+
+#### `/attest_*` + `/snap_*` -- durability (Phase M R3, ADR-0091)
+
+R3 replaces the R20F `/attest_log` and R23C `/snap_replicas`-adjacent
+stubs with four live handlers (`/attest_log`, `/attest_verify`,
+`/snap_fetch`, `/snap_serve`). All four require `/gossip_start` first:
+the module-level lazy-init state (`_chat_fed_att`, `_chat_fed_sr`) is
+allocated alongside R1's `_chat_fed_gs` / R2's `_chat_fed_le` /
+`_chat_fed_dr` inside `_admin_gossip_start`, so one `/gossip_start`
+boots the R1+R2+R3 mesh surface. The recommended production entry point
+remains the fed daemon (`nova run examples/crossengin_fed_daemon.nova`),
+which additionally loads an Ed25519 signer keypair via
+`merkle_signing_keypair_load(CE_FED_ATTEST_KEY_DIR/signer)` for the
+sending half; the chat REPL is a viewer for the RECEIVED-from-peers
+half of the attestation store.
+
+| Command                    | Effect                                                                                                                               |
+|----------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `/attest_log`              | Dump up to 20 most-recent verified attestations across all peers (header + one line per entry). Empty store prints only the header. |
+| `/attest_verify <soul_id>` | Look up peer's most-recent attestation via `att_store_latest`, resolve pubkey via `gossip_lookup_att_pubkey`, re-verify. Prints `attest_verify: peer=<n> ok` or `... FAILED (<reason>)`. |
+| `/snap_fetch <root_hex>`   | Validate 64-char lowercase-hex root, walk `gossip_alive_peers`, dial each with `gossip_send_snap_fetch`; stop on first success. Verifies + stores via `sr_observe_snap_response`. |
+| `/snap_serve on|off`       | Toggle `sr_set_serving`. Off (default) means peers' SNAP_FETCH requests get bare SNAP_END back (miss); on means the sr_state's local replica table is served. |
+
+Env vars added by R3:
+
+| Env var                              | Default            | Effect                                                                    |
+|--------------------------------------|--------------------|---------------------------------------------------------------------------|
+| `CE_FED_ATTEST_ENABLED`              | `1` (only `"0"` disables) | Fed daemon skips `att_store_new` + keypair load; `/attest_log` prints "no state". |
+| `CE_FED_ATTEST_KEY_DIR`              | `$HOME/.crossengin/fed_keys` | Signer keypair location. Daemon reads `<dir>/signer.priv` + `<dir>/signer.pub`. Missing files -> WARN + attestation disabled (mesh peer still runs). Container fallback: `./crossengin_fed_keys`. |
+| `CE_FED_SNAP_REPLICATION_ENABLED`    | `1` (only `"0"` disables) | Fed daemon skips `sr_init`; `/snap_fetch` prints "no state"; gossip inbound SNAP_FETCH answered with bare SNAP_END. |
+| `CE_FED_SNAP_SERVE`                  | `0` (opt-in; `"1"` enables) | On `1`, fed daemon calls `sr_set_serving(sr, 1)` at boot; chat REPL surfaces same toggle via `/snap_serve on|off`. |
+| `CE_SNAP_PATH`                       | (reused)           | Local snapshot directory for `sr_init(gs, local_snap_dir)`. When unset: `$HOME/.crossengin/snap`, then `./crossengin_snap`. `/tmp` never used (container `sys_open` restriction). |
 
 ### Diagnostics
 
@@ -221,6 +331,56 @@ detailed in their per-round audit docs (`AUDIO_AUDIT.md`, `IMAGE_AUDIT.md`,
 | `/__metrics__`     | Internal: machine-readable `key=value` block for `web.py`'s `/metrics` scraper. You can call it interactively for raw counters. |
 | `/__atoms__`       | Internal: machine-readable `ATOM ...` block for `web.py`'s `/api/atoms` search. |
 | `/ann_query LABEL` | Debug: top-5 nearest atoms by LSH-bucketed cosine.            |
+| `/gc-stats [kg=L]` | GC observability report (ADR-0087). Per-KG reclaim / sweep / compact / protection counters + latest freelist sample. Optional `kg=<label>` filter reports only that KG. |
+
+#### `/gc-stats` -- GC observability (ADR-0087)
+
+Renders the per-agent GC-metrics registry populated by the autonomous
+loop's memory-lifecycle machinery. Every counter is per-KG; the report
+prints one block per KG the registry has metrics for:
+
+```
+> /gc-stats
+KG experience:
+  reclaimed=47  swept=12  swept_episodic=35
+  protected_operator_premise=8  ...conclusion=6  episodic_member=14  alias=21
+  compact_runs=2  atoms_removed=44  last_tick=4096
+  freelist_size=0  freelist_ratio_permille=0
+```
+
+Filter to a single KG when the daemon runs multiple:
+
+```
+> /gc-stats kg=experience
+KG experience:
+  ...
+```
+
+**Reading the counters:**
+
+- `reclaimed` -- total atoms whose slot was hard-freed by the GC across
+  the agent's lifetime (both sweep-driven and hand-invoked reclaims).
+- `swept` -- atoms removed by non-episodic `adm_sweep_attributed_metric`
+  calls; `swept_episodic` -- atoms removed by the episodic-aware
+  `adm_sweep_ep_metric` (the autonomous loop's ADR-0081 sweep).
+- `protected_*` -- number of times each protection gate refused to
+  collect an atom. Zero across the board means either the daemon has
+  seen no collectable-but-protected atoms, or the ADR-0081/0082/0084
+  protection gates are cold. A `protected_alias > 0` alongside
+  `reclaimed_total > 0` is the healthy signal: the alias gate is
+  preventing fragmentation while unrelated weak atoms are still being
+  collected.
+- `compact_runs` / `atoms_removed` / `last_tick` -- ADR-0086 auto-
+  compact stats. A `compact_runs` that grows too fast means the
+  `CROSSENGIN_AUTOCOMPACT_THRESHOLD_PERMILLE` is too low for the churn
+  profile; `atoms_removed / compact_runs` is the average hole-collapse
+  yield per compaction.
+- `freelist_size` / `freelist_ratio_permille` -- the most recent sample
+  (overwritten each check tick). A freelist that grows without runs
+  firing means the threshold has not been crossed yet, or the watcher
+  is disabled via `CROSSENGIN_AUTOCOMPACT_ENABLED=0`.
+
+Fresh chat REPL with no daemon running prints `no GC activity yet`.
 
 ### Exit
 

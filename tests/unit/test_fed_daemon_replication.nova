@@ -1,0 +1,439 @@
+// Unit tests for examples/crossengin_fed_daemon.nova R3 snapshot-replication
+// wiring (Phase M R3, ADR-0091).
+//
+// Coverage (~40 assertions) -- the daemon's env-config resolvers for
+// CE_FED_SNAP_REPLICATION_ENABLED + CE_FED_SNAP_SERVE + CE_SNAP_PATH,
+// the R3 boot alloc contract (sr_init + gossip_set_sr_state +
+// sr_set_serving), and the chat REPL /snap_fetch + /snap_serve output
+// shape via the pure formatters in src/chat/fed_slash.nova.
+//
+// NOVA has no `setenv`; the resolvers are pure functions that take the
+// raw env value as an argument. Same shape as
+// test_fed_daemon_leader.nova, test_fed_daemon_rules.nova, and
+// test_fed_daemon_attest.nova.
+//
+// Coverage map:
+//   1. Env-flag resolver: CE_FED_SNAP_REPLICATION_ENABLED default-on
+//      (only "0" disables); CE_FED_SNAP_SERVE default-OFF (only "1"
+//      enables, matching the plan's "serving opt-in" contract).
+//   2. Local-snap-dir resolver: CE_SNAP_PATH wins; HOME fallback;
+//      container fallback when both are unset.
+//   3. sr_init(gs, dir) returns a well-shaped sr_state; counters at 0;
+//      serving flag starts at 0 (opt-in).
+//   4. sr_set_serving(sr, 1) enables; sr_set_serving(sr, 0) disables;
+//      idempotent on repeated calls.
+//   5. sr_serve_snap_request short-circuits to 0 when serving is off
+//      (peer sees SNAP_END miss); returns bytes when serving is on
+//      and the root is known.
+//   6. sr_observe_attestation records root->peer mapping for later
+//      fetch (integration with the R20F attestation module).
+//   7. gossip_set_sr_state wires the sr_state onto gossip; round-trip
+//      via gossip_sr_state.
+//   8. /snap_fetch <root> refusal on non-hex arg; refusal message shape
+//      matches _snap_fetch_result_line.
+//   9. /snap_serve on|off toggles sr_set_serving; result-line shape
+//      matches _snap_serve_toggle_result_line.
+//  10. Env-disabled path: sr_enabled=0 -> daemon skips sr_init.
+
+import "../ce_test.nova"
+import "../../src/federation/gossip.nova"
+import "../../src/federation/snapshot_attestation.nova"
+import "../../src/federation/snapshot_replication.nova"
+import "../../src/safety/ed25519.nova"
+import "../../src/chat/fed_slash.nova"
+
+// ---- daemon-parity pure resolvers ---------------------------------------
+
+fn _t_bool_from_env_value(v, default_on) {
+    if v == 0 { return default_on }
+    if len(v) == 0 { return default_on }
+    if str_eq_bytes(v, "0") == 1 { return 0 }
+    return 1
+}
+
+// CE_FED_SNAP_REPLICATION_ENABLED default-on: only literal "0" disables.
+fn _t_sr_enabled_resolve(v) {
+    return _t_bool_from_env_value(v, 1)
+}
+
+// CE_FED_SNAP_SERVE default-OFF (opt-in per ADR-0091). Matches the
+// daemon's _fed_snap_serve_from_env(): the fed daemon passes 0 as
+// default_on, so the resolver returns 0 for null/empty.
+fn _t_snap_serve_resolve(v) {
+    return _t_bool_from_env_value(v, 0)
+}
+
+// Byte-identical to the daemon's local-snap-dir resolver: CE_SNAP_PATH
+// wins, then $HOME/.crossengin/snap, then ./crossengin_snap.
+fn _t_local_snap_dir_resolve(snap_path_env, home_env) {
+    if snap_path_env != 0 {
+        if len(snap_path_env) > 0 { return snap_path_env }
+    }
+    if home_env != 0 {
+        if len(home_env) > 0 { return home_env + "/.crossengin/snap" }
+    }
+    return "./crossengin_snap"
+}
+
+// ---- env resolvers -------------------------------------------------------
+
+fn test_sr_enabled_default_when_null() {
+    ce_eq("null env -> enabled (default 1)", _t_sr_enabled_resolve(0), 1)
+}
+
+fn test_sr_enabled_disabled_by_literal_zero() {
+    ce_eq("'0' env -> disabled", _t_sr_enabled_resolve("0"), 0)
+}
+
+fn test_sr_enabled_passes_through_one() {
+    ce_eq("'1' env -> enabled", _t_sr_enabled_resolve("1"), 1)
+}
+
+fn test_sr_enabled_passes_through_other_nonempty() {
+    ce_eq("'yes' env -> enabled (only '0' disables)",
+          _t_sr_enabled_resolve("yes"), 1)
+}
+
+fn test_snap_serve_default_when_null_is_off() {
+    ce_eq("null env -> off (default 0)", _t_snap_serve_resolve(0), 0)
+}
+
+fn test_snap_serve_default_when_empty_is_off() {
+    ce_eq("empty env -> off (default 0)", _t_snap_serve_resolve(""), 0)
+}
+
+fn test_snap_serve_disabled_by_literal_zero() {
+    ce_eq("'0' env -> off", _t_snap_serve_resolve("0"), 0)
+}
+
+fn test_snap_serve_enabled_by_one() {
+    ce_eq("'1' env -> on", _t_snap_serve_resolve("1"), 1)
+}
+
+fn test_snap_serve_enabled_by_true() {
+    ce_eq("'true' env -> on (any non-'0' non-empty enables)",
+          _t_snap_serve_resolve("true"), 1)
+}
+
+fn test_local_snap_dir_uses_explicit_snap_path() {
+    let d = _t_local_snap_dir_resolve("/data/snap", "/root")
+    ce_str_eq("CE_SNAP_PATH wins",
+              d, "/data/snap")
+}
+
+fn test_local_snap_dir_falls_back_to_home() {
+    let d = _t_local_snap_dir_resolve(0, "/home/tester")
+    ce_str_eq("HOME fallback used when CE_SNAP_PATH unset",
+              d, "/home/tester/.crossengin/snap")
+}
+
+fn test_local_snap_dir_falls_back_to_container() {
+    let d = _t_local_snap_dir_resolve(0, 0)
+    ce_str_eq("container fallback when both unset",
+              d, "./crossengin_snap")
+}
+
+// ---- sr bootstrap -------------------------------------------------------
+
+fn _mk_gs() { return gossip_init("127.0.0.1:9990", 0) }
+
+fn test_sr_init_returns_wellformed_state() {
+    let gs = _mk_gs()
+    let sr = sr_init(gs, "/tmp/ce_r3_snap")
+    ce_check("sr non-null", sr != 0)
+    ce_eq("known roots count = 0", sr_known_root_count(sr), 0)
+    ce_eq("replica count = 0", sr_replica_count(sr), 0)
+    ce_eq("fetched = 0", sr_stats_fetched(sr), 0)
+    ce_eq("verify_fail = 0", sr_stats_verify_fail(sr), 0)
+    ce_eq("observed = 0", sr_stats_observed(sr), 0)
+}
+
+fn test_sr_init_serving_starts_off() {
+    // R3: opt-in per ADR-0091. Serving must default to 0 so a curious
+    // operator running `/gossip_start` alone does not accidentally
+    // start shipping local replica bytes to the mesh.
+    let sr = sr_init(_mk_gs(), "/tmp/ce_r3_snap")
+    ce_eq("sr_is_serving(fresh) = 0", sr_is_serving(sr), 0)
+}
+
+fn test_sr_set_serving_toggle() {
+    let sr = sr_init(_mk_gs(), "")
+    sr_set_serving(sr, 1)
+    ce_eq("after set(1) -> 1", sr_is_serving(sr), 1)
+    sr_set_serving(sr, 0)
+    ce_eq("after set(0) -> 0", sr_is_serving(sr), 0)
+    // Idempotent on repeat.
+    sr_set_serving(sr, 0)
+    ce_eq("set(0) again -> still 0", sr_is_serving(sr), 0)
+    sr_set_serving(sr, 1)
+    sr_set_serving(sr, 1)
+    ce_eq("set(1) twice -> still 1", sr_is_serving(sr), 1)
+}
+
+fn test_sr_set_serving_null_state_returns_zero() {
+    ce_eq("sr_set_serving(0, 1) -> 0", sr_set_serving(0, 1), 0)
+    ce_eq("sr_is_serving(0) -> 0", sr_is_serving(0), 0)
+}
+
+// ---- gossip wiring ------------------------------------------------------
+
+fn test_gossip_set_sr_state_round_trip() {
+    let gs = _mk_gs()
+    let sr = sr_init(gs, "")
+    gossip_set_sr_state(gs, sr)
+    ce_check("gossip_sr_state returns the sr",
+             gossip_sr_state(gs) == sr)
+}
+
+// ---- serve gating -------------------------------------------------------
+
+let _T_SR_SEED_HEX = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+let _T_SR_ROOT_HEX = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+fn _t_keypair() {
+    let seed = ed25519_hex_to_bytes(_T_SR_SEED_HEX)
+    let parts = _ed_derive_a_and_prefix(seed)
+    let pk = _ed_pk_from_a(parts[0])
+    let r = list_new()
+    push(r, seed)
+    push(r, pk)
+    return r
+}
+
+fn _t_attestation(soul_id, ts_ns) {
+    let kp = _t_keypair()
+    let root = ed25519_hex_to_bytes(_T_SR_ROOT_HEX)
+    return att_make(soul_id, ts_ns, root, kp[0], kp[1])
+}
+
+// Minimal valid snapshot body -- header + meta.merkle_root + end line.
+// Matches the shape sr_verify_snap_bytes accepts.
+fn _t_snap_bytes() {
+    let s = "crossengin-snapshot v2\n"
+    s = s + "meta.merkle_root " + _T_SR_ROOT_HEX + "\n"
+    s = s + "end\n"
+    return s
+}
+
+fn test_sr_observe_attestation_records_root() {
+    let sr = sr_init(0, "")
+    let att = _t_attestation(7, 100)
+    ce_check("att built", att != 0)
+    let newly = sr_observe_attestation(sr, att)
+    ce_eq("newly = 1", newly, 1)
+    ce_eq("known count = 1", sr_known_root_count(sr), 1)
+    ce_eq("pending count = 1", sr_pending_count(sr), 1)
+    let kr = sr_known_roots(sr)
+    ce_check("known roots non-empty", len(kr) >= 1)
+    ce_eq("root peer_id = 7", kr[0][1], 7)
+}
+
+fn test_sr_serve_returns_zero_when_off() {
+    let sr = sr_init(0, "")
+    // Register a local replica but do NOT enable serving.
+    sr_register_local(sr, _T_SR_ROOT_HEX, 99, 1, _t_snap_bytes())
+    ce_eq("serve while OFF returns 0 (miss)",
+          sr_serve_snap_request(sr, _T_SR_ROOT_HEX), 0)
+}
+
+fn test_sr_serve_returns_bytes_when_on() {
+    let sr = sr_init(0, "")
+    let bytes = _t_snap_bytes()
+    sr_register_local(sr, _T_SR_ROOT_HEX, 99, 1, bytes)
+    sr_set_serving(sr, 1)
+    let served = sr_serve_snap_request(sr, _T_SR_ROOT_HEX)
+    ce_check("serve while ON returns non-null", served != 0)
+    ce_eq("served bytes length matches",
+          len(served), len(bytes))
+}
+
+fn test_sr_serve_returns_zero_on_miss_even_when_on() {
+    let sr = sr_init(0, "")
+    sr_set_serving(sr, 1)
+    // No local replica registered -> still 0.
+    ce_eq("serve for unknown root -> 0",
+          sr_serve_snap_request(sr, _T_SR_ROOT_HEX), 0)
+}
+
+// ---- /snap_fetch arg validation ----------------------------------------
+
+fn test_snap_fetch_root_hex_valid() {
+    ce_eq("valid 64-char lc-hex -> 1",
+          chat_fed_is_root_hex(_T_SR_ROOT_HEX), 1)
+}
+
+fn test_snap_fetch_root_hex_wrong_length() {
+    ce_eq("too short -> 0",
+          chat_fed_is_root_hex("deadbeef"), 0)
+    ce_eq("too long -> 0",
+          chat_fed_is_root_hex(_T_SR_ROOT_HEX + "aa"), 0)
+}
+
+fn test_snap_fetch_root_hex_bad_chars() {
+    // Uppercase A-F rejected (validator is lowercase-only, matching
+    // the R15E Merkle wire form).
+    let upper = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+    ce_eq("uppercase hex -> 0",
+          chat_fed_is_root_hex(upper), 0)
+    let with_g = "g3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    ce_eq("non-hex char 'g' -> 0",
+          chat_fed_is_root_hex(with_g), 0)
+}
+
+fn test_snap_fetch_root_hex_null_empty() {
+    ce_eq("null -> 0", chat_fed_is_root_hex(0), 0)
+    ce_eq("empty -> 0", chat_fed_is_root_hex(""), 0)
+}
+
+// ---- /snap_fetch result-line formatter --------------------------------
+
+fn test_snap_fetch_result_line_success() {
+    let s = _snap_fetch_result_line(1, _T_SR_ROOT_HEX, "127.0.0.1:8791")
+    ce_str_eq("success line",
+              s, "snap_fetch: ok root=" + _T_SR_ROOT_HEX + " peer=127.0.0.1:8791")
+}
+
+fn test_snap_fetch_result_line_unknown_root() {
+    let s = _snap_fetch_result_line(0, _T_SR_ROOT_HEX, "")
+    ce_str_eq("no-peer refusal",
+              s, "snap_fetch: refused root=" + _T_SR_ROOT_HEX
+                 + " (unknown root or no alive peers)")
+}
+
+fn test_snap_fetch_result_line_peer_but_failed() {
+    let s = _snap_fetch_result_line(0, _T_SR_ROOT_HEX, "127.0.0.1:8792")
+    ce_str_eq("peer-but-fail refusal",
+              s, "snap_fetch: refused root=" + _T_SR_ROOT_HEX
+                 + " peer=127.0.0.1:8792"
+                 + " (fetch failed or verify mismatch)")
+}
+
+// ---- /snap_serve arg parser + result-line -----------------------------
+
+fn test_snap_serve_parse_on() {
+    ce_str_eq("'on' parses",
+              chat_fed_snap_serve_parse_arg("on"), "on")
+    ce_str_eq("'  on ' trims + parses",
+              chat_fed_snap_serve_parse_arg("  on "), "on")
+}
+
+fn test_snap_serve_parse_off() {
+    ce_str_eq("'off' parses",
+              chat_fed_snap_serve_parse_arg("off"), "off")
+}
+
+fn test_snap_serve_parse_usage() {
+    ce_str_eq("empty -> usage",
+              chat_fed_snap_serve_parse_arg(""), "usage")
+    ce_str_eq("null -> usage",
+              chat_fed_snap_serve_parse_arg(0), "usage")
+    ce_str_eq("'yes' -> usage (strict on/off vocabulary)",
+              chat_fed_snap_serve_parse_arg("yes"), "usage")
+    ce_str_eq("'ON' -> usage (case-sensitive)",
+              chat_fed_snap_serve_parse_arg("ON"), "usage")
+}
+
+fn test_snap_serve_toggle_result_line_on() {
+    ce_str_eq("on toggle line",
+              _snap_serve_toggle_result_line(1),
+              "snap_serve: on (peer SNAP_FETCH requests will be served)")
+}
+
+fn test_snap_serve_toggle_result_line_off() {
+    ce_str_eq("off toggle line",
+              _snap_serve_toggle_result_line(0),
+              "snap_serve: off (peer SNAP_FETCH requests answered with SNAP_END miss)")
+}
+
+// ---- env-disabled path -------------------------------------------------
+
+fn test_env_disabled_daemon_skips_sr_init() {
+    let enabled = _t_sr_enabled_resolve("0")
+    let sr = 0
+    if enabled == 1 {
+        sr = sr_init(_mk_gs(), "")
+    }
+    ce_eq("CE_FED_SNAP_REPLICATION_ENABLED=0 -> sr stays 0", sr, 0)
+}
+
+fn test_env_enabled_daemon_allocates_sr() {
+    let enabled = _t_sr_enabled_resolve(0)  // null -> default 1
+    let sr = 0
+    if enabled == 1 {
+        sr = sr_init(_mk_gs(), "")
+    }
+    ce_check("null CE_FED_SNAP_REPLICATION_ENABLED -> sr allocated",
+             sr != 0)
+    ce_eq("allocated sr starts NOT serving", sr_is_serving(sr), 0)
+}
+
+fn test_env_snap_serve_on_daemon_flips_serving() {
+    // Simulate the daemon path: if snap_serve == 1, call
+    // sr_set_serving(sr, 1) at boot. The chat REPL surfaces the same
+    // toggle via /snap_serve on|off at runtime.
+    let serve = _t_snap_serve_resolve("1")
+    let sr = sr_init(_mk_gs(), "")
+    if serve == 1 { sr_set_serving(sr, 1) }
+    ce_eq("CE_FED_SNAP_SERVE=1 -> serving on at boot",
+          sr_is_serving(sr), 1)
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    // env resolvers
+    test_sr_enabled_default_when_null()
+    test_sr_enabled_disabled_by_literal_zero()
+    test_sr_enabled_passes_through_one()
+    test_sr_enabled_passes_through_other_nonempty()
+    test_snap_serve_default_when_null_is_off()
+    test_snap_serve_default_when_empty_is_off()
+    test_snap_serve_disabled_by_literal_zero()
+    test_snap_serve_enabled_by_one()
+    test_snap_serve_enabled_by_true()
+    test_local_snap_dir_uses_explicit_snap_path()
+    test_local_snap_dir_falls_back_to_home()
+    test_local_snap_dir_falls_back_to_container()
+
+    // sr bootstrap
+    test_sr_init_returns_wellformed_state()
+    test_sr_init_serving_starts_off()
+    test_sr_set_serving_toggle()
+    test_sr_set_serving_null_state_returns_zero()
+
+    // gossip wiring
+    test_gossip_set_sr_state_round_trip()
+
+    // serve gating
+    test_sr_observe_attestation_records_root()
+    test_sr_serve_returns_zero_when_off()
+    test_sr_serve_returns_bytes_when_on()
+    test_sr_serve_returns_zero_on_miss_even_when_on()
+
+    // /snap_fetch arg validation
+    test_snap_fetch_root_hex_valid()
+    test_snap_fetch_root_hex_wrong_length()
+    test_snap_fetch_root_hex_bad_chars()
+    test_snap_fetch_root_hex_null_empty()
+
+    // /snap_fetch result formatter
+    test_snap_fetch_result_line_success()
+    test_snap_fetch_result_line_unknown_root()
+    test_snap_fetch_result_line_peer_but_failed()
+
+    // /snap_serve arg parser + formatter
+    test_snap_serve_parse_on()
+    test_snap_serve_parse_off()
+    test_snap_serve_parse_usage()
+    test_snap_serve_toggle_result_line_on()
+    test_snap_serve_toggle_result_line_off()
+
+    // env-disabled path
+    test_env_disabled_daemon_skips_sr_init()
+    test_env_enabled_daemon_allocates_sr()
+    test_env_snap_serve_on_daemon_flips_serving()
+
+    ce_summary("fed_daemon_replication")
+}
+
+main()

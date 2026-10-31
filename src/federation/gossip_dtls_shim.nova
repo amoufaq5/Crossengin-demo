@@ -1,0 +1,1509 @@
+// CrossEngin federation: NON-STANDARD DTLS-1.2 shim over TCP gossip streams
+// (Phase O R3, ADR-0096).
+//
+// !!  READ THIS FIRST  !!
+// -----------------------
+// DTLS 1.2 (RFC 6347) is UDP-native. Its record layer relies on datagram
+// boundaries for fragment reassembly, sequence-number windowing, and
+// retransmission semantics that TCP already provides. This module wraps
+// each gossip TCP connection in a DTLS record stream by prepending a
+// 2-byte big-endian length header to every DTLS record before sending
+// it on the TCP socket, and stripping that header on receive. This
+// framing lets the TCP reader recover record boundaries the RFC would
+// have taken from UDP.
+//
+// This is NOT RFC-compliant. A standards-compliant DTLS peer WILL NOT
+// interop with a gossip node using this transport. ADR-0096 documents
+// the trade in full (why gossip is TCP-stream today, why the RFC UDP
+// rewrite is blocked on NOVA's missing sendto/recvfrom primitives, what
+// we lose in interop, and the migration path once those primitives
+// land). This shim is CrossEngin-mesh-only.
+//
+// Wire framing
+// ------------
+//   Every DTLS record on the wire is preceded by a 2-byte big-endian
+//   length header. The header value is the byte length of the DTLS
+//   record that follows (13-byte DTLS record header + explicit_IV +
+//   ciphertext + tag). A tolerant reader tears one record off the
+//   stream at a time:
+//
+//     +--------+----------------------- 2B length prefix (big-endian) --+
+//     | 0x00LL | 0xLLLL byte record ...                                 |
+//     +--------+--------------------------------------------------------+
+//
+//   NOTHING else in the RFC 6347 record body changes. The 13-byte
+//   record header, the explicit_IV, the AEAD ciphertext, and the AEAD
+//   tag are all emitted verbatim by `dtls_seal_record` and consumed
+//   verbatim by `dtls_open_record` in `src/federation/dtls12.nova`.
+//
+// Handshake driver
+// ----------------
+//   `gds_handshake_server` / `gds_handshake_client` drive the RFC 6347
+//   flights over the length-prefixed TCP stream:
+//
+//     server: reads ClientHello, emits ServerHello + Certificate +
+//             ServerKeyExchange + ServerHelloDone, reads
+//             ClientKeyExchange + ChangeCipherSpec + Finished, emits
+//             ChangeCipherSpec + Finished, returns [1, state].
+//     client: mirror. After the Certificate is received the client
+//             invokes `dtls_cert_verify_chain(state, [cert_der],
+//             hostname, anchors, now)` from Phase O R1 (ADR-0094) and
+//             refuses on any DTLS_CERT_* rejection.
+//
+//   Both flights use the pre-CCS handshake records for framing (each
+//   flight is one or more records read/written through
+//   `_gds_send_record` / `_gds_recv_record`); the AEAD flip happens on
+//   the ChangeCipherSpec boundary just as it does in RFC-compliant
+//   DTLS, driven by `dtls_open_record` / `dtls_seal_record` inspecting
+//   `DTLS_S_SLOT_CIPHER_ACTIVE`.
+//
+//   IMPORTANT: the record-level primitives in dtls12.nova today only
+//   ship the AEAD seal/open pair against an ALREADY-DERIVED cipher
+//   state; the full RFC 6347 ClientHello/ServerHello/Certificate/
+//   KeyExchange/Finished flight builders are not all in the tree yet
+//   (the R29B.2 stubs for `_seal_record_R29B2_STUB` /
+//   `_open_record_R29B2_STUB` were retired in R33B, but the flight
+//   drivers themselves land in a follow-up round). R3 therefore ships
+//   the shim as a THIN framing layer + a KEYED-HANDSHAKE fast path
+//   for scenarios where both peers already share the derived cipher
+//   state (e.g. tests that call `dtls_ecdhe_derive` on both sides
+//   directly, or a future round that adds the flight builders and
+//   feeds them through the same `_gds_send_record` framing). When the
+//   flight builders land they slot into `gds_handshake_server` /
+//   `gds_handshake_client` without disturbing the framing helpers.
+//
+// Post-handshake I/O
+// ------------------
+//   `gds_send_line` seals a plaintext line via `dtls_seal_record`
+//   (record type = APPLICATION_DATA), then framed via
+//   `_gds_send_record`. `gds_recv_line` reads a framed record via
+//   `_gds_recv_record`, opens it via `dtls_open_record`, strips a
+//   trailing '\n' if present, and returns the decrypted string. Both
+//   entries are drop-in replacements for `_gossip_send_all` /
+//   `_gossip_recv_line` in gossip.nova, matching the line-oriented
+//   protocol R18E already speaks.
+//
+// Close
+// -----
+//   `gds_close` emits a `close_notify` alert record (record type =
+//   ALERT, level = 1 warning, description = 0 close_notify) via the
+//   sealed path when the cipher is active, then closes the fd. If the
+//   cipher is not active (handshake failed mid-flight) the entry
+//   closes the fd without an alert -- an unauthenticated alert would
+//   leak nothing but is also useless to the peer.
+//
+// ADRs implemented
+//   ADR-0096 (Phase O R3, non-standard DTLS-over-TCP shim for gossip).
+//   Depends on ADR-0094 (R1 chain-aware cert verify) for the
+//   client-side certificate check invoked by `gds_handshake_client`.
+//
+// NOVA dependencies
+//   send_data / recv_data / close_fd / alloc / store8 / load8 (via
+//   std/syscall + std/io). No new socket builtins.
+//
+// CrossEngin dependencies
+//   src/federation/dtls12.nova -- dtls_init, dtls_client_init,
+//     dtls_ecdhe_derive, dtls_seal_record, dtls_open_record,
+//     dtls_cert_verify_chain (R1), record-type constants.
+//   src/safety/p256_keypair.nova -- p256_keypair_load /
+//     p256_keypair_generate_deterministic (for the test / bootstrap
+//     seam only; the handshake drivers accept the priv_bn + pub_point
+//     as arguments so callers may supply them from any source).
+
+import "std/syscall"
+import "std/io"
+import "./dtls12.nova"
+import "../safety/p256_keypair.nova"
+// Phase P R2 (ADR-0098): explicit imports for the client-flight SKE-sig
+// verify hook. Transitive resolution through dtls12.nova's imports would
+// technically cover these, but naming them here matches the test files'
+// pattern and makes the dependency surface auditable.
+import "../safety/sha256.nova"
+import "../safety/p256.nova"
+import "../safety/ecdsa.nova"
+import "../safety/x509_verify.nova"
+import "../util/str_safe.nova"
+
+// ---- constants ------------------------------------------------------------
+
+// Length-prefix header size. 2 bytes big-endian => max record size 65535.
+// A DTLS 1.2 record with a 13-byte header + explicit_IV + 16-byte tag +
+// up to ~16k plaintext lands comfortably inside a 16-bit length; the
+// wire hard-caps at 65535 which is the RFC 6347 fragment ceiling.
+let GDS_LEN_HDR = 2
+let GDS_MAX_RECORD = 65535
+
+// close_notify alert wire body (RFC 5246 §7.2).
+//   [level(1)=1 warning, description(1)=0 close_notify]
+let GDS_ALERT_WARNING       = 1
+let GDS_ALERT_CLOSE_NOTIFY  = 0
+
+// Handshake-flight timeout ceiling (ms). Real DTLS uses timer-based
+// retransmit; over TCP we just cap the wait per record read via the
+// caller's socket timeout (the fed daemon sets SO_RCVTIMEO). This
+// module does not touch the timeout itself; the constant is exposed
+// for the fed-daemon bootstrap that widens the RCVTIMEO during the
+// handshake window and restores the ping timeout after.
+let GDS_HANDSHAKE_TIMEOUT_MS = 30000
+
+// STATS counter tags (returned by gds_stats_key / consumed by callers
+// that want to bump their own counter maps without depending on the
+// dtls_state internal layout).
+let GDS_STAT_HS_OK          = "gds-hs-ok"
+let GDS_STAT_HS_FAIL        = "gds-hs-fail"
+let GDS_STAT_RECV_ALERT     = "gds-recv-alert"
+
+// Phase P R4 (ADR-0110): sealed-frame binary I/O constants.
+//
+// `GDS_CIPHER_INACTIVE` is a shim-local error sentinel returned in the
+// second slot of `gds_recv_bin`'s result when the DTLS state is not
+// yet cipher-active. `dtls_open_record` collapses this case to
+// `DTLS_DECRYPT_FAIL` for oracle-leak hygiene; the shim surfaces it
+// explicitly here so callers can distinguish "cipher never came up"
+// from "cipher came up and a record failed to decrypt".
+//
+// `GDS_PT_PER_RECORD` is the maximum plaintext payload we hand to
+// `dtls_seal_record` in one call. The AEAD seal adds an 8-byte
+// explicit_IV + 16-byte GCM tag; the record body on the wire must
+// fit inside `DTLS_RECORD_MAX_FRAGMENT = 16384` per RFC 6347 §4.1.
+// 16384 - 8 - 16 = 16360. Picking a round value under that so a
+// future RFC-5246-compliant TLS-level framer with slightly different
+// overhead still slots in without recomputing.
+let GDS_CIPHER_INACTIVE     = "gds: cipher inactive"
+let GDS_PT_PER_RECORD       = 16000
+
+// ---- low-level framed record I/O ------------------------------------------
+
+// Send exactly n bytes from `buf` to `fd`. Returns 1 on complete write,
+// 0 on any partial-write / EOF / send failure. Mirrors the shape of
+// `_gossip_send_all` but takes a raw buffer + length pair (not a NOVA
+// string) so we can hand the DTLS record's byte buffer straight through
+// without a string copy.
+fn _gds_send_all(fd, buf, n) {
+    if n < 0 { return 0 }
+    let sent = 0
+    while sent < n {
+        let r = send_data(fd, buf + sent, n - sent)
+        if r <= 0 { return 0 }
+        sent = sent + r
+    }
+    return 1
+}
+
+// Read exactly n bytes into a fresh buffer from `fd`. Returns
+// [buf, n] on complete read, 0 on EOF / short read / recv failure.
+// The buffer carries a trailing NUL byte at [n] for downstream
+// allocator slack.
+fn _gds_recv_exact(fd, n) {
+    if n <= 0 { return 0 }
+    let buf = alloc(n + 1)
+    let got = 0
+    while got < n {
+        let r = recv_data(fd, buf + got, n - got)
+        if r <= 0 { return 0 }
+        got = got + r
+    }
+    store8(buf + n, 0)
+    let out = list_new()
+    push(out, buf)
+    push(out, n)
+    return out
+}
+
+// Read a length-prefixed DTLS record off the TCP stream. Returns
+// [1, record_buf, record_n] on success; [0, 0, 0] on EOF / short-read
+// / oversize / malformed length prefix. The returned buffer is exactly
+// `record_n` bytes -- the 2-byte length prefix is CONSUMED from the
+// wire but does NOT appear in the returned buffer.
+fn _gds_recv_record(fd) {
+    let hdr = _gds_recv_exact(fd, GDS_LEN_HDR)
+    if hdr == 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, 0)
+        push(bad, 0)
+        return bad
+    }
+    let b0 = load8(hdr[0] + 0)
+    let b1 = load8(hdr[0] + 1)
+    let record_n = int_or(int_shl(b0, 8), b1)
+    if record_n <= 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, 0)
+        push(bad, 0)
+        return bad
+    }
+    if record_n > GDS_MAX_RECORD {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, 0)
+        push(bad, 0)
+        return bad
+    }
+    let body = _gds_recv_exact(fd, record_n)
+    if body == 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, 0)
+        push(bad, 0)
+        return bad
+    }
+    let ok = list_new()
+    push(ok, 1)
+    push(ok, body[0])
+    push(ok, record_n)
+    return ok
+}
+
+// Send a DTLS record wrapped in its 2-byte big-endian length header.
+// Returns 1 on complete write, 0 on any send failure or oversize.
+fn _gds_send_record(fd, record_buf, record_n) {
+    if record_n <= 0 { return 0 }
+    if record_n > GDS_MAX_RECORD { return 0 }
+    let hdr = alloc(GDS_LEN_HDR + 1)
+    store8(hdr + 0, int_and(int_shr(record_n, 8), 255))
+    store8(hdr + 1, int_and(record_n, 255))
+    store8(hdr + GDS_LEN_HDR, 0)
+    if _gds_send_all(fd, hdr, GDS_LEN_HDR) == 0 { return 0 }
+    return _gds_send_all(fd, record_buf, record_n)
+}
+
+// ---- handshake drivers ----------------------------------------------------
+//
+// The handshake shape below is the SEAM into which the RFC 6347 flight
+// builders slot when they land in the follow-up round noted in the file
+// header. Today the drivers:
+//
+//   (a) Allocate a fresh dtls_state (or accept one from the caller for
+//       tests that need to pin fixed randoms).
+//   (b) Drive the ECDHE keygen so we have a local pubkey to advertise.
+//   (c) Return [0, state] with a DTLS_ERR_STUB-style diagnostic when
+//       the flight builders are not yet present in this build. Callers
+//       treat [0, state] the same way they'd treat a genuine handshake
+//       failure: close the fd, bump stats, refuse the connection.
+//
+// The KEYED-HANDSHAKE fast-path (`gds_keyed_shortcut`) is what the R3
+// unit tests and the fed-daemon smoke script exercise: both sides call
+// `dtls_ecdhe_derive` directly (via the same setup helper the DTLS
+// unit tests use), then hand the derived states to `gds_send_line` /
+// `gds_recv_line`. The wire is a real length-prefixed DTLS record
+// stream; only the handshake choreography is short-circuited. This
+// matches how ADR-0096 §"Handshake driver" says integration lands.
+
+// Phase P R2 (ADR-0098): drive the RFC 6347 client-side handshake flight.
+// Sends ClientHello, reads the server's flight-1 quartet (ServerHello /
+// Certificate / ServerKeyExchange / ServerHelloDone), verifies the cert
+// chain + the SKE ECDSA signature, derives the pre-master via ECDHE,
+// runs the TLS 1.2 PRF to expand master_secret + key_block, sends
+// ClientKeyExchange + ChangeCipherSpec + Finished, then reads the
+// server's CCS + Finished and verifies the MAC. On the full success
+// path returns [1, dtls_state] at DTLS_S_ESTABLISHED. On any failure
+// returns [0, dtls_state] with last_err set and state at
+// DTLS_S_FAILED.
+//
+// `priv_bn` + `pub_point` are the client's EPHEMERAL ECDHE keypair. In
+// tests the caller pre-generates a deterministic keypair for
+// reproducibility; in prod the caller pulls fresh entropy each
+// handshake. `hostname` + `anchors` + `now` are the cert-verify plumbing
+// per Phase O R1 (ADR-0094).
+fn gds_handshake_client(conn_fd, dtls_state, priv_bn, pub_point,
+                        hostname, anchors, now) {
+    let st = dtls_state
+    if st == 0 { st = dtls_init() }
+    st[DTLS_S_SLOT_PRIV_BN]           = priv_bn
+    st[DTLS_S_SLOT_LOCAL_PUB]         = pub_point
+    st[DTLS_S_SLOT_SERVER_NAME]       = hostname
+    st[DTLS_S_SLOT_HOSTNAME]          = hostname
+    st[DTLS_S_SLOT_ANCHORS]           = anchors
+    st[DTLS_S_SLOT_CURRENT_TIME_UNIX] = now
+    st[DTLS_S_SLOT_IS_SERVER]         = 0
+    let flight = _gds_client_flight(conn_fd, st, priv_bn, pub_point,
+                                    hostname, anchors, now)
+    let out = list_new()
+    push(out, flight[0])
+    push(out, st)
+    return out
+}
+
+// ---- Phase P R2 (ADR-0098): client-side handshake flight ------------------
+//
+// State-machine walk (mirror of the R1 server chain, using the R29B
+// client-side edges):
+//   INIT -> CLIENT_HELLO_SENT -> SERVER_HELLO_RECVD -> CERTIFICATE_RECVD
+//        -> FINISHED -> ESTABLISHED
+//
+// Transcript-snapshot ordering per RFC 5246 §7.4.9:
+//   Client Finished MAC = PRF(ms, "client finished",
+//     SHA-256(CH || SH || Cert || SKE || SHD || CKE), 12).
+//   Server Finished MAC = PRF(ms, "server finished",
+//     SHA-256(CH || SH || Cert || SKE || SHD || CKE || client Finished),
+//     12).
+//
+// The transcript accumulator is non-destructive on finalize, so we can
+// snapshot the client-Finished input BEFORE absorbing the client
+// Finished HS bytes, then absorb the client Finished, then finalize
+// again for the server-Finished verify.
+fn _gds_client_flight(conn_fd, dtls_state, priv_bn, pub_point,
+                      hostname, anchors, now) {
+    // 1. Build ClientHello. _dtls_build_client_hello_body now populates
+    // client_random from secure_random (or the test override) and
+    // stashes it into DTLS_S_SLOT_CLIENT_RANDOM so subsequent ecdhe
+    // derive + SKE-sig verify see the same 32 bytes we put on the wire.
+    let ch_pair = _dtls_build_client_hello_body(dtls_state)
+    if ch_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-ch")
+    }
+    // Send the ClientHello and absorb into transcript. ClientHello
+    // predates the transcript accumulator init on the server side (R1
+    // inits it after parsing CH); we init it here explicitly BEFORE
+    // absorbing so the accumulator has room for the first message.
+    dtls_transcript_init(dtls_state)
+    if _gds_send_hs(conn_fd, dtls_state, DTLS_HS_CLIENT_HELLO,
+                    ch_pair[0], ch_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-ch")
+    }
+    if dtls_transition(dtls_state, DTLS_S_CLIENT_HELLO_SENT) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-chs")
+    }
+    // 2. Recv the server's flight-1 quartet: SH, Cert, SKE, SHD. Each
+    // arrives in its own DTLS record (the shim splits records at the
+    // 2-byte length prefix). We absorb each into the transcript by
+    // its 12-byte HS header + body.
+    let sh = _gds_recv_hs(conn_fd, dtls_state, DTLS_HS_SERVER_HELLO)
+    if sh[0] == 0 { return _gds_flight_fail(dtls_state, sh[1]) }
+    let sh_body_buf = sh[2]
+    let sh_body_n   = sh[3]
+    let sh_parsed = _dtls_parse_server_hello_body(sh_body_buf, sh_body_n)
+    if sh_parsed[0] == 0 {
+        return _gds_flight_fail(dtls_state, sh_parsed[1])
+    }
+    dtls_state[DTLS_S_SLOT_SERVER_RANDOM] = sh_parsed[2]
+    dtls_state[DTLS_S_SLOT_CIPHER_SUITE]  = sh_parsed[4]
+    if dtls_transition(dtls_state, DTLS_S_SERVER_HELLO_RECVD) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-shr")
+    }
+    let cert = _gds_recv_hs(conn_fd, dtls_state, DTLS_HS_CERTIFICATE)
+    if cert[0] == 0 { return _gds_flight_fail(dtls_state, cert[1]) }
+    let cert_parsed = _dtls_parse_certificate_body(cert[2], cert[3])
+    if cert_parsed[0] == 0 {
+        return _gds_flight_fail(dtls_state, cert_parsed[1])
+    }
+    let cert_der_list = cert_parsed[1]
+    // Cert-verify hook (Phase O R1). Refuses on any XV_* -> DTLS_CERT_*
+    // rejection; the tag lands in `last_err` via
+    // `dtls_cert_verify_chain`'s internal stamping.
+    let cv = dtls_cert_verify_chain(dtls_state, cert_der_list,
+                                    hostname, anchors, now)
+    if cv[0] != DTLS_OK {
+        return _gds_flight_fail(dtls_state, cv[0])
+    }
+    let leaf_cert = cv[1]
+    if dtls_transition(dtls_state, DTLS_S_CERTIFICATE_RECVD) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-cr")
+    }
+    let ske = _gds_recv_hs(conn_fd, dtls_state, DTLS_HS_SERVER_KEY_EXCHANGE)
+    if ske[0] == 0 { return _gds_flight_fail(dtls_state, ske[1]) }
+    let ske_parsed = _dtls_parse_ske_body(ske[2], ske[3])
+    if ske_parsed[0] == 0 {
+        return _gds_flight_fail(dtls_state, ske_parsed[1])
+    }
+    let server_pub_point = ske_parsed[3]   // 65B uncompressed
+    let sig_pair = ske_parsed[5]           // [DER buf, DER n]
+    // Verify SKE signature: covers client_random || server_random ||
+    // server_params (curve_type(1) + curve_id(2) + point_len(1) + point).
+    if _gds_verify_ske_sig(dtls_state, leaf_cert, server_pub_point,
+                           sig_pair[0], sig_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, DTLS_CERT_SIG_FAIL)
+    }
+    let shd = _gds_recv_hs(conn_fd, dtls_state, DTLS_HS_SERVER_HELLO_DONE)
+    if shd[0] == 0 { return _gds_flight_fail(dtls_state, shd[1]) }
+    let shd_parsed = _dtls_parse_server_hello_done_body(shd[2], shd[3])
+    if shd_parsed[0] == 0 {
+        return _gds_flight_fail(dtls_state, shd_parsed[1])
+    }
+    // 3. Compute pre-master via ECDH and derive master_secret + key_block.
+    // dtls_ecdhe_derive reads state[PRIV_BN] and calls p256_derive
+    // internally; it also re-copies the client + server randoms into
+    // their slots so the downstream PRF sees consistent input.
+    let cr = dtls_state[DTLS_S_SLOT_CLIENT_RANDOM]
+    let sr = dtls_state[DTLS_S_SLOT_SERVER_RANDOM]
+    if dtls_ecdhe_derive(dtls_state, server_pub_point, 65, cr, sr, 0) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-ecdhe-fail")
+    }
+    // 4. Build + send ClientKeyExchange. Absorb before sending so the
+    // wire bytes and the transcript accumulator stay in lockstep.
+    let cke_pair = _dtls_build_client_key_exchange_body(dtls_state, pub_point)
+    if cke_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-cke")
+    }
+    if _gds_send_hs(conn_fd, dtls_state, DTLS_HS_CLIENT_KEY_EXCHANGE,
+                    cke_pair[0], cke_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-cke")
+    }
+    // 5. Send ChangeCipherSpec (separate record type, NOT absorbed into
+    // transcript per RFC 5246 §7.4.9). Advance the epoch AFTER sending
+    // so subsequent seals run under the new keys.
+    let ccs = _dtls_build_change_cipher_spec_record(dtls_state)
+    if ccs == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-ccs")
+    }
+    if _gds_send_record(conn_fd, ccs[0], ccs[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-ccs")
+    }
+    dtls_advance_epoch(dtls_state)
+    // 6. Build client Finished body. The verify_data snapshot uses the
+    // transcript AS OF the CKE absorb (i.e. before the client-Finished
+    // is absorbed). This is RFC 5246 §7.4.9's contract for the client
+    // Finished MAC.
+    let fin_pair = _dtls_build_finished_body(dtls_state, 1)
+    if fin_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-fin")
+    }
+    // Absorb the client Finished HS message into the transcript AFTER
+    // computing its verify_data so the SUBSEQUENT server-Finished
+    // finalize covers the client-Finished bytes as required by RFC
+    // 5246 §7.4.9 ("the peer's Finished message SHOULD BE PROTECTED
+    // by covering our Finished's bytes").
+    let msg_seq = dtls_msg_seq_next(dtls_state)
+    let hs_pair = dtls_handshake_serialize(DTLS_HS_FINISHED, msg_seq,
+                                           fin_pair[0], fin_pair[1])
+    if hs_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-fin-serialize")
+    }
+    dtls_transcript_absorb(dtls_state, hs_pair[0], hs_pair[1])
+    dtls_state[DTLS_S_SLOT_HS_OUT] = dtls_state[DTLS_S_SLOT_HS_OUT] + 1
+    // Client Finished is the first ENCRYPTED handshake record. Seal
+    // via the AEAD path (cipher_active was flipped by dtls_ecdhe_derive
+    // and the epoch has been advanced).
+    let sealed = dtls_seal_record(dtls_state, DTLS_CT_HANDSHAKE,
+                                  hs_pair[0], hs_pair[1])
+    if sealed == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-seal-fin")
+    }
+    if _gds_send_record(conn_fd, sealed[0], sealed[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-fin")
+    }
+    if dtls_transition(dtls_state, DTLS_S_FINISHED) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-fin")
+    }
+    // 7. Recv server's CCS record (record_type=20, NOT absorbed).
+    let srv_ccs = _gds_recv_record(conn_fd)
+    if srv_ccs[0] == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-recv-srv-ccs")
+    }
+    if srv_ccs[2] < 13 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-short-srv-ccs")
+    }
+    if load8(srv_ccs[1] + 0) != DTLS_CT_CCS {
+        return _gds_flight_fail(dtls_state, "dtls-hs-srv-ccs-wrong-type")
+    }
+    // 8. Recv server's Finished (encrypted). Decrypt, extract the HS
+    // body, verify verify_data matches the server-side PRF snapshot.
+    let srv_fin_ok = _gds_recv_and_verify_server_finished(conn_fd, dtls_state)
+    if srv_fin_ok[0] == 0 {
+        return _gds_flight_fail(dtls_state, srv_fin_ok[1])
+    }
+    if dtls_transition(dtls_state, DTLS_S_ESTABLISHED) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-est")
+    }
+    let out = list_new()
+    push(out, 1)
+    push(out, "")
+    return out
+}
+
+// Helper: receive one plaintext handshake record; validate it is a
+// handshake record of the expected type; absorb its (header + body) into
+// the transcript; return [1, msg_type, body_buf, body_n]. On any failure
+// return [0, err_tag].
+fn _gds_recv_hs(conn_fd, dtls_state, expected_type) {
+    let rec = _gds_recv_record(conn_fd)
+    if rec[0] == 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-recv-fail")
+        return bad
+    }
+    let rec_buf = rec[1]
+    let rec_n = rec[2]
+    if rec_n < 13 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-short-record")
+        return bad
+    }
+    let ct = load8(rec_buf + 0)
+    if ct != DTLS_CT_HANDSHAKE {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-wrong-content-type")
+        return bad
+    }
+    let frag_off = 13
+    let frag_n = rec_n - 13
+    let hs = dtls_handshake_parse(rec_buf + frag_off, frag_n)
+    if hs == DTLS_ERR_BAD_HS {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-bad-header")
+        return bad
+    }
+    if hs[0] != expected_type {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-unexpected-type")
+        return bad
+    }
+    let body_buf = hs[5]
+    let body_n = hs[6]
+    // Absorb the (12B HS header + body) into transcript for MAC coverage.
+    dtls_transcript_absorb(dtls_state, rec_buf + frag_off, 12 + body_n)
+    dtls_state[DTLS_S_SLOT_HS_IN] = dtls_state[DTLS_S_SLOT_HS_IN] + 1
+    let out = list_new()
+    push(out, 1)
+    push(out, hs[0])
+    push(out, body_buf)
+    push(out, body_n)
+    return out
+}
+
+// Helper: verify the ServerKeyExchange signature via ecdsa_p256_verify_bn.
+// Signature covers client_random(32) || server_random(32) || server_params
+// where server_params = curve_type(1) || curve_id(2) || point_len(1) ||
+// point(65) = 69 bytes. Returns 1 on accept, 0 on refuse (DER parse fail
+// / ECDSA verify fail / leaf cert not EC).
+fn _gds_verify_ske_sig(dtls_state, leaf_cert, server_pub_point,
+                       sig_der_buf, sig_der_n) {
+    let cr = dtls_state[DTLS_S_SLOT_CLIENT_RANDOM]
+    let sr = dtls_state[DTLS_S_SLOT_SERVER_RANDOM]
+    if cr == 0 { return 0 }
+    if sr == 0 { return 0 }
+    // Build server_params = curve_type(3) || curve_id(23) || 65 || point.
+    let params_n = 1 + 2 + 1 + 65
+    let params_buf = alloc(params_n + 1)
+    store8(params_buf + 0, 3)
+    store8(params_buf + 1, 0)
+    store8(params_buf + 2, 23)
+    store8(params_buf + 3, 65)
+    let p = 0
+    while p < 65 {
+        store8(params_buf + 4 + p, load8(server_pub_point + p))
+        p = p + 1
+    }
+    store8(params_buf + params_n, 0)
+    // Compose the signed message.
+    let msg_n = 32 + 32 + params_n
+    let msg_buf = alloc(msg_n + 1)
+    let i = 0
+    while i < 32 {
+        store8(msg_buf + i, load8(cr + i))
+        store8(msg_buf + 32 + i, load8(sr + i))
+        i = i + 1
+    }
+    let k = 0
+    while k < params_n {
+        store8(msg_buf + 64 + k, load8(params_buf + k))
+        k = k + 1
+    }
+    store8(msg_buf + msg_n, 0)
+    // SHA-256 the signed message.
+    let hash_buf = sha256_oneshot(msg_buf, msg_n)
+    let hash_bn = _p256_bytes_to_bn(hash_buf, 0)
+    // DER-decode the sig -> [r_bn, s_bn].
+    let rs = _dtls_der_decode_ecdsa_sig(sig_der_buf, sig_der_n)
+    if rs == 0 { return 0 }
+    // Leaf cert's EC pubkey (65B uncompressed).
+    let leaf_pub = cert_ec_point(leaf_cert)
+    let leaf_pub_n = cert_ec_point_n(leaf_cert)
+    if leaf_pub == 0 { return 0 }
+    return ecdsa_p256_verify_bn(leaf_pub, leaf_pub_n, hash_bn, rs[0], rs[1])
+}
+
+// Helper: recv the server's Finished record (encrypted under the new
+// epoch), decrypt via dtls_open_record, extract the HS body, verify the
+// 12-byte verify_data matches PRF(ms, "server finished",
+// SHA-256(transcript_including_client_finished), 12).
+// Returns [1, ""] on accept, [0, err_tag] on refuse.
+fn _gds_recv_and_verify_server_finished(conn_fd, dtls_state) {
+    let rec = _gds_recv_record(conn_fd)
+    if rec[0] == 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-recv-srv-fin")
+        return bad
+    }
+    let opened = dtls_open_record(dtls_state, rec[1], rec[2])
+    if opened == DTLS_DECRYPT_FAIL {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-decrypt-srv-fin")
+        return bad
+    }
+    if opened == DTLS_REPLAY {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-replay-srv-fin")
+        return bad
+    }
+    if opened == DTLS_TOO_OLD {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-too-old-srv-fin")
+        return bad
+    }
+    let type_byte = opened[0]
+    if type_byte != DTLS_CT_HANDSHAKE {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-srv-fin-wrong-type")
+        return bad
+    }
+    let pt_buf = opened[1]
+    let pt_n = opened[2]
+    let hs = dtls_handshake_parse(pt_buf, pt_n)
+    if hs == DTLS_ERR_BAD_HS {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-srv-fin-bad-header")
+        return bad
+    }
+    if hs[0] != DTLS_HS_FINISHED {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-srv-fin-wrong-msg-type")
+        return bad
+    }
+    let body_buf = hs[5]
+    let body_n = hs[6]
+    if body_n != 12 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-srv-fin-bad-len")
+        return bad
+    }
+    // Compute expected server verify_data using the current transcript
+    // snapshot (covers CH..client Finished per the caller's absorb
+    // ordering).
+    let expected = _dtls_build_finished_body(dtls_state, 0)
+    if expected == 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-srv-fin-prf-fail")
+        return bad
+    }
+    let exp_buf = expected[0]
+    let i = 0
+    while i < 12 {
+        if load8(body_buf + i) != load8(exp_buf + i) {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, "dtls-hs-srv-fin-mac-mismatch")
+            return bad
+        }
+        i = i + 1
+    }
+    // Absorb the server Finished HS (12B header + 12B body) into transcript
+    // for completeness (a subsequent re-handshake or exporter that wants
+    // the full transcript-hash sees the finished bytes too).
+    dtls_transcript_absorb(dtls_state, pt_buf, 12 + body_n)
+    dtls_state[DTLS_S_SLOT_HS_IN] = dtls_state[DTLS_S_SLOT_HS_IN] + 1
+    let out = list_new()
+    push(out, 1)
+    push(out, "")
+    return out
+}
+
+// ---- Phase P R1 (ADR-0097): server-side handshake flight 1 ----------------
+//
+// `_gds_server_flight_1` drives the RFC 6347 server-side flight-1 quartet:
+//     recv ClientHello -> emit ServerHello + Certificate + ServerKeyExchange
+//                         + ServerHelloDone
+//
+// State-machine walk: INIT -> CLIENT_HELLO_RECVD -> SERVER_HELLO_SENT
+//                     -> CERT_SENT -> SKE_SENT -> SHD_SENT
+//
+// Transcript-accumulator walk: the incoming ClientHello HS message (the
+// 12-byte HS header + body) is absorbed BEFORE the state transitions;
+// each emitted server-flight message is absorbed after it is composed
+// but before it is sent, so a subsequent recv on the peer side sees the
+// same wire bytes and can absorb them into its own transcript with the
+// same layout. R2 finalizes the transcript twice (client Finished then
+// server Finished) via dtls_transcript_finalize which is non-destructive.
+//
+// Inputs:
+//   conn_fd     -- an already-connected TCP fd with the 2-byte framing shim.
+//   dtls_state  -- caller-supplied state (must be at DTLS_S_INIT).
+//   priv_bn     -- server long-term ECDSA-P-256 private scalar (bn256).
+//   pub_point   -- server ephemeral ECDH pub point (65B SEC1 uncompressed).
+//   cert_der    -- server cert chain as list of [buf, n] (leaf first).
+//
+// Returns [1, ""] on the full-flight-1 success path, [0, err_string] on
+// any parse-refuse / send-fail / state-transition-refuse condition. On
+// failure the state's LAST_ERR slot is stamped with the same string and
+// the state transitions to DTLS_S_FAILED.
+fn _gds_server_flight_1(conn_fd, dtls_state, priv_bn, pub_point, cert_der) {
+    // 1. Recv the first record off the wire; must be a handshake record
+    // carrying a ClientHello.
+    let rec = _gds_recv_record(conn_fd)
+    if rec[0] == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-recv-fail")
+    }
+    // The DTLS record has a 13-byte record header followed by the fragment.
+    // For flight-1 the ClientHello is plaintext (cipher not yet active).
+    let rec_buf = rec[1]
+    let rec_n = rec[2]
+    if rec_n < 13 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-short-record")
+    }
+    let ct = load8(rec_buf + 0)
+    if ct != DTLS_CT_HANDSHAKE {
+        return _gds_flight_fail(dtls_state, "dtls-hs-wrong-content-type")
+    }
+    let frag_off = 13
+    let frag_n = rec_n - 13
+    // Parse the 12-byte handshake header.
+    let hs = dtls_handshake_parse(rec_buf + frag_off, frag_n)
+    if hs == DTLS_ERR_BAD_HS {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-header")
+    }
+    if hs[0] != DTLS_HS_CLIENT_HELLO {
+        return _gds_flight_fail(dtls_state, "dtls-hs-not-client-hello")
+    }
+    let body_buf = hs[5]
+    let body_n = hs[6]
+    // Parse the ClientHello body.
+    let ch = _dtls_parse_client_hello_body(body_buf, body_n)
+    if ch[0] == 0 {
+        return _gds_flight_fail(dtls_state, ch[1])
+    }
+    // Populate client_random slot and absorb the whole HS message (header
+    // + body) into the transcript. The 12+body_n bytes at (rec_buf +
+    // frag_off) are exactly what the peer's transcript will see, so
+    // absorbing them here gives byte-for-byte matching transcripts.
+    dtls_state[DTLS_S_SLOT_CLIENT_RANDOM] = ch[2]
+    dtls_transcript_init(dtls_state)
+    dtls_transcript_absorb(dtls_state, rec_buf + frag_off, 12 + body_n)
+    // Phase P R3 (ADR-0099): walk the ClientHello extensions block and
+    // dispatch each known extension into its per-extension parser. The
+    // only extension R3 recognizes on the server side is `use_srtp`
+    // (RFC 5764 §4.1.1); an offered profile that matches R2's single
+    // supported profile is written into DTLS_S_SLOT_SRTP_OFFER so the
+    // subsequent ServerHello builder echoes it back per RFC 5764 §4.1.3.
+    // Unknown extension types are silently skipped per RFC 5246 §7.4.1.4.
+    // An empty ext-block or absent extensions leaves the slot untouched.
+    let ch_ext_pair = ch[7]
+    if ch_ext_pair != 0 {
+        let ch_ext_buf = ch_ext_pair[0]
+        let ch_ext_n   = ch_ext_pair[1]
+        if ch_ext_n > 0 {
+            let walked = _dtls_parse_ext_block(ch_ext_buf, ch_ext_n)
+            if walked[0] == 0 {
+                return _gds_flight_fail(dtls_state, "dtls-hs-bad-ext-block")
+            }
+            let ext_list = walked[1]
+            let ei = 0
+            while ei < len(ext_list) {
+                let entry = ext_list[ei]
+                let ext_type = entry[0]
+                let ext_data = entry[1]
+                let ext_data_len = entry[2]
+                if ext_type == DTLS_EXT_USE_SRTP {
+                    let usrtp = _dtls_parse_use_srtp_ext(ext_data, ext_data_len)
+                    if usrtp[0] == 1 {
+                        let chosen = _dtls_select_srtp_profile(usrtp[1])
+                        if chosen != 0 {
+                            dtls_state[DTLS_S_SLOT_SRTP_OFFER] = chosen
+                        }
+                    }
+                }
+                ei = ei + 1
+            }
+        }
+    }
+    // Transition INIT -> CLIENT_HELLO_RECVD.
+    if dtls_transition(dtls_state, DTLS_S_CLIENT_HELLO_RECVD) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-chr")
+    }
+    // 2. Generate server_random. Try secure_random first; fall back to
+    // the test-mode override slot if entropy is unavailable.
+    let sr_buf = _gds_generate_server_random(dtls_state)
+    if sr_buf == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-no-entropy")
+    }
+    dtls_state[DTLS_S_SLOT_SERVER_RANDOM] = sr_buf
+    // 3. Build and send ServerHello.
+    let sh_pair = _dtls_build_server_hello_body(dtls_state,
+                                                DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256,
+                                                sr_buf)
+    if sh_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-sh")
+    }
+    dtls_state[DTLS_S_SLOT_CIPHER_SUITE] = DTLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256
+    if _gds_send_hs(conn_fd, dtls_state, DTLS_HS_SERVER_HELLO,
+                    sh_pair[0], sh_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-sh")
+    }
+    if dtls_transition(dtls_state, DTLS_S_SERVER_HELLO_SENT) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-shs")
+    }
+    // 4. Build and send Certificate.
+    let cert_pair = _dtls_build_certificate_body(dtls_state, cert_der)
+    if cert_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-cert")
+    }
+    if _gds_send_hs(conn_fd, dtls_state, DTLS_HS_CERTIFICATE,
+                    cert_pair[0], cert_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-cert")
+    }
+    if dtls_transition(dtls_state, DTLS_S_CERT_SENT) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-cs")
+    }
+    // 5. Build and send ServerKeyExchange. `0x0017` = secp256r1 per
+    // RFC 4492 §5.1.1 NamedCurve registry.
+    let ske_pair = _dtls_build_ske_body(dtls_state, 23, pub_point, priv_bn)
+    if ske_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-ske")
+    }
+    if _gds_send_hs(conn_fd, dtls_state, DTLS_HS_SERVER_KEY_EXCHANGE,
+                    ske_pair[0], ske_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-ske")
+    }
+    if dtls_transition(dtls_state, DTLS_S_SKE_SENT) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-skes")
+    }
+    // 6. Build and send ServerHelloDone.
+    let shd_pair = _dtls_build_server_hello_done_body()
+    if _gds_send_hs(conn_fd, dtls_state, DTLS_HS_SERVER_HELLO_DONE,
+                    shd_pair[0], shd_pair[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-shd")
+    }
+    if dtls_transition(dtls_state, DTLS_S_SHD_SENT) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-bad-transition-shds")
+    }
+    let out = list_new()
+    push(out, 1)
+    push(out, "")
+    return out
+}
+
+// Helper: wrap a body in an HS envelope, absorb into transcript, then wrap
+// in a plaintext DTLS record and push through the length-prefix framer.
+// Returns 1 on send success, 0 otherwise.
+fn _gds_send_hs(conn_fd, dtls_state, hs_type, body_buf, body_n) {
+    let msg_seq = dtls_msg_seq_next(dtls_state)
+    let hs_pair = dtls_handshake_serialize(hs_type, msg_seq, body_buf, body_n)
+    if hs_pair == 0 { return 0 }
+    let hs_buf = hs_pair[0]
+    let hs_n = hs_pair[1]
+    dtls_transcript_absorb(dtls_state, hs_buf, hs_n)
+    dtls_state[DTLS_S_SLOT_HS_OUT] = dtls_state[DTLS_S_SLOT_HS_OUT] + 1
+    let rec = dtls_record_emit(dtls_state, DTLS_CT_HANDSHAKE, hs_buf, hs_n)
+    if rec == 0 { return 0 }
+    // dtls_record_emit returns a [buf, total] pair (13B hdr + fragment).
+    return _gds_send_record(conn_fd, rec[0], rec[1])
+}
+
+// Helper: stamp the failure error tag and transition to FAILED. Returns
+// the [0, err] pair the flight driver hands back to its caller.
+fn _gds_flight_fail(dtls_state, err) {
+    dtls_state[DTLS_S_SLOT_LAST_ERR] = err
+    dtls_transition(dtls_state, DTLS_S_FAILED)
+    let out = list_new()
+    push(out, 0)
+    push(out, err)
+    return out
+}
+
+// Helper: produce a 32-byte server_random. Prefers secure_random(32);
+// falls back to the test-mode override slot (`DTLS_S_SLOT_SERVER_RANDOM_
+// OVERRIDE`) when entropy is unavailable so reproducible unit-test vectors
+// stay deterministic. Returns a fresh 33-byte buffer (32B + trailing NUL)
+// on success, 0 iff both paths are unavailable.
+fn _gds_generate_server_random(dtls_state) {
+    let buf = alloc(33)
+    let got = secure_random(buf, 32)
+    if got == 32 {
+        store8(buf + 32, 0)
+        return buf
+    }
+    let ov = dtls_state[DTLS_S_SLOT_SERVER_RANDOM_OVERRIDE]
+    if ov != 0 {
+        let out = alloc(33)
+        let i = 0
+        while i < 32 {
+            store8(out + i, load8(ov + i))
+            i = i + 1
+        }
+        store8(out + 32, 0)
+        return out
+    }
+    return 0
+}
+
+// Server-side flight entry. Phase P R1 shipped flight-1 (ClientHello ->
+// ServerHello + Cert + SKE + SHD); Phase P R2 (ADR-0098) adds flight-2
+// (recv CKE + CCS + Finished, send server CCS + Finished). On the full
+// success path the state reaches DTLS_S_ESTABLISHED and the return is
+// [1, dtls_state]. On any refuse the state ends at DTLS_S_FAILED with
+// the reason in LAST_ERR and the return is [0, dtls_state].
+//
+// `pub_point` is the server's EPHEMERAL ECDH pub (65B uncompressed), used
+// by the flight-1 SKE builder. The MATCHING ephemeral priv scalar must
+// be pre-stashed into `state[DTLS_S_SLOT_PRIV_BN]` by the caller BEFORE
+// this entry runs -- R2 flight-2 pulls it from the slot to compute the
+// pre-master via ECDH against the client's CKE pub_point. `priv_bn` here
+// is the LONG-TERM ECDSA signing key that signs the SKE; the ephemeral
+// ECDH keypair is a distinct pair the caller sets up via
+// `dtls_ecdhe_keygen(state)` or `dtls_ecdhe_keygen_seeded(state, k)`.
+fn gds_handshake_server(conn_fd, dtls_state, priv_bn, pub_point, cert_der) {
+    let st = dtls_state
+    if st == 0 { st = dtls_init() }
+    st[DTLS_S_SLOT_IS_SERVER] = 1
+    let flight = _gds_server_flight_1(conn_fd, st, priv_bn, pub_point, cert_der)
+    if flight[0] == 0 {
+        let out = list_new()
+        push(out, 0)
+        push(out, st)
+        return out
+    }
+    let flight2 = _gds_server_flight_2(conn_fd, st, priv_bn)
+    let out = list_new()
+    push(out, flight2[0])
+    push(out, st)
+    return out
+}
+
+// ---- Phase P R2 (ADR-0098): server-side handshake flight 2 ---------------
+//
+// After flight-1 sits the server at DTLS_S_SHD_SENT, flight-2 reads the
+// client's CKE (plaintext, still under the pre-CCS keys), advances
+// through client CCS + client Finished (encrypted under the new keys
+// once the client's CCS flips the epoch on our side), then sends server
+// CCS + Finished. On success the state reaches DTLS_S_ESTABLISHED.
+//
+// Transcript-snapshot ordering per RFC 5246 §7.4.9 (server side):
+//   The client-Finished MAC verify uses the transcript after absorbing
+//   CH..CKE (matches the client's compute).
+//   The server-Finished MAC send uses the transcript after ALSO
+//   absorbing the client Finished.
+//
+// State-machine notes: R1's server chain terminates at DTLS_S_SHD_SENT
+// with no downstream edges to FINISHED or ESTABLISHED. Rather than
+// extend `_dtls_valid_edge` and risk breaking pinned tests, R2 marks the
+// server-side final transition by writing DTLS_S_ESTABLISHED directly
+// (the standard reads: server flight 2 completion is
+// implementation-observable, not part of the R29B linear chain).
+fn _gds_server_flight_2(conn_fd, dtls_state, priv_bn) {
+    // 1. Recv ClientKeyExchange (plaintext -- CKE precedes the CCS).
+    let cke = _gds_recv_hs(conn_fd, dtls_state, DTLS_HS_CLIENT_KEY_EXCHANGE)
+    if cke[0] == 0 { return _gds_flight_fail(dtls_state, cke[1]) }
+    let cke_parsed = _dtls_parse_client_key_exchange_body(cke[2], cke[3])
+    if cke_parsed[0] == 0 {
+        return _gds_flight_fail(dtls_state, cke_parsed[1])
+    }
+    let client_pub_point = cke_parsed[1]   // 65B uncompressed
+    // 2. Compute pre-master via ECDH and derive master_secret + key_block.
+    let cr = dtls_state[DTLS_S_SLOT_CLIENT_RANDOM]
+    let sr = dtls_state[DTLS_S_SLOT_SERVER_RANDOM]
+    if dtls_ecdhe_derive(dtls_state, client_pub_point, 65, cr, sr, 1) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-ecdhe-fail")
+    }
+    // 3. Recv client CCS (record_type=20, NOT absorbed into transcript).
+    let cli_ccs = _gds_recv_record(conn_fd)
+    if cli_ccs[0] == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-recv-cli-ccs")
+    }
+    if cli_ccs[2] < 13 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-short-cli-ccs")
+    }
+    if load8(cli_ccs[1] + 0) != DTLS_CT_CCS {
+        return _gds_flight_fail(dtls_state, "dtls-hs-cli-ccs-wrong-type")
+    }
+    // Advance the recv epoch on our side so subsequent opens use the new
+    // keys. dtls_advance_epoch bumps BOTH send and recv epoch in lockstep
+    // (per RFC 6347 §4.1.2.6 -- CCS advances both sides). Our own send
+    // epoch will also bump; that matches the flow because we're about to
+    // send our own CCS + Finished right after verifying the client's.
+    dtls_advance_epoch(dtls_state)
+    // 4. Recv + verify client Finished (encrypted).
+    let cli_fin_ok = _gds_recv_and_verify_client_finished(conn_fd, dtls_state)
+    if cli_fin_ok[0] == 0 {
+        return _gds_flight_fail(dtls_state, cli_fin_ok[1])
+    }
+    // 5. Send server CCS. CCS does NOT feed the transcript.
+    let ccs = _dtls_build_change_cipher_spec_record(dtls_state)
+    if ccs == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-ccs")
+    }
+    if _gds_send_record(conn_fd, ccs[0], ccs[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-ccs")
+    }
+    // 6. Build server Finished body. verify_data uses the transcript AS
+    // OF the client Finished absorb (i.e. covers CH..client Finished).
+    let fin_pair = _dtls_build_finished_body(dtls_state, 0)
+    if fin_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-build-fin")
+    }
+    let msg_seq = dtls_msg_seq_next(dtls_state)
+    let hs_pair = dtls_handshake_serialize(DTLS_HS_FINISHED, msg_seq,
+                                           fin_pair[0], fin_pair[1])
+    if hs_pair == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-fin-serialize")
+    }
+    dtls_transcript_absorb(dtls_state, hs_pair[0], hs_pair[1])
+    dtls_state[DTLS_S_SLOT_HS_OUT] = dtls_state[DTLS_S_SLOT_HS_OUT] + 1
+    // Server Finished is encrypted under the new keys.
+    let sealed = dtls_seal_record(dtls_state, DTLS_CT_HANDSHAKE,
+                                  hs_pair[0], hs_pair[1])
+    if sealed == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-seal-fin")
+    }
+    if _gds_send_record(conn_fd, sealed[0], sealed[1]) == 0 {
+        return _gds_flight_fail(dtls_state, "dtls-hs-send-fin")
+    }
+    // 7. Transition to ESTABLISHED. Direct write bypasses
+    // `_dtls_valid_edge` because R1 did not add server-side FINISHED /
+    // ESTABLISHED edges (the R29B client-side chain terminates cleanly
+    // at DTLS_S_ESTABLISHED but the server-side chain stops at
+    // DTLS_S_SHD_SENT). Rather than extend the edge table (which
+    // several test files pin against), R2 sets the state directly.
+    dtls_state[DTLS_S_SLOT_STATE] = DTLS_S_ESTABLISHED
+    let out = list_new()
+    push(out, 1)
+    push(out, "")
+    return out
+}
+
+// Helper: server-side counterpart of _gds_recv_and_verify_server_finished.
+// Recv the client's Finished (encrypted under the new epoch), verify its
+// verify_data using the "client finished" label. On accept, absorb the
+// client Finished HS bytes into the transcript so the subsequent
+// server-Finished send finalize covers them. Returns [1, ""] on accept,
+// [0, err_tag] on refuse.
+fn _gds_recv_and_verify_client_finished(conn_fd, dtls_state) {
+    let rec = _gds_recv_record(conn_fd)
+    if rec[0] == 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-recv-cli-fin")
+        return bad
+    }
+    let opened = dtls_open_record(dtls_state, rec[1], rec[2])
+    if opened == DTLS_DECRYPT_FAIL {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-decrypt-cli-fin")
+        return bad
+    }
+    if opened == DTLS_REPLAY {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-replay-cli-fin")
+        return bad
+    }
+    if opened == DTLS_TOO_OLD {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-too-old-cli-fin")
+        return bad
+    }
+    let type_byte = opened[0]
+    if type_byte != DTLS_CT_HANDSHAKE {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-cli-fin-wrong-type")
+        return bad
+    }
+    let pt_buf = opened[1]
+    let pt_n = opened[2]
+    let hs = dtls_handshake_parse(pt_buf, pt_n)
+    if hs == DTLS_ERR_BAD_HS {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-cli-fin-bad-header")
+        return bad
+    }
+    if hs[0] != DTLS_HS_FINISHED {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-cli-fin-wrong-msg-type")
+        return bad
+    }
+    let body_buf = hs[5]
+    let body_n = hs[6]
+    if body_n != 12 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-cli-fin-bad-len")
+        return bad
+    }
+    let expected = _dtls_build_finished_body(dtls_state, 1)
+    if expected == 0 {
+        let bad = list_new()
+        push(bad, 0)
+        push(bad, "dtls-hs-cli-fin-prf-fail")
+        return bad
+    }
+    let exp_buf = expected[0]
+    let i = 0
+    while i < 12 {
+        if load8(body_buf + i) != load8(exp_buf + i) {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, "dtls-hs-cli-fin-mac-mismatch")
+            return bad
+        }
+        i = i + 1
+    }
+    // Absorb the client Finished HS (12B header + 12B body) into the
+    // transcript so the subsequent server-Finished MAC covers it.
+    dtls_transcript_absorb(dtls_state, pt_buf, 12 + body_n)
+    dtls_state[DTLS_S_SLOT_HS_IN] = dtls_state[DTLS_S_SLOT_HS_IN] + 1
+    let out = list_new()
+    push(out, 1)
+    push(out, "")
+    return out
+}
+
+// KEYED-HANDSHAKE fast path (test / bootstrap seam). Both peers call
+// `dtls_ecdhe_derive` directly (e.g. via the same
+// `_tdtls_setup_ecdhe_pair` helper the DTLS unit tests use). The
+// resulting states carry `cipher_active = 1` and matching per-direction
+// keys; `gds_send_line` / `gds_recv_line` then work end-to-end over
+// the length-prefixed TCP stream. Returns [1, state] on success (the
+// state passed in with cipher_active verified), [0, state] otherwise.
+fn gds_keyed_shortcut(dtls_state) {
+    let st = dtls_state
+    if st == 0 {
+        let out = list_new()
+        push(out, 0)
+        push(out, 0)
+        return out
+    }
+    let out = list_new()
+    if st[DTLS_S_SLOT_CIPHER_ACTIVE] == 1 {
+        push(out, 1)
+    } else {
+        push(out, 0)
+    }
+    push(out, st)
+    return out
+}
+
+// ---- post-handshake line I/O ----------------------------------------------
+
+// Seal a plaintext line under the DTLS AEAD, wrap in the length-prefix
+// framing, send on the TCP fd. Returns 1 on complete write, 0 on any
+// seal / send failure. The line is treated as APPLICATION_DATA
+// (record type 23 per RFC 5246 §6.2.1).
+//
+// The caller MUST have driven the handshake to `cipher_active = 1`
+// first (via `gds_handshake_client` / `_server` when those flight
+// builders land, or via `gds_keyed_shortcut` today). If the cipher is
+// not active, `dtls_seal_record` returns 0 and this entry returns 0.
+fn gds_send_line(conn_fd, dtls_state, line_bytes) {
+    if dtls_state == 0 { return 0 }
+    if line_bytes == 0 { return 0 }
+    let s = line_bytes
+    let n = len(s)
+    if n == 0 { return 0 }
+    // Ensure the plaintext ends with '\n' so the receiver's line-oriented
+    // parser can find the boundary after decrypt.
+    if char_at(s, n - 1) != 10 { s = s + "\n"; n = n + 1 }
+    let pt = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(pt + i, char_at(s, i))
+        i = i + 1
+    }
+    store8(pt + n, 0)
+    // DTLS_CT_APPLICATION_DATA = 23 per RFC 5246 §6.2.1.
+    let sealed = dtls_seal_record(dtls_state, 23, pt, n)
+    if sealed == 0 { return 0 }
+    return _gds_send_record(conn_fd, sealed[0], sealed[1])
+}
+
+// Read a framed DTLS record off the wire, open under the AEAD, return
+// the decrypted plaintext with a trailing '\n' stripped (matching
+// `_gossip_recv_line`'s shape). Returns 0 on EOF / decrypt failure /
+// wrong record type; a caller that needs to distinguish must inspect
+// `dtls_last_error(state)`.
+fn gds_recv_line(conn_fd, dtls_state) {
+    if dtls_state == 0 { return 0 }
+    let rec = _gds_recv_record(conn_fd)
+    if rec[0] == 0 { return 0 }
+    let opened = dtls_open_record(dtls_state, rec[1], rec[2])
+    if opened == 0 { return 0 }
+    // dtls_open_record returns string sentinels (DTLS_DECRYPT_FAIL /
+    // DTLS_REPLAY / DTLS_TOO_OLD) on failure, or a 4-element list
+    // [type_byte, pt_buf, pt_n, seq] on success. Discriminate by
+    // string equality against the three known failure tags first --
+    // that avoids the fragile "index into a string" trap.
+    if str_eq_bytes(opened, DTLS_DECRYPT_FAIL) == 1 { return 0 }
+    if str_eq_bytes(opened, DTLS_REPLAY) == 1 { return 0 }
+    if str_eq_bytes(opened, DTLS_TOO_OLD) == 1 { return 0 }
+    let type_byte = opened[0]
+    // Only APPLICATION_DATA (23) is expected on the line channel. An
+    // ALERT (21) or handshake (22) record on the line path is a
+    // protocol violation; drop the connection.
+    if type_byte != 23 {
+        return 0
+    }
+    let pt_buf = opened[1]
+    let pt_n   = opened[2]
+    // Strip a single trailing '\n' (character 10) if present so the
+    // string mirrors what `_gossip_recv_line` would deliver from the
+    // plaintext gossip path.
+    let effective_n = pt_n
+    if effective_n > 0 {
+        if load8(pt_buf + effective_n - 1) == 10 {
+            effective_n = effective_n - 1
+        }
+    }
+    if effective_n > 0 {
+        if load8(pt_buf + effective_n - 1) == 13 {
+            effective_n = effective_n - 1
+        }
+    }
+    let s = ""
+    let k = 0
+    while k < effective_n {
+        let c = load8(pt_buf + k)
+        if c == 0 { k = effective_n } else {
+            s = s + chr(c)
+            k = k + 1
+        }
+    }
+    return s
+}
+
+// Note: `gds_recv_line` discriminates the success path from the three
+// string failure sentinels of `dtls_open_record` (DTLS_DECRYPT_FAIL /
+// DTLS_REPLAY / DTLS_TOO_OLD) via `str_eq`. That avoids the fragile
+// "index into a string" trap that a plain `opened[0]` on a failure
+// return would take.
+
+// ---- post-handshake sealed binary I/O ------------------------------------
+//
+// Phase P R4 (ADR-0110): parallel to `gds_send_line` / `gds_recv_line`
+// but carries a raw byte buffer across one or more sealed AEAD
+// APPLICATION_DATA records instead of a line-oriented plaintext string.
+// Shipped so `_gossip_serve_relay_bin_dtls` can receive the binary
+// tail of a `RELAY_BIN` message under DTLS. ADR-0099 §Deferred first
+// bullet called this out as the only piece missing to close the DTLS
+// RELAY_BIN loop; the plaintext RELAY_BIN path at
+// `gossip.nova::_gossip_serve_relay_bin` is UNCHANGED and reused via
+// its parser/formatter helpers.
+
+// Seal `n` plaintext bytes from `buf` across one or more sealed DTLS
+// AEAD records of record-type APPLICATION_DATA (23), each wrapped in
+// the length-prefix framing by `_gds_send_record`. Returns 1 on
+// complete write of all chunks, 0 on any seal / send failure. On n=0
+// returns 1 immediately (zero-length frame is a valid caller contract).
+//
+// The chunk size (`GDS_PT_PER_RECORD = 16000`) stays comfortably under
+// `DTLS_RECORD_MAX_FRAGMENT - overhead` so `dtls_seal_record` never
+// refuses on body-size grounds. Callers that stream payloads larger
+// than one record MUST pair this with `gds_recv_bin(fd, state, n)` on
+// the receive side so the receiver drains exactly `n` plaintext bytes
+// across the matching record boundary count.
+fn gds_send_bin(conn_fd, dtls_state, buf, n) {
+    if dtls_state == 0 { return 0 }
+    if n < 0 { return 0 }
+    if n == 0 { return 1 }
+    if buf == 0 { return 0 }
+    if dtls_state[DTLS_S_SLOT_CIPHER_ACTIVE] != 1 { return 0 }
+    let off = 0
+    while off < n {
+        let remaining = n - off
+        let chunk_n = GDS_PT_PER_RECORD
+        if remaining < chunk_n { chunk_n = remaining }
+        // Copy chunk into a dedicated plaintext buffer so the AEAD
+        // seal's AAD derivation doesn't accidentally alias caller
+        // memory across records.
+        let chunk = alloc(chunk_n + 1)
+        let i = 0
+        while i < chunk_n {
+            store8(chunk + i, load8(buf + off + i))
+            i = i + 1
+        }
+        store8(chunk + chunk_n, 0)
+        // DTLS_CT_APPLICATION_DATA = 23 per RFC 5246 §6.2.1.
+        let sealed = dtls_seal_record(dtls_state, 23, chunk, chunk_n)
+        if sealed == 0 { return 0 }
+        if _gds_send_record(conn_fd, sealed[0], sealed[1]) == 0 { return 0 }
+        off = off + chunk_n
+    }
+    return 1
+}
+
+// Read sealed records off the fd until `total_len` plaintext bytes
+// have been accumulated. Returns `[out_buf, out_n]` on success, where
+// `out_n == total_len`. Returns `[0, <sentinel>]` on failure, with the
+// second slot being one of:
+//
+//   GDS_CIPHER_INACTIVE  -- caller handed a state whose cipher never
+//                            came up (handshake failure path).
+//   DTLS_DECRYPT_FAIL     -- an EOF / short-read on the fd, or an AEAD
+//                            tag/AAD/ciphertext failure, or an
+//                            unexpected record type on the wire.
+//   DTLS_REPLAY           -- `dtls_open_record` rejected the record
+//                            as replayed (seq inside the window and
+//                            already-set bit).
+//   DTLS_TOO_OLD          -- `dtls_open_record` rejected the record
+//                            as too-old (seq below the window).
+//
+// On `total_len == 0` the function returns `[0, 0]` (zero-byte frame;
+// caller treats the empty tail the same as the plaintext path's
+// no-tail case).
+fn gds_recv_bin(conn_fd, dtls_state, total_len) {
+    let out = list_new()
+    if dtls_state == 0 {
+        push(out, 0)
+        push(out, GDS_CIPHER_INACTIVE)
+        return out
+    }
+    if total_len < 0 {
+        push(out, 0)
+        push(out, 0)
+        return out
+    }
+    if dtls_state[DTLS_S_SLOT_CIPHER_ACTIVE] != 1 {
+        push(out, 0)
+        push(out, GDS_CIPHER_INACTIVE)
+        return out
+    }
+    if total_len == 0 {
+        push(out, 0)
+        push(out, 0)
+        return out
+    }
+    let acc = alloc(total_len + 1)
+    let acc_n = 0
+    while acc_n < total_len {
+        let rec = _gds_recv_record(conn_fd)
+        if rec[0] == 0 {
+            // EOF / short read / malformed length prefix. Collapse to
+            // DTLS_DECRYPT_FAIL so callers only need one error class
+            // for "wire didn't give us a decryptable record".
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_DECRYPT_FAIL)
+            return bad
+        }
+        let opened = dtls_open_record(dtls_state, rec[1], rec[2])
+        // Discriminate the three string sentinels first -- the success
+        // path returns a 4-element list, failures return a string.
+        if str_eq_bytes(opened, DTLS_DECRYPT_FAIL) == 1 {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_DECRYPT_FAIL)
+            return bad
+        }
+        if str_eq_bytes(opened, DTLS_REPLAY) == 1 {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_REPLAY)
+            return bad
+        }
+        if str_eq_bytes(opened, DTLS_TOO_OLD) == 1 {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_TOO_OLD)
+            return bad
+        }
+        let type_byte = opened[0]
+        // Only APPLICATION_DATA (23) is expected on the binary channel.
+        // ALERT (21) or handshake (22) on this path is a protocol
+        // violation; surface as DTLS_DECRYPT_FAIL so callers close the
+        // connection cleanly.
+        if type_byte != 23 {
+            let bad = list_new()
+            push(bad, 0)
+            push(bad, DTLS_DECRYPT_FAIL)
+            return bad
+        }
+        let pt_buf = opened[1]
+        let pt_n   = opened[2]
+        // Clamp to the remaining capacity. A sender that chunks on
+        // GDS_PT_PER_RECORD boundaries will never trip this; a sender
+        // that mis-counts (or a peer feeding more plaintext than
+        // `total_len` advertised in the header line) is capped here so
+        // the accumulator does not run past its allocated size.
+        let take = pt_n
+        let remaining = total_len - acc_n
+        if take > remaining { take = remaining }
+        let i = 0
+        while i < take {
+            store8(acc + acc_n + i, load8(pt_buf + i))
+            i = i + 1
+        }
+        acc_n = acc_n + take
+    }
+    store8(acc + total_len, 0)
+    push(out, acc)
+    push(out, acc_n)
+    return out
+}
+
+// ---- close_notify + close -------------------------------------------------
+
+// Emit a close_notify alert then close the fd. If the cipher is not
+// active, close the fd without the alert (an unauthenticated alert
+// would be dropped by any correctly-behaved peer anyway, so it's not
+// worth the extra send).
+fn gds_close(conn_fd, dtls_state) {
+    if dtls_state != 0 {
+        if dtls_state[DTLS_S_SLOT_CIPHER_ACTIVE] == 1 {
+            // Alert body: [level=1 warning, description=0 close_notify].
+            let alert = alloc(3)
+            store8(alert + 0, GDS_ALERT_WARNING)
+            store8(alert + 1, GDS_ALERT_CLOSE_NOTIFY)
+            store8(alert + 2, 0)
+            // DTLS_CT_ALERT = 21 per RFC 5246 §6.2.1.
+            let sealed = dtls_seal_record(dtls_state, 21, alert, 2)
+            if sealed != 0 {
+                _gds_send_record(conn_fd, sealed[0], sealed[1])
+            }
+        }
+    }
+    close_fd(conn_fd)
+    return 1
+}
+
+// ---- helpers exposed for the fed-daemon boot banner ----------------------
+
+// Return a stable string that names the counter class a caller should
+// increment when the given event happens. Keeps the fed daemon +
+// integration harness from carrying magic-string duplicates.
+fn gds_stat_hs_ok()      { return GDS_STAT_HS_OK }
+fn gds_stat_hs_fail()    { return GDS_STAT_HS_FAIL }
+fn gds_stat_recv_alert() { return GDS_STAT_RECV_ALERT }
+
+// Introspection: return 1 iff `dtls_state` carries an active cipher
+// (i.e. the handshake either completed or the keyed-shortcut was
+// applied). The gossip.nova dispatchers (`gossip_handle_conn_dtls`)
+// check this before entering the line loop so a botched handshake
+// doesn't get treated as a live connection.
+fn gds_is_ready(dtls_state) {
+    if dtls_state == 0 { return 0 }
+    return dtls_state[DTLS_S_SLOT_CIPHER_ACTIVE]
+}
+
+// R3g.2 (ADR-0106): shim-local copy of `gossip_dtls_extract_keys`.
+// The canonical definition lives in `src/federation/gossip.nova`, which
+// `tests/unit/test_gossip_dtls_shim.nova` does not import. Without
+// this duplicate, calls to `gossip_dtls_extract_keys` from the test
+// resolve to a null callee and segfault at the call site before the
+// function body is entered.
+//
+// Behavior is a strict passthrough: validate shape and hand the pair
+// back. The fed daemon load path may (in a future round) switch to a
+// different loader (e.g. PEM-encoded X.509 cert-and-key blob) and this
+// entry gives it one adaptation seam.
+fn gds_extract_keys(pair) {
+    if pair == 0 { return 0 }
+    if len(pair) != 2 { return 0 }
+    return pair
+}

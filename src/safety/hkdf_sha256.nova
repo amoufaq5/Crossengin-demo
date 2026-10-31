@@ -1,0 +1,208 @@
+// CrossEngin safety: HKDF-SHA-256 (RFC 5869) primitive.
+//
+// Purpose
+//   TLS 1.3 (RFC 8446 §7.1) locks its key schedule to HKDF over SHA-256:
+//   every derived secret (early, handshake, master, traffic) and every
+//   record-layer key/IV falls out of a Extract-then-Expand pipeline
+//   whose only cryptographic dependency is HMAC-SHA-256. R88 delivers
+//   that dependency here so R92/R93 can wire the handshake state
+//   machine and the wire-hook flip without pulling any new
+//   primitive in.
+//
+//   HKDF sits on top of `src/safety/sha256.nova` (which already exposes
+//   `hmac_sha256(key_buf, key_n, msg_buf, msg_n)` per RFC 2104). This
+//   file adds NOTHING to the hash surface -- it just composes.
+//
+// API (RFC 5869 §2)
+//   hkdf_extract(salt_buf, salt_len, ikm_buf, ikm_len) -> 33-byte buffer
+//     PRK = HMAC-SHA-256(salt, IKM). When salt_len == 0, RFC 5869 §2.2
+//     specifies substituting 32 zero bytes as the salt. Returns 32
+//     bytes of pseudorandom key + trailing NUL byte (same 33-byte
+//     shape every other digest producer in the tree emits).
+//
+//   hkdf_expand(prk_buf, prk_len, info_buf, info_len, out_len)
+//                                                   -> [okm_buf, out_len]
+//     T(0) = empty; T(i) = HMAC(PRK, T(i-1) || info || i).
+//     OKM = (T(1) || T(2) || ... || T(N)) truncated to out_len bytes.
+//     Enforces out_len in [0, 255 * 32] per RFC 5869 §2.3; larger
+//     values return a NUL buffer + length 0 (refusal is the caller's
+//     signal to alert-close in the TLS context).
+//
+//   hkdf_sha256(salt_buf, salt_len, ikm_buf, ikm_len,
+//               info_buf, info_len, out_len) -> [okm_buf, out_len]
+//     Convenience: Extract then Expand.
+//
+// Byte-buffer discipline
+//   Every input/output is a `[buf, len]` pair (or a `buf`+`len` pair of
+//   arguments). NOVA strings are C-style NUL-terminated and cannot
+//   round-trip arbitrary 8-bit data; every key-schedule input is
+//   arbitrary 8-bit bytes. This matches the convention chacha20.nova,
+//   poly1305.nova, chacha20_poly1305.nova, and sha256.nova use for
+//   their byte-level surfaces.
+//
+// Constant-time / side-channel caveats
+//   HKDF's only crypto call is HMAC-SHA-256, whose constant-time
+//   properties are documented in sha256.nova's header. The
+//   concatenation loops in hkdf_expand are data-independent
+//   (they walk fixed-length T(i) blocks and a public-length `info`).
+//   The refusal branch on `out_len > 8160` compares only against a
+//   public constant; no secret-dependent control flow.
+//
+// Algorithm references
+//   RFC 5869 §2.2 -- HKDF-Extract.
+//   RFC 5869 §2.3 -- HKDF-Expand + the 255*HashLen ceiling.
+//   RFC 5869 Appendix A.1..A.3 -- SHA-256 test vectors (used by
+//                                 tests/unit/test_hkdf_sha256.nova).
+//   RFC 8446 §7.1 -- TLS 1.3 key schedule (HKDF-Expand-Label,
+//                    Derive-Secret; the TLS-specific wrappers live in
+//                    src/net/tls/tls_kdf.nova).
+//
+// ADRs touched: r86-in-process-tls-scaffolding.md (R88 HKDF phase).
+// NOVA dependencies: builtins (alloc / load8 / store8 / list ops).
+// CrossEngin dependencies: src/safety/sha256.nova (HMAC-SHA-256 +
+//   the SHA256_HASH_LEN / SHA256_BLOCK_LEN constants).
+
+import "std/io"
+import "./sha256.nova"
+
+// ============================================================================
+//                          Constants (RFC 5869 §2)
+// ============================================================================
+
+let HKDF_SHA256_HASH_LEN = 32
+// RFC 5869 §2.3: HKDF-Expand output length must satisfy L <= 255*HashLen.
+let HKDF_SHA256_MAX_OKM  = 8160     // 255 * 32
+
+// Return codes for the [okm_buf, okm_len] pair on refusal.
+let _HKDF_REFUSED_LEN = 0
+
+// ============================================================================
+//                          hkdf_extract (RFC 5869 §2.2)
+// ============================================================================
+//
+// PRK = HMAC-SHA-256(salt, IKM). If salt is absent (salt_len == 0), RFC
+// 5869 §2.2 requires substituting a string of HashLen zero bytes -- so
+// we allocate 32 zeros and pass those to HMAC. Note that this is NOT the
+// same as passing a zero-length key: HMAC's key pad would then hash the
+// empty string; RFC 5869 specifically wants the 32-zero-byte salt.
+
+fn hkdf_extract(salt_buf, salt_len, ikm_buf, ikm_len) {
+    if salt_len == 0 {
+        // Materialize the 32-byte zero salt required by RFC 5869 §2.2.
+        let zero_salt = alloc(HKDF_SHA256_HASH_LEN + 1)
+        let i = 0
+        while i < HKDF_SHA256_HASH_LEN {
+            store8(zero_salt + i, 0)
+            i = i + 1
+        }
+        store8(zero_salt + HKDF_SHA256_HASH_LEN, 0)
+        return hmac_sha256(zero_salt, HKDF_SHA256_HASH_LEN,
+                           ikm_buf, ikm_len)
+    }
+    return hmac_sha256(salt_buf, salt_len, ikm_buf, ikm_len)
+}
+
+// ============================================================================
+//                          hkdf_expand (RFC 5869 §2.3)
+// ============================================================================
+//
+// T(0) = empty
+// T(i) = HMAC-SHA-256(PRK, T(i-1) || info || i)   where i is a single
+//                                                 octet, 1-indexed
+// OKM  = first `out_len` bytes of T(1) || T(2) || ... || T(N),
+//        N = ceil(out_len / HashLen), N in [0, 255].
+//
+// Returns [okm_buf, okm_len]. On refusal (out_len < 0 or > 8160) the
+// list is [zero_buf, 0]; the caller must check the length to detect
+// the refusal (a length of 0 with out_len==0 is a legitimate empty
+// output, so callers who ASK for zero bytes get back a legitimate
+// zero-byte buffer -- they only need to distinguish refusal when they
+// asked for >0 bytes).
+
+fn hkdf_expand(prk_buf, prk_len, info_buf, info_len, out_len) {
+    // Refuse invalid lengths. Zero is legal (produces empty OKM).
+    if out_len < 0 {
+        let zero = alloc(1); store8(zero, 0)
+        let r0 = list_new(); push(r0, zero); push(r0, _HKDF_REFUSED_LEN)
+        return r0
+    }
+    if out_len > HKDF_SHA256_MAX_OKM {
+        let zero = alloc(1); store8(zero, 0)
+        let r1 = list_new(); push(r1, zero); push(r1, _HKDF_REFUSED_LEN)
+        return r1
+    }
+    let okm = alloc(out_len + 1)
+    store8(okm + out_len, 0)
+    if out_len == 0 {
+        let r2 = list_new(); push(r2, okm); push(r2, 0)
+        return r2
+    }
+    // How many T(i) blocks do we need?
+    let n_blocks = (out_len + HKDF_SHA256_HASH_LEN - 1) / HKDF_SHA256_HASH_LEN
+    // Working buffer holds T(i-1) || info || i. Its max size is
+    // HashLen + info_len + 1.
+    let t_prev_len = 0
+    let t_prev = alloc(HKDF_SHA256_HASH_LEN + 1)
+    store8(t_prev + HKDF_SHA256_HASH_LEN, 0)
+    let msg_cap = HKDF_SHA256_HASH_LEN + info_len + 1
+    let msg = alloc(msg_cap + 1)
+    let written = 0
+    let i = 1
+    while i <= n_blocks {
+        // Build the HMAC message: T(i-1) || info || counter.
+        let off = 0
+        let j = 0
+        while j < t_prev_len {
+            store8(msg + off + j, load8(t_prev + j))
+            j = j + 1
+        }
+        off = off + t_prev_len
+        j = 0
+        while j < info_len {
+            store8(msg + off + j, load8(info_buf + j))
+            j = j + 1
+        }
+        off = off + info_len
+        // Counter i is a single octet (1..255 fits since n_blocks<=255).
+        store8(msg + off, int_and(i, 255))
+        off = off + 1
+        // T(i) = HMAC(prk, msg).
+        let t_i = hmac_sha256(prk_buf, prk_len, msg, off)
+        // Copy T(i)[0..min(HashLen, out_len - written)] into okm.
+        let take = HKDF_SHA256_HASH_LEN
+        let remain = out_len - written
+        if take > remain { take = remain }
+        let k = 0
+        while k < take {
+            store8(okm + written + k, load8(t_i + k))
+            k = k + 1
+        }
+        written = written + take
+        // Stage T(i) as the next T(i-1) for the following iteration.
+        let m = 0
+        while m < HKDF_SHA256_HASH_LEN {
+            store8(t_prev + m, load8(t_i + m))
+            m = m + 1
+        }
+        t_prev_len = HKDF_SHA256_HASH_LEN
+        i = i + 1
+    }
+    let r = list_new()
+    push(r, okm)
+    push(r, out_len)
+    return r
+}
+
+// ============================================================================
+//                          hkdf_sha256 (convenience wrapper)
+// ============================================================================
+//
+// Extract then Expand in a single call, for callers who don't need
+// to reuse the PRK.
+
+fn hkdf_sha256(salt_buf, salt_len, ikm_buf, ikm_len,
+               info_buf, info_len, out_len) {
+    let prk = hkdf_extract(salt_buf, salt_len, ikm_buf, ikm_len)
+    return hkdf_expand(prk, HKDF_SHA256_HASH_LEN,
+                       info_buf, info_len, out_len)
+}

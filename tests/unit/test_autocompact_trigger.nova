@@ -1,0 +1,265 @@
+// Unit tests for ADR-0086: auto-compact trigger.
+//
+// Verifies the freelist-ratio watcher wired into the autonomous loop:
+//   - kg_freelist_ratio_permille math (empty KG, no reclaims, over threshold,
+//     divide-by-zero guard when atoms_alive == 0);
+//   - _ag_maybe_autocompact only fires when ratio >= threshold, respects the
+//     CHECK_EVERY_TICKS cadence and the per-KG MIN_INTERVAL_TICKS cooldown;
+//   - CROSSENGIN_AUTOCOMPACT_ENABLED=0 disables the watcher entirely;
+//   - two KGs at different ratios: only the over-threshold one compacts;
+//   - after compaction the freelist is empty so the next check does not
+//     re-trigger.
+
+import "../ce_test.nova"
+import "../../src/agent/autonomous_loop.nova"
+
+// ---- helpers --------------------------------------------------------------
+
+// Reclaim `n` atoms out of `total` in-place: adds `total` atoms then reclaims
+// the last `n` (id `total-n` .. `total-1`), leaving `total - n` alive and a
+// freelist of length `n`. Returns the KG.
+fn seed_kg(reg, label, total, reclaim_n) {
+    let kg = kg_spawn(reg, label)
+    let i = 0
+    while i < total {
+        kg_add_atom(kg, ATOM_FACT, "atom" + int_to_str(i), 0)
+        i = i + 1
+    }
+    let j = 0
+    while j < reclaim_n {
+        kg_reclaim_atom(kg, (total - 1) - j)
+        j = j + 1
+    }
+    return kg
+}
+
+// A minimal agent-like list carrying just the slots _ag_maybe_autocompact
+// touches: AG_LAST_COMPACT. All the other slots are irrelevant here, so a
+// full agent_new() would just be tossed cycles.
+fn mini_agent() {
+    let a = list_new()
+    let i = 0
+    while i <= AG_LAST_COMPACT {
+        push(a, 0)
+        i = i + 1
+    }
+    list_set(a, AG_LAST_COMPACT, list_new())
+    return a
+}
+
+// ---- ratio helper ---------------------------------------------------------
+
+fn test_ratio_empty_kg() {
+    let reg = kg_registry_new()
+    let kg = kg_spawn(reg, "empty")
+    ce_eq("freelist size on empty KG", kg_freelist_size(kg), 0)
+    ce_eq("atoms_alive on empty KG", kg_atoms_alive(kg), 0)
+    ce_eq("ratio on empty KG (no divide-by-zero)", kg_freelist_ratio_permille(kg), 0)
+}
+
+fn test_ratio_fresh_kg_no_reclaims() {
+    let reg = kg_registry_new()
+    let kg = seed_kg(reg, "fresh", 10, 0)
+    ce_eq("fresh KG freelist empty", kg_freelist_size(kg), 0)
+    ce_eq("fresh KG has 10 alive", kg_atoms_alive(kg), 10)
+    ce_eq("fresh KG ratio 0", kg_freelist_ratio_permille(kg), 0)
+}
+
+fn test_ratio_over_threshold() {
+    let reg = kg_registry_new()
+    // 5 total, reclaim 1 -> 4 alive + freelist=1 -> 250 permille.
+    let kg = seed_kg(reg, "hot", 5, 1)
+    ce_eq("alive after 1 reclaim", kg_atoms_alive(kg), 4)
+    ce_eq("freelist size 1", kg_freelist_size(kg), 1)
+    ce_eq("ratio = 1*1000/4 = 250 permille", kg_freelist_ratio_permille(kg), 250)
+    ce_check("ratio above default threshold 200", kg_freelist_ratio_permille(kg) >= 200)
+}
+
+fn test_ratio_at_zero_after_all_reclaimed() {
+    let reg = kg_registry_new()
+    // Reclaim EVERY atom: 3 total, reclaim 3 -> 0 alive -> ratio 0 (guard).
+    let kg = seed_kg(reg, "gone", 3, 3)
+    ce_eq("all reclaimed: alive=0", kg_atoms_alive(kg), 0)
+    ce_eq("freelist size 3", kg_freelist_size(kg), 3)
+    ce_eq("ratio 0 when atoms_alive==0", kg_freelist_ratio_permille(kg), 0)
+}
+
+// ---- trigger cadence ------------------------------------------------------
+
+fn test_trigger_no_compaction_when_below_threshold() {
+    _ac_config_reset()
+    let ag = mini_agent()
+    let reg = kg_registry_new()
+    // 10 alive, 1 freelist -> ratio 100 permille < default 200.
+    let kg = seed_kg(reg, "cold", 11, 1)
+    ce_eq("ratio 100 permille (below threshold)",
+          kg_freelist_ratio_permille(kg), 100)
+    // Tick 64 hits the check-every cadence but the ratio is under threshold.
+    let fired = _ag_maybe_autocompact(ag, reg, 64)
+    ce_eq("no compaction fired below threshold", fired, 0)
+    ce_eq("freelist size unchanged", kg_freelist_size(kg), 1)
+}
+
+fn test_trigger_fires_when_over_threshold() {
+    _ac_config_reset()
+    let ag = mini_agent()
+    let reg = kg_registry_new()
+    // 5 total, reclaim 2 -> 3 alive + freelist 2 -> ~667 permille.
+    let kg = seed_kg(reg, "hot", 5, 2)
+    ce_check("ratio above threshold before compaction",
+             kg_freelist_ratio_permille(kg) >= 200)
+    let atoms_before = kg_atoms_alive(kg)
+    let fired = _ag_maybe_autocompact(ag, reg, 64)
+    ce_eq("one compaction fired", fired, 1)
+    ce_eq("freelist empty after compaction", kg_freelist_size(kg), 0)
+    ce_eq("live atom count preserved by compaction",
+          kg_atoms_alive(kg), atoms_before)
+    ce_eq("ratio back to 0 after compaction",
+          kg_freelist_ratio_permille(kg), 0)
+    // last-compact-tick recorded.
+    ce_eq("AG_LAST_COMPACT records tick",
+          _ag_last_compact_get(ag, "hot"), 64)
+}
+
+fn test_trigger_skips_non_check_ticks() {
+    _ac_config_reset()
+    let ag = mini_agent()
+    let reg = kg_registry_new()
+    let kg = seed_kg(reg, "hot", 5, 2)
+    // Tick 1 is not a multiple of CHECK_EVERY_TICKS (default 64), so no check.
+    let fired = _ag_maybe_autocompact(ag, reg, 1)
+    ce_eq("no fire on non-check-every tick", fired, 0)
+    ce_eq("freelist still populated", kg_freelist_size(kg), 2)
+    // Tick 63 also skips.
+    let fired2 = _ag_maybe_autocompact(ag, reg, 63)
+    ce_eq("no fire on tick 63", fired2, 0)
+}
+
+fn test_trigger_second_check_no_retrigger() {
+    _ac_config_reset()
+    let ag = mini_agent()
+    let reg = kg_registry_new()
+    let kg = seed_kg(reg, "hot", 5, 2)
+    _ag_maybe_autocompact(ag, reg, 64)
+    ce_eq("freelist empty", kg_freelist_size(kg), 0)
+    // Next check-every tick: no new reclaims, so ratio 0 -> no compaction.
+    let fired = _ag_maybe_autocompact(ag, reg, 128)
+    ce_eq("no re-trigger after compaction", fired, 0)
+    // last-compact-tick is NOT updated when no compaction fires.
+    ce_eq("last_compact still 64", _ag_last_compact_get(ag, "hot"), 64)
+}
+
+fn test_min_interval_cooldown() {
+    _ac_config_reset()
+    let ag = mini_agent()
+    let reg = kg_registry_new()
+    let kg = seed_kg(reg, "hot", 5, 2)
+    let fired1 = _ag_maybe_autocompact(ag, reg, 64)
+    ce_eq("first compaction fires", fired1, 1)
+    // Immediately re-fill the freelist: reclaim 2 more of the (post-compaction)
+    // live atoms. After compaction, alive atoms are re-indexed to dense ids
+    // 0..2, so ids 1 and 2 are safe to reclaim.
+    kg_reclaim_atom(kg, 1)
+    kg_reclaim_atom(kg, 2)
+    ce_check("freelist repopulated", kg_freelist_size(kg) >= 2)
+    ce_check("ratio again above threshold",
+             kg_freelist_ratio_permille(kg) >= 200)
+    // Tick 128 is a check-every-multiple, but 128 - 64 = 64 < default 1000
+    // MIN_INTERVAL_TICKS, so the compaction is suppressed by the cooldown.
+    let fired2 = _ag_maybe_autocompact(ag, reg, 128)
+    ce_eq("cooldown suppresses second compaction", fired2, 0)
+    ce_check("freelist unchanged (cooldown)", kg_freelist_size(kg) >= 2)
+    // After MIN_INTERVAL_TICKS has passed, the next check fires.
+    // 64 + 1000 = 1064; the next check-every-multiple >= 1064 is 1088.
+    let fired3 = _ag_maybe_autocompact(ag, reg, 1088)
+    ce_eq("compaction fires again after cooldown", fired3, 1)
+    ce_eq("freelist empty after second compaction",
+          kg_freelist_size(kg), 0)
+    ce_eq("last_compact_tick updated",
+          _ag_last_compact_get(ag, "hot"), 1088)
+}
+
+// ---- disabled via env -----------------------------------------------------
+
+fn test_disabled_via_env() {
+    _ac_config_reset()
+    // Note: this exercises the env-off path via a direct config poke -- setting
+    // an env var from a test would leak across test order. Force the loaded
+    // config to disabled and assert the watcher becomes a no-op.
+    _ac_cfg_loaded = 1
+    _ac_cfg_enabled = 0
+    _ac_cfg_thresh  = 200
+    _ac_cfg_min_iv  = 1000
+    _ac_cfg_every   = 64
+    let ag = mini_agent()
+    let reg = kg_registry_new()
+    let kg = seed_kg(reg, "hot", 5, 2)
+    ce_check("ratio above threshold",
+             kg_freelist_ratio_permille(kg) >= 200)
+    let fired = _ag_maybe_autocompact(ag, reg, 64)
+    ce_eq("disabled: no fire even at over-threshold check tick", fired, 0)
+    ce_eq("freelist untouched when disabled",
+          kg_freelist_size(kg), 2)
+    // Restore defaults so the next test runs with the enabled watcher.
+    _ac_config_reset()
+}
+
+// ---- multi-KG isolation ---------------------------------------------------
+
+fn test_two_kgs_only_over_threshold_compacts() {
+    _ac_config_reset()
+    let ag = mini_agent()
+    let reg = kg_registry_new()
+    // KG A: 10 total, 1 reclaimed -> 9 alive + freelist 1 -> 111 permille (< 200).
+    let kg_a = seed_kg(reg, "cold_kg", 10, 1)
+    ce_eq("cold_kg under threshold",
+          kg_freelist_ratio_permille(kg_a), 111)
+    // KG B: 5 total, 2 reclaimed -> 3 alive + freelist 2 -> 666 permille.
+    let kg_b = seed_kg(reg, "hot_kg", 5, 2)
+    ce_check("hot_kg over threshold",
+             kg_freelist_ratio_permille(kg_b) >= 200)
+    let fired = _ag_maybe_autocompact(ag, reg, 64)
+    ce_eq("exactly one KG compacted", fired, 1)
+    // The cold KG's freelist is untouched.
+    ce_eq("cold_kg freelist unchanged", kg_freelist_size(kg_a), 1)
+    // The hot KG was compacted.
+    ce_eq("hot_kg freelist empty", kg_freelist_size(kg_b), 0)
+    // last-compact tick recorded only for the hot KG.
+    ce_eq("cold_kg never compacted",
+          _ag_last_compact_get(ag, "cold_kg"), 0)
+    ce_eq("hot_kg last_compact at 64",
+          _ag_last_compact_get(ag, "hot_kg"), 64)
+}
+
+// ---- config defaults ------------------------------------------------------
+
+fn test_config_defaults() {
+    _ac_config_reset()
+    // No env vars set in this test run, so all four config values should be
+    // the compiled-in defaults.
+    ce_eq("default enabled = 1", _ac_config_enabled(), 1)
+    ce_eq("default threshold = 200 permille",
+          _ac_config_threshold_permille(), 200)
+    ce_eq("default min-interval = 1000 ticks",
+          _ac_config_min_interval_ticks(), 1000)
+    ce_eq("default check-every = 64 ticks",
+          _ac_config_check_every_ticks(), 64)
+}
+
+fn main() {
+    test_ratio_empty_kg()
+    test_ratio_fresh_kg_no_reclaims()
+    test_ratio_over_threshold()
+    test_ratio_at_zero_after_all_reclaimed()
+    test_trigger_no_compaction_when_below_threshold()
+    test_trigger_fires_when_over_threshold()
+    test_trigger_skips_non_check_ticks()
+    test_trigger_second_check_no_retrigger()
+    test_min_interval_cooldown()
+    test_disabled_via_env()
+    test_two_kgs_only_over_threshold_compacts()
+    test_config_defaults()
+    ce_summary("autocompact_trigger")
+}
+
+main()

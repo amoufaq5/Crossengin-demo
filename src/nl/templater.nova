@@ -1,0 +1,412 @@
+// CrossEngin NL Surface: deterministic ProposalResult -> English renderer
+// (ADR-0104 R48p4; R52 wires style capsules per ADR-0108).
+//
+// This module is LLM-FREE by design. Same input -> same output, forever.
+// The R52 style-capsule wiring keeps that guarantee: the templater now
+// reads a `Style Capsule` (from src/capsules/style_capsule.nova) to
+// pick wording + section presence, but the (PR, style) pair is still
+// deterministic -- same PR + same style => same rendered string. An
+// audit reader can re-derive the exact string a user saw from the
+// ProposalResult alone as long as the style capsule that rendered it
+// is known (its name is on the trailer).
+//
+// Rendered structure for an OK ProposalResult (default style):
+//
+//   <proposal body from the skill>
+//
+//   Sources cited (N atoms):
+//     - [kg_label] atom_label: belief M/1000
+//     ...
+//
+//   ⚠ Sources disagree on 'label' (spread S milli, K sources).      (if any spread >= 300)
+//     ...
+//
+//   Persona projection: valence +V, arousal A, risk R/1000.
+//     N similar past decisions; M matching preferences.
+//                                                       (if projection is non-neutral)
+//
+//   Would perform (described, not executed):
+//     - name(arg1, arg2)                                (if any effector calls)
+//
+//   Confidence: C/1000  |  parser: P  |  style: S
+//
+// For a REFUSED ProposalResult, only the refusal line + trailer are
+// emitted. Sources/projection/effector-calls sections are suppressed
+// (the proposal never ran; nothing to describe).
+//
+// Style capsules (R52) can swap wording + hide sections. The
+// STRUCTURE (which sections in which order) stays fixed. A style
+// capsule can never make a refusal look like a success or vice-versa.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/nl/query_shape.nova
+//   src/nl/executor.nova
+//   src/skills/skill_supervisor.nova (ProposalResult accessors)
+//   src/persona/persona.nova + persona_project.nova
+//   src/kg/atom_store.nova (atom_kg / atom_label / atom_confidence)
+//   src/capsules/style_capsule.nova (knob object + registry)
+//   src/util/str_safe.nova.
+
+import "./query_shape.nova"
+import "./executor.nova"
+import "../skills/skill_supervisor.nova"
+import "../persona/persona.nova"
+import "../persona/persona_project.nova"
+import "../kg/atom_store.nova"
+import "../capsules/style_capsule.nova"
+import "../util/str_safe.nova"
+
+// ---- small formatting helpers --------------------------------------------
+
+// Signed integer with explicit '+' for non-negative values. Matches the
+// convention used across CrossEngin telemetry ("valence +425").
+fn _t_signed(n) {
+    if n >= 0 { return "+" + int_to_str(n) }
+    return int_to_str(n)
+}
+
+// Style-capsule name to render in the trailer. Empty ref => "default".
+fn _t_style_name_for(persona) {
+    if persona == 0 { return "default" }
+    let s = persona_style_capsule(persona)
+    if len(s) == 0 { return "default" }
+    return s
+}
+
+// Resolve the style capsule the given persona names. Unknown names fall
+// back to the "default" style (registry_lookup handles that). Never
+// returns 0 -- callers can always read knobs off the returned object.
+fn _t_resolve_style(persona) {
+    return style_registry_lookup(_t_style_name_for(persona))
+}
+
+// A projection is "interesting" (worth surfacing) when any of its
+// numeric fields moved off 0 OR any similar/pref list is non-empty.
+// A neutral projection (empty proposal, no history, no prefs) reads
+// as all-zeros/empty-lists and would render as a pure-noise line.
+fn _t_projection_interesting(proj) {
+    if proj == 0 { return 0 }
+    if proj_valence_shift(proj) != 0 { return 1 }
+    if proj_arousal_shift(proj) != 0 { return 1 }
+    if proj_risk_score(proj)    != 0 { return 1 }
+    if proj_similar_count(proj) > 0  { return 1 }
+    if proj_pref_match_count(proj) > 0 { return 1 }
+    return 0
+}
+
+// ---- sources listing (cited atoms) ---------------------------------------
+
+// Render the "Sources cited" block using knobs from `style`. Order =
+// order atoms were added by the policy; stable + audit-reproducible.
+fn _t_render_sources(atoms, style) {
+    let n = len(atoms)
+    if n == 0 { return "" }
+    let hdr2 = style_sources_hdr_2_plur(style)
+    if n == 1 { hdr2 = style_sources_hdr_2_sing(style) }
+    let s = style_sources_hdr_1(style) + int_to_str(n) + hdr2
+    let kg_open  = style_source_kg_open(style)
+    let kg_close = style_source_kg_close(style)
+    let bel_pre  = style_source_belief_prefix(style)
+    let bel_suf  = style_source_belief_suffix(style)
+    let bullet   = style_bullet(style)
+    let i = 0
+    while i < n {
+        let a = atoms[i]
+        if a != 0 {
+            s = s + bullet + kg_open + atom_kg(a) + kg_close
+                + atom_label(a) + bel_pre + int_to_str(atom_confidence(a)) + bel_suf
+        }
+        i = i + 1
+    }
+    return s
+}
+
+// ---- disagreement scan ---------------------------------------------------
+//
+// Two atoms with the same label on DIFFERENT KGs whose belief means
+// differ by >= 300 milli surface as a disagreement callout. The
+// threshold matches RESEARCH_DEFAULT_SPREAD in research_skill so a
+// user reading the templated answer sees the same disagreement the
+// skill's own conflict scan flagged.
+
+let TEMPLATE_DISAGREE_SPREAD = 300
+
+// Case-sensitive label match: was `label` already seen in `seen_labels`?
+fn _t_label_seen(seen_labels, label) {
+    let i = 0
+    while i < len(seen_labels) {
+        if str_eq_bytes(seen_labels[i], label) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Is `kg_label` already in `seen_kgs`?
+fn _t_kg_seen(seen_kgs, kg_label) {
+    let i = 0
+    while i < len(seen_kgs) {
+        if str_eq_bytes(seen_kgs[i], kg_label) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// For a given label, walk the atom list and collect (kg, mean) pairs,
+// deduplicating on KG (first-seen wins). Returns a pair of parallel
+// lists: [kgs, means].
+fn _t_collect_for_label(atoms, label) {
+    let kgs   = list_new()
+    let means = list_new()
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            if str_eq_bytes(atom_label(a), label) == 1 {
+                let k = atom_kg(a)
+                if _t_kg_seen(kgs, k) == 0 {
+                    push(kgs, k)
+                    push(means, atom_confidence(a))
+                }
+            }
+        }
+        i = i + 1
+    }
+    let pair = list_new()
+    push(pair, kgs)
+    push(pair, means)
+    return pair
+}
+
+// Max - min over a list of ints; 0 if fewer than 2 entries.
+fn _t_spread(nums) {
+    let n = len(nums)
+    if n < 2 { return 0 }
+    let mn = nums[0]
+    let mx = nums[0]
+    let i = 1
+    while i < n {
+        if nums[i] < mn { mn = nums[i] }
+        if nums[i] > mx { mx = nums[i] }
+        i = i + 1
+    }
+    return mx - mn
+}
+
+// Render the "Sources disagree" block via `style` knobs. Returns "" if
+// no label has cross-KG spread >= threshold.
+fn _t_render_disagreements(atoms, style) {
+    let out = ""
+    let hdr1   = style_disagree_hdr_1(style)
+    let hdr2   = style_disagree_hdr_2(style)
+    let hdr3   = style_disagree_hdr_3(style)
+    let hdr4   = style_disagree_hdr_4(style)
+    let indent = style_disagree_item_indent(style)
+    let mid    = style_disagree_item_mid(style)
+    let seen_labels = list_new()
+    let i = 0
+    while i < len(atoms) {
+        let a = atoms[i]
+        if a != 0 {
+            let lab = atom_label(a)
+            if _t_label_seen(seen_labels, lab) == 0 {
+                push(seen_labels, lab)
+                let pair  = _t_collect_for_label(atoms, lab)
+                let kgs   = pair[0]
+                let means = pair[1]
+                if len(kgs) >= 2 {
+                    let spread = _t_spread(means)
+                    if spread >= TEMPLATE_DISAGREE_SPREAD {
+                        out = out + hdr1 + lab + hdr2 + int_to_str(spread)
+                            + hdr3 + int_to_str(len(kgs)) + hdr4
+                        let ki = 0
+                        while ki < len(kgs) {
+                            out = out + indent + kgs[ki] + mid
+                                + int_to_str(means[ki]) + "\n"
+                            ki = ki + 1
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- persona projection line ---------------------------------------------
+
+fn _t_render_projection(proj, style) {
+    if _t_projection_interesting(proj) == 0 { return "" }
+    let s = style_projection_label(style) + _t_signed(proj_valence_shift(proj))
+          + style_projection_mid_1(style) + int_to_str(proj_arousal_shift(proj))
+          + style_projection_mid_2(style) + int_to_str(proj_risk_score(proj))
+          + style_projection_suffix(style)
+    let nsim  = proj_similar_count(proj)
+    let npref = proj_pref_match_count(proj)
+    if nsim > 0 {
+        s = s + "  " + int_to_str(nsim) + " similar past decision"
+        if nsim != 1 { s = s + "s" }
+        if npref > 0 {
+            s = s + "; " + int_to_str(npref) + " matching preference"
+            if npref != 1 { s = s + "s" }
+        }
+        s = s + ".\n"
+    } else {
+        if npref > 0 {
+            s = s + "  " + int_to_str(npref) + " matching preference"
+            if npref != 1 { s = s + "s" }
+            s = s + ".\n"
+        }
+    }
+    return s
+}
+
+// ---- effector calls (described, NOT executed) ----------------------------
+
+fn _t_render_args(args) {
+    let s = ""
+    let n = len(args)
+    let i = 0
+    while i < n {
+        if i > 0 { s = s + ", " }
+        s = s + args[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn _t_render_effector_calls(calls, style) {
+    let n = len(calls)
+    if n == 0 { return "" }
+    let s = style_effector_hdr(style)
+    let bullet = style_bullet(style)
+    let i = 0
+    while i < n {
+        let c = calls[i]
+        s = s + bullet + c[0] + "(" + _t_render_args(c[1]) + ")\n"
+        i = i + 1
+    }
+    return s
+}
+
+// ---- trailer -------------------------------------------------------------
+
+fn _t_render_trailer(confidence, parser_used, persona, style) {
+    return style_trailer_hdr_1(style) + int_to_str(confidence)
+         + style_trailer_hdr_2(style) + parser_used
+         + style_trailer_hdr_3(style) + _t_style_name_for(persona)
+         + style_trailer_suffix(style)
+}
+
+// ---- ProposalResult renderer ---------------------------------------------
+
+// Render a ProposalResult from a skill run. `parser_used` and `persona`
+// are external context the templater surfaces in the trailer / uses to
+// pick the style capsule that controls wording.
+fn templater_render_proposal(pr, parser_used, persona) {
+    if pr == 0 {
+        return "(no proposal produced)\n"
+    }
+    let style = _t_resolve_style(persona)
+    // ---- refusal short-circuit --------------------------------------
+    if skill_pr_ok(pr) == 0 {
+        let out = style_refusal_hdr(style) + skill_pr_refusal_reason(pr) + "\n"
+        if style_show_trailer(style) == 1 {
+            out = out + _t_render_trailer(skill_pr_confidence(pr),
+                                          parser_used, persona, style)
+        }
+        return out
+    }
+    // ---- happy path --------------------------------------------------
+    let out = ""
+    let hdr = style_answer_header(style)
+    if len(hdr) > 0 { out = out + hdr }
+    let body = skill_pr_proposal(pr)
+    if len(body) > 0 { out = out + body + "\n" }
+    let atoms = skill_pr_atoms(pr)
+    if len(atoms) > 0 {
+        if style_show_sources(style) == 1 {
+            out = out + "\n" + _t_render_sources(atoms, style)
+        }
+        if style_show_disagreements(style) == 1 {
+            out = out + _t_render_disagreements(atoms, style)
+        }
+    }
+    if style_show_projection(style) == 1 {
+        out = out + _t_render_projection(skill_pr_projection(pr), style)
+    }
+    if style_show_effectors(style) == 1 {
+        out = out + _t_render_effector_calls(skill_pr_effector_calls(pr), style)
+    }
+    if style_show_trailer(style) == 1 {
+        out = out + _t_render_trailer(skill_pr_confidence(pr),
+                                      parser_used, persona, style)
+    }
+    return out
+}
+
+// ---- ExecutionResult renderer (dispatch: proposal | admin | refusal) -----
+
+// Render an admin action queued by the executor. The chat / RPC layer
+// still has to run the action; the templater just tells the user what
+// was queued so they can trace it. Wording is fixed here (not
+// style-driven) because it's a system-level status message, not user-
+// facing prose.
+fn _t_render_admin(action, args) {
+    let s = "Admin action queued: " + action
+    if len(args) == 0 { return s + "\n" }
+    s = s + "("
+    let i = 0
+    while i < len(args) {
+        if i > 0 { s = s + ", " }
+        s = s + args[i]
+        i = i + 1
+    }
+    return s + ")\n"
+}
+
+// Top-level renderer for an ExecutionResult. Callers hand the returned
+// string to their transport (chat print / JSON-RPC reply / voice TTS).
+//
+// Uses `nl_er_set_templated_answer` as its final side-effect so the
+// same ExecutionResult can flow to downstream consumers (audit reader,
+// UI toast, log) without re-rendering.
+fn templater_render(er, persona) {
+    if er == 0 { return "(no execution result)\n" }
+    let parser_used = nl_er_parser_used(er)
+    let style = _t_resolve_style(persona)
+    // ---- NL-layer refusal (query invalid, no registry, etc.) ---------
+    if nl_er_ok(er) == 0 {
+        let out = "⚠ Cannot answer: " + nl_er_refusal_reason(er) + "\n"
+        if style_show_trailer(style) == 1 {
+            out = out + _t_render_trailer(0, parser_used, persona, style)
+        }
+        nl_er_set_templated_answer(er, out)
+        return out
+    }
+    // ---- Admin action delegated to caller ----------------------------
+    let admin = nl_er_admin_action(er)
+    if len(admin) > 0 {
+        let out = _t_render_admin(admin, nl_er_admin_args(er))
+        if style_show_trailer(style) == 1 {
+            out = out + _t_render_trailer(0, parser_used, persona, style)
+        }
+        nl_er_set_templated_answer(er, out)
+        return out
+    }
+    // ---- NONE kind (empty input) -------------------------------------
+    let pr = nl_er_proposal_result(er)
+    if pr == 0 {
+        let out = "(nothing to answer)\n"
+        if style_show_trailer(style) == 1 {
+            out = out + _t_render_trailer(0, parser_used, persona, style)
+        }
+        nl_er_set_templated_answer(er, out)
+        return out
+    }
+    // ---- Skill proposal ---------------------------------------------
+    let out = templater_render_proposal(pr, parser_used, persona)
+    nl_er_set_templated_answer(er, out)
+    return out
+}

@@ -1,0 +1,336 @@
+// Unit tests for examples/crossengin_fed_daemon.nova R2 distributed-
+// rules wiring (Phase M R2, ADR-0090).
+//
+// Coverage (~30 assertions) -- the daemon's env-config resolver for
+// CE_FED_DR_ENABLED, plus the bootstrap + rule-add + run-round +
+// run-to-fixpoint flow of distributed_rules itself when wired against
+// a gossip state + a fresh rule engine + a local KG. All I/O-free
+// (no gossip listener, no real DRFETCH round-trip); the live wire path
+// is covered by tests/integration/scenario_eeee_distributed_rules.sh.
+//
+// NOVA has no `setenv`; the resolver is a pure function taking the raw
+// env value as an argument (mirrors test_fed_daemon_leader.nova and
+// test_fed_daemon_boot.nova).
+//
+// Coverage map:
+//   1. Env-flag resolver: default when input is 0 / empty, only "0"
+//      disables, all other non-empty values enabled.
+//   2. dr_init(gs, engine): returns a well-shaped dr_state; counters at
+//      zero; gossip_set_dr_state wired.
+//   3. dr_add_rule(dr, valid_rule): appends to engine, bumps rules_tx.
+//   4. dr_add_rule(dr, malformed): returns error tuple; rule count
+//      unchanged; rules_tx unchanged.
+//   5. dr_run_round derives from a parent-chain fixture (matches R21B's
+//      unit test path).
+//   6. dr_run_to_fixpoint terminates within max_rounds and returns
+//      [total, rounds]; max_rounds=0 falls back to DR_DEFAULT_MAX_ROUNDS.
+//   7. dr_provenance_count grows after a run.
+//   8. Env-disabled path: dr_enabled=0 -> daemon skips dr_init.
+
+import "../ce_test.nova"
+import "../../src/kg/atom_store.nova"
+import "../../src/kg/multi_kg_manager.nova"
+import "../../src/kg/rule_inference.nova"
+import "../../src/federation/gossip.nova"
+import "../../src/federation/distributed_rules.nova"
+
+// ---- daemon-parity pure resolver ----------------------------------------
+
+// Byte-identical to _fed_bool_from_env_value in the daemon (default-on
+// flavour used by _fed_dr_enabled_from_env).
+fn _t_bool_from_env_value(v, default_on) {
+    if v == 0 { return default_on }
+    if len(v) == 0 { return default_on }
+    if str_eq_bytes(v, "0") == 1 { return 0 }
+    return 1
+}
+
+fn _t_dr_enabled_resolve(v) {
+    return _t_bool_from_env_value(v, 1)
+}
+
+// ---- fixtures -----------------------------------------------------------
+
+fn _mk_gs() { return gossip_init("127.0.0.1:9990", 0) }
+
+fn _mk_dr() {
+    let gs = _mk_gs()
+    let eng = rule_engine_new()
+    return dr_init(gs, eng)
+}
+
+fn _empty_kg() {
+    let reg = kg_registry_new()
+    return kg_spawn(reg, "test_dr_fed")
+}
+
+fn _seed_parent_chain(kg, n) {
+    // Seed n `parent(i, i+1)` relation atoms so an `ancestor` rule
+    // has facts to fire on.
+    let i = 0
+    while i < n {
+        let label = "parent|" + int_to_str(i) + "|" + int_to_str(i + 1)
+        kg_add_atom(kg, ATOM_RELATION, label, 0)
+        i = i + 1
+    }
+    return kg
+}
+
+// ---- env-flag resolver --------------------------------------------------
+
+fn test_dr_enabled_default_when_null() {
+    ce_eq("null env -> enabled (default 1)", _t_dr_enabled_resolve(0), 1)
+}
+
+fn test_dr_enabled_default_when_empty() {
+    ce_eq("empty env -> enabled (default 1)", _t_dr_enabled_resolve(""), 1)
+}
+
+fn test_dr_enabled_disabled_by_literal_zero() {
+    ce_eq("'0' env -> disabled", _t_dr_enabled_resolve("0"), 0)
+}
+
+fn test_dr_enabled_passes_through_one() {
+    ce_eq("'1' env -> enabled", _t_dr_enabled_resolve("1"), 1)
+}
+
+fn test_dr_enabled_passes_through_other_nonempty() {
+    ce_eq("'on' env -> enabled (only '0' disables)",
+          _t_dr_enabled_resolve("on"), 1)
+}
+
+// ---- dr bootstrap -------------------------------------------------------
+
+fn test_dr_init_returns_wellformed_state() {
+    let gs = _mk_gs()
+    let eng = rule_engine_new()
+    let dr = dr_init(gs, eng)
+    ce_check("dr_init returns non-null", dr != 0)
+    ce_check("dr_is_state recognises the state",
+             dr_is_state(dr) == 1)
+    ce_check("dr_engine returns the engine",
+             dr_engine(dr) == eng)
+}
+
+fn test_dr_init_counters_start_at_zero() {
+    let dr = _mk_dr()
+    ce_eq("bootstrap rules = 0", dr_rule_count(dr), 0)
+    ce_eq("bootstrap inbound rules = 0",
+          dr_inbound_rule_count(dr), 0)
+    ce_eq("bootstrap inbound derivs = 0",
+          dr_inbound_deriv_count(dr), 0)
+    ce_eq("bootstrap derived = 0", dr_stats_derived(dr), 0)
+    ce_eq("bootstrap rounds = 0", dr_stats_rounds(dr), 0)
+    ce_eq("bootstrap rules_tx = 0", dr_stats_rules_tx(dr), 0)
+    ce_eq("bootstrap derivs_tx = 0", dr_stats_derivs_tx(dr), 0)
+}
+
+fn test_dr_init_installs_on_gossip() {
+    // dr_init should call gossip_set_dr_state(gs, dr) so inbound RULE /
+    // DERIVATION lines route to this dr without a separate hook call.
+    let gs = _mk_gs()
+    let eng = rule_engine_new()
+    let dr = dr_init(gs, eng)
+    ce_check("gossip_dr_state is wired to the new dr",
+             gossip_dr_state(gs) == dr)
+}
+
+// ---- dr_add_rule --------------------------------------------------------
+
+fn test_dr_add_rule_valid_returns_one() {
+    let dr = _mk_dr()
+    let r = dr_add_rule(dr,
+        "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    ce_eq("dr_add_rule returns 1 on success", r, 1)
+    ce_eq("engine has 1 rule after add", dr_rule_count(dr), 1)
+    // rules_tx counter bumps even with 0 alive peers (broadcast attempt
+    // is counted; the actual best-effort I/O is silent on no peers).
+    ce_eq("stats_rules_tx bumps to 1",
+          dr_stats_rules_tx(dr), 1)
+}
+
+fn test_dr_add_rule_second_call_appends() {
+    let dr = _mk_dr()
+    dr_add_rule(dr, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    dr_add_rule(dr,
+        "RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)")
+    ce_eq("two rules registered", dr_rule_count(dr), 2)
+    ce_eq("stats_rules_tx bumps to 2",
+          dr_stats_rules_tx(dr), 2)
+}
+
+fn test_dr_add_rule_malformed_returns_error() {
+    let dr = _mk_dr()
+    // No leading "RULE " keyword -> R20B parser rejects.
+    let r = dr_add_rule(dr, "not-a-rule-at-all")
+    ce_check("dr_add_rule returns error on malformed rule",
+             _rule_is_error(r) == 1)
+    ce_eq("engine still has 0 rules after refused add",
+          dr_rule_count(dr), 0)
+    // Broadcast is suppressed on parse failure -- rules_tx stays at 0.
+    ce_eq("stats_rules_tx stays 0 on refused rule",
+          dr_stats_rules_tx(dr), 0)
+}
+
+// ---- dr_run_round -------------------------------------------------------
+
+fn test_dr_run_round_derives_from_parent_chain() {
+    let dr = _mk_dr()
+    let kg = _empty_kg()
+    _seed_parent_chain(kg, 3)   // parent(0,1), parent(1,2), parent(2,3)
+    dr_add_rule(dr, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    let n = dr_run_round(dr, kg)
+    // 3 parent facts feed 3 ancestor derivations in one round.
+    ce_eq("first round derives 3 ancestors", n, 3)
+    ce_eq("stats_derived cumulates the round",
+          dr_stats_derived(dr), 3)
+    ce_eq("stats_rounds = 1", dr_stats_rounds(dr), 1)
+    ce_eq("last_derived tracks the round", dr_last_derived(dr), 3)
+}
+
+fn test_dr_run_round_second_round_no_new_derivations() {
+    // Base rule only -- no transitive step -- so a second round derives 0.
+    let dr = _mk_dr()
+    let kg = _empty_kg()
+    _seed_parent_chain(kg, 3)
+    dr_add_rule(dr, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    dr_run_round(dr, kg)
+    let n = dr_run_round(dr, kg)
+    ce_eq("second round produces 0 new (all cached)", n, 0)
+    ce_eq("stats_rounds = 2", dr_stats_rounds(dr), 2)
+    ce_eq("stats_derived still 3 (no new)",
+          dr_stats_derived(dr), 3)
+}
+
+// ---- dr_run_to_fixpoint -------------------------------------------------
+
+fn test_dr_run_to_fixpoint_terminates() {
+    // Transitive-closure rule set -- ancestor chain unfolds to the full
+    // closure over the parent chain and then terminates.
+    let dr = _mk_dr()
+    let kg = _empty_kg()
+    _seed_parent_chain(kg, 4)   // parent 0->1, 1->2, 2->3, 3->4
+    dr_add_rule(dr, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    dr_add_rule(dr,
+        "RULE ancestor(?a, ?c) <- ancestor(?a, ?b), parent(?b, ?c)")
+    let r = dr_run_to_fixpoint(dr, kg, 0)
+    ce_check("fixpoint result is [total, rounds]", len(r) == 2)
+    let total  = r[0]
+    let rounds = r[1]
+    // Full transitive closure over 4 parent edges = C(5,2) - 4 = 6
+    // ancestor facts NOT in the parent set + 4 direct = 10 -- but the
+    // engine only counts NEW atoms per round, so total >= 4.
+    ce_check("total derivations > 0", total > 0)
+    // Termination within DR_DEFAULT_MAX_ROUNDS (=50). With a 4-hop
+    // chain we converge well before the cap.
+    ce_check("rounds within max_rounds", rounds <= DR_DEFAULT_MAX_ROUNDS)
+    ce_check("rounds > 0 (some work done)", rounds > 0)
+}
+
+fn test_dr_run_to_fixpoint_max_rounds_zero_uses_default() {
+    let dr = _mk_dr()
+    let kg = _empty_kg()
+    _seed_parent_chain(kg, 2)
+    dr_add_rule(dr, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    // max_rounds=0 falls back to DR_DEFAULT_MAX_ROUNDS (50).
+    let r = dr_run_to_fixpoint(dr, kg, 0)
+    ce_check("fixpoint with cap=0 still terminates",
+             r[1] <= DR_DEFAULT_MAX_ROUNDS)
+    ce_eq("last_rounds tracks the run",
+          dr_last_rounds(dr), r[1])
+}
+
+fn test_dr_run_to_fixpoint_max_rounds_small_cap() {
+    let dr = _mk_dr()
+    let kg = _empty_kg()
+    _seed_parent_chain(kg, 3)
+    dr_add_rule(dr, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    // Cap at 1 round: the engine stops early.
+    let r = dr_run_to_fixpoint(dr, kg, 1)
+    ce_check("small cap terminates at cap", r[1] <= 1)
+}
+
+// ---- provenance ---------------------------------------------------------
+
+fn test_dr_provenance_count_grows_after_run() {
+    let dr = _mk_dr()
+    let kg = _empty_kg()
+    _seed_parent_chain(kg, 2)
+    dr_add_rule(dr, "RULE ancestor(?a, ?b) <- parent(?a, ?b)")
+    let before = dr_provenance_count(dr)
+    dr_run_round(dr, kg)
+    let after = dr_provenance_count(dr)
+    ce_check("provenance count grows after run", after > before)
+}
+
+// ---- env-disabled path --------------------------------------------------
+
+fn test_env_disabled_daemon_skips_dr_init() {
+    let enabled = _t_dr_enabled_resolve("0")
+    let gs = _mk_gs()
+    let dr_engine = 0
+    let dr = 0
+    if enabled == 1 {
+        dr_engine = rule_engine_new()
+        dr = dr_init(gs, dr_engine)
+    }
+    ce_eq("CE_FED_DR_ENABLED=0 -> dr stays 0", dr, 0)
+    ce_eq("CE_FED_DR_ENABLED=0 -> engine stays 0", dr_engine, 0)
+    // The gossip dr_state hook is also NOT installed.
+    ce_check("gossip_dr_state stays 0 on disabled path",
+             gossip_dr_state(gs) == 0)
+}
+
+fn test_env_enabled_daemon_allocates_dr() {
+    let enabled = _t_dr_enabled_resolve(0)   // null -> default 1
+    let gs = _mk_gs()
+    let dr = 0
+    if enabled == 1 {
+        let eng = rule_engine_new()
+        dr = dr_init(gs, eng)
+    }
+    ce_check("null CE_FED_DR_ENABLED -> dr allocated", dr != 0)
+    ce_check("gossip_dr_state wired",
+             gossip_dr_state(gs) == dr)
+}
+
+// ---- main --------------------------------------------------------------
+
+fn main() {
+    // env flag
+    test_dr_enabled_default_when_null()
+    test_dr_enabled_default_when_empty()
+    test_dr_enabled_disabled_by_literal_zero()
+    test_dr_enabled_passes_through_one()
+    test_dr_enabled_passes_through_other_nonempty()
+
+    // bootstrap
+    test_dr_init_returns_wellformed_state()
+    test_dr_init_counters_start_at_zero()
+    test_dr_init_installs_on_gossip()
+
+    // add_rule
+    test_dr_add_rule_valid_returns_one()
+    test_dr_add_rule_second_call_appends()
+    test_dr_add_rule_malformed_returns_error()
+
+    // run_round
+    test_dr_run_round_derives_from_parent_chain()
+    test_dr_run_round_second_round_no_new_derivations()
+
+    // fixpoint
+    test_dr_run_to_fixpoint_terminates()
+    test_dr_run_to_fixpoint_max_rounds_zero_uses_default()
+    test_dr_run_to_fixpoint_max_rounds_small_cap()
+
+    // provenance
+    test_dr_provenance_count_grows_after_run()
+
+    // env-disabled
+    test_env_disabled_daemon_skips_dr_init()
+    test_env_enabled_daemon_allocates_dr()
+
+    ce_summary("fed_daemon_rules")
+}
+
+main()

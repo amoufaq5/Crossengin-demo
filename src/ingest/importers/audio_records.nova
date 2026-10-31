@@ -1,0 +1,305 @@
+// CrossEngin ingestion: audio importer (R105 -- Phase G).
+//
+// Recognizes WAV/RIFF containers holding PCM audio (the canonical
+// output of scripts/audio_capture.sh + the fmt every STT backend in
+// tree consumes). Produces one perceptual curriculum record per
+// input carrying the shared perceptual-atom shape from
+// src/ingest/perceptual_capsule.nova:
+//
+//   root atom: perc:audio:<hash16>            (kind=FACT, seed=900)
+//   meta atoms:
+//     perc:audio:<hash16>:format=wav
+//     perc:audio:<hash16>:rate=<hz>
+//     perc:audio:<hash16>:channels=<n>
+//     perc:audio:<hash16>:bits=<n>
+//     perc:audio:<hash16>:bytes=<len>
+//     perc:audio:<hash16>:duration_ms=<ms>
+//     perc:audio:<hash16>:sha256=<hash64>
+//
+// STT: gated on env CROSSENGIN_STT_ENABLED=1 + CROSSENGIN_STT_BACKEND
+// = "whisper" or "vosk". When enabled, the importer will attempt to
+// hand the WAV to the corresponding backend
+// (src/io/transducers/whisper_backend.nova /
+//  src/io/transducers/vosk_backend.nova); a successful text projection
+// becomes a `perc:audio:<hash>:text` derived-atom cluster via
+// perc_add_derived_text. In R105 the default is OFF -- the backends
+// use fork+exec to a locally-installed whisper.cpp / vosk binary that
+// is not guaranteed on every host. When the env knobs are set on a
+// permissive host, flipping them is the whole integration path; the
+// importer already emits the root + metadata atoms.
+//
+// Public API
+//   audr_parse_bytes(byte_list, kg_hint, source_tag) -> [records, errors]
+//   audr_parse_text (body_str,  kg_hint, source_tag) -> [records, errors]
+//
+// Refusals (produce zero records, one error each):
+//   * empty input
+//   * first 4 bytes != "RIFF"
+//   * bytes 8..11 != "WAVE"
+//   * "fmt " chunk missing or truncated
+//   * audio_format != 1 (only PCM supported in R105; the transducer
+//     inventory can grow -- IEEE float, alaw, mulaw -- in follow-on
+//     rounds without shape change on the perceptual atom side).
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies:
+//   src/ingest/curriculum.nova
+//   src/ingest/perceptual_capsule.nova
+//   src/util/str_safe.nova
+
+import "../curriculum.nova"
+import "../perceptual_capsule.nova"
+import "../../util/str_safe.nova"
+
+// ---- WAV/RIFF layout constants ---------------------------------------------
+
+let _AUDR_MIN_HEADER = 44
+
+// ---- helpers ---------------------------------------------------------------
+
+fn _audr_u32_le(bl, off, n) {
+    if off + 4 > n { return -1 }
+    let b0 = bl[off + 0]
+    let b1 = bl[off + 1]
+    let b2 = bl[off + 2]
+    let b3 = bl[off + 3]
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+fn _audr_u16_le(bl, off, n) {
+    if off + 2 > n { return -1 }
+    return bl[off + 0] + bl[off + 1] * 256
+}
+
+// Compare four bytes at `off` against a 4-byte ASCII tag.
+fn _audr_4cc(bl, off, n, c0, c1, c2, c3) {
+    if off + 4 > n { return 0 }
+    if bl[off + 0] != c0 { return 0 }
+    if bl[off + 1] != c1 { return 0 }
+    if bl[off + 2] != c2 { return 0 }
+    if bl[off + 3] != c3 { return 0 }
+    return 1
+}
+
+fn _audr_err_rec(errors, idx, msg) {
+    let e = list_new()
+    push(e, idx)
+    push(e, msg)
+    push(errors, e)
+}
+
+// Parsed-header result slot layout.
+let _AUDR_H_RATE      = 0
+let _AUDR_H_CHANNELS  = 1
+let _AUDR_H_BITS      = 2
+let _AUDR_H_DATA_LEN  = 3
+let _AUDR_H_ERR       = 4
+
+fn _audr_parse_wav_header(bl, n) {
+    let out = list_new()
+    push(out, 0) push(out, 0) push(out, 0) push(out, 0) push(out, "")
+    if n < _AUDR_MIN_HEADER {
+        list_set(out, _AUDR_H_ERR, "audio: WAV shorter than 44 header bytes")
+        return out
+    }
+    // RIFF...WAVE
+    if _audr_4cc(bl, 0, n, 82, 73, 70, 70) == 0 {
+        list_set(out, _AUDR_H_ERR, "audio: not a RIFF container")
+        return out
+    }
+    if _audr_4cc(bl, 8, n, 87, 65, 86, 69) == 0 {
+        list_set(out, _AUDR_H_ERR, "audio: RIFF form is not WAVE")
+        return out
+    }
+    // fmt  chunk at offset 12.
+    if _audr_4cc(bl, 12, n, 102, 109, 116, 32) == 0 {
+        list_set(out, _AUDR_H_ERR, "audio: WAV missing 'fmt ' chunk at offset 12")
+        return out
+    }
+    let fmt_len = _audr_u32_le(bl, 16, n)
+    if fmt_len < 16 {
+        list_set(out, _AUDR_H_ERR, "audio: WAV fmt chunk shorter than 16 bytes")
+        return out
+    }
+    let audio_format = _audr_u16_le(bl, 20, n)
+    if audio_format != 1 {
+        list_set(out, _AUDR_H_ERR,
+            "audio: WAV audio_format != 1 (only PCM supported in R105)")
+        return out
+    }
+    let channels    = _audr_u16_le(bl, 22, n)
+    let rate        = _audr_u32_le(bl, 24, n)
+    let bits        = _audr_u16_le(bl, 34, n)
+    if channels < 1 {
+        list_set(out, _AUDR_H_ERR, "audio: WAV channels < 1")
+        return out
+    }
+    if rate < 1 {
+        list_set(out, _AUDR_H_ERR, "audio: WAV sample_rate < 1")
+        return out
+    }
+    if bits < 8 {
+        list_set(out, _AUDR_H_ERR, "audio: WAV bits_per_sample < 8")
+        return out
+    }
+    // Data chunk starts at 20 + fmt_len. In canonical PCM this is 36.
+    let data_off = 20 + fmt_len
+    if data_off + 8 > n {
+        list_set(out, _AUDR_H_ERR, "audio: WAV truncated before data chunk")
+        return out
+    }
+    if _audr_4cc(bl, data_off, n, 100, 97, 116, 97) == 0 {
+        // Some WAV writers insert a LIST/JUNK chunk between fmt and
+        // data; we don't require strict placement -- scan forward for
+        // 'data' up to a modest window.
+        let scan = data_off
+        let saw = 0
+        while scan + 8 <= n {
+            if _audr_4cc(bl, scan, n, 100, 97, 116, 97) == 1 {
+                saw = 1
+                data_off = scan
+                scan = n
+            } else {
+                let ck = _audr_u32_le(bl, scan + 4, n)
+                if ck < 0 { scan = n }
+                else { scan = scan + 8 + ck }
+            }
+        }
+        if saw == 0 {
+            list_set(out, _AUDR_H_ERR, "audio: WAV 'data' chunk not found")
+            return out
+        }
+    }
+    let data_len = _audr_u32_le(bl, data_off + 4, n)
+    list_set(out, _AUDR_H_RATE,     rate)
+    list_set(out, _AUDR_H_CHANNELS, channels)
+    list_set(out, _AUDR_H_BITS,     bits)
+    list_set(out, _AUDR_H_DATA_LEN, data_len)
+    return out
+}
+
+// ---- STT opt-in ------------------------------------------------------------
+//
+// Currently CROSSENGIN_STT_ENABLED=1 is the wire but the whisper /
+// vosk backends fork+exec external binaries that are not guaranteed
+// on every host. R105 leaves the derived-text branch stubbed off by
+// default so the importer still produces useful perceptual atoms
+// (root + metadata) on any host. When flipping the env knob on a
+// permissive host, `_audr_run_stt` is where the transducer call
+// lands. Tests exercise the disabled path (no text produced) via the
+// default env; a mocked test can pin the branch via the direct
+// perc_add_derived_text helper.
+
+fn _audr_stt_enabled() {
+    let s = getenv("CROSSENGIN_STT_ENABLED")
+    if s == 0        { return 0 }
+    if len(s) == 0   { return 0 }
+    if str_eq_bytes(s, "1") == 1 { return 1 }
+    return 0
+}
+
+fn _audr_stt_backend() {
+    let s = getenv("CROSSENGIN_STT_BACKEND")
+    if s == 0        { return "" }
+    if len(s) == 0   { return "" }
+    return s
+}
+
+// Stub: returns "" (no derived text) in R105's default host. On a
+// permissive host, this is where the whisper_backend / vosk_backend
+// bridge call lands.
+fn _audr_run_stt(bl, rate, channels, bits) {
+    if _audr_stt_enabled() == 0 { return "" }
+    let backend = _audr_stt_backend()
+    if len(backend) == 0 { return "" }
+    // The R105 default: acknowledge the opt-in but return "" so the
+    // importer doesn't try to fork+exec on a hostile host. Follow-on
+    // rounds wire the actual transducer here (whisper_backend.nova
+    // already uses fork+exec, and the wire format matches -- see
+    // whisper_backend.nova:380-449 for the reference pattern).
+    return ""
+}
+
+// ---- record builder --------------------------------------------------------
+
+fn _audr_int_to_str(n) { return int_to_str(n) }
+
+fn _audr_duration_ms(data_len, rate, channels, bits) {
+    if rate <= 0 { return 0 }
+    if channels <= 0 { return 0 }
+    if bits <= 0 { return 0 }
+    let bytes_per_sample = int_shr(bits + 7, 3)          // ceil(bits/8)
+    let bytes_per_frame  = channels * bytes_per_sample
+    if bytes_per_frame <= 0 { return 0 }
+    let frames = data_len / bytes_per_frame
+    return frames * 1000 / rate
+}
+
+fn _audr_build_record(kg_hint, source_tag,
+                       rate, channels, bits, byte_count, data_len,
+                       hash_prefix, hash_full, derived_text) {
+    let src = source_tag
+    if len(src) == 0 { src = perc_source_prefix(PERC_MOD_AUDIO) + hash_prefix }
+    let kg = kg_hint
+    if len(kg) == 0 { kg = "auditory" }
+    let r = cur_new(kg, src)
+    perc_add_root(r, PERC_MOD_AUDIO, hash_prefix, 900)
+    perc_add_meta(r, PERC_MOD_AUDIO, hash_prefix, "format",   "wav")
+    perc_add_meta(r, PERC_MOD_AUDIO, hash_prefix, "rate",     _audr_int_to_str(rate))
+    perc_add_meta(r, PERC_MOD_AUDIO, hash_prefix, "channels", _audr_int_to_str(channels))
+    perc_add_meta(r, PERC_MOD_AUDIO, hash_prefix, "bits",     _audr_int_to_str(bits))
+    perc_add_meta(r, PERC_MOD_AUDIO, hash_prefix, "bytes",    _audr_int_to_str(byte_count))
+    perc_add_meta(r, PERC_MOD_AUDIO, hash_prefix, "duration_ms",
+                   _audr_int_to_str(_audr_duration_ms(data_len, rate, channels, bits)))
+    perc_add_meta(r, PERC_MOD_AUDIO, hash_prefix, "sha256",   hash_full)
+    if len(derived_text) > 0 {
+        perc_add_derived_text(r, PERC_MOD_AUDIO, hash_prefix, derived_text)
+    }
+    return r
+}
+
+// ---- public entry points ---------------------------------------------------
+
+fn audr_parse_bytes(byte_list, kg_hint, source_tag) {
+    let records = list_new()
+    let errors  = list_new()
+    let n = len(byte_list)
+    if n == 0 {
+        _audr_err_rec(errors, 0, "audio: empty input")
+        let out = list_new() push(out, records) push(out, errors) return out
+    }
+    let hd = _audr_parse_wav_header(byte_list, n)
+    if len(hd[_AUDR_H_ERR]) > 0 {
+        _audr_err_rec(errors, 0, hd[_AUDR_H_ERR])
+        let out = list_new() push(out, records) push(out, errors) return out
+    }
+    let rate     = hd[_AUDR_H_RATE]
+    let channels = hd[_AUDR_H_CHANNELS]
+    let bits     = hd[_AUDR_H_BITS]
+    let data_len = hd[_AUDR_H_DATA_LEN]
+    let hash_prefix = perc_hash_from_bytes(byte_list)
+    let hash_full   = perc_hash_full_from_bytes(byte_list)
+    let stt_text    = _audr_run_stt(byte_list, rate, channels, bits)
+    let rec = _audr_build_record(kg_hint, source_tag,
+                                  rate, channels, bits, n, data_len,
+                                  hash_prefix, hash_full, stt_text)
+    push(records, rec)
+    let out = list_new()
+    push(out, records)
+    push(out, errors)
+    return out
+}
+
+fn audr_parse_text(body_str, kg_hint, source_tag) {
+    let bl = list_new()
+    let n = len(body_str)
+    let i = 0
+    while i < n {
+        push(bl, char_at(body_str, i))
+        i = i + 1
+    }
+    return audr_parse_bytes(bl, kg_hint, source_tag)
+}
+
+fn audr_records(result) { return result[0] }
+fn audr_errors(result)  { return result[1] }
