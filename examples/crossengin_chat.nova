@@ -29,6 +29,9 @@ import "../src/scheduler/hybrid_scheduler.nova"
 import "../src/agent/loop_perception.nova"
 import "../src/agent/loop_memory.nova"
 import "../src/agent/loop_reasoning.nova"
+import "../src/agent/cognitive_router.nova"
+import "../src/learning/learn_pipeline.nova"
+import "../src/learning/research_sources.nova"
 import "../src/agent/loop_emotion.nova"
 import "../src/agent/loop_goals.nova"
 import "../src/agent/loop_imagination_idle.nova"
@@ -114,6 +117,34 @@ let chat_stats_self_id_replies = 0
 // Total KG-triple-templated replies emitted. Useful for verifying the chat
 // is reaching for real knowledge rather than the ACK fallback.
 let chat_stats_kg_triple_replies = 0
+
+// R40 per-category cognitive router (ADR-0055). The router classifies each
+// utterance and routes it to a category-specific strategy. We retain the last
+// reply's reasoning trace + the operator-atom ids it leaned on so (a) the
+// trace can be surfaced under the agent line (reasoning made visible), and
+// (b) /good / /bad can re-weight exactly those operators (conversational
+// feedback -> ADR-0007 plasticity). _last_category carries the code for the
+// telemetry + JSON log. Process-wide so they survive /switch.
+let _last_reason_ops = ""
+let _last_reason_trace = ""
+let _last_category = 0
+let chat_stats_router_replies = 0
+
+// R56: when a same-turn re-answer (R52) re-perceives the query after research,
+// these hold the RE-PERCEIVED match/unknown counts (the post-research
+// understanding), or -1 when no re-answer happened this turn -- so the perceive
+// line can show what the agent understood AFTER learning, not just before.
+let _reperceive_m = 0 - 1
+let _reperceive_unk = 0 - 1
+
+// R61: set to 1 when the idle drain auto-defined at least one word this turn, so
+// the same-turn re-answer fires for autodefine (not just research). Reset per turn.
+let _autodefined_turn = 0
+
+// R75: the conversation's last subject, for anaphora resolution ("what does it
+// produce" -> "what does <last topic> produce"). Process-wide so it persists
+// across turns.
+let _last_topic = ""
 
 // Phase 18 (Half A): in-process multi-tenant routing. `sreg` is the
 // SessionRegistry (built at boot); `active_id` is the id of the session every
@@ -629,11 +660,365 @@ fn _smq_kg_templated_reply(kg, concept) {
     return concept + " " + rel_phrase + " " + atom_label(obj_atom) + "."
 }
 
+// ---- R50: autonomous research (the idle-loop self-initiated /learn) ---------
+// The ADR-0026 trigger queue already collects unknown query terms; R41-R49 built
+// the live fetch + ingest pipeline. This wires them together: at idle, the agent
+// dequeues an unknown topic, derives a Wikipedia URL, and runs it through
+// learn_from_url (DNS + TLS 1.3 + preprocess + compound ingest) -- learning from
+// the internet on its own initiative. Opt-in (CE_AUTORESEARCH=1) since it makes
+// outbound requests; one fetch per turn; each topic researched at most once.
+let _researched_topics = 0
+
+fn _autoresearch_on() {
+    let e = getenv("CE_AUTORESEARCH")
+    if e != 0 { if str_eq(e, "1") == 1 { return 1 } }
+    return 0
+}
+
+// R53: a fetched candidate must clear this many learned operators to count as a
+// real article (so a disambiguation stub / redirect / 404 falls through to the
+// next source). Overridable via CE_RESEARCH_MIN_OPS for the gateway env.
+fn _research_min_ops() {
+    let e = getenv("CE_RESEARCH_MIN_OPS")
+    if e != 0 { let v = str_to_int(e) if v > 0 { return v } }
+    return 3
+}
+
+// R59: dictionary enrichment is ON by default (research aggregates a definition
+// alongside the encyclopedia article); CE_RESEARCH_NO_DICT=1 turns it off to
+// save a fetch.
+fn _research_dict_on() {
+    let e = getenv("CE_RESEARCH_NO_DICT")
+    if e != 0 { if str_eq(e, "1") == 1 { return 0 } }
+    return 1
+}
+
+// R60: autodefine -- the idle unknown-word drain looks up a dictionary
+// definition for unknown content words (not just stub-minting them), grounding
+// each with a real sense. Opt-in (it makes outbound requests, like
+// CE_AUTORESEARCH); budgeted per turn since it fetches per word.
+fn _autodefine_on() {
+    let e = getenv("CE_AUTODEFINE")
+    if e != 0 { if str_eq(e, "1") == 1 { return 1 } }
+    return 0
+}
+fn _autodefine_budget() {
+    let e = getenv("CE_AUTODEFINE_BUDGET")
+    if e != 0 { let v = str_to_int(e) if v > 0 { return v } }
+    return 2
+}
+
+fn _research_seen(topic) {
+    if _researched_topics == 0 { _researched_topics = list_new() }
+    let i = 0
+    while i < len(_researched_topics) {
+        if str_eq(_researched_topics[i], topic) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+fn _research_mark(topic) {
+    if _researched_topics == 0 { _researched_topics = list_new() }
+    push(_researched_topics, topic)
+    return 1
+}
+
+// R55: real search/disambiguation. Ask Wikipedia's OpenSearch API for the
+// canonical article URL for `topic` -- this corrects typos, casing, and
+// acronyms (phtosynthesis / dna -> the real article) and resolves disambiguation
+// server-side, rather than guessing the title. Returns the resolved URL, or ""
+// when the search fetch failed or carried no URL (we then fall back to the
+// guessed candidates). The JSON is read RAW via lp_fetch, not learned as facts.
+fn _research_search_resolve(topic, now) {
+    let su = research_search_url(topic)
+    let f = lp_fetch(su, now)
+    if lp_fetch_status(f) != LP_OK { return "" }
+    return research_first_url(lp_fetch_body(f))
+}
+
+// Fetch + learn about one topic via the live pipeline. R53/R55: try an ORDERED
+// set of source candidates -- first the OpenSearch-RESOLVED canonical URL
+// (R55), then the guessed sources (research_candidates: canonical Wikipedia
+// title, an upper-case acronym variant, Simple-English Wikipedia, and the
+// independent Wiktionary dictionary). Stop at the first that yields a real
+// article (>= _research_min_ops operators); otherwise fall through to the next
+// SOURCE so a disambiguation stub / acronym redirect / missing page doesn't end
+// the search. Every ingest is idempotent by label, so the sources we do fetch
+// reinforce + extend rather than duplicate. Returns 1 if ANY source learned
+// something (LP_OK), else 0.
+fn _research_topic(lang, kg, topic, now) {
+    if len(topic) < 2 { return 0 }
+    // R55: lead with a real search resolve, then the guessed source candidates.
+    let cands = list_new()
+    let resolved = _research_search_resolve(topic, now)
+    if len(resolved) > 0 {
+        io_println("(search resolved '" + topic + "' -> " + resolved + ")")
+        push(cands, research_cand("en.wikipedia/search", resolved))
+    }
+    let guesses = research_candidates(topic)
+    let gi = 0
+    while gi < len(guesses) { push(cands, guesses[gi]) gi = gi + 1 }
+    let min_ops = _research_min_ops()
+    let got_ok = 0
+    let best_ops = 0 - 1
+    let best_src = ""
+    let stop = 0
+    let i = 0
+    while i < len(cands) {
+        if stop == 0 {
+            let label = research_cand_label(cands[i])
+            let url = research_cand_url(cands[i])
+            io_println("(researching '" + topic + "' via " + label + " -> " + url + " ...)")
+            let r = learn_from_url(url, kg, lang, now)
+            if lp_status(r) == LP_OK {
+                got_ok = 1
+                io_println("(  " + label + ": " + int_to_str(lp_words(r)) + " word(s), "
+                    + int_to_str(lp_ops(r)) + " operator(s), "
+                    + int_to_str(lp_new_atoms(r)) + " new atom(s))")
+                if lp_ops(r) > best_ops { best_ops = lp_ops(r) best_src = label }
+                // Strong article -> stop (keeps the common case at one fetch).
+                if research_is_strong(lp_ops(r), min_ops) == 1 { stop = 1 }
+            } else {
+                io_println("(  " + label + ": " + lp_status_name(lp_status(r))
+                    + " -- " + lp_message(r) + ")")
+            }
+        }
+        i = i + 1
+    }
+    // R59: always-on dictionary enrichment. Aggregate a structured definition
+    // (the genuinely independent dictionary API) ALONGSIDE the encyclopedia
+    // article -- not just as a deep fallback -- so research cross-sources prose
+    // plus definition. Runs whether or not the encyclopedia sweep was strong;
+    // a topic the dictionary doesn't list (a 404) just adds nothing.
+    let dict_defs = 0
+    if _research_dict_on() == 1 {
+        let dr = _dict_learn(lang, kg, topic, now)
+        dict_defs = dr[0]
+        if dict_defs > 0 {
+            io_println("(+ dictionary: " + int_to_str(dr[0]) + " definition(s), "
+                + int_to_str(dr[1]) + " word(s), " + int_to_str(dr[2])
+                + " operator(s))")
+        }
+    }
+    if got_ok == 1 {
+        io_println("(autonomously learned about '" + topic + "' [best source: "
+            + best_src + ", " + int_to_str(best_ops) + " operator(s)]; KG="
+            + int_to_str(kg_atom_count(kg)) + ")")
+        return 1
+    }
+    if dict_defs > 0 {
+        io_println("(learned about '" + topic + "' from the dictionary only; KG="
+            + int_to_str(kg_atom_count(kg)) + ")")
+        return 1
+    }
+    io_println("(research for '" + topic + "' failed across "
+        + int_to_str(len(cands)) + " source(s))")
+    return 0
+}
+
+// /research TOPIC -- explicit autonomous research (no env flag needed).
+fn _admin_research(lang, kg, arg, now) {
+    if len(arg) == 0 { io_println("usage: /research TOPIC") return 1 }
+    let topic = str_trim(arg)
+    _research_mark(topic)
+    _research_topic(lang, kg, topic, now)
+    return 1
+}
+
+// R58/R59: fetch the dictionaryapi.dev JSON for a word, parse it, and ingest the
+// definition prose as knowledge attributed to the dictionary (src:dict:WORD).
+// Returns [num_defs, words_ingested, ops_ingested, defs_list]; [0,0,0,[]] when
+// the fetch failed or the word has no entry (a 404 -> empty defs). Shared by the
+// /define command and the research enrichment step.
+fn _no_space(s) {
+    if str_find(s, " ") < 0 { return 1 }
+    return 0
+}
+
+// R66/R67: link the headword to each related term with a reasoning operator of
+// `kind` -- ROP_ANALOGY for synonyms ("is like"), ROP_OPPOSITE for antonyms
+// ("is the opposite of") -- widening the reasoning graph beyond the genus.
+// Single-token terms only (clean concepts), capped, self-links skipped, concept
+// atoms created as needed. Returns the operator count. The label carries the tag
+// ("syn"/"ant") for provenance.
+fn _dict_link_related(kg, nword, hc, terms, kind, tag, disp, now) {
+    let made = 0
+    let i = 0
+    let printed = ""
+    while i < len(terms) {
+        if made < 5 {
+            let term = terms[i]
+            if _no_space(term) == 1 { if str_eq(term, nword) == 0 {
+                let tc = kg_find_atom(kg, term)
+                if tc == 0 { tc = kg_add_atom(kg, ATOM_CONCEPT, term, now) }
+                if atom_id(tc) != atom_id(hc) {
+                    rop_new(kg, kind, atom_id(hc), atom_id(tc),
+                            "src:dict:" + nword + ":" + tag + "->" + term, now)
+                    made = made + 1
+                    if len(printed) > 0 { printed = printed + ", " }
+                    printed = printed + term
+                }
+            } }
+        }
+        i = i + 1
+    }
+    if made > 0 { io_println("(" + disp + ": " + nword + " ~ " + printed + ")") }
+    return made
+}
+
+fn _dict_learn(lang, kg, word, now) {
+    let empty = list_new()
+    push(empty, 0) push(empty, 0) push(empty, 0) push(empty, list_new())
+    let f = lp_fetch(dict_api_url(word), now)
+    if lp_fetch_status(f) != LP_OK { return empty }
+    let body = lp_fetch_body(f)
+    let defs = dict_definitions(body)
+    if len(defs) == 0 { return empty }
+    let nword = lang_normalize(word)
+    // R69: attach the primary definition as the word's gloss here -- so /define,
+    // autodefine, AND research enrichment all set it consistently (was only the
+    // autodefine path). word_intern ensures the word atom exists for /define.
+    word_set_gloss(word_intern(lang, nword, now), defs[0][1])
+    let pp = preprocess_run(dict_learn_text(defs))
+    let ing = lp_ingest(kg, lang, pp[0], pp[1], "src:dict:" + word, now)
+    // Ensure the headword concept exists (au_ingest usually minted it already).
+    let hc = kg_find_atom(kg, nword)
+    if hc == 0 { hc = kg_add_atom(kg, ATOM_CONCEPT, nword, now) }
+    let extra_ops = 0
+    // R63: genus operator (headword -> genus, implicative -> forward-chains).
+    let genus = dict_genus(defs[0][1])
+    if len(genus) > 0 { if str_eq(genus, nword) == 0 {
+        let gc = kg_find_atom(kg, genus)
+        if gc != 0 { if atom_id(hc) != atom_id(gc) {
+            rop_new(kg, ROP_IMPLY, atom_id(hc), atom_id(gc), "src:dict:" + nword + ":genus", now)
+            extra_ops = extra_ops + 1
+            io_println("(genus: " + nword + " -> " + genus + ")")
+        } }
+    } }
+    // R66/R67: synonyms (analogy) + antonyms (opposite) widen the reasoning graph.
+    extra_ops = extra_ops + _dict_link_related(kg, nword, hc, dict_synonyms(body), ROP_ANALOGY, "syn", "synonyms", now)
+    extra_ops = extra_ops + _dict_link_related(kg, nword, hc, dict_antonyms(body), ROP_OPPOSITE, "ant", "antonyms", now)
+    let r = list_new()
+    push(r, len(defs)) push(r, ing[0]) push(r, ing[1] + extra_ops) push(r, defs)
+    return r
+}
+
+// R60: fetch a word's dictionary definition and learn it (gloss + genus +
+// synonyms/antonyms). _dict_learn (R69) sets the gloss for every caller, so this
+// just reports. Returns 1 if the word was defined, 0 otherwise.
+fn _autodefine_word(lang, kg, word, now) {
+    let r = _dict_learn(lang, kg, word, now)
+    if r[0] == 0 { return 0 }
+    io_println("(defined '" + word + "': " + r[3][0][1] + ")")
+    return 1
+}
+
+// R58: /define WORD -- fetch + parse the dictionary JSON, print the definitions,
+// and learn them. Demonstrates the JSON parser unlocking a structured (non-HTML)
+// source: where /learn HTML-scrapes prose, /define reads a typed API.
+fn _admin_define(lang, kg, arg, now) {
+    if len(arg) == 0 { io_println("usage: /define WORD") return 1 }
+    let word = str_trim(arg)
+    io_println("(defining '" + word + "' -> " + dict_api_url(word) + " ...)")
+    let r = _dict_learn(lang, kg, word, now)
+    if r[0] == 0 {
+        io_println("(no definitions found for '" + word + "')")
+        return 1
+    }
+    let defs = r[3]
+    let shown = 0
+    while shown < len(defs) {
+        if shown < 3 { io_println("  (" + defs[shown][0] + ") " + defs[shown][1]) }
+        shown = shown + 1
+    }
+    io_println("(learned " + int_to_str(r[1]) + " word(s), " + int_to_str(r[2])
+        + " operator(s) from " + int_to_str(r[0]) + " definition(s) of '"
+        + word + "')")
+    return 1
+}
+
+// At idle, when CE_AUTORESEARCH=1, dequeue ONE unknown topic and research it
+// (the rest of the queue falls through to _drain_and_teach's stub minting).
+// Returns the topic that was successfully researched (so the caller can
+// re-answer the current query in the same turn -- R52), or "" if nothing
+// was researched (autoresearch off, empty queue, already-seen, or fetch failed).
+fn _drain_and_research(arb, kg, lang, now) {
+    if _autoresearch_on() == 0 { return "" }
+    if slt_queue_size(arb) == 0 { return "" }
+    let trig = slt_arbiter_step(arb)
+    if trig == 0 { slt_clear_active(arb) return "" }
+    let topic = slt_target(trig)
+    slt_clear_active(arb)
+    if _research_seen(topic) == 1 { return "" }
+    _research_mark(topic)
+    if _research_topic(lang, kg, topic, now) == 1 { return topic }
+    return ""
+}
+
+// R52: a reasoning trace counts as a real answer (vs a knowledge gap) when it
+// shows a forward-chain or a known relation -- the two router traces that mean
+// "I reasoned over learned operators". Used to gate the same-turn re-answer so
+// research only ever replaces a gap with an ANSWER, never with another gap.
+fn _trace_is_reasoned(trace) {
+    if str_find(trace, "forward-chain") >= 0 { return 1 }
+    if str_find(trace, "known relation") >= 0 { return 1 }
+    return 0
+}
+
+// R61: a real answer is a reasoned chain OR a dictionary gloss -- both are
+// genuine content the same-turn re-answer should adopt over a gap. (R60's
+// autodefine produces the "dictionary gloss" trace.)
+fn _trace_is_answer(trace) {
+    if _trace_is_reasoned(trace) == 1 { return 1 }
+    if str_find(trace, "dictionary gloss") >= 0 { return 1 }
+    return 0
+}
+
+// R52/R61: after idle learning (autonomous research OR autodefine) grows the KGs
+// mid-turn, answer the SAME query again before the reply is printed. The first
+// pass already produced the honest gap reply ("i don't have a model of X yet");
+// now we re-perceive (so the query's tokens re-anchor to the freshly-learned
+// atoms) and re-run the router. Returns the improved reply, or "" to keep the
+// gap. Only overrides a gap/ack with a real ANSWER (a reasoned chain or a
+// dictionary gloss) that differs from the first, so a fetch that yielded nothing
+// usable leaves the honest gap standing. On adoption it re-speaks through the
+// governed effector (so the decision log + /why + /good /bad track the final
+// answer) and refreshes the last-reply reasoning state.
+fn _reanswer_after_learning(ctx, reader, kg, lang, log, sl, prev_reply, now) {
+    let raw_msg = ctx_input(ctx)
+    if len(raw_msg) == 0 { return "" }
+    // Only upgrade a gap/ack reply -- never override an answer that already
+    // reasoned or glossed (the original trace is still intact at entry).
+    if _trace_is_answer(_last_reason_trace) == 1 { return "" }
+    // Re-perceive against the grown KGs; remember the new counts so the caller
+    // can surface the post-learning understanding (R56).
+    let m2 = loop_perception_step(ctx, reader)
+    let u2 = ctx_unknown(ctx)
+    let rr = router_reply(_last_category, raw_msg, kg, lang, ctx_percept(ctx), now)
+    let new_reply = rr_reply(rr)
+    if len(new_reply) == 0 { return "" }
+    if str_eq(new_reply, prev_reply) == 1 { return "" }
+    if _trace_is_answer(rr_trace(rr)) == 0 { return "" }
+    let said = effector_speak_governed(log, sl, new_reply, halted, 0 - 1, list_new(), 0, now)
+    if len(said) == 0 { said = new_reply }
+    _last_reason_trace = rr_trace(rr)
+    _last_reason_ops = rr_ops(rr)
+    _last_reply = said
+    _reperceive_m = m2
+    _reperceive_unk = u2
+    return said
+}
+
 // Drain the trigger arbiter, ingesting up to 4 unknowns into the KGs at idle.
-// Returns how many were taught this cycle.
+// Returns how many were taught this cycle. R60: when CE_AUTODEFINE=1, the first
+// few unknowns each turn also get a dictionary definition (a real sense), not
+// just a bare stub atom.
 fn _drain_and_teach(arb, kg, lang, now) {
     let go = 1
     let taught = 0
+    let defined = 0
+    let budget = _autodefine_budget()
+    let autodef = _autodefine_on()
     while go == 1 {
         if slt_queue_size(arb) == 0 { go = 0 }
         if go == 1 {
@@ -645,6 +1030,15 @@ fn _drain_and_teach(arb, kg, lang, now) {
                 let target = slt_target(trig)
                 au_ingest(lang, kg, target, "u:" + target, now)
                 taught = taught + 1
+                // R60: ground this unknown word with a dictionary sense.
+                if autodef == 1 {
+                    if defined < budget {
+                        if _autodefine_word(lang, kg, target, now) == 1 {
+                            defined = defined + 1
+                            _autodefined_turn = 1   // R61: enable same-turn re-answer
+                        }
+                    }
+                }
             }
             slt_clear_active(arb)
         }
@@ -669,7 +1063,11 @@ fn _admin_help() {
     io_println("  /why-deep [N]       recursive decision tree (default 3 levels, cap 8):")
     io_println("                      operator chain + activating message + upstream evidence")
     io_println("  /teach W            ingest W as a new word + concept binding")
-    io_println("  /learn TOPIC | URL | FILE | @batch | rss:URL | dir:PATH")
+    io_println("  /learn http(s)://host/path  LIVE: resolve + fetch + preprocess + ingest")
+    io_println("                      atoms & reasoning operators in-engine. https uses the")
+    io_println("                      in-engine TLS 1.3 client (R42; ChaCha20-Poly1305 + P-256,")
+    io_println("                      no cert verification -- confidential, not authenticated)")
+    io_println("  /learn TOPIC | FILE | @batch | rss:URL | dir:PATH")
     io_println("                      ingest /tmp/crossengin_learn_<tag>.txt")
     io_println("                      (populate first with scripts/learn.sh ARG)")
     io_println("  /reflect [DEPTH]    forward-simulate from current conclusions; record")
@@ -685,6 +1083,21 @@ fn _admin_help() {
     io_println("  /snap_sign_status [PATH] report Ed25519 signature attestation (R16A)")
     io_println("  /halt               stop the effector (input keeps flowing)")
     io_println("  /resume             un-halt")
+    io_println("  /good               reinforce the reasoning behind the last reply (ADR-0055)")
+    io_println("  /bad                weaken the reasoning behind the last reply")
+    io_println("  /correct S R O      teach the right relation (e.g. /correct fever causes headache)")
+    io_println("                      and weaken the operators the last reply leaned on")
+    io_println("  /classify TEXT      show the input category the router would route TEXT to")
+    io_println("  /research TOPIC     fetch + learn about TOPIC from the internet now")
+    io_println("                      (multi-source: canonical + acronym + simple-wiki,")
+    io_println("                      falling through weak/missing pages; autonomous on")
+    io_println("                      unknowns when CE_AUTORESEARCH=1; also aggregates a")
+    io_println("                      dictionary definition unless CE_RESEARCH_NO_DICT=1)")
+    io_println("  /define WORD        fetch WORD's definitions from the dictionary JSON")
+    io_println("                      API (real JSON parser), print + learn them")
+    io_println("                      (CE_AUTODEFINE=1 auto-defines unknown words at idle)")
+    io_println("  /knowledge WORD     all the agent knows about WORD: gloss, genus,")
+    io_println("                      synonyms, antonyms, relations, sources (alias /know)")
     io_println("  /meta               per-source promotion / atrophy rates")
     io_println("  /meta-feedback      dry-run: what source_authority tier changes the")
     io_println("                      observer's feedback WOULD apply right now")
@@ -825,7 +1238,43 @@ fn _admin_history(log, n) {
     return 1
 }
 
-fn _admin_why(log) {
+// R64: aggregate the distinct knowledge sources behind the last reply's
+// operators (_last_reason_ops is a CSV of reasoning-KG operator ids; each
+// operator's label carries a src: provenance prefix). Returns a human list like
+// "Wikipedia, dictionary", or "" when the reply leaned on no learned operators.
+fn _why_sources(kg, ops_csv) {
+    if len(ops_csv) == 0 { return "" }
+    let ids = split(ops_csv, ",")
+    let seen = list_new()
+    let i = 0
+    while i < len(ids) {
+        let t = str_trim(ids[i])
+        if len(t) > 0 {
+            let a = kg_atom(kg, str_to_int(t))
+            if a != 0 {
+                let name = src_label_name(atom_label(a))
+                let dup = 0
+                let j = 0
+                while j < len(seen) {
+                    if str_eq(seen[j], name) == 1 { dup = 1 }
+                    j = j + 1
+                }
+                if dup == 0 { push(seen, name) }
+            }
+        }
+        i = i + 1
+    }
+    let out = ""
+    let k = 0
+    while k < len(seen) {
+        if k > 0 { out = out + ", " }
+        out = out + seen[k]
+        k = k + 1
+    }
+    return out
+}
+
+fn _admin_why(log, kg) {
     let n = dl_count(log)
     if n == 0 { io_println("(no decisions yet)") return 1 }
     let e = dl_get(log, n - 1)
@@ -834,6 +1283,110 @@ fn _admin_why(log) {
     io_println("  tier    : " + perm_tier_name(dl_perm_tier(e)))
     io_println("  outcome : " + out_name(dl_outcome(e)))
     io_println("  trace   : " + int_to_str(len(dl_trace(e))) + " node(s)")
+    // R64: cite where the reasoning came from (the operators the reply used).
+    let srcs = _why_sources(kg, _last_reason_ops)
+    if len(srcs) > 0 {
+        io_println("  sources : " + srcs)
+    }
+    return 1
+}
+
+fn _know_join(lst) {
+    let out = ""
+    let i = 0
+    while i < len(lst) {
+        if i > 0 { out = out + ", " }
+        out = out + lst[i]
+        i = i + 1
+    }
+    return out
+}
+fn _know_add_distinct(lst, s) {
+    if len(s) == 0 { return 0 }
+    let i = 0
+    while i < len(lst) { if str_eq(lst[i], s) == 1 { return 0 } i = i + 1 }
+    push(lst, s)
+    return 1
+}
+
+// R68/R70: /knowledge WORD -- everything the agent knows about a word in one
+// view: gloss (R60), genus (R63), synonyms (R66), antonyms (R67), other learned
+// relations, the aggregated sources (R64), incoming edges, and senses (R70).
+// Read-only.
+fn _admin_knowledge(lang, kg, kgreg, arg) {
+    if len(arg) == 0 { io_println("usage: /knowledge WORD") return 1 }
+    let word = lang_normalize(str_trim(arg))
+    let wa = word_find_morph(lang, word)
+    let base = word
+    if wa != 0 { base = word_form(wa) }
+    io_println("knowledge of '" + word + "':")
+    if str_eq(base, word) == 0 { io_println("  (resolved to base form '" + base + "')") }
+    if wa != 0 {
+        let g = word_gloss(wa)
+        if len(g) > 0 { io_println("  gloss    : " + g) }
+    }
+    let c = kg_find_atom(kg, base)
+    if c == 0 {
+        io_println("  (no concept atom for '" + base + "' yet -- only a word, or unknown)")
+        return 1
+    }
+    let ops = rk_operators_from(kg, atom_id(c))
+    let genus = ""
+    let syns = list_new()
+    let ants = list_new()
+    let rels = list_new()
+    let srcs = list_new()
+    let i = 0
+    while i < len(ops) {
+        let op = ops[i]
+        let ca = kg_atom(kg, rop_conclusion(op))
+        if ca != 0 {
+            let cl = atom_label(ca)
+            let lbl = atom_label(op)
+            let tag = dict_rel_tag(lbl)
+            if str_eq(tag, "genus") == 1 { genus = cl }
+            else { if str_eq(tag, "syn") == 1 { _know_add_distinct(syns, cl) }
+            else { if str_eq(tag, "ant") == 1 { _know_add_distinct(ants, cl) }
+            else { _know_add_distinct(rels, _cr_rel(rop_kind(op)) + " " + cl) } } }
+            _know_add_distinct(srcs, src_label_name(lbl))
+        }
+        i = i + 1
+    }
+    // R70: incoming edges -- operators whose CONCLUSION is this concept (what
+    // points at it). The "from" side is the premise.
+    let inc = rk_operators_to(kg, atom_id(c))
+    let froms = list_new()
+    let ii = 0
+    while ii < len(inc) {
+        let pa = kg_atom(kg, rop_premise(inc[ii]))
+        if pa != 0 { _know_add_distinct(froms, atom_label(pa)) }
+        _know_add_distinct(srcs, src_label_name(atom_label(inc[ii])))
+        ii = ii + 1
+    }
+    // R70: senses -- the word atom's cross-KG references to concept atoms.
+    let senses = list_new()
+    if wa != 0 {
+        let xs = word_senses(wa)
+        let si = 0
+        while si < len(xs) {
+            let dkg = kg_find(kgreg, xref_dst_kg(xs[si]))
+            if dkg != 0 {
+                let da = kg_atom(dkg, xref_dst_atom(xs[si]))
+                if da != 0 {
+                    _know_add_distinct(senses, _know_sense_label(kg_label(dkg), atom_label(da)))
+                }
+            }
+            si = si + 1
+        }
+    }
+    if len(genus) > 0 { io_println("  genus    : " + base + " -> " + genus) }
+    if len(syns) > 0 { io_println("  synonyms : " + _know_join(syns)) }
+    if len(ants) > 0 { io_println("  antonyms : " + _know_join(ants)) }
+    if len(rels) > 0 { io_println("  relations: " + _know_join(rels)) }
+    if len(froms) > 0 { io_println("  implied by: " + _know_join(froms)) }
+    if len(senses) > 0 { io_println("  senses   : " + _know_join(senses)) }
+    if len(srcs) > 0 { io_println("  sources  : " + _know_join(srcs)) }
+    io_println("  (" + int_to_str(len(ops)) + " out, " + int_to_str(len(inc)) + " in)")
     return 1
 }
 
@@ -1105,11 +1658,36 @@ fn _learn_ingest_batch_per_url(lang, kg, list_path, now) {
 // just stores the prefix; the P13 meta_observer (separate agent) is the
 // designated consumer for promoting / atrophying atoms by source. See the
 // comment block in src/learning/source_authority.nova for the contract.
+// R41: live internet learning. `/learn http://host/path` runs the in-engine
+// FETCH -> PREPROCESS -> INGEST pipeline (src/learning/learn_pipeline.nova):
+// resolve the host over UDP DNS, GET it over a real socket, strip HTML to
+// content words + S/R/O triples, and MINT concept atoms + reasoning operators
+// (creating new endpoints) so the knowledge is immediately reasoned-over. No
+// pre-populated cache, no external curl shim. https:// reports the deferred
+// TLS gap plainly rather than failing silently.
+fn _admin_learn_live(lang, kg, url, now) {
+    io_println("(fetching " + url + " ...)")
+    let r = learn_from_url(url, kg, lang, now)
+    let st = lp_status(r)
+    if st == LP_OK {
+        io_println("(learned from " + url + ": " + int_to_str(lp_words(r))
+            + " word(s), " + int_to_str(lp_ops(r)) + " operator(s), "
+            + int_to_str(lp_new_atoms(r)) + " new atom(s); http "
+            + int_to_str(lp_http(r)) + ", KG=" + int_to_str(kg_atom_count(kg)) + ")")
+    } else {
+        io_println("(learn failed [" + lp_status_name(st) + "]: " + lp_message(r) + ")")
+    }
+    return 1
+}
+
 fn _admin_learn(lang, kg, arg, now) {
     if len(arg) == 0 {
         io_println("(/learn needs an argument; first run: scripts/learn.sh <topic|url|file|@batch|rss:URL|dir:PATH>)")
         return 1
     }
+    // R41: an http(s):// argument takes the LIVE pipeline, not the cache files.
+    if starts_with(arg, "http://") == 1 { return _admin_learn_live(lang, kg, arg, now) }
+    if starts_with(arg, "https://") == 1 { return _admin_learn_live(lang, kg, arg, now) }
     let kind = _learn_kind(arg)
     let kname = _learn_kind_name(kind)
     let tag = _learn_tag(arg)
@@ -2914,6 +3492,78 @@ fn _admin_fed_leave() {
     return 1
 }
 
+// ---- /good, /bad: conversational feedback on the last reply (ADR-0055) ----
+// The last router reply recorded the reasoning-operator atoms it leaned on in
+// `_last_reason_ops`. /good reinforces them (the inference was useful), /bad
+// weakens them (wrong or unhelpful) -- driving ADR-0007 plasticity from the
+// conversation itself, not just source-authority scoring. This is the
+// user-facing correction loop the meta-observer never provided.
+fn _admin_feedback(kg, sign) {
+    if len(_last_reason_ops) == 0 {
+        io_println("(no reasoning to adjust -- the last reply didn't lean on any learned operators)")
+        return 1
+    }
+    let n = router_apply_feedback(kg, _last_reason_ops, sign)
+    if sign > 0 {
+        io_println("thanks -- reinforced " + int_to_str(n) + " inference(s).")
+    } else {
+        io_println("noted -- weakened " + int_to_str(n) + " inference(s); i'll lean on them less.")
+    }
+    return 1
+}
+
+// Map a natural relation word to a reasoning-operator kind for /correct.
+fn _correct_rel_kind(r) {
+    if str_eq(r, "causes") == 1 { return ROP_CAUSAL }
+    if str_eq(r, "cause") == 1 { return ROP_CAUSAL }
+    if str_eq(r, "causal") == 1 { return ROP_CAUSAL }
+    if str_eq(r, "leads") == 1 { return ROP_CAUSAL }
+    if str_eq(r, "produces") == 1 { return ROP_CAUSAL }
+    if str_eq(r, "makes") == 1 { return ROP_CAUSAL }
+    if str_eq(r, "has") == 1 { return ROP_CAUSAL }
+    if str_eq(r, "is") == 1 { return ROP_IMPLY }
+    if str_eq(r, "is_a") == 1 { return ROP_IMPLY }
+    if str_eq(r, "are") == 1 { return ROP_IMPLY }
+    if str_eq(r, "implies") == 1 { return ROP_IMPLY }
+    if str_eq(r, "imply") == 1 { return ROP_IMPLY }
+    if str_eq(r, "like") == 1 { return ROP_ANALOGY }
+    return 0
+}
+
+// ---- /correct S R O: teach the right relation + weaken the wrong one -------
+// "/correct fever causes headache" learns fever ->(causal) headache as a new
+// operator (both concepts must already be atoms) AND weakens whatever the last
+// reply leaned on, so a wrong inference is both contradicted and supplanted.
+fn _admin_correct(kg, arg, now) {
+    let p = _split_cmd(arg)
+    let subj = p[0]
+    let p2 = _split_cmd(p[1])
+    let rel = p2[0]
+    let obj = p2[1]
+    if len(subj) == 0 { io_println("usage: /correct SUBJECT RELATION OBJECT  (e.g. /correct fever causes headache)") return 1 }
+    if len(rel) == 0  { io_println("usage: /correct SUBJECT RELATION OBJECT") return 1 }
+    if len(obj) == 0  { io_println("usage: /correct SUBJECT RELATION OBJECT") return 1 }
+    let s_atom = kg_find_atom(kg, subj)
+    let o_atom = kg_find_atom(kg, obj)
+    if s_atom == 0 { io_println("i don't know '" + subj + "' yet -- /teach it first, then /correct.") return 1 }
+    if o_atom == 0 { io_println("i don't know '" + obj + "' yet -- /teach it first, then /correct.") return 1 }
+    let kind = _correct_rel_kind(rel)
+    if kind == 0 { io_println("i don't recognise the relation '" + rel + "' -- try: causes / is / has / implies / leads / like.") return 1 }
+    rop_new(kg, kind, atom_id(s_atom), atom_id(o_atom), "correct:" + subj + "-" + rel + "->" + obj, now)
+    if len(_last_reason_ops) > 0 { router_apply_feedback(kg, _last_reason_ops, 0 - 1) }
+    io_println("got it -- learned '" + subj + " " + rel + " " + obj + "' and adjusted my earlier reasoning.")
+    return 1
+}
+
+// ---- /classify TEXT: show how the router categorises an utterance ---------
+fn _admin_classify(arg) {
+    if len(arg) == 0 { io_println("usage: /classify SOME TEXT") return 1 }
+    let r = classify_input(arg)
+    io_println("category: " + cat_name(ci_category(r)) + "  (confidence "
+        + int_to_str(ci_confidence(r)) + "/1000)")
+    return 1
+}
+
 fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, reg, stream, em, syn_g, sm, now) {
     if len(msg) == 0 { return 0 }
     if char_at(msg, 0) != 47 { return 0 }   // not '/'
@@ -2927,11 +3577,19 @@ fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, 
     if str_eq(cmd, "/exit") == 1 { io_println("bye.") dl_close(log) exit(0) }
     if str_eq(cmd, "/help")    == 1 { return _admin_help() }
     if str_eq(cmd, "/status")  == 1 { return _admin_status(sl, kg, refl_kg, log, engine, hs, stream, em, syn_g, sm, session_dp(sreg_lookup(sreg, active_id))) }
-    if str_eq(cmd, "/why")     == 1 { return _admin_why(log) }
+    if str_eq(cmd, "/why")     == 1 { return _admin_why(log, kg) }
+    if str_eq(cmd, "/knowledge") == 1 { return _admin_knowledge(lang, kg, kgreg, arg) }
+    if str_eq(cmd, "/know")    == 1 { return _admin_knowledge(lang, kg, kgreg, arg) }
     if str_eq(cmd, "/why-deep") == 1 { return _admin_why_deep(kg, ctx, log, arg) }
     if str_eq(cmd, "/__atoms__") == 1 { return _admin_atoms_probe(kg, lang) }
     if str_eq(cmd, "/halt")    == 1 { return _admin_halt() }
     if str_eq(cmd, "/resume")  == 1 { return _admin_resume() }
+    if str_eq(cmd, "/good")    == 1 { return _admin_feedback(kg, 1) }
+    if str_eq(cmd, "/bad")     == 1 { return _admin_feedback(kg, 0 - 1) }
+    if str_eq(cmd, "/correct") == 1 { return _admin_correct(kg, arg, now) }
+    if str_eq(cmd, "/classify") == 1 { return _admin_classify(arg) }
+    if str_eq(cmd, "/research") == 1 { return _admin_research(lang, kg, arg, now) }
+    if str_eq(cmd, "/define")  == 1 { return _admin_define(lang, kg, arg, now) }
     if str_eq(cmd, "/teach")   == 1 { return _admin_teach(lang, kg, mo, arg, now) }
     if str_eq(cmd, "/learn")   == 1 { return _admin_learn(lang, kg, arg, now) }
     if str_eq(cmd, "/reflect") == 1 { return _admin_reflect(ctx, kg, ikg, refl_kg, arg, now) }
@@ -3175,6 +3833,13 @@ fn main() {
             // Admin command handled; do not feed to the agent.
         } else {
 
+        // R75: resolve a follow-up pronoun ("it"/"they") to the last topic so
+        // multi-turn conversation flows. Only on agent messages (not admin).
+        let _resolved = resolve_anaphora(msg, _last_topic)
+        if str_eq(_resolved, msg) == 0 {
+            io_println("(\"" + msg + "\" -> \"" + _resolved + "\")")
+            msg = _resolved
+        }
         hs_post_event(hs, EV_MESSAGE, msg)
         let reply = ""
         let last_matched = 0
@@ -3232,6 +3897,11 @@ fn main() {
                 // surfacing of the rule's canonical concept). Either path
                 // fires the constitutional veto -- and the gate writes a
                 // VETOED outcome to the decision log.
+                // R40: clear last-reply reasoning state at the top of each
+                // drained event so a [refused] / self-ID reply never surfaces a
+                // stale trace, and a follow-up /good has nothing to re-weight.
+                _last_reason_trace = ""
+                _last_reason_ops = ""
                 let input_veto = const_input_veto_for(sl, ctx_input(ctx), kgreg, ctx_percept(ctx))
                 if input_veto == 1 {
                     effector_speak(log, ctx_input(ctx), 1, halted, 0 - 1, list_new(), 0, hs_now(hs))
@@ -3282,30 +3952,28 @@ fn main() {
                         chat_stats_self_id_replies = chat_stats_self_id_replies + 1
                     }
                     if len(dispatched) == 0 {
-                        // KG-templated reply: extract the concept the user is
-                        // asking about ("what is fever" / bare "fever") and try
-                        // the highest-belief triple. An empty return means no
-                        // known triple -- the fallback paths run below.
-                        let concept = _smq_extract_concept_query(raw_msg)
-                        if len(concept) > 0 {
-                            let kg_reply = _smq_kg_templated_reply(kg, concept)
-                            if len(kg_reply) > 0 {
-                                dispatched = kg_reply
-                                chat_stats_kg_triple_replies = chat_stats_kg_triple_replies + 1
-                            }
-                        }
-                    }
-                    if len(dispatched) == 0 {
-                        // Unknown-word path: when perceive reported unk > 0 the
-                        // SLT signals are ALREADY filed upstream. Surface the
-                        // first unknown token by name so the user knows what
-                        // the agent is going to look into.
-                        if last_unk > 0 {
-                            let unk_word = _smq_first_unknown_token(lang, raw_msg)
-                            if len(unk_word) > 0 {
-                                dispatched = _smq_unknown_reply(unk_word)
-                            }
-                        }
+                        // ====== R40 per-category cognitive router (ADR-0055) ===
+                        // Classify the utterance and route it to a strategy that
+                        // fits its KIND -- forward-chain for academic, balanced
+                        // hedge for debatable, real arithmetic for maths, empathic
+                        // ack for personal, warm smalltalk for social, etc. The
+                        // router SUBSUMES the former KG-templated + unknown-word +
+                        // "okay" cognition fallback in one place and returns
+                        // [reply, trace, ops]: the trace is surfaced under the
+                        // agent line (reasoning made visible), and the operator
+                        // atoms it leaned on are stashed so /good / /bad can
+                        // re-weight exactly those edges. classify_input is pure
+                        // (no KG) so it cannot regress cognition; the learned
+                        // kg-triple path lives on inside the academic/factual
+                        // strategies. Numbered counters kept for /status parity.
+                        let cat_res = classify_input(raw_msg)
+                        _last_category = ci_category(cat_res)
+                        let rr = router_reply(_last_category, raw_msg, kg, lang,
+                                              ctx_percept(ctx), hs_now(hs))
+                        dispatched = rr_reply(rr)
+                        _last_reason_trace = rr_trace(rr)
+                        _last_reason_ops = rr_ops(rr)
+                        chat_stats_router_replies = chat_stats_router_replies + 1
                     }
                     if len(dispatched) > 0 {
                         // Speak the dispatched reply directly (bypassing the
@@ -3366,9 +4034,28 @@ fn main() {
             }
         }
 
+        // R50: autonomous research first (CE_AUTORESEARCH=1) -- fetch + learn one
+        // unknown topic from the internet on the agent's own initiative; the rest
+        // of the curiosity queue falls through to stub minting below. R60's
+        // autodefine grounds those stubs with a dictionary sense.
+        _reperceive_m = 0 - 1            // R56: reset; set only if we re-answer
+        _reperceive_unk = 0 - 1
+        _autodefined_turn = 0            // R61: reset; set by _drain_and_teach
+        let researched = _drain_and_research(arb, kg, lang, hs_now(hs))
         // Idle-style: if curiosity triggers were submitted, drain + teach now
         // so the agent grows its KGs mid-conversation.
         let taught = _drain_and_teach(arb, kg, lang, hs_now(hs))
+        // R52/R61: same-turn re-answer. If research OR autodefine just filled the
+        // gap for THIS query, answer it again now (re-perceive + re-route) instead
+        // of waiting for the next turn -- adopting a reasoned chain or a dictionary
+        // gloss over the gap. Runs after both drains so it sees either result.
+        if len(researched) > 0 {
+            let improved = _reanswer_after_learning(ctx, reader, kg, lang, log, sl, reply, hs_now(hs))
+            if len(improved) > 0 { reply = improved }
+        } else if _autodefined_turn == 1 {
+            let improved2 = _reanswer_after_learning(ctx, reader, kg, lang, log, sl, reply, hs_now(hs))
+            if len(improved2) > 0 { reply = improved2 }
+        }
 
         // Any refl_kg atom whose belief crossed the promotion threshold this
         // turn graduates to a real concept now -- reflective speculation that
@@ -3377,6 +4064,10 @@ fn main() {
 
         if len(reply) == 0 { reply = "[no response]" }
         _last_reply = reply
+        // R75: remember this turn's subject (the resolved input's first content
+        // word) so a pronoun next turn resolves to it.
+        let _tw = _cr_topic_word(msg)
+        if len(_tw) > 0 { _last_topic = _tw }
         if _log_json_enabled() == 1 {
             // One JSON object per turn -- the operator-visible record of
             // the agent's reply + perception counts. Tests/integration/
@@ -3385,11 +4076,22 @@ fn main() {
             let rf = list_new()
             push(rf, _logf_s("msg", msg))
             push(rf, _logf_s("reply", reply))
+            push(rf, _logf_s("category", cat_name(_last_category)))
+            push(rf, _logf_s("reasoning", _last_reason_trace))
             _log_json("info", active_id, "reply", rf)
             let pf = list_new()
             push(pf, _logf_s("msg", msg))
-            push(pf, _logf_i("m", last_matched))
-            push(pf, _logf_i("unk", last_unk))
+            if _reperceive_m >= 0 {
+                // R56: a same-turn re-answer re-perceived after idle learning;
+                // report the post-learning counts as m/unk and keep the initial.
+                push(pf, _logf_i("m", _reperceive_m))
+                push(pf, _logf_i("unk", _reperceive_unk))
+                push(pf, _logf_i("m_initial", last_matched))
+                push(pf, _logf_i("unk_initial", last_unk))
+            } else {
+                push(pf, _logf_i("m", last_matched))
+                push(pf, _logf_i("unk", last_unk))
+            }
             _log_json("info", active_id, "perceive", pf)
             if taught > 0 {
                 let tf = list_new()
@@ -3412,8 +4114,24 @@ fn main() {
             }
         } else {
             io_println("agent> " + reply)
-            io_println("       perceive(m=" + int_to_str(last_matched)
-                + ",unk=" + int_to_str(last_unk) + ")")
+            if _reperceive_m >= 0 {
+                // R56: keep the legacy "perceive(m=N,unk=N)" prefix intact (so
+                // tooling/regex still matches), then annotate with the initial
+                // pre-research counts the re-answer improved on.
+                io_println("       perceive(m=" + int_to_str(_reperceive_m)
+                    + ",unk=" + int_to_str(_reperceive_unk)
+                    + ")  [re-perceived after learning; initially m="
+                    + int_to_str(last_matched) + ",unk=" + int_to_str(last_unk) + "]")
+            } else {
+                io_println("       perceive(m=" + int_to_str(last_matched)
+                    + ",unk=" + int_to_str(last_unk) + ")")
+            }
+            // R40: make reasoning visible -- which strategy ran + the operator
+            // chain it followed (ADR-0055). Empty for [refused] / self-ID / bare
+            // social replies that didn't lean on the reasoning KG.
+            if len(_last_reason_trace) > 0 {
+                io_println("       reasoning: " + _last_reason_trace)
+            }
             if taught > 0 {
                 io_println("       (learned " + int_to_str(taught) + " new word(s) -- "
                     + int_to_str(kg_atom_count(kg)) + " atoms total)")

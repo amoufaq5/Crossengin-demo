@@ -1,0 +1,318 @@
+// CrossEngin learning: research source candidates.
+//
+// Purpose
+//   Autonomous research (R50) and /research turn an unknown topic into a URL to
+//   fetch + learn. R50 used a SINGLE guess -- the English-Wikipedia article at
+//   the capitalized title -- which misses two common cases:
+//     * acronyms: "dna" -> "Dna", a 301 the no-redirect TLS client can't
+//       follow, instead of the real title "DNA";
+//     * topics whose en.wikipedia page is a disambiguation stub (few real
+//       sentences, so almost no reasoning operators are learned).
+//   This module builds an ORDERED list of (source, url) candidates spanning
+//   title-casings and multiple hosts, so the fetch loop can fall through to the
+//   next source when one yields nothing real -- multi-source, disambiguation-
+//   aware research (R53). The candidate list is PURE (no IO); the chat's
+//   _research_topic does the fetching and keeps the strongest result, and since
+//   each learn_from_url ingest is idempotent by label, fetching several sources
+//   reinforces + extends knowledge rather than duplicating it.
+//
+// ADRs: extends ADR-0026 (self-learning triggers) + ADR-0028 (learn pipeline).
+// NOVA dependencies: builtins (len, char_at, chr, substr, str_eq, str_upper,
+//   str_replace, list_new, push). CrossEngin dependencies: src/data/json.nova
+//   (R58: structured parsing of the OpenSearch + dictionary-API responses).
+
+import "../data/json.nova"
+
+// A research candidate is [source_label, url].
+fn research_cand(label, url) {
+    let c = list_new()
+    push(c, label)
+    push(c, url)
+    return c
+}
+fn research_cand_label(c) { return c[0] }
+fn research_cand_url(c)   { return c[1] }
+
+// Capitalize the first letter (ASCII), preserve the rest. "photosynthesis" ->
+// "Photosynthesis". Wikipedia titles are first-letter-capital by convention, so
+// this hits the canonical article directly instead of a lowercase redirect.
+fn research_cap_first(topic) {
+    if len(topic) == 0 { return "" }
+    let first = char_at(topic, 0)
+    if first >= 97 { if first <= 122 { first = first - 32 } }
+    return chr(first) + substr(topic, 1, len(topic) - 1)
+}
+
+// Wiki path form: spaces -> underscores (Wikipedia's title separator). Topics
+// from the lexer are single tokens, but a multi-word topic should still form a
+// valid title rather than a URL with raw spaces.
+fn research_wiki_path(title) {
+    return str_replace(title, " ", "_")
+}
+
+// Ordered (source, url) candidates for a topic. Tried in order by the fetch
+// loop; the first that yields a real article wins, and weak/failed candidates
+// fall through to the next SOURCE -- so a disambiguation stub or an acronym
+// redirect on one host doesn't end the search.
+fn research_candidates(topic) {
+    let out = list_new()
+    if len(topic) == 0 { return out }
+    let cap = research_wiki_path(research_cap_first(topic))
+    // 1. English Wikipedia at the canonical capitalized title.
+    push(out, research_cand("en.wikipedia",
+        "https://en.wikipedia.org/wiki/" + cap))
+    // 2. Acronym disambiguation: a short all-lower token is usually an
+    //    initialism whose title is upper-case (dna -> DNA). The capitalized
+    //    guess only 301-redirects, which the no-redirect client can't follow,
+    //    so try the upper-case title before giving up on Wikipedia.
+    if len(topic) <= 5 {
+        let up = research_wiki_path(str_upper(topic))
+        if str_eq(up, cap) == 0 {
+            push(out, research_cand("en.wikipedia/acronym",
+                "https://en.wikipedia.org/wiki/" + up))
+        }
+    }
+    // 3. Simple English Wikipedia: a genuinely different host whose articles are
+    //    shorter and far less likely to be disambiguation pages -- a good second
+    //    opinion when the main article was a stub or missing.
+    push(out, research_cand("simple.wikipedia",
+        "https://simple.wikipedia.org/wiki/" + cap))
+    // 4. Wiktionary: a genuinely INDEPENDENT source (a dictionary, not an
+    //    encyclopedia) -- definitions and etymology rather than article prose, so
+    //    it covers everyday words a topic-encyclopedia may not have an article
+    //    for. Lowercased title (Wiktionary entries are lower-case by convention).
+    push(out, research_cand("en.wiktionary",
+        "https://en.wiktionary.org/wiki/" + research_wiki_path(topic)))
+    return out
+}
+
+// ---- R55: real search / disambiguation via Wikipedia's OpenSearch API -------
+
+// Minimal URL-encoding for a query parameter: spaces -> %20. Topics from the
+// lexer are single alnum tokens, but a multi-word topic must not put raw spaces
+// in the query string.
+fn research_url_encode(s) {
+    return str_replace(s, " ", "%20")
+}
+
+// The OpenSearch endpoint that resolves a (possibly mis-cased / misspelled /
+// ambiguous) topic to the canonical article. Returns JSON:
+//   [query, [titles...], [descriptions...], [urls...]]
+// limit=1 + namespace=0 keeps it to the single best main-namespace article.
+fn research_search_url(topic) {
+    return "https://en.wikipedia.org/w/api.php?action=opensearch&search="
+        + research_url_encode(topic)
+        + "&limit=1&format=json&namespace=0"
+}
+
+// Extract the canonical article URL from an OpenSearch JSON response. R58: parse
+// the real structure -- [query, [titles], [descriptions], [urls]] -- and read
+// the first element of the URL array (index 3), rather than scanning for the
+// first "https://" (which a description or a sourceUrl could spoof). Returns ""
+// when the response isn't the expected shape.
+fn research_first_url(body) {
+    let v = json_parse(body)
+    let first = json_arr_get(json_arr_get(v, 3), 0)
+    if json_type(first) == JV_STR { return json_str(first) }
+    return ""
+}
+
+// ---- R58: dictionaryapi.dev, a structured JSON definitions source ----------
+
+// The free dictionary API entry endpoint for a word. Returns a JSON array of
+// entry objects; see dict_definitions for the shape.
+fn dict_api_url(word) {
+    return "https://api.dictionaryapi.dev/api/v2/entries/en/" + research_url_encode(word)
+}
+
+// Extract [partOfSpeech, definition] pairs from a dictionaryapi.dev response.
+// Shape: [ {..,"meanings":[ {"partOfSpeech":..,"definitions":[ {"definition":..},
+// .. ]}, .. ]}, .. ]. Returns a (possibly empty) list -- never errors, so a 404
+// body ("{title:...}") or malformed JSON just yields no definitions.
+fn dict_definitions(body) {
+    let out = list_new()
+    let root = json_parse(body)
+    if json_type(root) != JV_ARR { return out }
+    let ei = 0
+    while ei < json_arr_len(root) {
+        let entry = json_arr_get(root, ei)
+        let meanings = json_get(entry, "meanings")
+        let mi = 0
+        while mi < json_arr_len(meanings) {
+            let meaning = json_arr_get(meanings, mi)
+            let pos = json_str(json_get(meaning, "partOfSpeech"))
+            let defs = json_get(meaning, "definitions")
+            let di = 0
+            while di < json_arr_len(defs) {
+                let dtext = json_str(json_get(json_arr_get(defs, di), "definition"))
+                if len(dtext) > 0 {
+                    let pair = list_new()
+                    push(pair, pos)
+                    push(pair, dtext)
+                    push(out, pair)
+                }
+                di = di + 1
+            }
+            mi = mi + 1
+        }
+        ei = ei + 1
+    }
+    return out
+}
+
+// R66: distinct lowercased strings from meanings[].KEY across a dictionaryapi.dev
+// response -- used for synonyms / antonyms, which the API lists per meaning. Pure.
+fn _dict_string_list(body, key) {
+    let out = list_new()
+    let root = json_parse(body)
+    if json_type(root) != JV_ARR { return out }
+    let ei = 0
+    while ei < json_arr_len(root) {
+        let meanings = json_get(json_arr_get(root, ei), "meanings")
+        let mi = 0
+        while mi < json_arr_len(meanings) {
+            let arr = json_get(json_arr_get(meanings, mi), key)
+            let si = 0
+            while si < json_arr_len(arr) {
+                let s = str_lower(str_trim(json_str(json_arr_get(arr, si))))
+                if len(s) > 0 {
+                    let dup = 0
+                    let k = 0
+                    while k < len(out) { if str_eq(out[k], s) == 1 { dup = 1 } k = k + 1 }
+                    if dup == 0 { push(out, s) }
+                }
+                si = si + 1
+            }
+            mi = mi + 1
+        }
+        ei = ei + 1
+    }
+    return out
+}
+fn dict_synonyms(body) { return _dict_string_list(body, "synonyms") }
+fn dict_antonyms(body) { return _dict_string_list(body, "antonyms") }
+
+// Join the definition strings from dict_definitions into one block of prose for
+// the preprocess + ingest path (each definition is a sentence, "." terminated so
+// the splitter sees sentence boundaries). Pure; empty list -> "".
+fn dict_learn_text(defs) {
+    let out = ""
+    let i = 0
+    while i < len(defs) {
+        out = out + defs[i][1] + ". "
+        i = i + 1
+    }
+    return out
+}
+
+// ---- R63: genus extraction (the head of a dictionary definition) ----------
+
+// The maximal lowercase-letter core of a token (strips surrounding punctuation):
+// "events," -> "events", "(sometimes" -> "sometimes". Assumes already lowercased.
+fn _dict_word(t) {
+    let n = len(t)
+    let a = 0
+    let g1 = 1
+    while g1 == 1 {
+        if a >= n { g1 = 0 }
+        else { let c = char_at(t, a) if c >= 97 { if c <= 122 { g1 = 0 } } if g1 == 1 { a = a + 1 } }
+    }
+    let b = n
+    let g2 = 1
+    while g2 == 1 {
+        if b <= a { g2 = 0 }
+        else { let c = char_at(t, b - 1) if c >= 97 { if c <= 122 { g2 = 0 } } if g2 == 1 { b = b - 1 } }
+    }
+    if b <= a { return "" }
+    return substr(t, a, b - a)
+}
+fn _dict_is_article(t) {
+    if str_eq(t, "a") == 1 { return 1 }    if str_eq(t, "an") == 1 { return 1 }
+    if str_eq(t, "the") == 1 { return 1 }  if str_eq(t, "to") == 1 { return 1 }
+    if str_eq(t, "any") == 1 { return 1 }  if str_eq(t, "some") == 1 { return 1 }
+    if str_eq(t, "one") == 1 { return 1 }
+    return 0
+}
+fn _dict_is_boundary(t) {
+    if str_eq(t, "of") == 1 { return 1 }    if str_eq(t, "in") == 1 { return 1 }
+    if str_eq(t, "on") == 1 { return 1 }    if str_eq(t, "at") == 1 { return 1 }
+    if str_eq(t, "for") == 1 { return 1 }   if str_eq(t, "with") == 1 { return 1 }
+    if str_eq(t, "that") == 1 { return 1 }  if str_eq(t, "which") == 1 { return 1 }
+    if str_eq(t, "who") == 1 { return 1 }   if str_eq(t, "by") == 1 { return 1 }
+    if str_eq(t, "from") == 1 { return 1 }  if str_eq(t, "as") == 1 { return 1 }
+    if str_eq(t, "into") == 1 { return 1 }  if str_eq(t, "onto") == 1 { return 1 }
+    if str_eq(t, "and") == 1 { return 1 }   if str_eq(t, "or") == 1 { return 1 }
+    if str_eq(t, "but") == 1 { return 1 }   if str_eq(t, "to") == 1 { return 1 }
+    return 0
+}
+// "act/process/state of X" frames -- skip the frame noun and take X as the genus.
+fn _dict_is_frame(t) {
+    if str_eq(t, "act") == 1 { return 1 }       if str_eq(t, "process") == 1 { return 1 }
+    if str_eq(t, "state") == 1 { return 1 }     if str_eq(t, "condition") == 1 { return 1 }
+    if str_eq(t, "quality") == 1 { return 1 }   if str_eq(t, "result") == 1 { return 1 }
+    if str_eq(t, "form") == 1 { return 1 }      if str_eq(t, "type") == 1 { return 1 }
+    if str_eq(t, "kind") == 1 { return 1 }      if str_eq(t, "way") == 1 { return 1 }
+    if str_eq(t, "manner") == 1 { return 1 }    if str_eq(t, "action") == 1 { return 1 }
+    if str_eq(t, "series") == 1 { return 1 }    if str_eq(t, "means") == 1 { return 1 }
+    return 0
+}
+
+// True if a raw token ends a clause (trailing , ; : .) -- the genus clause stops
+// there ("A fruit, usually red." -> fruit).
+fn _dict_ends_clause(t) {
+    let n = len(t)
+    if n == 0 { return 0 }
+    let c = char_at(t, n - 1)
+    if c == 44 { return 1 }   // ,
+    if c == 59 { return 1 }   // ;
+    if c == 58 { return 1 }   // :
+    if c == 46 { return 1 }   // .
+    return 0
+}
+
+// The GENUS of a definition: the head of the leading noun phrase (or the lead
+// verb of a verb definition). Skip leading articles + "to", collect content
+// words until the first preposition / conjunction / clause-ending punctuation,
+// return the LAST one (the NP head): "a small rodent" -> rodent, "a combination
+// of events" -> combination, "to bring into existence" -> bring. The
+// "act/process of X" frame skips to X. Returns "" when no clear head. Pure.
+fn dict_genus(definition) {
+    let toks = split(str_lower(definition), " ")
+    let genus = ""
+    let started = 0
+    let done = 0
+    let i = 0
+    while i < len(toks) {
+        if done == 0 {
+            let raw = toks[i]
+            let w = _dict_word(raw)
+            if len(w) >= 2 {
+                if _dict_is_article(w) == 1 {
+                    // leading article -- skip
+                } else if _dict_is_boundary(w) == 1 {
+                    if started == 1 {
+                        if str_eq(w, "of") == 1 {
+                            if _dict_is_frame(genus) == 1 { started = 0 }
+                            else { done = 1 }
+                        } else { done = 1 }
+                    }
+                } else {
+                    genus = w
+                    started = 1
+                }
+            }
+            if done == 0 { if started == 1 { if _dict_ends_clause(raw) == 1 { done = 1 } } }
+        }
+        i = i + 1
+    }
+    return genus
+}
+
+// A fetched candidate is "strong" (a real article -- the search can stop) when
+// it learned at least `min_ops` reasoning operators. A disambiguation page,
+// redirect stub, or 404 yields ~none, so the loop falls through to the next
+// source. Centralized here so the threshold is a single knob.
+fn research_is_strong(ops, min_ops) {
+    if ops >= min_ops { return 1 }
+    return 0
+}

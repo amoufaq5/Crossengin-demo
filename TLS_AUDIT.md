@@ -1,7 +1,34 @@
 # TLS_AUDIT — what real TLS in CrossEngin would take
 
-Status: **PSK secure-channel shipped; full TLS 1.3 deferred (NOVA enhancement
-#11).** Plain HTTP/1.1 is in pure NOVA
+Status: **TLS 1.3 client with opt-in strict authentication + a pluggable PEM
+trust store (R43, R46).** R46 (`src/safety/pem_truststore.nova`) loads RSA trust
+anchors from a PEM CA bundle pointed to by `CE_TLS_CA_BUNDLE` (e.g.
+`/etc/ssl/certs/ca-certificates.crt`), so anchors are configuration rather than
+hard-coded; the built-in gateway pins remain the no-config fallback. See
+`docs/adr/r46-pluggable-pem-trust-store.md`.
+
+Status (R43): **TLS 1.3 client with opt-in strict authentication.** R43 adds
+RSA cert-chain verification (`src/safety/rsa.nova` PKCS#1 v1.5 + PSS,
+`src/safety/x509_verify.nova` chain + SAN + validity) and a pinned gateway-root
+anchor: with `CE_TLS_STRICT=1` the client verifies the presented chain to the
+pinned sandbox egress-gateway CA + hostname + CertificateVerify before sending
+the request, and rejects on any failure (verified live, incl. wrong-host /
+wrong-pin rejection). The pins authenticate the gateway -- the actual TLS peer
+in this sandbox -- not the true origin; strict is opt-in, lenient is the
+portable default. See `docs/adr/r43-tls-certificate-verification.md`.
+
+Status (R42): **TLS 1.3 1-RTT client shipped — without certificate
+verification.** `src/io/transducers/tls13_client.nova` completes a real
+`TLS_CHACHA20_POLY1305_SHA256` + P-256 handshake and exchanges encrypted HTTP,
+validated against the RFC 8448 key-schedule trace and the RFC 8439 AEAD vector
+(`tests/unit/test_tls13_keyschedule.nova`) and live against example.com /
+en.wikipedia.org. It does NOT yet verify the server's X.509 chain
+(confidential but UNAUTHENTICATED — see `docs/adr/r42-tls13-https-client.md`);
+X.509/ASN.1/PKI is the next slab. The PSK secure-channel and plain HTTP below
+remain.
+
+Status (pre-R42): **PSK secure-channel shipped; full TLS 1.3 deferred (NOVA
+enhancement #11).** Plain HTTP/1.1 is in pure NOVA
 (`src/io/transducers/http_client.nova`, P1.4 Mode 1). A second hop on the
 roadmap also landed: a **PSK-only ChaCha20-Poly1305 secure channel over TCP**
 (`src/io/transducers/secure_channel.nova` + `src/safety/chacha20.nova` +
