@@ -5918,10 +5918,12 @@ pattern (same pattern already shipped for `_nova___arg`).
 
 ### Latent-triage queue (post-R55)
 
-- **UPSTREAM §17 doc extension**: record R55's getenv fix
-  and the general "kernel-pushed strings may be odd-aligned"
-  pitfall so future callers of raw-ptr-returning syscalls
-  know to normalize via `_nova_concat`.
+- ~~**UPSTREAM §17 doc extension**~~ — **DONE** (R56). §17b
+  "Kernel-pushed strings may be odd-aligned" added
+  documenting the R55 getenv fix pattern + the general
+  normalize-at-source rule for raw-kernel-pointer builtins
+  (`_nova___arg`, `_nova_getenv`, candidates for future
+  `readlink`/`realpath`/`strerror`).
 - **test_noise_xk timeout**: not a bug, just slow. Bump
   `CE_TEST_TIMEOUT` default in `scripts/test.sh` or add a
   per-test opt-in extension.
