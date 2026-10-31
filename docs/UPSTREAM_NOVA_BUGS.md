@@ -800,14 +800,79 @@ Still deferred:
   the shim, but that path works because `_nova_eq` already
   does post-call tagging. No action needed.
 
+### §17b (R55) — Kernel-pushed strings may be odd-aligned
+
+**Context**: the two-tier contract (shims tag-poly, internals
+raw) relies on raw pointers always being even (bit 0 = 0) so
+that `test rdi, 1 / sar rdi, 1` cleanly distinguishes
+"tagged NOVA value" from "raw pointer." R46's `.align 2` on
+every emitted string literal enforces this for `.rodata`
+addresses. **Kernel-pushed strings — argv and envp — have
+no such alignment guarantee**: the kernel lays them out
+consecutively starting from a stack-top address, and any
+preceding env variable's length can leave the next string
+at an odd byte offset.
+
+**Fault shape**: a raw env pointer at e.g. `0x7FFF_FFFF_C617`
+(bit 0 = 1) reaches R44's tag-poly `_nova_len`:
+
+```
+test rdi, 1
+jz .nlen_raw
+sar rdi, 1       ← executes because bit 0 = 1
+                 ← halves to 0x3FFF_FFFF_E30B
+.nlen_raw:
+    ...          ← deref at halved addr → SEGV
+```
+
+Deterministic per-binary (depends on envp layout which
+shifts with binary size); non-deterministic across binaries.
+A test's `test_truststore_dir`-style use of
+`len(getenv("HOME"))` crashes on one build and passes on the
+next.
+
+**Normalize-at-source rule**: builtins that return raw
+pointers into kernel-pushed memory must normalize to a
+bit-0-safe heap copy before returning. The canonical
+pattern (shipped by `_nova___arg` since early tagging work;
+R55 brought `_nova_getenv` up to the same standard):
+
+```
+lea rdi, [rsi + r13 + 1]        ; raw value ptr
+lea rsi, [rip + _empty_str]
+call _nova_concat                ; aligned heap copy (bit 0 = 0)
+ret
+```
+
+`_nova_concat` goes through `_nova_alloc` (8-byte-aligned
+return) so the resulting pointer is guaranteed even. One
+strlen+alloc+memcpy per call — negligible cost since both
+`__arg` and `getenv` are called rarely in hot paths.
+
+**Current coverage** (R55 end state):
+- `_nova___arg` (`codegen.nova:16997`) — normalizes argv.
+- `_nova_getenv` (`codegen.nova:19249`) — normalizes env value.
+
+**Future builtins that return raw-kernel-pointer MUST follow
+the same rule**. Candidates to audit if added later:
+`readlink`, `realpath`, `strerror`, `getcwd` (if it ever
+takes a size-0 "return kernel-alloc'd buf" variant), etc.
+
+**Verification**: `test_p256_keypair_load` SEGV →
+OK (31 checks) under R55 proved the pattern works on the
+failing getenv case. `test_truststore_dir` deterministic
+20/20 under R55 confirmed the earlier "fixture flake"
+attribution was really this bug surfacing intermittently.
+
 R43 scratchpad probe: `len(alloc'd) = 2`. R46 probe:
 `str_to_int(alloc'd) = 42`. R50 probe: `str_eq` returns 1 for
 equal alloc'd bufs, `str_find("foobar baz", "bar") = 3`,
 `starts_with`/`ends_with`/`contains`/`str_trim` all green.
 
-Full regression sample across R44 + R46 + R50 landings:
-15 Crossengin tests, 1,114 cumulative checks, zero regressions.
-Entry retained below for historical reference.
+Full regression sample across R44 + R46 + R50 + R55 landings:
+17 Crossengin tests, 1,385 cumulative checks, zero regressions.
+Full-suite 478/478 clean post-R55. Entry retained below for
+historical reference.
 
 (Originally confirmed R43. Root cause for face_recognize load-path
 SEGV cluster (R30/R32/R33/R40 revert chain). Likely root cause for
