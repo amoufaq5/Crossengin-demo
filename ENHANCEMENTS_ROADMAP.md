@@ -5942,6 +5942,15 @@ pattern (same pattern already shipped for `_nova___arg`).
      arrived tagged (reg 1) → read fired on fd=1 (stdout write
      end) → -EBADF forever. Fixed R59 (`sar rdi` prepended
      to the asm block).
+- ~~**test_truststore_dir fixture-cleanup**~~ — **DONE** (R55
+  resolved; verified R60). The pre-R55 flake was attributed to
+  stale `$HOME/.crossengin_ph_o_r1_*` fixtures, but the real root
+  cause was `_nova_getenv` returning raw env-string pointers whose
+  address could be odd-aligned (R55 UPSTREAM §17b). After R55
+  normalized getenv via `_nova_concat`, test_truststore_dir
+  passes 15/15 deterministically — both with stale fixtures AND
+  with cleaned `$HOME` — so no fixture-cleanup fix was needed.
+  No per-test rm-tree or uuid-dir rename required.
 
   Scenario progression: 2/5 → 4/5 (R58) → **5/5 (R59)**.
   `scenario_l_stream_stdin.sh` passes end-to-end — FIFO-fed
