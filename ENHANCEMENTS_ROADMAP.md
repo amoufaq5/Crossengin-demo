@@ -5929,6 +5929,15 @@ pattern (same pattern already shipped for `_nova___arg`).
   `scripts/test.sh`. test_noise_xk now opts to 240s and passes
   44/44 under the full suite driver. Avoids raising the global
   default (keeps "detect hung test fast" for every other test).
+- ~~**test_truststore_dir fixture-cleanup**~~ — **DONE** (R55
+  resolved; verified R60). The pre-R55 flake was attributed to
+  stale `$HOME/.crossengin_ph_o_r1_*` fixtures, but the real root
+  cause was `_nova_getenv` returning raw env-string pointers whose
+  address could be odd-aligned (R55 UPSTREAM §17b). After R55
+  normalized getenv via `_nova_concat`, test_truststore_dir
+  passes 15/15 deterministically — both with stale fixtures AND
+  with cleaned `$HOME` — so no fixture-cleanup fix was needed.
+  No per-test rm-tree or uuid-dir rename required.
 - **Daemon end-to-end re-check post-R49** — **partial** (R58).
   Rebuilt the daemon and ran `scenario_l_stream_stdin.sh`. Surfaced
   two companion tag bugs R49 missed:
