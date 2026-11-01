@@ -4,7 +4,7 @@ This document shows, on a running build, how the symbolic knowledge agent gets f
 
 The demo is reproducible on any machine with the current `claude/phase-0-substrate` branch built. It runs in ~15 seconds and uses only the shipped `fever` seed vocabulary — no corpora required.
 
-> **Status**: Phase 0 parts 1–2 landed. Four of six substrate wire-ups are live: predictive-coding learner, synapse-weighted forward-chain retrieval, lazy synapse growth, direct `/good` reinforcement, and episodic consolidation. Forward-Forward and HDC-on-new-atoms are the remaining wire-ups, scheduled for part 3.
+> **Status**: Phase 0 parts 1–3 landed. All six substrate wire-ups are live: predictive-coding learner, synapse-weighted forward-chain retrieval, lazy synapse growth, direct `/good` reinforcement, episodic consolidation, HDC embed mode, and Forward-Forward goodness on moments. The first self-indexing acceleration module — the chain compiler — is also live. The remaining three acceleration modules (`kg_router`, `moment_cache`, `intent_adaptive`) are scheduled for part 4.
 
 ---
 
@@ -60,7 +60,9 @@ Each message passes through five layers. Three of them *write state* that persis
 │  │       live.                                                  │   │
 │  │    Predictive coding (pc_pred_learn): live. Learns the       │   │
 │  │       arousal trajectory per familiar input.                 │   │
-│  │    Forward-Forward (ff_train_pair): scheduled for part 3.    │   │
+│  │    Forward-Forward (ff_train_pair): live. Goodness over    │   │
+│  │       the current moment vector rises on /good, falls on    │   │
+│  │       /bad -- surfaced in /__learning__ as `ff_goodness`.   │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │         │                                                            │
 │         ▼                                                            │
@@ -140,18 +142,45 @@ This is the *frequency-adaptive latency* property. It's what you get from Hebbia
 | Layer | Live on chat hot path? | Mechanism |
 |---|---|---|
 | Atoms | yes | read + write via `rop_*`, `atom_observe` |
-| HDC | partial (word atoms only) | `hdc_symbol`, `hdc_bundle` — new-atom embed pending |
+| HDC | **yes** (embed mode set to HDC at session init) | `atom_set_embed_mode(ATOM_EMBED_MODE_HDC)` |
 | Synapse graph | **yes** (lazy grow + direct `/good` reinforcement) | `syn_grow_if_absent` + `syn_set_weight` |
 | Moments / tick | yes | `loop_memory_step_with_episodic` + `tick_driver` |
 | Hebbian plasticity | yes (modulator path) | `emotion_modulate_plasticity → pm_modulator` |
 | Predictive coding (learner) | **yes** | `pc_pred_learn` + `pc_pred_predict` |
-| Forward-Forward | pending part 3 | `ff_train_pair` + `ff_learn` |
+| Forward-Forward | **yes** | `ff_layer_new` + `ff_train_pair` + `ff_goodness` |
+| Chain compiler | **yes** (pt3) | `chain_compile_from_ops_csv` on `/good` |
 
 Observability commands:
 
 - `/synapse <atom-label>` — list outgoing synapses with current weights.
-- `/__learning__` — key=value snapshot of synapse state (scriptable).
+- `/__learning__` — key=value snapshot of synapse + FF state (scriptable).
+- `/__compiled__` — list derived operator atoms the chain compiler has minted.
 - `/status` — one-line summary (moments, episodes, synapses, mood, DP budget).
+
+---
+
+## Chain compilation (Phase 0 pt3)
+
+The chain compiler watches `/good` reinforcement. When a two-hop segment `A → B → C` of the just-rewarded chain has both legs' Hebbian synapse weights at or above `CHAIN_COMPILE_THRESHOLD` (default 500 milli = half of `W_MAX`), the compiler mints a direct derived operator atom `A → C` labeled `cc:A->C [via B]`. The original chain stays in the KG, so `/why` still traces to the full path.
+
+```
+> /__compiled__                    # before any /good
+compiled_count=0
+compile_threshold=500
+
+> fever
+agent> infection leads to headache (infection->symptom->fever->headache).
+> /good
+...  (repeat four more times — each /good adds 100 milli to every leg)
+> /__compiled__
+compiled_count=2
+compile_threshold=500
+  cc:infection->fever [via symptom] (infection -> fever)
+  cc:symptom->headache [via fever] (symptom -> headache)
+```
+
+Threshold is first cleared on the 5th `/good` (100 × 5 = 500 milli per leg). Because the compiled operator plugs into the same scoring code as any seeded one, the next `fever` query can short-circuit the two-hop traversal through the derived rule.
+
 
 ---
 
