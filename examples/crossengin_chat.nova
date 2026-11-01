@@ -117,6 +117,12 @@ import "../src/kg/temporal.nova"
 import "../src/kg/query.nova"
 import "../src/kg/rule_inference.nova"
 import "../src/kg/rule_explain.nova"
+import "../src/learning/forward_forward.nova"
+import "../src/kg/kg_router.nova"
+import "../src/kg/hdc_embed.nova"
+import "../src/parts/episodic/moment_cache.nova"
+import "../src/nl/intent_adaptive.nova"
+import "../src/kg/atom_store.nova"
 import "../src/io/transducers/kg_rss_ingest.nova"
 import "../src/perception/sensor_fusion.nova"
 import "../src/perception/lipsync.nova"
@@ -161,6 +167,133 @@ let _last_reason_ops = ""
 let _last_reason_trace = ""
 let _last_category = 0
 let chat_stats_router_replies = 0
+
+// Phase 0 pt3 wire-up 3: Forward-Forward layer state and the last
+// moment's 8-dim bucketed vector. The FF layer learns "which moment
+// signatures look positive" from /good + /bad feedback; its goodness
+// over the current moment goes into /__learning__ so an operator can
+// see familiar-moment confidence rising.
+//
+// _ff_layer is session-wide and lazily allocated at first use (0 == uninit).
+// _last_moment_vec is the 8-dim bucketed representation of the most
+// recent percept, built in main's REPL turn before router_reply fires.
+let _ff_layer = 0
+let _last_moment_vec = 0
+
+// Phase 0 pt4: self-indexing acceleration handles. All three are
+// session-wide and lazily allocated at session init (0 == uninit).
+// Rollback: set a handle to 0 and the corresponding feature is dormant
+// with no further code change.
+//   _kgr      : KG routing table (topic_hash, shape_hash) -> row
+//   _mc       : HDC-keyed LRU of (reply, trace, ops)
+//   _ia       : per-CAT HDC prototypes reinforced on /good
+//   _last_*   : surfaced for /good's ia_reinforce + /__routing__
+let _kgr = 0
+let _mc = 0
+let _ia = 0
+let _last_topic_hash = 0
+let _last_shape_hash = 0
+let _last_raw_msg = ""
+
+// Phase 0 pt3: build an 8-dim moment vector by bucketing atom ids from
+// the current percept. Each atom contributes `+1000` (milli = 1.0) to
+// bucket `atom_id % 8`. Deterministic given the same atom set, so two
+// identical queries produce identical vectors and FF's "familiar moment"
+// detector can fire.
+fn _moment_vec_from_percept(percept) {
+    let v = list_new()
+    let b = 0
+    while b < 8 { push(v, 0); b = b + 1 }
+    let i = 0
+    while i < len(percept) {
+        let aid = percept[i][1]
+        if aid >= 0 {
+            let slot = aid % 8
+            if slot < 0 { slot = 0 - slot }
+            list_set(v, slot, v[slot] + 1000)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+// Phase 0 pt3: 8-dim zero vector for FF negative examples (/bad). Reused.
+fn _moment_zero_vec() {
+    let v = list_new()
+    let b = 0
+    while b < 8 { push(v, 0); b = b + 1 }
+    return v
+}
+
+// Phase 0 pt4: HDC hypervector of the current percept, used as the
+// moment cache key. Bundle the HDC symbol of each atom's label. Falls
+// back to a stable zero vector when the percept is empty, so cosine
+// against any entry is 0 (never a false hit).
+fn _moment_hdc_from_percept(kg, percept) {
+    let vecs = list_new()
+    let i = 0
+    while i < len(percept) {
+        let aid = percept[i][1]
+        if aid >= 0 {
+            let a = kg_atom(kg, aid)
+            if a != 0 {
+                let lbl = atom_label(a)
+                if len(lbl) > 0 {
+                    push(vecs, hdc_symbol(lbl))
+                }
+            }
+        }
+        i = i + 1
+    }
+    if len(vecs) == 0 {
+        // Return a deterministic zero-ish vec; hdc_cosine with any
+        // real moment yields 0 so lookup can't match. Use hdc_symbol
+        // of a sentinel so the shape matches hdc_dims().
+        return hdc_symbol("__pt4_empty__")
+    }
+    return hdc_bundle(vecs)
+}
+
+// Phase 0 pt4: first content token of a raw utterance (reuses the
+// classifier's lowercasing + tokenizer). Falls back to "" when every
+// token is a stopword or a number.
+fn _pt4_first_content_token(raw_msg) {
+    let toks = _ic_tokens(_ic_lower(str_trim(raw_msg)))
+    let stops = _pt4_stopwords()
+    let i = 0
+    while i < len(toks) {
+        let t = toks[i]
+        if _ic_in(t, stops) == 0 {
+            if _ic_is_number_tok(t) == 0 { return t }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _pt4_stopwords() {
+    return ["the", "a", "an", "is", "are", "was", "were", "of", "to", "in",
+            "on", "at", "for", "and", "or", "but",
+            "i", "you", "we", "they", "it",
+            "this", "that", "these", "those",
+            "what", "why", "how", "when", "where", "who",
+            "can", "could", "will", "would", "should"]
+}
+
+// Phase 0 pt4: shape hash = cat_name + bucketed-token-length. Bucket
+// is len/4 so "fever" (1 tok -> 0) and "what causes fever" (3 toks
+// -> 0) share a shape, while longer prompts fall into higher buckets.
+fn _pt4_shape_hash(raw_msg, category) {
+    let toks = _ic_tokens(_ic_lower(str_trim(raw_msg)))
+    let bucket = len(toks) / 4
+    return label_hash(cat_name(category) + ":" + int_to_str(bucket))
+}
+
+fn _pt4_topic_hash(raw_msg) {
+    let t = _pt4_first_content_token(raw_msg)
+    if len(t) == 0 { return 0 }
+    return label_hash(t)
+}
 
 // R56: when a same-turn re-answer (R52) re-perceives the query after research,
 // these hold the RE-PERCEIVED match/unknown counts (the post-research
@@ -2957,6 +3090,155 @@ fn _admin_status(sl, kg, refl_kg, log, engine, hs, stream, em, syn_g, sm, dp) {
     return 1
 }
 
+// Phase 0 observability: /synapse <atom-label>. Lists the outgoing live
+// synapses from the named atom's node, with the current Hebbian weight
+// on each. Lets the operator (and the 20-query demo in
+// docs/HOW_IT_LEARNS.md) verify directly that plasticity is strengthening
+// the right edges over repeat interactions.
+fn _admin_synapse(kg, syn_g, arg) {
+    if len(arg) == 0 {
+        println("usage: /synapse <atom-label>")
+        return 1
+    }
+    let a = kg_find_atom(kg, arg)
+    if a == 0 {
+        println("(no atom with label '" + arg + "')")
+        return 1
+    }
+    let src = atom_id(a)
+    let outs = syn_out(syn_g, src)
+    if len(outs) == 0 {
+        println(arg + " (node " + int_to_str(src) + "): 0 live outgoing synapses")
+        return 1
+    }
+    println(arg + " (node " + int_to_str(src) + "): " + int_to_str(len(outs)) + " outgoing synapse(s)")
+    let max_show = 20
+    let i = 0
+    while i < len(outs) {
+        if i >= max_show {
+            println("  (+" + int_to_str(len(outs) - max_show) + " more)")
+            return 1
+        }
+        let idx = outs[i]
+        let dst = syn_post(syn_g, idx)
+        let w = syn_weight(syn_g, idx)
+        let dst_atom = kg_atom(kg, dst)
+        let dst_label = "?"
+        if dst_atom != 0 { dst_label = atom_label(dst_atom) }
+        println("  -> " + dst_label + " (node " + int_to_str(dst) + ") weight=" + int_to_str(w))
+        i = i + 1
+    }
+    return 1
+}
+
+// Phase 0 observability: /__learning__ — machine-readable snapshot of
+// substrate learning state. One `key=value` per line so the demo doc's
+// 20-query scripted driver can parse it after each turn. Reports:
+//   synapse_live=N      synapses alive right now (reasoning part)
+//   synapse_total=N     slots used (includes dead -- compaction frees these)
+//   synapse_mean_weight=N  mean weight across live synapses (milli)
+//   dlog_entries=N      total decisions logged this session
+//   tick=N              scheduler tick count (proxy for ticks-elapsed)
+fn _admin_learning(syn_g, log, hs) {
+    let live = syn_live(syn_g)
+    let total = syn_total(syn_g)
+    println("synapse_live=" + int_to_str(live))
+    println("synapse_total=" + int_to_str(total))
+    let sum = 0
+    let n = 0
+    let i = 0
+    while i < total {
+        if syn_alive(syn_g, i) == 1 {
+            sum = sum + syn_weight(syn_g, i)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    let mean = 0
+    if n > 0 { mean = sum / n }
+    println("synapse_mean_weight=" + int_to_str(mean))
+    // Phase 0 pt3: Forward-Forward goodness over the last moment vector.
+    // Rising on /good reinforcements, falling on /bad. A machine-readable
+    // snapshot of "how familiar does the current moment look to the FF
+    // layer." Printed only when both the layer and a captured moment
+    // exist (first turn before any reply emits 0 for both).
+    let ffg = 0
+    if _ff_layer != 0 {
+        if _last_moment_vec != 0 {
+            ffg = ff_goodness(_ff_layer, _last_moment_vec)
+        }
+    }
+    println("ff_goodness=" + int_to_str(ffg))
+    // Phase 0 pt4: moment-cache + intent-adaptive observability. Only
+    // emits non-zero rows for intent prototypes that have been
+    // reinforced this session, so a fresh REPL stays tidy.
+    if _mc != 0 {
+        println("mc_entries=" + int_to_str(mc_count(_mc)))
+        println("mc_hits=" + int_to_str(mc_hits(_mc)))
+        println("mc_misses=" + int_to_str(mc_misses(_mc)))
+    }
+    if _ia != 0 {
+        let c = 0
+        while c < ia_count() {
+            let st = ia_prototype_strength(_ia, c)
+            if st > 0 {
+                println("ia_proto_strength_" + cat_name(c)
+                        + "=" + int_to_str(st))
+            }
+            c = c + 1
+        }
+    }
+    println("dlog_entries=" + int_to_str(dl_count(log)))
+    println("tick=" + int_to_str(hs_now(hs)))
+    return 1
+}
+
+// Phase 0 pt4: /__routing__ — top-20 KG routing entries sorted by hits.
+// Row shape: topic=<h> shape=<h> kg=<label> hits=<n> mean_lat_ticks=<n>.
+// Reads the module-level _kgr; prints "no routing data yet" when empty.
+fn _admin_routing() {
+    if _kgr == 0 {
+        println("(routing table not initialised)")
+        return 1
+    }
+    let n = kgr_count(_kgr)
+    println("routing_entries=" + int_to_str(n))
+    if n == 0 {
+        println("(no answered queries yet this session)")
+        return 1
+    }
+    let order = kgr_top(_kgr, 20)
+    let i = 0
+    while i < len(order) {
+        let r = order[i]
+        println("  topic=" + int_to_str(kgr_row_topic(_kgr, r))
+                + " shape=" + int_to_str(kgr_row_shape(_kgr, r))
+                + " kg=" + kgr_row_kg(_kgr, r)
+                + " hits=" + int_to_str(kgr_row_hits(_kgr, r))
+                + " mean_lat_ticks=" + int_to_str(kgr_row_lat(_kgr, r)))
+        i = i + 1
+    }
+    return 1
+}
+
+// Phase 0 pt3: /__compiled__ — list the derived operator atoms the
+// chain compiler has minted this session. One line per compiled rule.
+// Empty output means no two-hop segment has yet cleared the Hebbian
+// threshold (default 500 milli, ~5 /good reinforcements per leg).
+fn _admin_compiled(kg, syn_g) {
+    let reg = chain_compile_registry()
+    let n = len(reg)
+    println("compiled_count=" + int_to_str(n))
+    println("compile_threshold=" + int_to_str(chain_compile_threshold()))
+    let i = 0
+    while i < n {
+        let s = chain_compile_render(kg, syn_g, reg[i])
+        if len(s) > 0 { println("  " + s) }
+        i = i + 1
+    }
+    return 1
+}
+
 // ADR-0087 (Phase L R2): /gc-stats -- render the per-agent GC observability
 // registry (src/kg/gc_metrics.nova). The chat REPL has no `agent` in scope
 // (the autonomous loop is the daemon path), so we read from the module-level
@@ -5742,6 +6024,32 @@ fn _admin_feedback(kg, sign) {
         return 1
     }
     let n = router_apply_feedback(kg, _last_reason_ops, sign)
+    // Phase 0 pt3 wire-up 3: feed the last-moment vector to the Forward-
+    // Forward layer. /good trains the moment as a positive example (ff
+    // goodness over this moment rises); /bad trains it as negative
+    // (goodness falls). Zero-vector is the neutral counter-example in
+    // ff_train_pair -- avoids coupling the sign to any particular
+    // alternative moment.
+    if _ff_layer != 0 {
+        if _last_moment_vec != 0 {
+            if sign > 0 {
+                ff_train_pair(_ff_layer, _last_moment_vec, _moment_zero_vec(), 300)
+            } else {
+                ff_train_pair(_ff_layer, _moment_zero_vec(), _last_moment_vec, 300)
+            }
+        }
+    }
+    // Phase 0 pt4: bundle the just-rewarded utterance into the matched
+    // intent prototype. On /bad we deliberately do nothing — bundling a
+    // mislabelled utterance under its wrong category is strictly worse
+    // than slow learning.
+    if _ia != 0 {
+        if sign > 0 {
+            if len(_last_raw_msg) > 0 {
+                ia_reinforce(_ia, _last_category, _last_raw_msg)
+            }
+        }
+    }
     if sign > 0 {
         println("thanks -- reinforced " + int_to_str(n) + " inference(s).")
     } else {
@@ -5820,6 +6128,10 @@ fn _try_admin(msg, sl, kg, lang, ikg, refl_kg, ctx, log, engine, hs, kgreg, mo, 
     if str_eq_bytes(cmd, "/know")    == 1 { return _admin_knowledge(lang, kg, kgreg, arg) }
     if str_eq_bytes(cmd, "/why-deep") == 1 { return _admin_why_deep(kg, ctx, log, arg) }
     if str_eq_bytes(cmd, "/__atoms__") == 1 { return _admin_atoms_probe(kg, lang) }
+    if str_eq_bytes(cmd, "/synapse") == 1 { return _admin_synapse(kg, syn_g, arg) }
+    if str_eq_bytes(cmd, "/__learning__") == 1 { return _admin_learning(syn_g, log, hs) }
+    if str_eq_bytes(cmd, "/__compiled__") == 1 { return _admin_compiled(kg, syn_g) }
+    if str_eq_bytes(cmd, "/__routing__") == 1 { return _admin_routing() }
     if str_eq_bytes(cmd, "/halt")    == 1 { return _admin_halt() }
     if str_eq_bytes(cmd, "/resume")  == 1 { return _admin_resume() }
     if str_eq_bytes(cmd, "/good")    == 1 { return _admin_feedback(kg, 1) }
@@ -6068,6 +6380,19 @@ fn main() {
     let si = si_new()
     let reasoning_part = registry_get(reg, registry_find(reg, "reasoning"))
     let syn_g = part_syn(reasoning_part)
+    // Phase 0 wire-up: give the cognitive router access to the reasoning
+    // part's synapse graph so _cr_chain can weight forward-chain scoring
+    // by Hebbian-reinforced edge strength. Hot queries then settle faster
+    // over repeated interactions. Idempotent — safe to call once at init.
+    cr_set_syn_g(syn_g)
+    // Phase 0 pt3 wire-up 5: switch atom embed mode to HDC. New word
+    // atoms minted via /teach / rop_new get 10 000-dim hypervector
+    // embeds via `hdc_symbol`; concept_layer, learn_pipeline, and
+    // word_atoms all auto-branch to HDC paths once the flag is set.
+    // The autonomous_loop daemon already runs in HDC mode (see
+    // src/agent/autonomous_loop.nova:223); this brings the chat to
+    // parity so semantic_search + ANN work on fresh chat-ingested atoms.
+    atom_set_embed_mode(ATOM_EMBED_MODE_HDC)
     let sm = self_model_new()
 
     // Phase 18 Half A: install the default session ("default" / "Aurora") in
@@ -6149,6 +6474,37 @@ fn main() {
     let error = 0
     let predicted = 300
     let turn = 0
+    // Phase 0 wire-up: predictive-coding predictor state. Session-local;
+    // learns the arousal signal (ctx=0, node=0 — one scalar dim). Each tick
+    // records the actual arousal; next tick's `predicted` is the learned
+    // prediction instead of the trivial "assume same as last" at line 6318.
+    // See `pc_pred_new` / `pc_pred_learn` / `pc_pred_predict` in
+    // src/learning/predictive_coding_runtime.nova.
+    let _pc_pred = pc_pred_new()
+    // Phase 0 wire-up: episodic-atom store. Backs the rate-limited
+    // consolidation sweep in loop_memory_step_with_episodic — one new
+    // episodic atom gets minted per recurring moment-signature, and
+    // existing ones receive live Beta-belief updates when their
+    // observation ids re-appear. Session-local.
+    let _eas = episodic_atoms_new()
+    // Phase 0 pt3 wire-up 3: lazy-init Forward-Forward layer. 8 units,
+    // 8-dim input (bucketed atom-id moment vector), goodness threshold
+    // 500 milli, deterministic seed 42. Trained by /good + /bad in
+    // router_apply_feedback; goodness over the current moment surfaced
+    // in /__learning__.
+    _ff_layer = ff_layer_new(8, 8, 500, 42)
+
+    // Phase 0 pt4: self-indexing acceleration — one allocation each.
+    //   _kgr    tiny (topic,shape) -> hit/latency table surfaced by
+    //           /__routing__ (and ready for Phase 4 multi-KG routing).
+    //   _mc     1024-entry HDC-keyed LRU of (reply, trace, ops); hot
+    //           queries jump to attractor and skip router_reply.
+    //   _ia     per-category HDC prototype, bundled on /good so
+    //           idiomatic utterances specific to this user score higher
+    //           on the next similar input.
+    _kgr = kgr_new()
+    _mc = mc_new(1024)
+    _ia = ia_new()
 
     // For the boot banner, peek at the default session's KG. Suppressed in
     // R112 --json mode so a scripted caller gets nothing before its first
@@ -6293,8 +6649,14 @@ fn main() {
                 // Reflection corroboration: percept tokens whose label is
                 // already in refl_kg confirm prior speculation (ADR-0023).
                 let corroborated = refl_corroborate_percept(kg, refl_kg, ctx_percept(ctx))
-                loop_memory_step(ctx, stream, em)
+                loop_memory_step_with_episodic(ctx, stream, em, _eas)
                 let nconcl = loop_reasoning_step(ctx, kg)
+                // Phase 0 pt3 wire-up 3: capture the active moment as an
+                // 8-dim bucketed vector before router_reply fires. The
+                // vector is read later by _admin_feedback (/good // /bad)
+                // for FF training and by _admin_learning (/__learning__)
+                // to surface current goodness.
+                _last_moment_vec = _moment_vec_from_percept(ctx_percept(ctx))
 
                 _route_and_inject(reg, gate, XSIG_SENSORY, 700, hs_now(hs))
                 let unk = ctx_unknown(ctx)
@@ -6315,7 +6677,12 @@ fn main() {
                 let aro = ctx_arousal(ctx)
                 modulator = emotion_modulate_plasticity(val, aro, val)
                 error = pc_residual(aro, predicted)
-                predicted = aro
+                // Phase 0 wire-up: feed the actual arousal into the
+                // predictive-coding delta-rule learner (lr=300 => 30%).
+                // Next tick's `predicted` becomes the LEARNED prediction
+                // rather than the trivial "same as last tick" fallback.
+                pc_pred_learn(_pc_pred, 0, 0, aro, 300)
+                predicted = pc_pred_predict(_pc_pred, 0, 0)
 
                 let gap = 200
                 if unk > 0 { gap = 700 }
@@ -6398,11 +6765,55 @@ fn main() {
                         // strategies. Numbered counters kept for /status parity.
                         let cat_res = classify_input(raw_msg)
                         _last_category = ci_category(cat_res)
-                        let rr = router_reply(_last_category, raw_msg, kg, lang,
-                                              ctx_percept(ctx), hs_now(hs))
-                        dispatched = rr_reply(rr)
-                        _last_reason_trace = rr_trace(rr)
-                        _last_reason_ops = rr_ops(rr)
+                        // Phase 0 pt4: let the adaptive intent prototype
+                        // override only when confidently reinforced. ia
+                        // confidence 500 milli = cosine >= 0.5 to its
+                        // prototype; cross-category contamination
+                        // randomises out so a strong vote is unlikely
+                        // to be a false positive.
+                        if _ia != 0 {
+                            let ia_r = ia_score(_ia, raw_msg)
+                            if ia_score_conf(ia_r) >= 500 {
+                                _last_category = ia_score_cat(ia_r)
+                            }
+                        }
+                        _last_raw_msg = raw_msg
+                        _last_topic_hash = _pt4_topic_hash(raw_msg)
+                        _last_shape_hash = _pt4_shape_hash(raw_msg, _last_category)
+                        // Phase 0 pt4: moment cache lookup. On a near-
+                        // identical percept HDC vector (cosine >= 900
+                        // milli), skip router_reply and reuse the stored
+                        // reply + ops. /good + /bad still fire against
+                        // _last_reason_ops so the underlying synapse
+                        // graph still reinforces.
+                        let _pt4_t0 = hs_now(hs)
+                        let _mv = 0
+                        let _hit = 0
+                        if _mc != 0 {
+                            _mv = _moment_hdc_from_percept(kg, ctx_percept(ctx))
+                            _hit = mc_lookup(_mc, _mv, mc_default_threshold())
+                        }
+                        if _hit != 0 {
+                            dispatched = _hit[0]
+                            _last_reason_trace = _hit[1]
+                            _last_reason_ops = _hit[2]
+                        } else {
+                            let rr = router_reply(_last_category, raw_msg, kg, lang,
+                                                  ctx_percept(ctx), hs_now(hs))
+                            dispatched = rr_reply(rr)
+                            _last_reason_trace = rr_trace(rr)
+                            _last_reason_ops = rr_ops(rr)
+                            if _mc != 0 {
+                                mc_store(_mc, _mv, dispatched,
+                                         _last_reason_trace, _last_reason_ops)
+                            }
+                        }
+                        if _kgr != 0 {
+                            let _pt4_lat = hs_now(hs) - _pt4_t0
+                            kgr_observe(_kgr, _last_topic_hash,
+                                        _last_shape_hash, "reasoning",
+                                        _pt4_lat)
+                        }
                         chat_stats_router_replies = chat_stats_router_replies + 1
                     }
                     if len(dispatched) > 0 {
