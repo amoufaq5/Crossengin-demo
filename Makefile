@@ -17,7 +17,18 @@ NOVA_ROOT ?= $(HOME)/NOVA
 NOVA      := $(NOVA_ROOT)/nova
 BIN       := bin
 
-SRC_MODULES := $(shell find src -name '*.nova' ! -name '*.pending' 2>/dev/null | sort)
+# Files with circular-import duplicate-symbol collisions under standalone
+# compile. Both pairs form mutual-import cycles the NOVA compiler's dedup
+# does not currently break (upstream UPSTREAM §19 candidate). These modules
+# work fine when pulled transitively from an entry point (chat, daemon,
+# tests), so the chat binary builds normally; standalone `make build` just
+# can't exercise them. Remove entries here once NOVA fixes the dedup.
+BUILD_SKIP := src/federation/gossip.nova \
+              src/federation/gossip_relay.nova \
+              src/kg/multi_kg_manager.nova \
+              src/kg/cross_kg_references.nova
+
+SRC_MODULES := $(filter-out $(BUILD_SKIP),$(shell find src -name '*.nova' ! -name '*.pending' 2>/dev/null | sort))
 UNIT_TESTS  := $(shell find tests/unit -name '*.nova' 2>/dev/null | sort)
 BENCHMARKS  := $(shell find tests/benchmark -name '*.nova' 2>/dev/null | sort)
 SELFCHECK   := examples/kernel_selfcheck.nova
