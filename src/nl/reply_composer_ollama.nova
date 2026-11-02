@@ -1,0 +1,278 @@
+// CrossEngin Phase 2 pt1: Ollama reply composer sidecar.
+//
+// Purpose
+//   Rewrite a templated reply from router_reply in natural tone,
+//   preserving the semantic claim. The reasoning engine already decided
+//   what to say; this module is a stylist, not a knowledge source.
+//
+//   Mirrors src/nl/nl_llm_sidecar.nova's fork+exec + fd-drain pattern:
+//   same raw syscall shims, same cache-populate-once idiom, same
+//   fall-through-on-failure contract. On any failure the caller gets
+//   the input text back unchanged, so Ollama-absent = zero behavioural
+//   change on the chat hot path.
+//
+// Env-var contract:
+//   CE_OLLAMA_COMPOSER        Master gate. "1" turns the composer on.
+//                             Any other value leaves rco_compose_or_
+//                             passthrough(text, _) returning `text`
+//                             without touching stdin or the script.
+//   CE_REPLY_COMPOSER_SCRIPT  Path to the sidecar script. Default
+//                             "scripts/llm_compose.sh". Operators
+//                             repath for out-of-tree installs.
+//   OLLAMA_COMPOSER_BACKEND   Passed to the script as --backend.
+//                             Default "ollama". "dry-run" skips the
+//                             LLM entirely (echoes TEMPLATE).
+//   OLLAMA_COMPOSER_MODEL     Passed as --model. Default
+//                             "llama3.2:3b-instruct".
+//
+// Public API:
+//   rco_available()                        -> 0|1
+//   rco_compose_or_passthrough(text,atoms) -> string
+//
+// NOVA dependencies: builtins -- alloc, store8, store64, load8,
+//   list_new, push, getenv, str_eq_bytes, fork_process, exec_program,
+//   waitpid, sys_open, sys_write, sys_close, chr, int_to_str.
+// CrossEngin dependencies: src/util/str_safe.nova.
+
+import "std/io"
+import "std/string"
+import "std/syscall"
+import "../util/str_safe.nova"
+
+let _RCO_DEFAULT_SCRIPT   = "scripts/llm_compose.sh"
+let _RCO_DEFAULT_BACKEND  = "ollama"
+let _RCO_DEFAULT_MODEL    = "llama3.2:3b-instruct"
+let _RCO_INPUT_PATH       = "/tmp/crossengin_compose_in.txt"
+let _RCO_MAX_OUT_BYTES    = 4096
+
+let _RCO_CACHE_UNSET = 0
+let _RCO_CACHE_OFF   = 1
+let _RCO_CACHE_ON    = 2
+
+let _rco_cache_state   = 0
+let _rco_cache_script  = ""
+let _rco_cache_backend = ""
+let _rco_cache_model   = ""
+
+fn _rco_env_or(name, dfl) {
+    let env = getenv(name)
+    if env == 0 { return dfl }
+    if len(env) == 0 { return dfl }
+    return env
+}
+
+fn _rco_env_is_one(name) {
+    let env = getenv(name)
+    if env == 0 { return 0 }
+    if len(env) == 0 { return 0 }
+    if str_eq_bytes(env, "1") == 1 { return 1 }
+    return 0
+}
+
+fn _rco_file_openable(path) {
+    let fd = sys_open(path, 0, 0)
+    if fd < 0 { return 0 }
+    sys_close(fd)
+    return 1
+}
+
+fn _rco_cache_populate() {
+    if _rco_cache_state != _RCO_CACHE_UNSET { return 0 }
+    _rco_cache_script  = _rco_env_or("CE_REPLY_COMPOSER_SCRIPT", _RCO_DEFAULT_SCRIPT)
+    _rco_cache_backend = _rco_env_or("OLLAMA_COMPOSER_BACKEND", _RCO_DEFAULT_BACKEND)
+    _rco_cache_model   = _rco_env_or("OLLAMA_COMPOSER_MODEL",   _RCO_DEFAULT_MODEL)
+    let enabled = _rco_env_is_one("CE_OLLAMA_COMPOSER")
+    if enabled == 0 {
+        _rco_cache_state = _RCO_CACHE_OFF
+        return 1
+    }
+    if _rco_file_openable(_rco_cache_script) == 0 {
+        _rco_cache_state = _RCO_CACHE_OFF
+        return 1
+    }
+    _rco_cache_state = _RCO_CACHE_ON
+    return 1
+}
+
+fn rco_available() {
+    _rco_cache_populate()
+    if _rco_cache_state == _RCO_CACHE_ON { return 1 }
+    return 0
+}
+
+// ---- raw syscall shims (duplicated locally so this module is a leaf) ----
+
+fn _rco_pipe2(pipefd_buf) {
+    asm {
+        "mov rax, 293"
+        "mov rdi, [rbp-8]"
+        "xor rsi, rsi"
+        "syscall"
+    }
+}
+
+fn _rco_dup2(oldfd, newfd) {
+    asm {
+        "mov rax, 33"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "syscall"
+    }
+}
+
+fn _rco_close(fd) {
+    asm {
+        "mov rax, 3"
+        "mov rdi, [rbp-8]"
+        "syscall"
+    }
+}
+
+fn _rco_read(fd, buf, count) {
+    asm {
+        "mov rax, 0"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "mov rdx, [rbp-24]"
+        "syscall"
+    }
+}
+
+fn _rco_load_le_u32(addr) {
+    let b0 = load8(addr)
+    let b1 = load8(addr + 1)
+    let b2 = load8(addr + 2)
+    let b3 = load8(addr + 3)
+    let lo = b0 + b1 * 256
+    let hi = b2 + b3 * 256
+    return lo + hi * 65536
+}
+
+fn _rco_bytes_to_str(buf, n) {
+    if n <= 0 { return "" }
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + chr(load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn _rco_drain_fd(fd, max_bytes) {
+    let acc = ""
+    let buf = alloc(2048)
+    let total = 0
+    let keep = 1
+    while keep == 1 {
+        let n = _rco_read(fd, buf, 2048)
+        if n <= 0 {
+            keep = 0
+        } else {
+            acc = acc + _rco_bytes_to_str(buf, n)
+            total = total + n
+            if total >= max_bytes { keep = 0 }
+        }
+    }
+    return acc
+}
+
+// Write the TEMPLATE + ATOMS payload to the sidecar's --input file.
+// Returns 1 on success, 0 on any write failure.
+fn _rco_write_input(path, templated, atoms_csv) {
+    let flags = O_WRONLY + O_CREAT + O_TRUNC
+    let fd = sys_open(path, flags, 384)
+    if fd < 0 { return 0 }
+    let payload = "TEMPLATE " + templated + "\nATOMS " + atoms_csv + "\n"
+    let n = len(payload)
+    let w = sys_write(fd, payload, n)
+    sys_close(fd)
+    if w != n { return 0 }
+    return 1
+}
+
+// Fixed argv for scripts/llm_compose.sh. Matches the shim's CLI.
+//   [0] script_path
+//   [1] "--input"
+//   [2] input_file_path
+//   [3] "--output"
+//   [4] "-"
+//   [5] "--model"
+//   [6] model_name
+//   [7] "--backend"
+//   [8] backend_name
+//   [9] NULL
+fn _rco_argv(script_path, input_path, model_name, backend_name) {
+    let p = alloc(10 * 8)
+    store64(p,      script_path)
+    store64(p + 8,  "--input")
+    store64(p + 16, input_path)
+    store64(p + 24, "--output")
+    store64(p + 32, "-")
+    store64(p + 40, "--model")
+    store64(p + 48, model_name)
+    store64(p + 56, "--backend")
+    store64(p + 64, backend_name)
+    store64(p + 72, 0)
+    return p
+}
+
+// Trim trailing/leading whitespace from a one-line string.
+fn _rco_trim_line(s) {
+    let t = str_trim(s)
+    let n = len(t)
+    let i = 0
+    while i < n {
+        if char_at(t, i) == 10 { return substr(t, 0, i) }
+        i = i + 1
+    }
+    return t
+}
+
+// Returns the composed line on success, or `templated` on any
+// failure. `atoms_csv` is passed through to the LLM as context; empty
+// is fine. Length-caps output at `2 * len(templated) + 256` and falls
+// back on overlong replies (an LLM that ignores the one-sentence rule).
+fn rco_compose_or_passthrough(templated, atoms_csv) {
+    _rco_cache_populate()
+    if _rco_cache_state != _RCO_CACHE_ON { return templated }
+    if len(templated) == 0 { return templated }
+    if _rco_write_input(_RCO_INPUT_PATH, templated, atoms_csv) == 0 {
+        return templated
+    }
+
+    let pipefd_buf = alloc(8)
+    _rco_pipe2(pipefd_buf)
+    let read_fd  = _rco_load_le_u32(pipefd_buf)
+    let write_fd = _rco_load_le_u32(pipefd_buf + 4)
+    if read_fd == 0 { return templated }
+
+    let argv = _rco_argv(_rco_cache_script, _RCO_INPUT_PATH,
+                         _rco_cache_model, _rco_cache_backend)
+    let pid = fork_process()
+    if pid < 0 {
+        _rco_close(read_fd)
+        _rco_close(write_fd)
+        return templated
+    }
+    if pid == 0 {
+        _rco_dup2(write_fd, 1)
+        _rco_close(write_fd)
+        _rco_close(read_fd)
+        exec_program(_rco_cache_script, argv)
+        exit(127)
+    }
+    _rco_close(write_fd)
+    let raw = _rco_drain_fd(read_fd, _RCO_MAX_OUT_BYTES)
+    _rco_close(read_fd)
+    let status = waitpid(pid)
+    if status != 0 { return templated }
+
+    let line = _rco_trim_line(raw)
+    if len(line) == 0 { return templated }
+    // Length cap: an LLM that ran past "one short sentence" is a bad
+    // bet to splice into the user-facing reply.
+    let cap = len(templated) * 2 + 256
+    if len(line) > cap { return templated }
+    return line
+}
