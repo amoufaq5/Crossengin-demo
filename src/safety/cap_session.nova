@@ -1,0 +1,213 @@
+// CrossEngin Phase 1 pt1: session-local capability policy.
+//
+// Purpose
+//   `src/safety/capability_gate.nova` is a pure decision function.
+//   This module adds the thin session state the chat REPL needs to
+//   grant/deny capabilities for the lifetime of a session and resolve
+//   effective policy on each destructive action.
+//
+//   Precedence (first match wins):
+//     1. explicit per-session grant (ALLOW) or deny (DENY)
+//     2. default per-cap policy from the shipped table (overridable via
+//        a one-line config at `~/.crossengin/caps.conf`)
+//     3. fall through to `cg_decide` with the caller-supplied ctx.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies: src/safety/capability_gate.nova.
+
+import "std/io"
+import "std/string"
+import "std/syscall"
+import "./capability_gate.nova"
+import "../util/str_safe.nova"
+
+// Per-cap override values. 0 = no session override (fall through to default).
+let CAPS_UNSET  = 0
+let CAPS_ALLOW  = 1   // same encoding as CG_ALLOW
+let CAPS_DENY   = 3   // same encoding as CG_DENY
+
+// Policy state layout: list indexed by cap-code (small int, max 9 so
+// a 10-slot array is plenty) plus a trailing slot that remembers whether
+// the config file was loaded, for /__safety__ output.
+let CAPS_TAG       = 0
+let CAPS_OVERRIDES = 1   // list<int>, index=cap, value=CAPS_* code
+let CAPS_LOADED    = 2
+let CAPS_CAP_TAG   = 774
+
+// How many cap slots the overrides array holds. One past CAP_DELETE.
+let CAPS_CAP_SLOTS = 10
+
+fn caps_new() {
+    let c = list_new()
+    push(c, CAPS_CAP_TAG)
+    let ov = list_new()
+    let i = 0
+    while i < CAPS_CAP_SLOTS {
+        push(ov, CAPS_UNSET)
+        i = i + 1
+    }
+    push(c, ov)
+    push(c, 0)
+    return c
+}
+
+fn caps_grant(c, cap) {
+    if cap < 0 { return 0 }
+    if cap >= CAPS_CAP_SLOTS { return 0 }
+    list_set(c[CAPS_OVERRIDES], cap, CAPS_ALLOW)
+    return 1
+}
+
+fn caps_deny(c, cap) {
+    if cap < 0 { return 0 }
+    if cap >= CAPS_CAP_SLOTS { return 0 }
+    list_set(c[CAPS_OVERRIDES], cap, CAPS_DENY)
+    return 1
+}
+
+fn caps_clear(c, cap) {
+    if cap < 0 { return 0 }
+    if cap >= CAPS_CAP_SLOTS { return 0 }
+    list_set(c[CAPS_OVERRIDES], cap, CAPS_UNSET)
+    return 1
+}
+
+fn caps_override_for(c, cap) {
+    if cap < 0 { return CAPS_UNSET }
+    if cap >= CAPS_CAP_SLOTS { return CAPS_UNSET }
+    return c[CAPS_OVERRIDES][cap]
+}
+
+// Shipped defaults per the ADR-0094 fail-closed stance for everything
+// outward or irreversible; reads and ingest-candidates proceed silently.
+fn caps_default(cap) {
+    if cap == CAP_READ_KB          { return CG_ALLOW }
+    if cap == CAP_ANSWER           { return CG_ALLOW }
+    if cap == CAP_INGEST_ATOM      { return CG_ALLOW }
+    if cap == CAP_AUTONOMOUS_FETCH { return CG_REQUIRE_APPROVAL }
+    if cap == CAP_NETWORK_SEND     { return CG_REQUIRE_APPROVAL }
+    if cap == CAP_DELETE           { return CG_REQUIRE_APPROVAL }
+    if cap == CAP_SELF_UPDATE      { return CG_REQUIRE_APPROVAL }
+    if cap == CAP_EDIT_GOVERNANCE  { return CG_REQUIRE_APPROVAL }
+    if cap == CAP_PROMOTE_ATOM     { return CG_REQUIRE_APPROVAL }
+    return CG_DENY
+}
+
+// Resolve the effective decision for (cap, ctx) under this session.
+// Precedence: session override → ctx-aware cg_decide → default policy.
+fn caps_resolve(c, cap, ctx) {
+    let ov = caps_override_for(c, cap)
+    if ov == CAPS_ALLOW { return CG_ALLOW }
+    if ov == CAPS_DENY { return CG_DENY }
+    // Honour the context-aware decision when it is strictly stricter
+    // than the default (so e.g. governance-touching reads still
+    // require approval even on CAP_READ_KB) -- but never looser than
+    // the default. Shipped defaults are already fail-closed, so a
+    // governance / irreversible / unclean-source signal shouldn't
+    // relax them.
+    let gated = cg_decide(cap, ctx)
+    let base = caps_default(cap)
+    if gated == CG_DENY { return CG_DENY }
+    if base == CG_DENY { return CG_DENY }
+    if gated == CG_REQUIRE_APPROVAL { return CG_REQUIRE_APPROVAL }
+    return base
+}
+
+// Enumerate the per-cap effective state for `/cap list`. Returns a list
+// of [cap_code, override_code, default_decision] rows.
+fn caps_list_rows(c) {
+    let out = list_new()
+    let i = 1
+    while i < CAPS_CAP_SLOTS {
+        let r = list_new()
+        push(r, i)
+        push(r, caps_override_for(c, i))
+        push(r, caps_default(i))
+        push(out, r)
+        i = i + 1
+    }
+    return out
+}
+
+fn caps_loaded(c) { return c[CAPS_LOADED] }
+
+// Minimal one-line parser: `cap_name = allow | deny` (whitespace tolerated,
+// `#` begins a comment, blanks skipped). Returns the number of entries
+// applied. Silent on IO failure; absent file is a no-op.
+fn _caps_cap_from_name(name) {
+    if str_eq_bytes(name, "read_kb")          == 1 { return CAP_READ_KB }
+    if str_eq_bytes(name, "answer")           == 1 { return CAP_ANSWER }
+    if str_eq_bytes(name, "autonomous_fetch") == 1 { return CAP_AUTONOMOUS_FETCH }
+    if str_eq_bytes(name, "ingest_atom")      == 1 { return CAP_INGEST_ATOM }
+    if str_eq_bytes(name, "promote_atom")     == 1 { return CAP_PROMOTE_ATOM }
+    if str_eq_bytes(name, "self_update")      == 1 { return CAP_SELF_UPDATE }
+    if str_eq_bytes(name, "edit_governance")  == 1 { return CAP_EDIT_GOVERNANCE }
+    if str_eq_bytes(name, "network_send")     == 1 { return CAP_NETWORK_SEND }
+    if str_eq_bytes(name, "delete")           == 1 { return CAP_DELETE }
+    return 0
+}
+
+fn caps_cap_from_name(name) { return _caps_cap_from_name(name) }
+
+fn caps_load_file(c, path) {
+    if len(path) == 0 { return 0 }
+    let fd = sys_open(path, 0, 0)
+    if fd < 0 { return 0 }
+    let applied = 0
+    let buf_cap = 4096
+    let data = ""
+    let eof = 0
+    while eof == 0 {
+        let chunk = sys_read(fd, buf_cap)
+        if len(chunk) == 0 { eof = 1 }
+        else { data = data + chunk }
+    }
+    sys_close(fd)
+    // Line-by-line parse. Characters: '\n' = 10, '#' = 35, '=' = 61.
+    let n = len(data)
+    let i = 0
+    let line_start = 0
+    while i <= n {
+        let at_end = 0
+        if i == n { at_end = 1 }
+        let ch = 0
+        if at_end == 0 { ch = char_at(data, i) }
+        if at_end == 1 { ch = 10 }
+        if ch == 10 {
+            let raw = substr(data, line_start, i - line_start)
+            let line = str_trim(raw)
+            // skip blanks and comments
+            if len(line) > 0 {
+                if char_at(line, 0) != 35 {
+                    let eq = str_find(line, "=")
+                    if eq != (0 - 1) {
+                        let name = str_trim(substr(line, 0, eq))
+                        let val  = str_trim(substr(line, eq + 1, len(line) - (eq + 1)))
+                        let cap = _caps_cap_from_name(name)
+                        if cap > 0 {
+                            if str_eq_bytes(val, "allow") == 1 {
+                                caps_grant(c, cap)
+                                applied = applied + 1
+                            }
+                            if str_eq_bytes(val, "deny") == 1 {
+                                caps_deny(c, cap)
+                                applied = applied + 1
+                            }
+                        }
+                    }
+                }
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    list_set(c, CAPS_LOADED, 1)
+    return applied
+}
+
+// Human-readable name for an override code (for /cap list).
+fn caps_override_name(code) {
+    if code == CAPS_ALLOW { return "allow" }
+    if code == CAPS_DENY  { return "deny" }
+    return "default"
+}
