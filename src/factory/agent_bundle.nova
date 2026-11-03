@@ -1,0 +1,231 @@
+// CrossEngin Phase 5 pt1: agent-bundle Rx (read-only) parsers.
+//
+// Purpose
+//   The `/agent list | verify | info` chat commands need to peek inside
+//   signed bundles produced by `bake_child` / `bake_child_ex` without
+//   loading the full KG. This module parses only the header lines
+//   (name/version/domain/baked-at/mother-fingerprint) + the signer-pk
+//   trailer + section-marker counts. Signature verification itself is
+//   delegated to the existing `bake_verify_bundle` in bake.nova.
+//
+//   Bundle layout (from bake.nova):
+//     #CROSSENGIN-CHILD-BUNDLE v1
+//     #name <v>
+//     #version <v>
+//     #domain <v>
+//     #baked-at <int>
+//     #mother-fingerprint <hex>
+//     #PERSONA v1
+//        ... entries ...
+//     #OWNERSHIP v1
+//     #POLICY v1
+//     #PATTERN v1
+//     #SKILL v1
+//     #AGENT v1
+//     #KG v1
+//     #SIGNATURE <hex>
+//     #SIGNER-PK <hex>
+//
+// NOVA dependencies: builtins (sys_open, sys_read, sys_close,
+//   substr, find_char, str_eq_bytes, len).
+// CrossEngin dependencies:
+//   src/persistence/bundle_signing.nova (bundle_hex_decode -- reused
+//     for ab_hex_to_bytes).
+
+import "std/io"
+import "std/string"
+import "std/syscall"
+import "../persistence/bundle_signing.nova"
+import "../util/str_safe.nova"
+import "../util/sys_tagged.nova"
+
+// Entry indices for the header record returned by ab_parse_header.
+let AB_HDR_NAME       = 0
+let AB_HDR_VERSION    = 1
+let AB_HDR_DOMAIN     = 2
+let AB_HDR_BAKED_AT   = 3
+let AB_HDR_MOTHER_FP  = 4
+
+// Read a bundle file into a string. Returns "" on open/read error.
+// 4 MiB cap matches child_mode.nova's _cm_read_file.
+// Buffer-based reader following child_mode.nova's _cm_read_file
+// pattern. The stdlib sys_read(fd, N) auto-allocates a string the
+// syscall-shim's way; that proves unreliable for file fds in some
+// environments (child_mode.nova notes "sys_open on /tmp is broken
+// in this container; other absolute paths work"). The alloc + load8
+// pattern reads a known buffer and copies bytes out byte-by-byte,
+// which does work reliably. 4 MiB cap mirrors _cm_read_file.
+fn ab_read_file(path) {
+    if len(path) == 0 { return "" }
+    let fd = sys_open(path, O_RDONLY, 0)
+    if fd < 0 { return "" }
+    let cap = 4194304
+    let acc = ""
+    let buf = alloc(4097)
+    let done = 0
+    while done == 0 {
+        if len(acc) >= cap { done = 1 }
+        else {
+            let m = _sys_read_tagged(fd, buf, 4096)
+            if m <= 0 { done = 1 }
+            else {
+                let piece = ""
+                let i = 0
+                while i < m {
+                    piece = piece + chr(load8(buf + i))
+                    i = i + 1
+                }
+                acc = acc + piece
+            }
+        }
+    }
+    sys_close(fd)
+    return acc
+}
+
+// Return the content after `prefix` on the first matching line, trimmed.
+// Scans line-by-line to avoid matching the prefix in body text.
+fn _ab_header_value(text, prefix) {
+    let n = len(text)
+    let i = 0
+    let line_start = 0
+    while i <= n {
+        let at_end = 0
+        let ch = 0
+        if i == n { at_end = 1 ch = 10 }
+        if at_end == 0 { ch = char_at(text, i) }
+        if ch == 10 {
+            let line = substr(text, line_start, i - line_start)
+            if starts_with(line, prefix) == 1 {
+                let v = substr(line, len(prefix), len(line) - len(prefix))
+                return str_trim(v)
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Returns [name, version, domain, baked_at, mother_fp]. Empty strings
+// on misses; caller decides how to render.
+fn ab_parse_header(text) {
+    let out = list_new()
+    push(out, _ab_header_value(text, "#name "))
+    push(out, _ab_header_value(text, "#version "))
+    push(out, _ab_header_value(text, "#domain "))
+    push(out, _ab_header_value(text, "#baked-at "))
+    push(out, _ab_header_value(text, "#mother-fingerprint "))
+    return out
+}
+
+// Returns the hex of the trailing `#SIGNER-PK <hex>` line, or "" on
+// miss. Used for the signer-pk fingerprint shown in `/agent info`.
+fn ab_signer_pk_hex(text) {
+    return _ab_header_value(text, "#SIGNER-PK ")
+}
+
+// Count section-marker lines of the form `#NAME v1`. Returns a list
+// of [section_name, entry_count] rows, where entry_count is the
+// number of non-empty, non-comment lines between this marker and the
+// next marker (or #SIGNATURE / #SIGNER-PK / EOF). One pass.
+fn ab_section_counts(text) {
+    let out = list_new()
+    let n = len(text)
+    let i = 0
+    let line_start = 0
+    let cur_name = ""
+    let cur_count = 0
+    while i <= n {
+        let at_end = 0
+        let ch = 0
+        if i == n { at_end = 1 ch = 10 }
+        if at_end == 0 { ch = char_at(text, i) }
+        if ch == 10 {
+            let line = substr(text, line_start, i - line_start)
+            let t = str_trim(line)
+            // A section header is "#NAME v1". A new section (or the
+            // signature trailer) closes the previous one.
+            let is_section_hdr = 0
+            let is_trailer = 0
+            if _ab_is_section_header(t) == 1 { is_section_hdr = 1 }
+            if starts_with(t, "#SIGNATURE ") == 1 { is_trailer = 1 }
+            if starts_with(t, "#SIGNER-PK ") == 1 { is_trailer = 1 }
+            if is_section_hdr == 1 {
+                if len(cur_name) > 0 {
+                    let r = list_new()
+                    push(r, cur_name)
+                    push(r, cur_count)
+                    push(out, r)
+                }
+                cur_name = _ab_section_name(t)
+                cur_count = 0
+            } else {
+                if is_trailer == 1 {
+                    if len(cur_name) > 0 {
+                        let r2 = list_new()
+                        push(r2, cur_name)
+                        push(r2, cur_count)
+                        push(out, r2)
+                        cur_name = ""
+                        cur_count = 0
+                    }
+                } else {
+                    if len(cur_name) > 0 {
+                        if len(t) > 0 {
+                            if char_at(t, 0) != 35 {
+                                cur_count = cur_count + 1
+                            }
+                        }
+                    }
+                }
+            }
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+    if len(cur_name) > 0 {
+        let r3 = list_new()
+        push(r3, cur_name)
+        push(r3, cur_count)
+        push(out, r3)
+    }
+    return out
+}
+
+// Is this line a "#NAME v1" section header? Specifically: starts
+// with "#", has a space followed by "v1" at the end, and the chars
+// between the # and the space are uppercase letters.
+fn _ab_is_section_header(t) {
+    let n = len(t)
+    if n < 5 { return 0 }
+    if char_at(t, 0) != 35 { return 0 }   // '#'
+    // Must end with " v1".
+    if n < 4 { return 0 }
+    let tail = substr(t, n - 3, 3)
+    if str_eq_bytes(tail, " v1") == 0 { return 0 }
+    // Section name is uppercase A-Z, no digits (keeps us from matching
+    // the trailer lines, which don't end in " v1" anyway).
+    let i = 1
+    while i < n - 3 {
+        let c = char_at(t, i)
+        if c < 65 { return 0 }
+        if c > 90 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _ab_section_name(t) {
+    let n = len(t)
+    if n < 4 { return "" }
+    return substr(t, 1, n - 4)
+}
+
+// Decode a hex string into a byte-string buffer. Reuses the
+// bundle_signing.nova decoder so Phase 5 and bake share one hex path.
+// Returns 0 on malformed input.
+fn ab_hex_to_bytes(hex) {
+    if len(hex) == 0 { return 0 }
+    return bundle_hex_decode(hex)
+}
