@@ -141,6 +141,25 @@ safety_attestations=N
 
 Every cap decision is on the hash-chained decision log. Every ingested atom cites its extractor+model+run. The LLM did not write to the KG — the operator approved each record, individually, with the extracted sentence in view.
 
+## Free prompting
+
+Phase 3 pt1 adds an auto-prefix router so a bare-word first token is rewritten to its slash form. Instead of typing `/learn antibiotics` you can just type `learn antibiotics`:
+
+```
+> learn antibiotics
+(no cache for 'antibiotics' [topic] at /tmp/crossengin_learn_antibiotics.txt)
+  run first:  scripts/learn.sh antibiotics
+```
+
+The router applies two lists:
+
+- **Allowlist** (auto-prefix fires): `learn`, `teach`, `define`, `know`, `knowledge`, `why`, `status`, `help`, `good`, `bad`, `cap`, `synapse`, `recall`, `find`, `prove`, `explain`, `classify`. All of these are command-first by convention; typing them as the first word of a message is overwhelmingly a request to run the command.
+- **Denylist** (never auto-prefix, require explicit `/`): `halt`, `save`, `load`, `retract`, `unretract`, `compact`, `snap_verify`, `fed_*`, `gossip_*`, `agent`, `meta`, `admin`, `drule_*`. These touch durable state, open sockets, or change governance — the explicit slash forces operator awareness.
+
+Everything else (unlisted first-token words, verbs that start with a capital, anything with punctuation) falls through to the natural-language reasoning path unchanged.
+
+A convenience command `/learn_prepare <topic>` prints the exact `scripts/learn.sh <topic>` command for the topic flow (gated by `CAP_AUTONOMOUS_FETCH` so the attestation log records the intent). Run that in a separate shell, then come back to the chat and type `learn <topic>` to ingest the cache.
+
 ## Why not a one-step `/ingest_ollama` that runs the shell for you?
 
 In-chat `exec_program` currently hits three NOVA runtime gaps (fork-return tagging, `store64` of literal zero, `envp=NULL` on `_nova_exec`). Until those close, `/ingest_ollama` **prints** the two commands rather than running them. The two-command path is well-tested, bit-safe, and the operator sees exactly what will land. Once the runtime gaps are closed, `/ingest_ollama` can collapse to one step without any user-facing change.
