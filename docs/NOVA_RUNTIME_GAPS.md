@@ -182,6 +182,30 @@ The gap counts below match the per-gap entries in the next section:
 - **Referenced by.** `nova-deps.toml` enhancement #9,
   ADR-0043, ADR-0048.
 
+#### F-4. `sys_read(fd, N)` auto-allocated strings unreliable for new file fds
+
+- **Symptom.** The stdlib `sys_read(fd, N)` allocates a NOVA string
+  and returns the bytes read into it. On fresh file fds opened via
+  `sys_open(path, O_RDONLY, 0)` the returned string is empty (loop
+  terminates at zero-length chunk) or garbled even though the kernel
+  `read` succeeds. Reproduces reliably in the container when the
+  bundle reader walks a fresh fd.
+- **Current workaround.** `src/factory/child_mode.nova:_cm_read_file`
+  bypasses the auto-allocator: it allocates a buffer with `alloc`,
+  reads into it via `_sys_read_tagged`, and copies bytes out one at a
+  time with `load8` + `chr`. Phase 5 pt1's
+  `src/factory/agent_bundle.nova:ab_read_file` follows the same
+  pattern — specifically because the stdlib read returned empty data
+  from `/home/user/crossengin_agents/sample.bundle`.
+- **Impact.** Any new consumer that needs to read a file has to
+  know to avoid `sys_read`. The gap is invisible until a caller
+  tries it and silently gets no bytes.
+- **Priority.** MEDIUM. The alloc/_sys_read_tagged/load8 workaround
+  works; the stdlib API is just untrustworthy.
+- **Referenced by.** `src/factory/child_mode.nova:144` "sys_open on
+  /tmp is broken in this container; other absolute paths work"
+  note, `src/factory/agent_bundle.nova` header comment.
+
 ### Bytes vs strings
 
 #### B-1. NOVA strings are C-style NUL-terminated
@@ -255,6 +279,30 @@ The gap counts below match the per-gap entries in the next section:
   position-consumer is not.
 - **Priority.** HIGH — silently truncates URLs and PEM decoders.
 - **Referenced by.** `src/util/str_safe.nova:57..99`.
+
+#### B-5. `store64(ptr, 0)` writes raw `1`, not raw `0`
+
+- **Symptom.** NOVA integer literals compile to `(N<<1)|1`, so the
+  constant `0` is raw `1` at use time. `store64` untags its address
+  but stores its value as-is, so `store64(argv + k, 0)` writes raw
+  `1` to memory — a bogus pointer. When used as an argv NULL
+  terminator the kernel `execve` walks past it into garbage and
+  returns `EFAULT`. Reproduces in Phase 2 pt2 wiring
+  `/ingest_ollama` via `src/nl/ollama_spawn.nova`.
+- **Current workaround.** Inline-asm helper `os_store_null_terminator`
+  that `sar rdi, 1` to untag the address then `mov qword ptr [rdi], 0`
+  to write a RAW zero. Lives at
+  `src/nl/ollama_spawn.nova:os_store_null_terminator`.
+- **Impact.** Any NOVA caller building a C-ABI pointer array
+  (argv, envp, iovec, C-callback tables) must know to avoid
+  `store64(_, 0)` for the terminator. Latent bug class — nothing
+  warns until `execve` or a C library returns `EFAULT`.
+- **Priority.** HIGH. Breaks every caller that builds C-ABI null
+  terminators correctly-looking NOVA code. The fix is one line:
+  `store64` should special-case the tagged-0 payload, or callers
+  should have a `store64_raw(ptr, raw_val)` primitive.
+- **Referenced by.** `src/nl/ollama_spawn.nova` module header,
+  Phase 2 pt2 PR #21.
 
 ### Arithmetic
 
@@ -499,6 +547,64 @@ The gap counts below match the per-gap entries in the next section:
   restart (see F-3 above).
 - **Priority.** MEDIUM.
 - **Referenced by.** ADR-0043, ADR-0048 implicit.
+
+#### P-3. `_nova_exec` passes `envp = NULL`
+
+- **Symptom.** The Linux `_nova_exec` branch emits
+  `mov rdx, 0; syscall 59` — `execve(path, argv, NULL)`. The child
+  inherits an empty environment. A shebang `#!/usr/bin/env bash`
+  then fails because `env` can't find `bash` without `PATH`, and
+  even direct `/bin/bash` invocations can fail on binaries that
+  need `TERM`, `HOME`, or shared-library search variables.
+  Reproduces in Phase 2 pt2 wiring `/ingest_ollama` →
+  `scripts/llm_extract.sh` via `src/nl/ollama_spawn.nova`.
+- **Current workaround.** None at the NOVA level. CrossEngin's
+  `/ingest_ollama` pivoted to printing the two-step shell+chat
+  commands instead of exec'ing them in-process (Phase 2 pt2
+  "operator-guide" pattern). The operator runs the command in a
+  shell that has a real environment.
+- **Impact.** Blocks every in-process fork+exec of a shell script
+  or env-dependent binary. Phase 2 pt2 (`/ingest_ollama`), the
+  reply-composer sidecar (`src/nl/reply_composer_ollama.nova`), and
+  the NL sidecar (`src/nl/nl_llm_sidecar.nova`) all have this hole
+  in principle — pt2's composer survives only because its script
+  passes through on every backend error.
+- **Priority.** HIGH. Blocks every script-driven feature Phase 2+
+  wants to ship in-process.
+- **Suggested fix.** Pass the parent's `environ` as rdx on Linux;
+  on Windows, pass `GetEnvironmentStringsW` (or the "inherit parent
+  env" flag on `CreateProcessW`).
+- **Referenced by.** `src/nl/ollama_spawn.nova` module header,
+  Phase 2 pt2 PR #21.
+
+#### P-4. `fork_process()` returns raw syscall rax without tag-wrap
+
+- **Symptom.** `_nova_fork` on Linux is just `syscall 57; ret` —
+  the raw kernel pid is returned to NOVA code without applying the
+  `(N<<1)|1` tag. But every NOVA integer literal does carry the
+  tag, so `if pid == 0 { exec branch }` in the child runs
+  `_nova_eq(raw 0, raw 1 /* tagged 0 */)`, which is bitwise false,
+  and the child falls through to the parent code. Reproduces with
+  twin `bye.` prints from both parent and child in Phase 2 pt2.
+- **Current workaround.** `getpid()` returns tagged values
+  properly, so the correct detection is
+  `let parent_pid = getpid(); let pid = fork_process(); if
+  getpid() != parent_pid { exec_program(...); exit(127) }`. Lives
+  at `src/nl/ollama_spawn.nova:os_spawn_and_wait`. This also
+  dodges the follow-on gotcha that `pid < 0` in the parent
+  compares a raw pid to a tagged 0 (raw 1) and so works by
+  accident for positive pids.
+- **Impact.** Any NOVA code that forks will zombie-twin unless it
+  uses the `getpid()` dance. The classical `fork() ? parent :
+  child` idiom is a trap.
+- **Priority.** HIGH. Breaks every new fork user.
+- **Suggested fix.** Tag-wrap the return in `_nova_fork` on both
+  Linux and Windows:
+  `lea rax, [rax + rax + 1]` after the syscall, matching the
+  pattern in `_nova_sys_getsockopt_so_error` (line 18352 of
+  `src/compiler/codegen.nova`).
+- **Referenced by.** `src/nl/ollama_spawn.nova` module header,
+  Phase 2 pt2 PR #21.
 
 ### Diagnostic (crash / flakiness)
 
