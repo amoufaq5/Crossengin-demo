@@ -18,6 +18,11 @@ A single CrossEngin session shipped 12 PRs on `amoufaq5/Crossengin-demo` and ope
 | [29](https://github.com/amoufaq5/Crossengin-demo/pull/29) | Phase 6 pt1 | /mcp list | register | call (honest-scope stub) + inbound roadmap | `claude/zealous-keller-NTz2n` |
 | [30](https://github.com/amoufaq5/Crossengin-demo/pull/30) | end-to-end doc | integration transcript across Phases 0-6 pt1 | `claude/phase-6-pt1-mcp-registry` |
 | [31](https://github.com/amoufaq5/Crossengin-demo/pull/31) | Phase 7 pt1 | cowork planner + /cowork plan + roadmap doc | `claude/end-to-end-doc` |
+| [32](https://github.com/amoufaq5/Crossengin-demo/pull/32) | session-log | docs/SESSION_LOG.md — phase 0-7 arc index | `claude/phase-7-cowork-planner` |
+| [33](https://github.com/amoufaq5/Crossengin-demo/pull/33) | Phase 7 pt2 lite | cowork task dependencies + topological sort | `claude/session-log` |
+| [34](https://github.com/amoufaq5/Crossengin-demo/pull/34) | pt2 safety demo | scripts/snap_keygen.sh + docs/PT2_SAFETY_DEMO.md verify-on-load | `claude/phase-7-pt2-lite-deps` |
+| [35](https://github.com/amoufaq5/Crossengin-demo/pull/35) | CI workflow | .github/workflows/build-and-smoke.yml with Phase 0 regression assertions | `claude/phase-1-pt2-demo` |
+| [36](https://github.com/amoufaq5/Crossengin-demo/pull/36) | Phase 5 pt3 lite | scripts/bake_sample.sh + committed signed sample_agent.bundle | `claude/ci-workflow` |
 
 Not in the table: Phase 2 (reply composer PR #21 — same number as Phase 1 above; GitHub re-used it) and Phase 4 pt1 (logic pack, PR #24). Both landed on the default base branch. See "Note on PR numbering" below.
 
@@ -50,7 +55,12 @@ claude/zealous-keller-NTz2n
   └─ claude/phase-6-pt1-mcp-registry      → PR #29
       └─ claude/end-to-end-doc            → PR #30
           └─ claude/phase-7-cowork-planner → PR #31
-              └─ claude/session-log        → PR #32 (this one)
+              └─ claude/session-log        → PR #32
+                  └─ claude/phase-7-pt2-lite-deps → PR #33
+                      └─ claude/phase-1-pt2-demo  → PR #34
+                          └─ claude/ci-workflow   → PR #35
+                              └─ claude/phase-5-pt3-lite-sample → PR #36
+                                  └─ claude/session-log-update  → PR #37 (this one)
 ```
 
 ### Recommended merge order
@@ -59,10 +69,15 @@ Everything that bases on `claude/zealous-keller-NTz2n` can merge in any order (n
 
 1. All default-base PRs (#19-#29 modulo stacking).
 2. `#30 end-to-end` once `#29` lands (its transcript references PR #29).
-3. `#31 phase-7` once `#30` lands (its doc references end-to-end).
-4. This PR (`#32 session-log`) once `#31` lands.
+3. `#31 phase-7` once `#30` lands.
+4. `#32 session-log` once `#31` lands.
+5. `#33` Phase 7 pt2 lite once `#32` lands.
+6. `#34` pt2 safety demo once `#33` lands.
+7. `#35` CI workflow once `#34` lands (enforces Phase 0 regression invariants on every PR from here on).
+8. `#36` sample baked bundle once `#35` lands (committed sample under `docs/samples/`).
+9. This PR (`#37 session-log-update`) once `#36` lands.
 
-If the user wants a single giant merge instead of 12 sequential ones, rebasing every branch onto a working aggregate branch and squashing is fine — each PR is scoped small enough that individual commits read cleanly.
+If the user wants a single giant merge instead of ~18 sequential ones, rebasing every branch onto a working aggregate branch and squashing is fine — each PR is scoped small enough that individual commits read cleanly.
 
 ## 3. Upstream NOVA issues
 
@@ -118,8 +133,10 @@ The plan file at `/root/.claude/plans/gentle-toasting-zephyr.md` has the full ex
 
 ## 7. Session metrics
 
-- **12 PRs opened** (11 shipped, 1 updated in place): #19, #20, #21, #22, #23, #24, #25, #26, #27, #28, #29, #30, #31, and this one (#32).
-- **5 upstream NOVA issues**: nova#7-11.
+- **18 PRs opened** across the session: #19-#37.
+- **6 upstream NOVA issues**: nova#7-12 (including the umbrella #12 indexing #7-11).
 - **New NOVA modules**: `chain_compiler`, `kg_router`, `moment_cache`, `intent_adaptive`, `cap_session`, `approval_prompt`, `safety_log`, `reply_composer_ollama`, `ollama_spawn`, `logic_pack`, `agent_bundle`, `cowork_planner` — 12 modules.
-- **New docs**: `HOW_IT_LEARNS.md`, `TRAIN_WITH_OLLAMA.md`, `caps.sample.conf`, `AGENT_PLATFORM.md`, `CODING_REVIEWER.md`, `MCP_INBOUND.md`, `END_TO_END.md`, `COWORK.md`, `SESSION_LOG.md` (this one).
-- **Phase 0 regression invariant**: `mc_hits=9`, `ff_goodness=486000`, `synapse_mean_weight=300`, `ia_strength=10` after 10× `fever` + `/good` on a clean session. Every PR's smoke test reports this.
+- **New shell scripts**: `llm_compose.sh`, `snap_keygen.sh`, `bake_sample.sh` — 3.
+- **New docs**: `HOW_IT_LEARNS.md`, `TRAIN_WITH_OLLAMA.md`, `caps.sample.conf`, `AGENT_PLATFORM.md`, `CODING_REVIEWER.md`, `MCP_INBOUND.md`, `END_TO_END.md`, `COWORK.md`, `SESSION_LOG.md`, `PT2_SAFETY_DEMO.md` — 10.
+- **Committed sample**: `docs/samples/sample_agent.bundle` (616 bytes, Ed25519-signed) + `sample_agent.pub` (32 raw bytes).
+- **CI workflow**: `.github/workflows/build-and-smoke.yml` enforces the Phase 0 regression invariants (`mc_hits=9`, `ff_goodness=486000`, `synapse_mean_weight=300`, `ia_strength=10`) on every PR from PR #35 forward.
