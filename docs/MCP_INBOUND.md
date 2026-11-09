@@ -58,6 +58,52 @@ The dispatcher inlines a 3-function local shim (`_mcp_local_new / register / loo
 
 Once the upstream symbol-collision issue closes, the inline shim collapses to a direct `import "../src/io/effectors/effector_mcp.nova"` and the `/mcp` command surface is unchanged.
 
+## Phase 6 pt2b — chat registry seam (shipped)
+
+`bin/crossengin-mcp` and `bin/crossengin-chat` share a single file at `$CE_MCP_REGISTRY` (default `$HOME/.crossengin/mcp-tools.registry`). Tools registered inside the chat become visible to the external MCP client without a restart.
+
+File format: one line per tool, `name|canned_response`. Lines starting with `#` are comments; blank lines are skipped; malformed lines are silently ignored so a hand-edited typo on one line doesn't take the whole registry down.
+
+Operator flow:
+
+```
+chat> /mcp register weather sunny-72F
+registered: weather  (saved to /root/.crossengin/mcp-tools.registry)
+
+chat> /mcp register news tech-headlines-x3
+registered: news  (saved to /root/.crossengin/mcp-tools.registry)
+```
+
+External MCP client (or `bin/crossengin-mcp` with scripted stdin) now sees both:
+
+```
+{"jsonrpc":"2.0","id":2,"result":{"tools":[
+  {"name":"hello", "description":"Returns a canned greeting", ...},
+  {"name":"echo",  "description":"Returns a canned echo string", ...},
+  {"name":"weather","description":"Chat-registered MCP tool","inputSchema":{...}},
+  {"name":"news",   "description":"Chat-registered MCP tool","inputSchema":{...}}
+]}}
+```
+
+Hot updates propagate without restart — the server re-reads the file on every `tools/list` and `tools/call` dispatch. The server's built-in `hello` + `echo` fixtures stay in place as defaults.
+
+### `/mcp reload`
+
+If an external process edits the registry file (another chat session, a text editor, a sync tool), run `/mcp reload` in the chat to pull the file back into `_mcp_reg`:
+
+```
+chat> /mcp reload
+reloaded 3 tool(s) from /root/.crossengin/mcp-tools.registry
+```
+
+Chat sessions also run this at startup, so tools registered in a previous session survive restart.
+
+### Still deferred
+
+- **pt2c** — per-`tools/call` `_gate_or_prompt(CAP_INGEST_ATOM, …)` with the invoking client's identity as `authorized_user`.
+- **pt2d** — rich JSON tool manifests under `~/.crossengin/mcp-tools/*.json` with full input-schema types.
+- **pt2e** — HTTP+SSE transport.
+
 ## Phase 6 pt2a — minimum viable stdio MCP server (shipped)
 
 `bin/crossengin-mcp` is a standalone binary that speaks enough JSON-RPC 2.0 to let a Claude Desktop / Cursor / Zed instance complete the MCP handshake and call a tool. The source lives in two places:
