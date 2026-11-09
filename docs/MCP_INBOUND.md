@@ -58,6 +58,49 @@ The dispatcher inlines a 3-function local shim (`_mcp_local_new / register / loo
 
 Once the upstream symbol-collision issue closes, the inline shim collapses to a direct `import "../src/io/effectors/effector_mcp.nova"` and the `/mcp` command surface is unchanged.
 
+## Phase 6 pt2d — per-tool `inputSchema` (shipped)
+
+Every registry row now carries an optional `fields` CSV, rendered server-side as a real JSON Schema inside each `tools/list` tool manifest. External MCP clients can build correct call sites instead of guessing at the tool's arguments.
+
+File format grows to `name|canned|policy|fields`. Backwards compatible — pt2b/c two- and three-field rows default to empty fields (same `properties:{}` as pt2a).
+
+CSV grammar: `name:type,name:type,...` where type is one of `string`, `int`, `bool`. All declared fields become `required` in the emitted schema.
+
+Operator flow:
+
+```
+chat> /mcp register greet "Hello world"
+registered: greet  (saved to /root/.crossengin/mcp-tools.registry)
+
+chat> /mcp schema greet name:string,count:int
+schema greet = name:string,count:int  (saved to /root/.crossengin/mcp-tools.registry)
+
+chat> /mcp list
+mcp_services_registered=1
+  service=greet  canned=""Hello world""  policy=allow  fields=name:string,count:int
+
+# external MCP client sees the real schema --
+{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+{"jsonrpc":"2.0","id":1,"result":{"tools":[
+  ...
+  {"name":"greet","description":"Chat-registered MCP tool",
+   "inputSchema":{"type":"object","properties":{"name":{"type":"string"},"count":{"type":"integer"}},"required":["name","count"]}}
+]}}
+```
+
+Clear a schema with an empty CSV:
+
+```
+chat> /mcp schema greet
+schema greet = (cleared)  (saved to /root/.crossengin/mcp-tools.registry)
+```
+
+### Scope limit
+
+**Metadata only.** `tools/call` still returns the canned response regardless of what arguments actually arrived — no runtime validation against the published schema. A later sub-PR can add validation once a real byte-buffer JSON parser lands (today the stdio server uses substring search, which doesn't parse nested param objects).
+
+Supported types: `string`, `int`, `bool`. Rich types (`number`, `array`, `object`, `enum`) are deferred — most MCP tools don't need them.
+
 ## Phase 6 pt2c — per-tool policy (shipped)
 
 Every registry row now carries a `policy` field — `allow` or `deny`. `tools/call` on a `deny` row returns JSON-RPC error `-32603 "Tool denied by policy"`; `tools/list` still enumerates denied tools so the operator can see what's blocked.
