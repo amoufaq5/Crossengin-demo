@@ -29,6 +29,7 @@ KGSYNC_PUB  := examples/crossengin_kg_publisher.nova
 KGSYNC_SUB  := examples/crossengin_kg_subscriber.nova
 FED_COORD   := examples/crossengin_fed_coordinator.nova
 FED_DAEMON  := examples/crossengin_fed_daemon.nova
+MCP_STDIO   := examples/crossengin_mcp.nova
 
 .PHONY: all build test benchmark bench-nl bench-nl-compare bench-nl-baseline coverage lint-ints install integration clean check-nova help cross-windows smoke-windows-ce
 
@@ -311,6 +312,14 @@ install: build
 	  printf '  build %s ... ' "$(FED_DAEMON)"; \
 	  if "$(NOVA)" build "$(FED_DAEMON)" -o "$(BIN)/crossengin-fed-daemon" >/tmp/ce_install.log 2>&1; then \
 	    echo "OK -> $(BIN)/crossengin-fed-daemon"; \
+	  else \
+	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
+	  fi; \
+	fi
+	@if [ -f "$(MCP_STDIO)" ]; then \
+	  printf '  build %s ... ' "$(MCP_STDIO)"; \
+	  if "$(NOVA)" build "$(MCP_STDIO)" -o "$(BIN)/crossengin-mcp" >/tmp/ce_install.log 2>&1; then \
+	    echo "OK -> $(BIN)/crossengin-mcp"; \
 	  else \
 	    echo "FAIL"; sed 's/^/      /' /tmp/ce_install.log; exit 1; \
 	  fi; \
