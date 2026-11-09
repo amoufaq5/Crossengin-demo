@@ -1,0 +1,230 @@
+// CrossEngin Phase 6 pt2a: minimal stdio MCP server loop.
+//
+// Speaks just enough JSON-RPC 2.0 to let a Claude Desktop / Cursor /
+// Zed instance complete the MCP handshake and call a tool. No full
+// JSON parser — we only extract two string fields (`method`, inner
+// `name`) + one int (`id`) via substring search. Output is template-
+// formatted JSON; no serializer needed.
+//
+// Supported methods:
+//   initialize    -> protocolVersion 2024-11-05, capabilities.tools={}
+//   tools/list    -> enumerate registered tools
+//   tools/call    -> look up by name, return registered canned response
+//   notifications/initialized -> accepted, no response (notification)
+//   anything else -> error -32601 "Method not found"
+//
+// Not shipped here (deferred to pt2b-e):
+//   - integration with the chat REPL's MCP registry (pt2b)
+//   - per-tool _gate_or_prompt capability bridging (pt2c)
+//   - tool manifest loading from ~/.crossengin/mcp-tools/index (pt2d)
+//   - HTTP+SSE transport (pt2e)
+//
+// NOVA deps: builtins (read_line, print, println, len, str_find, substr,
+//   char_at, int_to_str, str_eq_bytes, list_new, push).
+// CrossEngin deps: none (the chat's effector_mcp.nova registry is a
+//   separate object; this module ships its own small tool list for pt2a).
+
+import "std/io"
+import "std/string"
+import "std/syscall"
+import "../../util/str_safe.nova"
+
+// A tool row in the registry: [name, description, canned_response].
+let MCPT_NAME     = 0
+let MCPT_DESC     = 1
+let MCPT_CANNED   = 2
+
+fn mcp_srv_new() {
+    // Return a list of tool rows. Empty by default.
+    return list_new()
+}
+
+fn mcp_srv_register_tool(srv, name, description, canned_response) {
+    let row = list_new()
+    push(row, name)
+    push(row, description)
+    push(row, canned_response)
+    push(srv, row)
+    return 1
+}
+
+// Extract the string value of `"<key>":"<value>"` from `line`.
+// Returns "" if not found. Doesn't handle backslash escapes — our
+// JSON-RPC methods are plain ASCII.
+fn _mcp_find_str(line, key) {
+    let needle = "\"" + key + "\":"
+    let at = str_find(line, needle)
+    if at < 0 { return "" }
+    let i = at + len(needle)
+    // NOVA has no `break`; use a flag loop. Skip whitespace after the colon.
+    let done_ws = 0
+    while done_ws == 0 {
+        if i >= len(line) { done_ws = 1 }
+        else {
+            let c = char_at(line, i)
+            if c == 32 { i = i + 1 }
+            else {
+                if c == 9 { i = i + 1 }
+                else { done_ws = 1 }
+            }
+        }
+    }
+    if i >= len(line) { return "" }
+    if char_at(line, i) != 34 { return "" }
+    i = i + 1
+    let start = i
+    let scan = 0
+    while scan == 0 {
+        if i >= len(line) { return "" }
+        if char_at(line, i) == 34 { scan = 1 }
+        else { i = i + 1 }
+    }
+    return substr(line, start, i - start)
+}
+
+// Extract the integer value of `"<key>":<n>` from `line`. Returns -1
+// on miss. Handles optional whitespace after the colon.
+fn _mcp_find_int(line, key) {
+    let needle = "\"" + key + "\":"
+    let at = str_find(line, needle)
+    if at < 0 { return 0 - 1 }
+    let i = at + len(needle)
+    let done_ws = 0
+    while done_ws == 0 {
+        if i >= len(line) { done_ws = 1 }
+        else {
+            let c = char_at(line, i)
+            if c == 32 { i = i + 1 }
+            else {
+                if c == 9 { i = i + 1 }
+                else { done_ws = 1 }
+            }
+        }
+    }
+    if i >= len(line) { return 0 - 1 }
+    let c0 = char_at(line, i)
+    if c0 < 48 { return 0 - 1 }
+    if c0 > 57 { return 0 - 1 }
+    let n = 0
+    let digit = 0
+    while digit == 0 {
+        if i >= len(line) { digit = 1 }
+        else {
+            let cc = char_at(line, i)
+            if cc < 48 { digit = 1 }
+            else {
+                if cc > 57 { digit = 1 }
+                else {
+                    n = n * 10 + (cc - 48)
+                    i = i + 1
+                }
+            }
+        }
+    }
+    return n
+}
+
+// Emit a single JSON-RPC response line. The caller precomputes the
+// `result` or `error` sub-object as a string.
+fn _mcp_emit_response(id, result_or_error_body) {
+    // No-id: notification; don't respond.
+    if id < 0 { return 1 }
+    let line = "{\"jsonrpc\":\"2.0\",\"id\":" + int_to_str(id)
+             + "," + result_or_error_body + "}"
+    println(line)
+    return 1
+}
+
+fn _mcp_initialize_result() {
+    return "\"result\":{"
+         + "\"protocolVersion\":\"2024-11-05\","
+         + "\"capabilities\":{\"tools\":{}},"
+         + "\"serverInfo\":{\"name\":\"crossengin-mcp\",\"version\":\"0.1\"}"
+         + "}"
+}
+
+fn _mcp_tools_list_result(srv) {
+    let s = "\"result\":{\"tools\":["
+    let i = 0
+    while i < len(srv) {
+        if i > 0 { s = s + "," }
+        let row = srv[i]
+        s = s + "{"
+          + "\"name\":\"" + row[MCPT_NAME] + "\","
+          + "\"description\":\"" + row[MCPT_DESC] + "\","
+          + "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}"
+          + "}"
+        i = i + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+fn _mcp_tool_find(srv, name) {
+    let i = 0
+    while i < len(srv) {
+        let row = srv[i]
+        if str_eq_bytes(row[MCPT_NAME], name) == 1 { return row }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _mcp_tools_call_result(row) {
+    return "\"result\":{\"content\":["
+         + "{\"type\":\"text\",\"text\":\"" + row[MCPT_CANNED] + "\"}"
+         + "],\"isError\":false}"
+}
+
+fn _mcp_error(code, message) {
+    return "\"error\":{"
+         + "\"code\":" + int_to_str(code) + ","
+         + "\"message\":\"" + message + "\""
+         + "}"
+}
+
+// Route one JSON-RPC line. Writes the response via println(), or
+// nothing if the line was a notification. Returns 1 on continue, 0
+// on protocol-level shutdown (currently never — EOF closes the loop).
+fn _mcp_srv_dispatch(srv, line) {
+    let method = _mcp_find_str(line, "method")
+    if len(method) == 0 { return 1 }
+    let id = _mcp_find_int(line, "id")
+    if str_eq_bytes(method, "initialize") == 1 {
+        return _mcp_emit_response(id, _mcp_initialize_result())
+    }
+    if str_eq_bytes(method, "notifications/initialized") == 1 {
+        // notification, no response
+        return 1
+    }
+    if str_eq_bytes(method, "tools/list") == 1 {
+        return _mcp_emit_response(id, _mcp_tools_list_result(srv))
+    }
+    if str_eq_bytes(method, "tools/call") == 1 {
+        let name = _mcp_find_str(line, "name")
+        if len(name) == 0 {
+            return _mcp_emit_response(id,
+                _mcp_error(0 - 32602, "Missing tool name"))
+        }
+        let row = _mcp_tool_find(srv, name)
+        if row == 0 {
+            return _mcp_emit_response(id,
+                _mcp_error(0 - 32602, "Unknown tool: " + name))
+        }
+        return _mcp_emit_response(id, _mcp_tools_call_result(row))
+    }
+    return _mcp_emit_response(id, _mcp_error(0 - 32601, "Method not found"))
+}
+
+// Main loop: read newline-delimited JSON-RPC frames from stdin until
+// EOF. For each line, route to _mcp_srv_dispatch which emits the
+// response (or nothing for notifications).
+fn mcp_srv_run(srv) {
+    let done = 0
+    while done == 0 {
+        let line = read_line()
+        if len(line) == 0 { done = 1 }
+        else { _mcp_srv_dispatch(srv, line) }
+    }
+    return 1
+}

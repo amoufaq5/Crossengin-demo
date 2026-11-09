@@ -58,6 +58,62 @@ The dispatcher inlines a 3-function local shim (`_mcp_local_new / register / loo
 
 Once the upstream symbol-collision issue closes, the inline shim collapses to a direct `import "../src/io/effectors/effector_mcp.nova"` and the `/mcp` command surface is unchanged.
 
+## Phase 6 pt2a — minimum viable stdio MCP server (shipped)
+
+`bin/crossengin-mcp` is a standalone binary that speaks enough JSON-RPC 2.0 to let a Claude Desktop / Cursor / Zed instance complete the MCP handshake and call a tool. The source lives in two places:
+
+- `src/io/effectors/mcp_server_stdio.nova` — the server loop + handshake dispatch. No full JSON parser: method / id / tool-name are extracted via substring search over the request line. Output is template-formatted JSON.
+- `examples/crossengin_mcp.nova` — the binary entry point. Registers two canned tools (`hello`, `echo`) so the handshake path can be exercised with scripted stdin.
+
+Supported methods:
+
+| method | behaviour |
+|---|---|
+| `initialize` | `{"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"crossengin-mcp","version":"0.1"}}}` |
+| `notifications/initialized` | Accepted silently (notification, no response). |
+| `tools/list` | Enumerates every tool registered via `mcp_srv_register_tool`. Each tool emits `{name, description, inputSchema:{type:"object",properties:{}}}`. |
+| `tools/call` with `"name":"<tool>"` | Looks up by name; returns `{"content":[{"type":"text","text":"<canned>"}],"isError":false}`. Unknown tool → error -32602. |
+| anything else | Error -32601 "Method not found". |
+
+### Wire into Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or the equivalent on your OS:
+
+```json
+{
+  "mcpServers": {
+    "crossengin": {
+      "command": "/absolute/path/to/bin/crossengin-mcp"
+    }
+  }
+}
+```
+
+Restart Claude Desktop. The `hello` and `echo` tools appear in the tool picker.
+
+### Scripted stdin smoke test
+
+```bash
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize"}\n{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hello"}}\n' \
+  | ./bin/crossengin-mcp
+```
+
+Output (three response frames, one per line, each valid JSON with matching `id`):
+
+```
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"crossengin-mcp","version":"0.1"}}}
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"hello","description":"Returns a canned greeting","inputSchema":{"type":"object","properties":{}}}, ...]}}
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"hello from crossengin-mcp pt2a"}],"isError":false}}
+```
+
+### Deferred to later pt2 sub-PRs
+
+- **pt2b** — wire the chat REPL's live MCP registry so `/mcp register <svc> <resp>` in-chat adds a tool the external MCP client sees. Needs an IPC seam between the chat process and the stdio server process (unix socket or shared-file registry).
+- **pt2c** — route `tools/call` through `_gate_or_prompt(CAP_INGEST_ATOM, ...)` with the invoking client's identity as the `authorized_user`. External clients can't bypass CrossEngin's policy gates.
+- **pt2d** — tool manifest file loading from `~/.crossengin/mcp-tools/index` (mirrors the Phase 5 `agent_bundle.nova` pattern). Lets an operator add a tool without recompiling.
+- **pt2e** — HTTP+SSE transport for clients that don't spawn stdio servers (web MCP clients, remote servers).
+- Real JSON parser — the substring search handles the fields pt2a-c need, but pt2d's tool manifests will want a proper byte-buffer parser (`src/nl/json_parser.nova`).
+
 ## What a real inbound MCP server needs (deferred)
 
 A real MCP server a Claude Desktop / Cursor / Zed instance can connect to needs all of:
