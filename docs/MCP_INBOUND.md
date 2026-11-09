@@ -58,6 +58,41 @@ The dispatcher inlines a 3-function local shim (`_mcp_local_new / register / loo
 
 Once the upstream symbol-collision issue closes, the inline shim collapses to a direct `import "../src/io/effectors/effector_mcp.nova"` and the `/mcp` command surface is unchanged.
 
+## Phase 6 pt2c — per-tool policy (shipped)
+
+Every registry row now carries a `policy` field — `allow` or `deny`. `tools/call` on a `deny` row returns JSON-RPC error `-32603 "Tool denied by policy"`; `tools/list` still enumerates denied tools so the operator can see what's blocked.
+
+File-format bump: `name|canned_response|policy`. Backwards compatible — pt2b two-field lines without a policy default to `allow` on load.
+
+Operator flow:
+
+```
+chat> /mcp register weather sunny-72F
+registered: weather  (saved to /root/.crossengin/mcp-tools.registry)
+
+chat> /mcp policy weather deny
+policy weather = deny  (saved to /root/.crossengin/mcp-tools.registry)
+
+# external MCP client (or scripted stdin) --
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather"}}
+{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Tool denied by policy"}}
+
+chat> /mcp policy weather allow
+policy weather = allow  (saved to /root/.crossengin/mcp-tools.registry)
+
+# next call succeeds --
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"weather"}}
+{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"sunny-72F"}],"isError":false}}
+```
+
+### Scope limit
+
+No `REQUIRE_APPROVAL` prompt from the stdio server: any extra text written to stdout breaks the JSON-RPC framing, so there's no way to ask the operator mid-call. The server's binary is `allow` / `deny`; a richer tiered approval flow needs an out-of-band seam (pt2d).
+
+### Why not thread `_gate_or_prompt` directly
+
+The gate lives in the chat REPL's session state (`_caps`, `_caps_log`, cap_session.nova's `caps_resolve`), which is in a separate process from the stdio server. The per-tool policy is the shared-file version of that gate — operator-set, persistent, honored by the server. A future pt2d can re-introduce the full gate via an out-of-band channel (named pipe or short-polled file).
+
 ## Phase 6 pt2b — chat registry seam (shipped)
 
 `bin/crossengin-mcp` and `bin/crossengin-chat` share a single file at `$CE_MCP_REGISTRY` (default `$HOME/.crossengin/mcp-tools.registry`). Tools registered inside the chat become visible to the external MCP client without a restart.
