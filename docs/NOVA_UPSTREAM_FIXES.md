@@ -1,9 +1,10 @@
 # NOVA Upstream Fixes — Status
 
-The five NOVA runtime gaps CrossEngin's Phase 0-7 work surfaced have
-all landed upstream in `amoufaq5/NOVA`. This doc is the pointer:
-the workarounds in CrossEngin can be retired on their respective PR
-branches in the next rebase pass.
+**All six NOVA runtime gaps CrossEngin's Phase 0-7 work surfaced have
+landed upstream** in `amoufaq5/NOVA` (PRs #13-#18). This doc is the
+pointer: the workarounds in CrossEngin can be retired on their
+respective PR branches in the next rebase pass. There is no remaining
+upstream blocker for in-process exec paths.
 
 ## Merged NOVA PRs
 
@@ -14,6 +15,7 @@ branches in the next rebase pass.
 | [NOVA #15](https://github.com/amoufaq5/NOVA/pull/15) | **B-5** | `store64` maps tagged-0 (raw 1) → raw 0 in memory; `load64` maps raw 0 → tagged-0 (round-trip preserved). argv/envp NULL terminators now work. | PR #21's `src/nl/ollama_spawn.nova` — drop the `os_store_null_terminator` inline asm helper. |
 | [NOVA #16](https://github.com/amoufaq5/NOVA/pull/16) | **P-3** | `_nova_exec` Linux threads `_g___envp` into execve (replacing hardcoded `mov rdx, 0`). Child inherits parent's PATH/HOME/etc — the POSIX norm. | PR #21's `/ingest_ollama` can drop the print-only pivot once fork + exec + store64 are wired together; the shebang + `getenv()` paths work from NOVA's side. |
 | [NOVA #17](https://github.com/amoufaq5/NOVA/pull/17) | **F-4** | `sys_read` / `sys_write` tag-polymorphic prolog on `buf` (untags an `alloc()`-backed buffer, passes a raw pointer unchanged) + unconditional `sar rdx, 1` on `count`. | PR #25's `src/factory/agent_bundle.nova:ab_read_file` — try the plain 3-arg `sys_read` path first; keep the alloc+load8 pattern as a dev-container fallback only. |
+| [NOVA #18](https://github.com/amoufaq5/NOVA/pull/18) | **P-5** | `_nova_exec` Linux untags `rdi` (path), `rsi` (argv), and each `argv[i]` string pointer before execve — tag-polymorphic, since string literals arrive raw while NOVA-variable strings and alloc'd buffers arrive tagged. Destructive untag of argv is safe (execve either replaces the process or the caller exits). | Unblocks CrossEngin's in-process `/ingest_ollama` one-step wrapper (Phase 2 pt2), in-process `/learn <url>` (Phase 3 pt2), and the real MCP server over spawned transports (Phase 6 pt2). No existing CrossEngin workaround to drop — those paths had been print-only or deferred. |
 
 ## When to retire the workarounds
 
@@ -33,17 +35,20 @@ so the cleanup commits belong there.
 
 ## Remaining NOVA gaps
 
-Five other gaps surfaced during Phases 0-6 are still open upstream.
-Per `docs/NOVA_RUNTIME_GAPS.md` (PR #27) they are tracked via the
-NOVA umbrella issue (`amoufaq5/nova#12`):
+The umbrella from `docs/NOVA_RUNTIME_GAPS.md §12` is fully closed for
+the Phase 0-7 arc. Four gaps that pre-date this session remain open
+upstream; none of them block a currently-shipped CrossEngin surface,
+and Phase 3 pt2's search-engine effector is the only one that would
+require an additional upstream fix before shipping:
+
 - Missing `setenv()` — CrossEngin falls back to shell init + systemd
   `Environment=`.
 - `secure_random` seccomp-blocked in the dev sandbox — key material
   must come in via env (see `bundle_signing.nova`).
 - `envp=NULL` for a *strict* empty-env exec form — a new 3-arg
   `exec_program(path, argv, envp)` would replace the current
-  inherit-by-default.
+  inherit-by-default. Cosmetic; no caller needs it today.
 - No in-process HTTPS — blocks Phase 3 pt2's `src/io/effectors/search_engine.nova`.
-- `exec_program` tag handling of path/argv — now the only remaining
-  blocker for a full in-process `/ingest_ollama` one-step wrapper
-  (NOVA #16 fixed envp but path/argv tagging is a separate rework).
+
+All exec, fork, pipe, read/write, and module-dedup gaps that surfaced
+during Phases 0-7 are closed.
