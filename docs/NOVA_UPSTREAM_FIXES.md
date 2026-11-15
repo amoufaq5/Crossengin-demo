@@ -1,7 +1,7 @@
 # NOVA Upstream Fixes — Status
 
-**All six NOVA runtime gaps CrossEngin's Phase 0-7 work surfaced have
-landed upstream** in `amoufaq5/NOVA` (PRs #13-#18). This doc is the
+**All seven NOVA runtime gaps CrossEngin's Phase 0-7 work surfaced have
+landed upstream** in `amoufaq5/NOVA` (PRs #13-#19). This doc is the
 pointer: the workarounds in CrossEngin can be retired on their
 respective PR branches in the next rebase pass. There is no remaining
 upstream blocker for in-process exec paths.
@@ -16,6 +16,7 @@ upstream blocker for in-process exec paths.
 | [NOVA #16](https://github.com/amoufaq5/NOVA/pull/16) | **P-3** | `_nova_exec` Linux threads `_g___envp` into execve (replacing hardcoded `mov rdx, 0`). Child inherits parent's PATH/HOME/etc — the POSIX norm. | PR #21's `/ingest_ollama` can drop the print-only pivot once fork + exec + store64 are wired together; the shebang + `getenv()` paths work from NOVA's side. |
 | [NOVA #17](https://github.com/amoufaq5/NOVA/pull/17) | **F-4** | `sys_read` / `sys_write` tag-polymorphic prolog on `buf` (untags an `alloc()`-backed buffer, passes a raw pointer unchanged) + unconditional `sar rdx, 1` on `count`. | PR #25's `src/factory/agent_bundle.nova:ab_read_file` — try the plain 3-arg `sys_read` path first; keep the alloc+load8 pattern as a dev-container fallback only. |
 | [NOVA #18](https://github.com/amoufaq5/NOVA/pull/18) | **P-5** | `_nova_exec` Linux untags `rdi` (path), `rsi` (argv), and each `argv[i]` string pointer before execve — tag-polymorphic, since string literals arrive raw while NOVA-variable strings and alloc'd buffers arrive tagged. Destructive untag of argv is safe (execve either replaces the process or the caller exits). | Unblocks CrossEngin's in-process `/ingest_ollama` one-step wrapper (Phase 2 pt2), in-process `/learn <url>` (Phase 3 pt2), and the real MCP server over spawned transports (Phase 6 pt2). No existing CrossEngin workaround to drop — those paths had been print-only or deferred. |
+| [NOVA #19](https://github.com/amoufaq5/NOVA/pull/19) | **N-1** | `accept_conn` maps tagged-0 `addr`/`addrlen` (raw `1`) to NULL. Before, every `accept_conn(fd, 0, 0)` made Linux fail the peer-address copy with EFAULT and drop the connection, so no NOVA TCP server ever served a request. Found while building the MCP HTTP transport. | Makes `bin/crossengin-mcp`'s HTTP mode (Phase 6 pt2e) work. It also silently repairs the RPC daemon and the `stream_http` transducer, which use the same idiom. No CrossEngin workaround existed. |
 
 ## When to retire the workarounds
 
