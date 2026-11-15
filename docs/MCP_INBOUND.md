@@ -58,6 +58,52 @@ The dispatcher inlines a 3-function local shim (`_mcp_local_new / register / loo
 
 Once the upstream symbol-collision issue closes, the inline shim collapses to a direct `import "../src/io/effectors/effector_mcp.nova"` and the `/mcp` command surface is unchanged.
 
+## Phase 6 pt2e — MCP over HTTP (shipped)
+
+`bin/crossengin-mcp` also speaks the MCP **Streamable HTTP** transport. Set `CE_MCP_HTTP_PORT` and it serves the same registry and dispatch as stdio on `http://127.0.0.1:<port>/mcp`:
+
+```bash
+CE_MCP_HTTP_PORT=8765 ./bin/crossengin-mcp
+# crossengin-mcp: listening on http://127.0.0.1:8765/mcp
+```
+
+Connect from Claude Code:
+
+```bash
+claude mcp add --transport http crossengin http://127.0.0.1:8765/mcp
+```
+
+Or by hand:
+
+```bash
+curl -s -H 'Content-Type: application/json' \
+     -H 'Accept: application/json, text/event-stream' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+     http://127.0.0.1:8765/mcp
+```
+
+| request | response |
+|---|---|
+| `POST /mcp`, JSON-RPC request | `200`, `Content-Type: application/json`, the JSON-RPC response (JSON-RPC errors such as `-32603` also come back as 200) |
+| `POST /mcp`, notification | `202 Accepted`, empty body |
+| `GET /mcp`, other methods | `405`, `Allow: POST` |
+| any other path | `404` |
+| `Origin` header not `http(s)://localhost` or `http(s)://127.0.0.1` | `403` |
+
+`initialize` now negotiates the protocol version on both transports. It echoes the client's `protocolVersion` when it is `2024-11-05`, `2025-03-26` or `2025-06-18`, and otherwise answers `2025-03-26`, the first revision with Streamable HTTP.
+
+`tests/integration/scenario_mcp_http.sh` covers every row above plus a deny-policy `tools/call`. Run it with `make integration`.
+
+### Scope limits
+
+- Stateless. There are no SSE response streams, no server-initiated messages, and no `Mcp-Session-Id` sessions.
+- One request per connection (`Connection: close`), handled serially. There is no keep-alive and no JSON-RPC batch arrays.
+- Binds 127.0.0.1 only, with no auth or TLS. Put a reverse proxy with auth in front before exposing it anywhere else.
+
+### Upstream fix this needed
+
+Every NOVA TCP server that called `accept_conn(fd, 0, 0)` dropped each connection with EFAULT, because the tagged literal `0` reached the kernel as the pointer `1`. That includes CrossEngin's RPC daemon and `stream_http`. Fixed upstream in NOVA #19; see `docs/NOVA_UPSTREAM_FIXES.md`.
+
 ## Phase 6 pt2d — per-tool `inputSchema` (shipped)
 
 Every registry row now carries an optional `fields` CSV, rendered server-side as a real JSON Schema inside each `tools/list` tool manifest. External MCP clients can build correct call sites instead of guessing at the tool's arguments.
