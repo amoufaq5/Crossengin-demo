@@ -22,6 +22,7 @@
 #   6. /load of the final path must succeed in a fresh chat regardless.
 
 . "$(dirname "$0")/_lib.sh"
+grant_caps delete   # /load is gated by CAP_DELETE
 require_chat
 
 PASS=0; FAIL=0

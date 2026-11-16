@@ -32,6 +32,7 @@
 #     fails with a clear "TAMPERED" error before any state is mutated.
 
 . "$(dirname "$0")/_lib.sh"
+grant_caps delete   # /load is gated by CAP_DELETE
 
 PASS=0; FAIL=0
 

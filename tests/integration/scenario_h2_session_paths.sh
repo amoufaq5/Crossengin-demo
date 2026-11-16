@@ -26,6 +26,7 @@
 #   6. Legacy back-compat: CE_SNAP_PATH wins over the per-session derivation.
 
 . "$(dirname "$0")/_lib.sh"
+grant_caps delete   # /load is gated by CAP_DELETE
 require_chat
 
 PASS=0; FAIL=0

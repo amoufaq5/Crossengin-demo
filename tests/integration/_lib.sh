@@ -110,6 +110,17 @@ run_chat() {
     printf '%s\n' "$input" | "$CHAT" 2>&1
 }
 
+# Pre-grant capabilities for a scenario that exercises gated verbs
+# non-interactively. /load needs `delete` (CAP_DELETE -> approval prompt by
+# default), and the scripted stdin would otherwise answer the y/N prompt with
+# the next command line and decline. Usage: grant_caps delete [other ...]
+grant_caps() {
+    local f
+    f="$(mktemp /tmp/ce_int_caps.XXXXXX)"
+    for c in "$@"; do printf '%s=allow\n' "$c" >> "$f"; done
+    export CE_CAPS_CONF="$f"
+}
+
 it_section() {
     printf "%s== %s ==%s\n" "$C_DIM" "$1" "$C_RST"
 }

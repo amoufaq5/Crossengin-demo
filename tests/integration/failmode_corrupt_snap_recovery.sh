@@ -11,6 +11,7 @@
 #      session was NOT clobbered by the failed load).
 
 . "$(dirname "$0")/_lib.sh"
+grant_caps delete   # /load is gated by CAP_DELETE
 require_chat
 
 PASS=0; FAIL=0

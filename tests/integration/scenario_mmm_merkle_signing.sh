@@ -39,6 +39,7 @@
 #     deterministic; same input -> same signature).
 
 . "$(dirname "$0")/_lib.sh"
+grant_caps delete   # /load is gated by CAP_DELETE
 
 PASS=0; FAIL=0
 
