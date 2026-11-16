@@ -159,9 +159,11 @@ fi
 SNAP_DIR="${CE_SNAP_DIR:-}"
 if [ -z "$SNAP_DIR" ]; then
     if [ -n "${CE_SNAP_PATH:-}" ]; then SNAP_DIR="$(dirname "${CE_SNAP_PATH}")"
-    else SNAP_DIR="${RUN_DIR:-/tmp}"; fi
+    else SNAP_DIR="$RUN_DIR"; fi
 fi
-if [ -d "$SNAP_DIR" ] && [ -w "$SNAP_DIR" ]; then
+if [ -z "$SNAP_DIR" ]; then
+    critical "snapshot dir writable" 0 "(no usable runtime dir; set CE_RUN_DIR or CE_SNAP_PATH)"
+elif [ -d "$SNAP_DIR" ] && [ -w "$SNAP_DIR" ]; then
     SNAP_FREE_KB="$(df -P "$SNAP_DIR" 2>/dev/null | awk 'NR==2 {print $4}')"
     case "$SNAP_FREE_KB" in ''|*[!0-9]*) SNAP_FREE_KB=0 ;; esac
     SNAP_FREE_MB=$((SNAP_FREE_KB / 1024))
@@ -175,9 +177,11 @@ DLOG_PATH="${CE_DLOG_PATH:-}"
 if [ -n "$DLOG_PATH" ]; then
     DLOG_DIR="$(dirname "$DLOG_PATH")"
 else
-    DLOG_DIR="${CE_DLOG_DIR:-${RUN_DIR:-/tmp}}"
+    DLOG_DIR="${CE_DLOG_DIR:-$RUN_DIR}"
 fi
-if [ -d "$DLOG_DIR" ] && [ -w "$DLOG_DIR" ]; then
+if [ -z "$DLOG_DIR" ]; then
+    critical "dlog dir writable" 0 "(no usable runtime dir; set CE_RUN_DIR or CE_DLOG_PATH)"
+elif [ -d "$DLOG_DIR" ] && [ -w "$DLOG_DIR" ]; then
     critical "dlog dir writable" 1 "($DLOG_DIR)"
 else
     critical "dlog dir writable" 0 "($DLOG_DIR -- not writable; set CE_DLOG_DIR)"

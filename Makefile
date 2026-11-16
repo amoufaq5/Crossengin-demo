@@ -86,7 +86,7 @@ cross-windows: check-nova
 		fi; \
 	done
 	@echo "cross-windows: done. Run under wine with"
-	@echo "  XDG_RUNTIME_DIR=/tmp/xdg-runtime wine $(BIN)/<name>.exe"
+	@echo "  XDG_RUNTIME_DIR=/tmp/xdg-runtime CE_RUN_DIR=/tmp wine $(BIN)/<name>.exe"
 
 # Run a functional smoke for each cross-compiled .exe under Wine. Requires
 # `cross-windows` already built the artifacts and `wine` is on PATH. The

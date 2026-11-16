@@ -714,8 +714,8 @@ daemon command inputs `crossengin_input` / `crossengin_fed_input`,
 directory, not in world-writable `/tmp`:
 
 1. `$CE_RUN_DIR` if set (used as given -- the test harnesses set `/tmp`),
-2. else `$XDG_RUNTIME_DIR/crossengin` (when `$XDG_RUNTIME_DIR` exists),
-3. else `$HOME/.crossengin/run`,
+2. else `$XDG_RUNTIME_DIR/crossengin` (when `$XDG_RUNTIME_DIR` is a directory you own),
+3. else `$HOME/.crossengin/run` (when `$HOME` is a directory you own),
 4. else `/tmp/crossengin-run-<uid>`.
 
 Cases 2-4 are created `0700`. If the directory exists but is not a real

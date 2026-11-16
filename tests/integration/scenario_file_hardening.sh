@@ -5,7 +5,8 @@
 #      dir ($HOME/.crossengin/run here), not /tmp.
 #   3. A runtime dir that is group/other accessible is refused (exit 70).
 #   4. A symlinked runtime dir is refused (exit 70).
-#   5. Explicit per-file paths (CE_DLOG_PATH, CE_SNAP_PATH) bypass the run dir.
+#   5. Explicit per-file paths (CE_DLOG_PATH, CE_SNAP_PATH) bypass the run dir;
+#      a missing HOME falls back to /tmp/crossengin-run-<uid>.
 #   6. The daemon reads its command input from the run dir; a planted
 #      /tmp/crossengin_input is ignored.
 
@@ -53,6 +54,13 @@ OUT=$(printf '/quit\n' | env -u CE_RUN_DIR -u XDG_RUNTIME_DIR \
       CE_DLOG_PATH="$WORK/o.dlog" CE_SNAP_PATH="$WORK/o.snap" \
       HOME="$WORK/home2" timeout 60 "$CHAT" 2>&1); RC=$?
 assert_eq "$RC" "0" "explicit CE_DLOG_PATH/CE_SNAP_PATH boot despite an insecure run dir"
+
+# 5b. a HOME that is missing (service accounts: HOME=/nonexistent) falls
+#     back to the private /tmp/crossengin-run-<uid> instead of exiting 70
+OUT=$(printf '/quit\n' | env -u CE_RUN_DIR -u XDG_RUNTIME_DIR -u CE_DLOG_PATH \
+      HOME="$WORK/no_such_home" timeout 60 "$CHAT" 2>&1); RC=$?
+assert_eq "$RC" "0" "missing HOME falls back to /tmp/crossengin-run-<uid>"
+assert_eq "$(stat -c '%a' "/tmp/crossengin-run-$(id -u)" 2>/dev/null)" "700" "/tmp/crossengin-run-<uid> is 0700"
 
 # 6. the daemon reads its command input from the run dir, not /tmp
 DAEMON="$REPO_ROOT/bin/crossengin"

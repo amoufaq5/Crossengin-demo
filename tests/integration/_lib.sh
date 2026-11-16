@@ -119,6 +119,7 @@ grant_caps() {
     f="$(mktemp /tmp/ce_int_caps.XXXXXX)"
     for c in "$@"; do printf '%s=allow\n' "$c" >> "$f"; done
     export CE_CAPS_CONF="$f"
+    _CE_INT_CAPS_FILE="$f"   # removed by summary()
 }
 
 it_section() {
@@ -129,6 +130,7 @@ it_section() {
 # tests/integration/*.sh script ends with `summary <name>`.
 summary() {
     local name="$1"
+    if [ -n "${_CE_INT_CAPS_FILE:-}" ]; then rm -f -- "${_CE_INT_CAPS_FILE}"; fi
     if [ "$FAIL" -eq 0 ]; then
         printf "integration %s: ${C_GRN}pass=%d fail=%d${C_RST}\n" "$name" "$PASS" "$FAIL"
     else

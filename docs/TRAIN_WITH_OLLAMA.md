@@ -107,15 +107,15 @@ review queue (7 pending, 0 ingested, 0 denied, 0 ingest-failed):
 
 ## 6. Teach from the web
 
-`/learn <url>` fetches and caches text to `/tmp/crossengin_learn_<tag>.txt`. Pt1 of Phase 1 gated this behind an approval prompt (`CAP_AUTONOMOUS_FETCH`) — the user confirms before the agent reaches outward. Once cached, feed it to `/ingest_ollama`:
+`/learn <url>` fetches and caches text to `<run dir>/crossengin_learn_<tag>.txt` (`<run dir>` is `$CE_RUN_DIR`, else `$XDG_RUNTIME_DIR/crossengin` or `~/.crossengin/run`; see CHAT_USAGE.md §10). Pt1 of Phase 1 gated this behind an approval prompt (`CAP_AUTONOMOUS_FETCH`) — the user confirms before the agent reaches outward. Once cached, feed it to `/ingest_ollama`:
 
 ```
 > /learn https://en.wikipedia.org/wiki/Fever
 agent> would like to fetch URL: https://en.wikipedia.org/wiki/Fever. approve? [y/N/why]
 > y
-(fetched 24KB to /tmp/crossengin_learn_fever.txt)
+(fetched 24KB to <run dir>/crossengin_learn_fever.txt)
 
-> /ingest_ollama /tmp/crossengin_learn_fever.txt
+> /ingest_ollama <run dir>/crossengin_learn_fever.txt
 # Phase 2 pt2: run these two commands …
 ```
 
@@ -128,7 +128,7 @@ After records land in the KG:
 ```
 > /why fever
 atom fever (kg=learned) traces to:
-  src:extractor:llm:llama3.2:3b-instruct:ollama-N (sentence 4, line 42 of /tmp/crossengin_learn_fever.txt)
+  src:extractor:llm:llama3.2:3b-instruct:ollama-N (sentence 4, line 42 of <run dir>/crossengin_learn_fever.txt)
   src:topic:fever (seed)
   …
 
@@ -147,7 +147,7 @@ Phase 3 pt1 adds an auto-prefix router so a bare-word first token is rewritten t
 
 ```
 > learn antibiotics
-(no cache for 'antibiotics' [topic] at /tmp/crossengin_learn_antibiotics.txt)
+(no cache for 'antibiotics' [topic] at <run dir>/crossengin_learn_antibiotics.txt)
   run first:  scripts/learn.sh antibiotics
 ```
 

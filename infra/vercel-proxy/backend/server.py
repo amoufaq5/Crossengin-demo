@@ -182,12 +182,17 @@ def chat_oneshot(binary, message):
             fp.write(message)
         env = dict(os.environ)
         env["CE_RUN_DIR"] = run_dir
-        result = subprocess.run(
-            [binary],
-            capture_output=True,
-            timeout=REQUEST_TIMEOUT_S,
-            env=env,
-        )
+        try:
+            result = subprocess.run(
+                [binary],
+                capture_output=True,
+                timeout=REQUEST_TIMEOUT_S,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as e:
+            # Surface as TimeoutError so the handler answers 504, like the
+            # persistent-child path (TimeoutExpired is not a TimeoutError).
+            raise TimeoutError(f"no reply within {REQUEST_TIMEOUT_S:.0f}s") from e
         out = (result.stdout or b"").decode("utf-8", errors="replace")
         for line in out.splitlines():
             if line.startswith("agent> "):
