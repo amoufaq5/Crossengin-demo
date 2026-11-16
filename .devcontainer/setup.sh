@@ -20,9 +20,13 @@ fi
 
 # 2. NOVA. Clone shallowly, then make (~1-2 minutes the first time).
 NOVA_ROOT="${NOVA_ROOT:-$HOME/NOVA}"
+# Pinned to the same NOVA commit CI uses (.github/workflows/build-and-smoke.yml
+# NOVA_REF) so dev containers build reproducibly. Override with NOVA_REF=<sha>.
+NOVA_REF="${NOVA_REF:-fd5bd0679a1fbeb9f3ba04ea86f1dbd3fd73cf20}"
 if [ ! -d "$NOVA_ROOT" ]; then
-    log "Cloning NOVA into $NOVA_ROOT ..."
-    git clone --depth 1 https://github.com/amoufaq5/nova "$NOVA_ROOT"
+    log "Cloning NOVA ($NOVA_REF) into $NOVA_ROOT ..."
+    git clone https://github.com/amoufaq5/NOVA "$NOVA_ROOT"
+    git -C "$NOVA_ROOT" checkout -q "$NOVA_REF"
 fi
 if [ ! -x "$NOVA_ROOT/bin/nova" ]; then
     log "Building the NOVA compiler ..."
