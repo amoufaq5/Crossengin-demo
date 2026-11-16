@@ -12,7 +12,7 @@
 #          -> reads the file from disk, derives tag from the basename
 #   BATCH  scripts/learn.sh @/path/to/urls.txt   (P1.5)
 #          -> one URL per line; recursively ingests each and concatenates the
-#             per-URL caches into a combined /tmp/crossengin_learn_batch_<tag>.txt
+#             per-URL caches into a combined $CE_LEARN_DIR/crossengin_learn_batch_<tag>.txt
 #   RSS    scripts/learn.sh rss:https://feeds.example.com/atom.xml   (P1.5)
 #          -> fetches the feed, parses the first 5 <link>...</link> items, and
 #             treats them as a BATCH. Tag is rss_<host>.
@@ -21,10 +21,10 @@
 #             each as a FILE corpus and concatenates them into a combined cache.
 #
 # In every kind the downstream pipeline is identical: BODY is split into
-# lowercase alphabetic words for /tmp/crossengin_learn_<tag>.txt, and the same
-# 5-word sliding-window extractor mines /tmp/crossengin_learn_<tag>_triples.txt.
+# lowercase alphabetic words for $CE_LEARN_DIR/crossengin_learn_<tag>.txt, and the same
+# 5-word sliding-window extractor mines $CE_LEARN_DIR/crossengin_learn_<tag>_triples.txt.
 # For BATCH/RSS/DIR the per-source caches stay on disk too, and an extra
-# /tmp/crossengin_learn_batch_<tag>.txt (or _rss_<tag>.txt / _dir_<tag>.txt)
+# $CE_LEARN_DIR/crossengin_learn_batch_<tag>.txt (or _rss_<tag>.txt / _dir_<tag>.txt)
 # concatenates them; the chat's `/learn <ARG>` ingests the combined cache and
 # also re-derives each per-source tag to ingest its individual cache.
 # The user types `/learn <ARG>` (the original argument) in the chat -- the chat
@@ -48,13 +48,18 @@ if [ $# -lt 1 ]; then
     echo "  BATCH: @/path/to/urls.txt (one URL per line, recursive per-URL ingest)"
     echo "  RSS:   rss:URL  fetches feed, ingests first 5 article links"
     echo "  DIR:   dir:/path/  walks .txt+.md files under the directory"
-    echo "  writes /tmp/crossengin_learn_<tag>.txt + ..._<tag>_triples.txt."
+    echo "  writes <run dir>/crossengin_learn_<tag>.txt + ..._<tag>_triples.txt."
     echo "  Then in bin/crossengin-chat:  /learn <ARG>"
     exit 1
 fi
 
 ARG="$1"
 SELF="${BASH_SOURCE[0]}"
+
+# Audit F-24: learn caches live in the private per-user runtime dir (the
+# chat reads them from there); /tmp let another user plant "facts".
+. "$(dirname "${BASH_SOURCE[0]}")/_run_dir.sh"
+CE_LEARN_DIR="$(ce_run_dir)" || exit 70
 
 # --- helper: sanitise a free-form string into an alphanumeric tag (used by
 # the BATCH / RSS / DIR derivers and the existing URL / FILE clauses). The
@@ -72,7 +77,7 @@ _tag_sanitise() {
 # Each one builds a per-source tag list, then drives the existing single-source
 # pipeline (TOPIC/URL/FILE) recursively for each input. After all per-source
 # caches have been written, we concatenate them into a single combined cache
-# at /tmp/crossengin_learn_batch_<TAG>.txt so the chat's /learn @... line can
+# at $CE_LEARN_DIR/crossengin_learn_batch_<TAG>.txt so the chat's /learn @... line can
 # do a single read for the combined corpus AND re-derive each per-source tag
 # to also pull the individual cache.
 # ============================================================================
@@ -90,7 +95,7 @@ case "$ARG" in
         LIST_BASE=$(basename "$LIST_PATH")
         LIST_STEM="${LIST_BASE%.*}"
         BATCH_TAG=$(_tag_sanitise "batch_${LIST_STEM}")
-        COMBINED="/tmp/crossengin_learn_${BATCH_TAG}.txt"
+        COMBINED="$CE_LEARN_DIR/crossengin_learn_${BATCH_TAG}.txt"
         : > "$COMBINED"
         echo "batch: $LIST_PATH  (kind=batch tag=$BATCH_TAG)"
         n_urls=0
@@ -108,7 +113,7 @@ case "$ARG" in
             # cache files. We don't fail-fast on a single URL failure.
             if "$SELF" "$url" >/dev/null 2>&1; then
                 URL_TAG=$(echo "$url" | sed -E 's|^https?://||; s|/|_|g; s|[^a-zA-Z0-9_-]||g' | cut -c1-64)
-                URL_CACHE="/tmp/crossengin_learn_${URL_TAG}.txt"
+                URL_CACHE="$CE_LEARN_DIR/crossengin_learn_${URL_TAG}.txt"
                 if [ -f "$URL_CACHE" ]; then
                     cat "$URL_CACHE" >> "$COMBINED"
                     n_ok=$((n_ok + 1))
@@ -139,7 +144,7 @@ case "$ARG" in
         # Tag from host of the feed URL.
         FEED_HOST=$(echo "$FEED_URL" | sed -E 's|^https?://||; s|/.*$||; s|[^a-zA-Z0-9_-]|_|g' | cut -c1-32)
         RSS_TAG=$(_tag_sanitise "rss_${FEED_HOST}")
-        COMBINED="/tmp/crossengin_learn_${RSS_TAG}.txt"
+        COMBINED="$CE_LEARN_DIR/crossengin_learn_${RSS_TAG}.txt"
         : > "$COMBINED"
         echo "rss: $FEED_URL  (kind=rss tag=$RSS_TAG)"
         RSS_MAX="${LEARN_RSS_MAX:-5}"
@@ -165,7 +170,7 @@ case "$ARG" in
             echo "  [rss $n_links] $link"
             if "$SELF" "$link" >/dev/null 2>&1; then
                 URL_TAG=$(echo "$link" | sed -E 's|^https?://||; s|/|_|g; s|[^a-zA-Z0-9_-]||g' | cut -c1-64)
-                URL_CACHE="/tmp/crossengin_learn_${URL_TAG}.txt"
+                URL_CACHE="$CE_LEARN_DIR/crossengin_learn_${URL_TAG}.txt"
                 if [ -f "$URL_CACHE" ]; then
                     cat "$URL_CACHE" >> "$COMBINED"
                     n_ok=$((n_ok + 1))
@@ -194,7 +199,7 @@ case "$ARG" in
         DIR_TRIM="${DIR_PATH%/}"
         DIR_BASE=$(basename "$DIR_TRIM")
         DIR_TAG=$(_tag_sanitise "dir_${DIR_BASE}")
-        COMBINED="/tmp/crossengin_learn_${DIR_TAG}.txt"
+        COMBINED="$CE_LEARN_DIR/crossengin_learn_${DIR_TAG}.txt"
         : > "$COMBINED"
         echo "dir: $DIR_PATH  (kind=dir tag=$DIR_TAG)"
         n_files=0
@@ -205,7 +210,7 @@ case "$ARG" in
             echo "  [dir $n_files] $f"
             if "$SELF" "$f" >/dev/null 2>&1; then
                 FILE_TAG=$(basename "$f" | sed -E 's|\.[^.]+$||; s|[^a-zA-Z0-9_-]|_|g' | cut -c1-64)
-                FILE_CACHE="/tmp/crossengin_learn_${FILE_TAG}.txt"
+                FILE_CACHE="$CE_LEARN_DIR/crossengin_learn_${FILE_TAG}.txt"
                 if [ -f "$FILE_CACHE" ]; then
                     cat "$FILE_CACHE" >> "$COMBINED"
                     n_ok=$((n_ok + 1))
@@ -252,8 +257,8 @@ case "$ARG" in
         ;;
 esac
 
-OUT="/tmp/crossengin_learn_${TAG}.txt"
-TRIPLES="/tmp/crossengin_learn_${TAG}_triples.txt"
+OUT="$CE_LEARN_DIR/crossengin_learn_${TAG}.txt"
+TRIPLES="$CE_LEARN_DIR/crossengin_learn_${TAG}_triples.txt"
 MAX_WORDS="${LEARN_MAX:-30}"
 MAX_TRIPLES="${LEARN_MAX_TRIPLES:-20}"
 

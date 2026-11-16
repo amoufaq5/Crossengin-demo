@@ -12,14 +12,19 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHAT="$REPO_ROOT/bin/crossengin-chat"
 
+# Audit F-24: learn caches live in the private per-user runtime dir (the
+# chat reads them from there); /tmp let another user plant "facts".
+. "$REPO_ROOT/scripts/_run_dir.sh"
+CE_LEARN_DIR="$(ce_run_dir)" || exit 70
+
 if [ ! -x "$CHAT" ]; then
     echo "ERROR: $CHAT not built. Run: NOVA_ROOT=/path/to/NOVA make install" >&2
     exit 2
 fi
 
 TOPIC="smoke$$"
-VOCAB="/tmp/crossengin_learn_${TOPIC}.txt"
-TRIPS="/tmp/crossengin_learn_${TOPIC}_triples.txt"
+VOCAB="$CE_LEARN_DIR/crossengin_learn_${TOPIC}.txt"
+TRIPS="$CE_LEARN_DIR/crossengin_learn_${TOPIC}_triples.txt"
 trap 'rm -f "$VOCAB" "$TRIPS"' EXIT
 
 # Two new words plus three triples. Subjects/objects mix seed atoms

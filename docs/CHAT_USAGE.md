@@ -185,7 +185,7 @@ session for the live listing -- the table below is the post-R39 canonical set.
 |--------------------------------------|--------------------------------------------------------------|
 | `/halt`                              | Stop the effector (input still flows in). Honours ADR-0044's hard-stop bit. |
 | `/resume`                            | Un-halt.                                                     |
-| `/save [PATH]`                       | Write a substrate snapshot. Default path: `$CE_SNAP_PATH` or `/tmp/crossengin.snap`. |
+| `/save [PATH]`                       | Write a substrate snapshot. Default path: `$CE_SNAP_PATH` or `<run dir>/crossengin.<session>.snap` (see §10, runtime directory). |
 | `/load [PATH]`                       | Read a snapshot from disk; rehydrate live soul + KGs (atoms merge by label). |
 | `/compact [--dry-run]`               | Compact the in-memory snapshot: drop dead atoms, archived episodes, sub-threshold synapses. Next `/save` writes the compacted form. |
 | `/snap_verify [PATH]`                | Recompute Merkle root and compare to the file's claim (R15E tamper detection). |
@@ -706,12 +706,33 @@ Paired with `/meta-feedback` (dry-run of proposed tier changes) and
 
 This is the area with the most planned R40 work. Today (post-R39C, pre-R40):
 
+### Runtime directory (audit F-24)
+
+Default state and IPC files (decision log, snapshots, `chat_state.dat`,
+learn caches, the daemon command inputs `crossengin_input` /
+`crossengin_fed_input`, `crossengin.sock`, the Ollama compose input) live
+in a private per-user directory, not in world-writable `/tmp`:
+
+1. `$CE_RUN_DIR` if set (used as given -- the test harnesses set `/tmp`),
+2. else `$XDG_RUNTIME_DIR/crossengin`,
+3. else `$HOME/.crossengin/run`,
+4. else `/tmp/crossengin-run`.
+
+Cases 2-4 are created `0700`. If the directory exists but is not a
+directory owned by you with no group/other permission bits, the binary
+exits 70 with a message rather than using it. Every explicit per-file
+env override (`CE_SNAP_PATH`, `CE_DLOG_PATH`, ...) still wins. The shell
+helpers use the same rules via `scripts/_run_dir.sh`.
+
 ### What persists today
 
 - **Substrate snapshots via `/save` and `/load`.** This is the ADR-0048
   binary tagged format. `/save [PATH]` writes the snapshot; `/load [PATH]`
   reads it back, rehydrating soul (first), KGs (second), episodic (third).
-  Default path is `$CE_SNAP_PATH` or `/tmp/crossengin.snap`. Snapshots
+  Default path is `$CE_SNAP_PATH` or `<run dir>/crossengin.<session>.snap`.
+  Snapshot files are written `0600` through a fresh `O_EXCL|O_NOFOLLOW`
+  temp file and rename, and the loader rejects record counts or indices
+  that are negative or larger than the file. Snapshots
   carry a Merkle root for tamper detection (`/snap_verify`) and an
   Ed25519 attestation (`/snap_sign_status`).
 - **Per-cookie state in `scripts/web.py` for the lifetime of the cookie.**

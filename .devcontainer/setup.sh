@@ -22,7 +22,7 @@ fi
 NOVA_ROOT="${NOVA_ROOT:-$HOME/NOVA}"
 # Pinned to the same NOVA commit CI uses (.github/workflows/build-and-smoke.yml
 # NOVA_REF) so dev containers build reproducibly. Override with NOVA_REF=<sha>.
-NOVA_REF="${NOVA_REF:-309377d6fb98c3be3345f960e2e80f18de79e197}"
+NOVA_REF="${NOVA_REF:-4917f10b2e224f0a036f4fc92879a51feaf0f6a6}"
 if [ ! -d "$NOVA_ROOT" ]; then
     log "Cloning NOVA ($NOVA_REF) into $NOVA_ROOT ..."
     git clone https://github.com/amoufaq5/NOVA "$NOVA_ROOT"

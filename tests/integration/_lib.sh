@@ -14,6 +14,11 @@
 # Convention: scripts use `set -uo pipefail` (NOT `set -e` -- we want to record
 # failures, not abort) and call `summary` as their last action.
 
+# Audit F-24: production defaults now live in a private per-user runtime
+# dir; the integration tests pin it to /tmp so the paths they inspect
+# (/tmp/crossengin.default.dlog, /tmp/crossengin_learn_*, ...) are unchanged.
+export CE_RUN_DIR="${CE_RUN_DIR:-/tmp}"
+
 set -uo pipefail
 
 PASS=${PASS:-0}
