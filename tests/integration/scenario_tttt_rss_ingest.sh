@@ -62,6 +62,26 @@ cat > "$BAD" <<'EOF'
 this is not even a feed, just some text and a stray < without close
 EOF
 
+# --- step 0: F-19 guards ------------------------------------------------
+# Without CE_RSS_ALLOW_FILE=1, file:// feeds are refused from chat; with no
+# grant, the autonomous_fetch prompt is answered "n" and declines.
+CHAT_OUT=$(run_chat "/cap grant autonomous_fetch
+/rss file://$FIXTURE")
+assert_match "$CHAT_OUT" "file:// feeds are disabled from chat" \
+    "/rss file:// refused without CE_RSS_ALLOW_FILE=1"
+CHAT_OUT=$(run_chat "/cap grant autonomous_fetch
+/rss http://127.0.0.1:9/feed.xml")
+assert_match "$CHAT_OUT" "loopback/private hosts are disabled" \
+    "/rss to a loopback host refused"
+CHAT_OUT=$(run_chat "/rss http://192.168.1.10/feed.xml
+n")
+assert_match "$CHAT_OUT" "declined \\(fetch RSS feed\\)" \
+    "/rss without a grant asks for approval and declines on n"
+
+# The remaining steps read local fixtures, so opt in.
+export CE_RSS_ALLOW_FILE=1
+GRANT="/cap grant autonomous_fetch"
+
 # --- step 1: usage on empty arg -----------------------------------------
 CHAT_OUT=$(run_chat '/rss')
 assert_match "$CHAT_OUT" "usage: /rss" \
@@ -70,7 +90,8 @@ assert_match "$CHAT_OUT" "usage: /rss" \
 # --- step 2: ingest the 3-item fixture ----------------------------------
 # Run /rss twice in one chat session: first call should report
 # ingested=3; second call should report ingested=0 (dedup).
-CHAT_OUT=$(run_chat "/rss file://$FIXTURE
+CHAT_OUT=$(run_chat "$GRANT
+/rss file://$FIXTURE
 /rss file://$FIXTURE")
 
 assert_match "$CHAT_OUT" "RSS feed=file://$FIXTURE fetched=[0-9]+ parsed=3 ingested=3" \
@@ -79,7 +100,8 @@ assert_match "$CHAT_OUT" "ingested=0" \
     "second /rss against same feed adds 0 atoms (dedup on guid)"
 
 # --- step 3: malformed XML --------------------------------------------
-CHAT_OUT=$(run_chat "/rss file://$BAD")
+CHAT_OUT=$(run_chat "$GRANT
+/rss file://$BAD")
 assert_match "$CHAT_OUT" "RSS feed=file://$BAD" \
     "/rss against malformed XML prints the RSS line"
 assert_match "$CHAT_OUT" "err=\"[^\"]+\"" \
@@ -88,21 +110,24 @@ assert_nomatch "$CHAT_OUT" "Segmentation fault" \
     "/rss against malformed XML does NOT segfault"
 
 # --- step 4: empty file ------------------------------------------------
-CHAT_OUT=$(run_chat "/rss file://$EMPTY")
+CHAT_OUT=$(run_chat "$GRANT
+/rss file://$EMPTY")
 assert_match "$CHAT_OUT" "RSS feed=file://$EMPTY" \
     "/rss against empty file prints the RSS line"
 assert_match "$CHAT_OUT" "err=\"" \
     "/rss against empty file reports an error tag"
 
 # --- step 5: missing file (fetch error) -------------------------------
-CHAT_OUT=$(run_chat "/rss file://$MISSING")
+CHAT_OUT=$(run_chat "$GRANT
+/rss file://$MISSING")
 assert_match "$CHAT_OUT" "RSS feed=file://$MISSING fetched=0" \
     "/rss against missing file reports fetched=0"
 assert_match "$CHAT_OUT" "ingested=0" \
     "/rss against missing file reports ingested=0"
 
 # --- step 6: unsupported scheme ----------------------------------------
-CHAT_OUT=$(run_chat "/rss gopher://example.com/feed")
+CHAT_OUT=$(run_chat "$GRANT
+/rss gopher://example.com/feed")
 assert_match "$CHAT_OUT" "err=" \
     "/rss against unsupported scheme reports an error"
 
