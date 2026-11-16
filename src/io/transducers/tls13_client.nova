@@ -10,12 +10,17 @@
 //     group  secp256r1 (P-256) key share
 //     1-RTT, no PSK, no 0-RTT, no client cert.
 //
-//   Scope / honesty: this completes the handshake and exchanges encrypted
-//   application data, but it does NOT verify the server certificate chain
-//   (no X.509/ASN.1/PKI yet -- that is the next slab on TLS_AUDIT.md). The
-//   channel is therefore CONFIDENTIAL but UNAUTHENTICATED: good enough to
-//   fetch public knowledge for /learn, not for anything trusting the peer's
-//   identity. Callers are told so plainly.
+//   Authentication (R43; on by default since PR 4e, audit F-17): before any
+//   request is sent the server's certificate chain is verified against the
+//   trust store (x509_verify: RSA-2048/3072/4096, P-256/P-384, SHA-256/384/
+//   512; the chain may end at a root the server omitted), the leaf must cover
+//   the host name, every cert must be valid now, the CertificateVerify
+//   signature must verify under the leaf key, and the server Finished MAC
+//   must match. Trust store: $CE_TLS_CA_BUNDLE (a PEM file; if set but it
+//   yields no usable root, every server is refused), else
+//   /etc/ssl/certs/ca-certificates.crt, else the built-in sandbox-gateway
+//   pins. CE_TLS_STRICT=0 turns verification off (encrypted but
+//   UNAUTHENTICATED) and prints a warning on stderr once per process.
 //
 //   This file is the crypto core: the TLS 1.3 key schedule (HKDF-Expand-Label,
 //   Derive-Secret, the early/handshake/master ladder) plus the record AEAD.
@@ -256,13 +261,57 @@ fn tls13_status_name(s) {
     return "unknown"
 }
 
-// Strict mode (CE_TLS_STRICT=1) requires the presented chain to terminate at a
-// pinned anchor + pass hostname/validity + a valid CertificateVerify. Default
-// is lenient (encrypted but unauthenticated), for portability.
+// Certificate verification is ON unless CE_TLS_STRICT is exactly "0"
+// (PR 4e, audit F-17: it used to be off unless CE_TLS_STRICT was set).
+// Pure function of the env value so it can be unit-tested (NOVA has no
+// setenv).
+fn _tls_strict_from(e) {
+    if e == 0 { return 1 }
+    if len(e) == 0 { return 1 }
+    if str_eq_bytes(e, "0") == 1 { return 0 }
+    return 1
+}
+
+// write(2, ...) -- sys_write passes its fd raw, so a NOVA literal 2 would be
+// fd 5; this writes to the real stderr.
+fn _tls_stderr_write(buf, count) {
+    asm {
+        "mov rax, 1"
+        "mov rdi, 2"
+        "mov rsi, [rbp-8]"
+        "test rsi, 1"
+        "jz .tlsw_u"
+        "sar rsi, 1"
+        ".tlsw_u:"
+        "mov rdx, [rbp-16]"
+        "sar rdx, 1"
+        "syscall"
+    }
+}
+
+// One line on stderr (warnings must not mix into stdout, which callers
+// such as the chat parse).
+fn _tls_warn(msg) {
+    let line = msg + "\n"
+    let n = len(line)
+    let b = alloc(n + 1)
+    let i = 0
+    while i < n { store8(b + i, char_at(line, i)) i = i + 1 }
+    _tls_stderr_write(b, n)
+    return 1
+}
+
+let _tls_insecure_warned = 0
+
 fn _tls_strict() {
-    let e = getenv("CE_TLS_STRICT")
-    if e != 0 { if len(e) > 0 { if str_eq_bytes(e, "0") == 0 { return 1 } } }
-    return 0
+    let s = _tls_strict_from(getenv("CE_TLS_STRICT"))
+    if s == 0 {
+        if _tls_insecure_warned == 0 {
+            _tls_insecure_warned = 1
+            _tls_warn("warning: CE_TLS_STRICT=0 -- TLS certificate verification is DISABLED; HTTPS is encrypted but not authenticated")
+        }
+    }
+    return s
 }
 
 // Pinned trust anchors: the sandbox egress-gateway root CAs (production +
@@ -296,30 +345,44 @@ fn _tls_parse_cert_msg(hsb, off) {
     return out
 }
 
-// Trust anchors (cached). CE_TLS_CA_BUNDLE points at a PEM CA bundle (e.g.
-// /etc/ssl/certs/ca-certificates.crt) whose RSA roots become the trust store;
-// when unset (or empty) we fall back to the built-in gateway pins so the
-// sandbox still authenticates out of the box. Each anchor is
-// [KEY_RSA, N, e] (N: 64/96/128 limbs) or [KEY_EC, point, point_n].
+// Trust anchors (cached). Each anchor is [KEY_RSA, N, e] or
+// [KEY_EC, point, point_n], plus the root's cert record when it came from a
+// PEM file (needed for chains that omit the root).
+//   1. $CE_TLS_CA_BUNDLE if set: an explicit choice. If it yields no usable
+//      root the result is EMPTY -- every server is refused -- rather than
+//      silently trusting something else (it used to fall back to the pins).
+//   2. else the system bundle /etc/ssl/certs/ca-certificates.crt,
+//   3. else the built-in sandbox-gateway pins (key-only; that gateway sends
+//      its root, so key matching suffices).
+let TLS_SYSTEM_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 let _tls_anchor_cache = 0
 
-fn _tls_anchors() {
-    if _tls_anchor_cache != 0 { return _tls_anchor_cache }
-    let bundle = getenv("CE_TLS_CA_BUNDLE")
-    if bundle != 0 {
-        if len(bundle) > 0 {
-            let loaded = truststore_load_file(bundle)
-            if len(loaded) > 0 {
-                _tls_anchor_cache = loaded
-                return loaded
-            }
-        }
-    }
+fn _tls_pin_anchors() {
     let pins = list_new()
     let a1 = list_new() push(a1, KEY_RSA) push(a1, bn2048_from_hex(_tls_pin_prod())) push(a1, 65537) push(pins, a1)
     let a2 = list_new() push(a2, KEY_RSA) push(a2, bn2048_from_hex(_tls_pin_stag())) push(a2, 65537) push(pins, a2)
-    _tls_anchor_cache = pins
     return pins
+}
+
+fn _tls_anchors_from(bundle_env, sys_path) {
+    if bundle_env != 0 {
+        if len(bundle_env) > 0 {
+            let loaded = truststore_load_file(bundle_env)
+            if len(loaded) == 0 {
+                _tls_warn("warning: CE_TLS_CA_BUNDLE=" + bundle_env + " has no usable root certificates; all HTTPS servers will be refused")
+            }
+            return loaded
+        }
+    }
+    let sys = truststore_load_file(sys_path)
+    if len(sys) > 0 { return sys }
+    return _tls_pin_anchors()
+}
+
+fn _tls_anchors() {
+    if _tls_anchor_cache != 0 { return _tls_anchor_cache }
+    _tls_anchor_cache = _tls_anchors_from(getenv("CE_TLS_CA_BUNDLE"), TLS_SYSTEM_CA_BUNDLE)
+    return _tls_anchor_cache
 }
 
 // Chain-verify against the trust store (single signature pass).
@@ -795,9 +858,9 @@ fn tls_get(host, ip, port, path, max_bytes) {
         }
     }
 
-    // R43 strict authentication: verify the chain to a pinned gateway root +
-    // hostname + validity + the CertificateVerify, BEFORE sending the request.
-    // Lenient mode (default) skips this -- confidential but unauthenticated.
+    // Authentication (default since PR 4e): verify the chain to the trust
+    // store + hostname + validity + the CertificateVerify, BEFORE sending the
+    // request. CE_TLS_STRICT=0 skips this -- confidential but unauthenticated.
     if _tls_strict() == 1 {
         if cert_off < 0 { close_fd(sock) return _tls_res(TLS13_CERT_FAIL, 0, "", "strict: no Certificate message") }
         let der_list = _tls_parse_cert_msg(hsb, cert_off)

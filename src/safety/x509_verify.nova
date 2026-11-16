@@ -448,13 +448,19 @@ fn cert_parse(der, n) {
     if load8(der + p) == 160 { let v = _der(der, p) p = v[3] }   // version [0]
     let ser = _der(der, p) p = ser[3]                            // serialNumber
     let alg1 = _der(der, p) p = alg1[3]                          // signature alg
+    let iss_off = p
     let issuer = _der(der, p) p = issuer[3]                      // issuer
     let val = _der(der, p)                                       // validity
     let nbt = _der(der, val[1])
     let nb = _x509v_time(der, val[1])
     let na = _x509v_time(der, nbt[3])
     p = val[3]
+    let subj_off = p
     let subj = _der(der, p) p = subj[3]                          // subject
+    // PR 4d: the issuer / subject Name TLVs are compared byte for byte when
+    // building the path; they must lie inside the TBS.
+    if issuer[3] > tbs_end { let bad_dn = list_new() push(bad_dn, 0) return bad_dn }
+    if subj[3] > tbs_end { let bad_dn2 = list_new() push(bad_dn2, 0) return bad_dn2 }
     let spki = _der(der, p)                                      // SPKI
     let kt = _x509v_spki_key_type(der, p)
     if kt == 0 { let bad = list_new() push(bad, 0) return bad }   // unsupported key alg
@@ -493,6 +499,7 @@ fn cert_parse(der, n) {
     push(r, san) push(r, nb) push(r, na)
     push(r, kt) push(r, ec_pt) push(r, ec_n) push(r, st)
     push(r, ca[0]) push(r, ca[1]) push(r, ca[2]) push(r, ca[3])
+    push(r, iss_off) push(r, issuer[3] - iss_off) push(r, subj_off) push(r, subj[3] - subj_off)
     return r
 }
 fn cert_ok(c)         { return c[0] }
@@ -509,6 +516,28 @@ fn cert_is_ca(c)      { return c[15] }
 fn cert_path_len(c)   { return c[16] }
 fn cert_ku_present(c) { return c[17] }
 fn cert_ku_cert_sign(c) { return c[18] }
+// Issuer / subject Name TLVs (offset into the DER buffer c[3], length).
+fn cert_issuer_off(c)  { return c[19] }
+fn cert_issuer_len(c)  { return c[20] }
+fn cert_subject_off(c) { return c[21] }
+fn cert_subject_len(c) { return c[22] }
+
+// 1 if `child`'s issuer Name equals `parent`'s subject Name byte for byte
+// (RFC 5280 name chaining, without the full comparison rules -- CAs encode
+// the issuer field by copying the issuing cert's subject).
+fn cert_issued_name_by(child, parent) {
+    let n = cert_issuer_len(child)
+    if n != cert_subject_len(parent) { return 0 }
+    if n <= 0 { return 0 }
+    let a = child[3] + cert_issuer_off(child)
+    let b = parent[3] + cert_subject_off(parent)
+    let i = 0
+    while i < n {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
 // Hash of the tbsCertificate bytes (what the signature covers), with the
 // hash the cert's signature algorithm names.
 fn cert_tbs_hash(c) {
@@ -612,6 +641,7 @@ let XV_NOT_PINNED    = 4
 let XV_HOSTNAME      = 5
 let XV_EXPIRED       = 6
 let XV_NOT_CA        = 7
+let XV_NAME_CHAIN    = 8   // a cert's issuer is not the next cert's subject
 
 fn xv_name(s) {
     if s == XV_OK         { return "ok" }
@@ -621,6 +651,7 @@ fn xv_name(s) {
     if s == XV_HOSTNAME   { return "hostname-mismatch" }
     if s == XV_EXPIRED    { return "expired-or-not-yet-valid" }
     if s == XV_NOT_CA     { return "issuer-not-a-ca" }
+    if s == XV_NAME_CHAIN { return "issuer-subject-mismatch" }
     return "unknown"
 }
 
@@ -628,10 +659,22 @@ fn xv_name(s) {
 // (leaf_cert valid only on XV_OK; used by the caller for the
 // CertificateVerify check).
 // anchors: a list of typed trust anchors (a single pin or a whole PEM trust
-// store): [KEY_RSA, N (64/96/128 limbs), e] or [KEY_EC, point_buf, point_n].
-// An RSA anchor matches only if the width, N and e are all equal. The chain
-// signatures are verified once, then the top cert's key must match SOME
-// anchor.
+// store): [KEY_RSA, N (64/96/128 limbs), e] or [KEY_EC, point_buf, point_n],
+// optionally followed by the anchor's parsed cert record (anchor[3], set by
+// truststore_load). An RSA anchor key matches only if the width, N and e are
+// all equal.
+//
+// Path (PR 4d): walking up from the leaf, the first cert that either IS an
+// anchor (same key) or is ISSUED BY an anchor that carries its cert (issuer
+// Name == anchor subject Name, the anchor is a CA allowed to sign certs at
+// that depth and currently valid, and the signature verifies under its key)
+// is the trust point; certs above it are ignored (servers usually omit the
+// root and sometimes send cross-signed extras). When the trust point matched
+// an anchor by key and that anchor carries its cert record, the record (not
+// the presented copy) supplies the trust point's constraints, validity and,
+// at depth 0, its names. Below the trust point every
+// issuer must be a CA, names must chain, every signature must verify, the
+// leaf must cover `host`, and every cert must be valid at `now`.
 fn cert_chain_verify(der_list, host, anchors, now) {
     let certs = list_new()
     let i = 0
@@ -643,12 +686,43 @@ fn cert_chain_verify(der_list, host, anchors, now) {
     }
     if len(certs) == 0 { let r = list_new() push(r, XV_PARSE) push(r, 0) return r }
 
-    // 0. every issuer in the chain must be a CA allowed to sign certs
-    //    (RFC 5280 6.1.4): basicConstraints cA=TRUE, keyCertSign if keyUsage
-    //    is present, pathLenConstraint respected. Without this, any
+    // Find the trust point.
+    let top_i = 0 - 1
+    let k0 = 0
+    while k0 < len(certs) {
+        if top_i < 0 {
+            let ai = 0
+            while ai < len(anchors) {
+                let how = _x509v_trusted_at(certs[k0], anchors[ai], k0, now)
+                if how != 0 {
+                    top_i = k0
+                    // Key match with an anchor that carries its cert: use the
+                    // TRUSTED record, not the presented copy, from here on.
+                    // The copy's own signature is never checked (it is the
+                    // trust point), so its basicConstraints / keyUsage /
+                    // pathLen / validity / SAN could be anything the sender
+                    // likes -- a forged cert with the root's public key would
+                    // otherwise lift the root's real constraints.
+                    if how == 1 {
+                        let rec = anchor_cert_rec(anchors[ai])
+                        if rec != 0 { if cert_ok(rec) == 1 { list_set(certs, k0, rec) } }
+                    }
+                    ai = len(anchors)
+                } else {
+                    ai = ai + 1
+                }
+            }
+        }
+        k0 = k0 + 1
+    }
+    if top_i < 0 { let r = list_new() push(r, XV_NOT_PINNED) push(r, 0) return r }
+
+    // 0. every issuer below the trust point must be a CA allowed to sign
+    //    certs (RFC 5280 6.1.4): basicConstraints cA=TRUE, keyCertSign if
+    //    keyUsage is present, pathLenConstraint respected. Without this, any
     //    end-entity cert from a trusted CA could sign a cert for another host.
     let ci = 1
-    while ci < len(certs) {
+    while ci <= top_i {
         let iss = certs[ci]
         if cert_is_ca(iss) == 0 { let r = list_new() push(r, XV_NOT_CA) push(r, 0) return r }
         if cert_ku_present(iss) == 1 {
@@ -661,35 +735,25 @@ fn cert_chain_verify(der_list, host, anchors, now) {
         ci = ci + 1
     }
 
-    // 1. each cert signed by its parent (RSA or ECDSA, dispatched per cert).
+    // 1. names chain and each cert is signed by its parent (RSA or ECDSA).
     let k = 0
-    while k < len(certs) - 1 {
+    while k < top_i {
+        if cert_issued_name_by(certs[k], certs[k + 1]) == 0 {
+            let r = list_new() push(r, XV_NAME_CHAIN) push(r, 0) return r
+        }
         if cert_verify_under(certs[k], certs[k + 1]) == 0 {
             let r = list_new() push(r, XV_SIG) push(r, 0) return r
         }
         k = k + 1
     }
 
-    // 2. top cert's key must equal a trusted anchor.
-    let top = certs[len(certs) - 1]
-    let matched = 0
-    let ai = 0
-    while ai < len(anchors) {
-        if cert_anchor_match(top, anchors[ai]) == 1 { matched = 1 ai = len(anchors) }
-        else { ai = ai + 1 }
-    }
-    if matched == 0 {
-        let r = list_new() push(r, XV_NOT_PINNED) push(r, 0) return r
-    }
-
-    // 3 + 4. leaf hostname + validity.
+    // 2 + 3. leaf hostname + validity of every cert up to the trust point.
     let leaf = certs[0]
     if _x509v_host_ok(host, cert_san(leaf)) == 0 {
         let r = list_new() push(r, XV_HOSTNAME) push(r, 0) return r
     }
-    // validity on every cert in the chain, not just the leaf.
     let vi = 0
-    while vi < len(certs) {
+    while vi <= top_i {
         let vc = certs[vi]
         if now < cert_not_before(vc) { let r = list_new() push(r, XV_EXPIRED) push(r, 0) return r }
         if now > cert_not_after(vc)  { let r = list_new() push(r, XV_EXPIRED) push(r, 0) return r }
@@ -697,4 +761,33 @@ fn cert_chain_verify(der_list, host, anchors, now) {
     }
 
     let r = list_new() push(r, XV_OK) push(r, leaf) return r
+}
+
+// The anchor's cert record, if the anchor carries one (PEM anchors do).
+fn anchor_cert_rec(a) {
+    if len(a) > 3 { return a[3] }
+    return 0
+}
+
+// Is chain cert `c` (at index `depth`, 0 = leaf) a trust point under
+// anchor `a`? 1: c's key IS the anchor key; 2: c is issued by the anchor's
+// cert (see cert_chain_verify); 0: neither.
+fn _x509v_trusted_at(c, a, depth, now) {
+    if cert_anchor_match(c, a) == 1 { return 1 }
+    let ac = anchor_cert_rec(a)
+    if ac == 0 { return 0 }
+    if cert_ok(ac) == 0 { return 0 }
+    if cert_issued_name_by(c, ac) == 0 { return 0 }
+    if cert_is_ca(ac) == 0 { return 0 }
+    if cert_ku_present(ac) == 1 {
+        if cert_ku_cert_sign(ac) == 0 { return 0 }
+    }
+    // CA certs below the anchor on this path = depth (certs 1..depth).
+    if cert_path_len(ac) >= 0 {
+        if depth > cert_path_len(ac) { return 0 }
+    }
+    if now < cert_not_before(ac) { return 0 }
+    if now > cert_not_after(ac) { return 0 }
+    if cert_verify_under(c, ac) == 1 { return 2 }
+    return 0
 }

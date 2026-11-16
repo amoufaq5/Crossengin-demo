@@ -1,6 +1,19 @@
 # TLS_AUDIT — what real TLS in CrossEngin would take
 
-Status: **TLS 1.3 client with opt-in strict authentication + a pluggable PEM
+Status (PR 4b-4e, audit F-17): **certificate verification is ON by default.**
+The client verifies the chain to the trust store (`CE_TLS_CA_BUNDLE`, else
+`/etc/ssl/certs/ca-certificates.crt`, else the gateway pins; a set but
+unusable `CE_TLS_CA_BUNDLE` refuses every server), the host name, validity,
+the CertificateVerify and the server Finished before sending a request.
+Supported: RSA-2048/3072/4096 (PKCS#1 v1.5 and PSS), P-256/P-384 ECDSA,
+SHA-256/384/512; chains that omit the root (the top cert issued by an
+anchor). `CE_TLS_STRICT=0` opts out with a stderr warning. Not supported:
+P-521, RSASSA-PSS certificate signatures, SHA-1, cipher suites other than
+TLS_CHACHA20_POLY1305_SHA256 and groups other than P-256. In this sandbox the
+peer is the egress gateway, whose root is in the system bundle. The older
+status notes below are kept for history.
+
+Status (R46): **TLS 1.3 client with opt-in strict authentication + a pluggable PEM
 trust store (R43, R46).** R46 (`src/safety/pem_truststore.nova`) loads RSA trust
 anchors from a PEM CA bundle pointed to by `CE_TLS_CA_BUNDLE` (e.g.
 `/etc/ssl/certs/ca-certificates.crt`), so anchors are configuration rather than
