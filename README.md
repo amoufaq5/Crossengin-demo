@@ -17,6 +17,24 @@
 > the full slash-command reference, cross-KG conflict workflows, and an
 > honest gap analysis vs. Claude/ChatGPT.
 
+> **Claims check (2026-11-16).** A due-diligence audit (`audit/MSC_DUE_DILIGENCE_REPORT.md` on branch `claude/loving-pasteur-5sndgr`)
+> found several statements in this README and in `docs/VISION.md` that the
+> code does not support. They are corrected in place below; in short:
+> - The chat runs a 64-node fabric (`CE_CAP = 128`, 8 parts x 8 nodes). "~6M
+>   nodes" is a planning target (ADR-0003), not what runs.
+> - "v1.0 -- all 10 phases complete" means the modules exist. The ADR-0049 /
+>   0050 capability exit tests were never run, and many phase modules are
+>   reachable only from tests.
+> - The default reasoning path makes no model call, but there are opt-in LLM
+>   hooks (Ollama reply composer, `scripts/llm_*.sh` extractor and fallback
+>   parser), and voice features shell out to whisper / vosk.
+> - Learning: the Hebbian weight update is always 0 in the live tick, and the
+>   Forward-Forward / predictive-coding outputs are not used. The smoke-test
+>   counters measure caching and feedback counts, not learning. See
+>   `docs/HOW_IT_LEARNS.md`.
+> - Theory of mind, counterfactual imagination and the world model are small
+>   bookkeeping modules, mostly test-only.
+
 CrossEngin implements **Moment-Signal Cognition (MSC)** — a named
 alternative to transformer-based LLMs built on four primitives (nodes,
 signals, moments, attribution). See
@@ -35,7 +53,7 @@ computational units rather than orchestrating a pipeline of modules.
 
 | Track | Latest round | What landed |
 |---|---|---|
-| Substrate v1 | R0..R29 | 10-phase agent assembled; ~6M-node fabric on tick-driven core. |
+| Substrate v1 | R0..R29 | 10-phase agent assembled on a tick-driven core. The chat runs 64 nodes; ~6M is a planning target (ADR-0003). |
 | Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D / R36A / R36B / R38B / R38C / R38D | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2 with R36B keying-material cache; TURN client state machine; ICE-TURN escalation; TURN long-term-credential auth (RFC 5389 §10) + per-permission cadence + 401 auto-retry; R38B PRF rekey on `dtls_advance_epoch` (closes R33B's last DTLS caveat); R38C TURN SERVER-side state machine (allocations + permissions + channels + tick); R38D SCRAM-SHA-256 auth (RFC 7635) coexisting with the R36A MD5 auth path. |
 | IO / learning transport | R39B | HTTP/1.1-over-TCP transport seam for `src/learning/internet_fetch.nova` (NOVA enhancement #11 / ADR-0028): URL parser, status line parser, header parser (incl. multi-value `Set-Cookie` / `Cookie` via `http_header_get_all`), `Content-Length` trim, RFC 7230 sec 4.1 chunked-transfer decoder (with HTTP\_ERR\_CHUNKED + HTTP\_ERR\_TOO\_LARGE error signals), `_hc_set_recv_timeout` seam (no-op until `sys_setsockopt` builtin lands), and the `if_fetch(f, kg, url, now) -> [tag, status, body, bytes, err]` composer wiring `if_permit` -> `http_get` -> `if_complete` -> optional `if_ingest`. New IF\_ERR\_HTTP\_* sentinels (CONNECT / TIMEOUT / PARSE / OVERSIZE / DNS / SCHEME). HTTPS deferred to R39B.2 (needs client-mode TLS; DTLS is server-shaped today). |
 | Chat dispatcher | R39A | Intent dispatcher in `examples/crossengin_chat.nova` (ADR-0038 self-model query + ADR-0026 self-learning triggers): adds three reply paths AHEAD of the legacy ACK fallback so the REPL stops saying "okay" to everything. Self-identification queries ("who are you" / "what are your goals" / "how are you" / "what can you do" / "what are you doing") route to the real `selfmodel_identity` / `selfmodel_state` / `selfmodel_goals` / `selfmodel_activity` and a competence-count surface for capabilities; concept queries ("what is X" / "tell me about X" / bare "X") render the highest-belief triple from KG operator atoms as "X is a Y" / "X causes Y" / "X has Y"; inputs with `unk > 0` reply "I don't know X yet -- I'll look into it" and bump a `chat_stats_self_learning_triggers_filed` counter as `_submit_curiosity` files SLT signals. Helpers (`_intent_self_id_kind`, `_smq_extract_concept_query`, `_smq_relation_phrase`, `_smq_template_triple`, `_smq_unknown_reply`) live in `src/chat/helpers.nova` and are unit-tested via `tests/unit/test_chat_intent_dispatch.nova` (60+ assertions). |
@@ -45,13 +63,14 @@ computational units rather than orchestrating a pipeline of modules.
 | Safety / crypto leaves | R33A / R34A / R37C / R38D | Canonical `safety/sha256.nova` (R33A/R34A) + canonical `safety/md5.nova` + `safety/sha1.nova` (R37C) + canonical `safety/scram.nova` (R38D: SCRAM-SHA-256 + PBKDF2-HMAC-SHA256 + base64); dedup of inline copies across noise_xk, merkle, ecdsa, dtls12, turn, srtp. |
 | Learning / DP | R8 / R19 / R23 | DP composition, EMA pull = 0.1, no secure aggregation in v1. |
 | Voice / STT | R34D | STT confidence threshold + clarifying-question fallback. |
-| NOVA toolchain | external | `stage2.s == stage3.s` self-host invariant treated as a load-bearing CI gate. |
+| NOVA toolchain | external | `stage2.s == stage3.s` self-host invariant. Checked in NOVA's own CI since NOVA #23 (2026-11-16); before that no CI ran it. |
 
 See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 [`docs/adr/r36f-0001-language-choice-nova.md`](docs/adr/r36f-0001-language-choice-nova.md)
 .. R36F-0006 for the rationale behind each track.
 
-> **R35A note.** v1.0 -- all 10 phases complete and assembled into one
+> **R35A note** (historical; see the claims check at the top -- the
+> capability exit tests were never run). v1.0 -- all 10 phases complete and assembled into one
 > unified agent process. Implemented in NOVA and verified against the
 > real self-hosting toolchain.
 >
@@ -1128,7 +1147,7 @@ See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 > end-to-end + non-INIT rejection, cipher-suite gate (accept /
 > reject / mixed / empty), 5 RFC test vectors above,
 > PRF determinism + multi-block path, and 5 R29B.2 stub regression
-> guards. All **221 unit tests pass** (+1 new in R29B); federation
+> guards. All **221 unit tests pass** (as of R29B; the suite is now 478 files) (+1 new in R29B); federation
 > baselines hold (gossip 34, gossip\_noise 44, gossip\_relay 61,
 > nat\_traversal 53, leader\_election 40, webrtc 19). Module count
 > +1 (`src/federation/dtls12.nova`).

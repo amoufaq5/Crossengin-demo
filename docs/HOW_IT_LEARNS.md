@@ -1,5 +1,23 @@
 # How CrossEngin learns
 
+> **Correction (2026-11-16).** This document overstated what it shows. A
+> due-diligence audit (audit F-03) found, and the code confirms:
+> - The tick's Hebbian weight change is always 0 in the live chat: the
+>   activity snapshot is indexed by node slot while synapses are keyed by
+>   atom id, so they never line up. The three-factor rule is off.
+> - The Forward-Forward goodness and predictive-coding outputs are computed
+>   but nothing downstream reads them.
+> - After 10 x `/good` the reply is byte-identical to the first one.
+> - The four numbers the CI smoke test pins (`mc_hits=9`,
+>   `ff_goodness=486000`, `synapse_mean_weight=300`,
+>   `ia_proto_strength_unknown=10`) are a reply cache's hit count and
+>   counters that grow with each query or `/good`. They are a regression pin
+>   for this code path, **not evidence that the system learns**.
+>
+> "Gets faster the more you use it" is true only in the sense of memoising
+> replies. Read the rest of this page as a description of the wiring, not as
+> a demonstration of learning.
+
 This document shows, on a running build, how the symbolic knowledge agent gets faster the more you use it — the mechanism that makes the system *not just a database*.
 
 The demo is reproducible on any machine with the current `claude/phase-0-substrate` branch built. It runs in ~15 seconds and uses only the shipped `fever` seed vocabulary — no corpora required.
