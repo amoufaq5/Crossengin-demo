@@ -332,7 +332,14 @@ awk -v MAX="$MAX_TRIPLES" '
             bridge["may"]=1; bridge["can"]=1; bridge["could"]=1; bridge["might"]=1
             bridge["often"]=1; bridge["usually"]=1; bridge["sometimes"]=1
             bridge["also"]=1; bridge["typically"]=1; bridge["generally"]=1
-            bridge["not"]=1; bridge["always"]=1; bridge["thus"]=1
+            # "not" / "never" must NOT bridge: "X is not Y" used to emit
+            # X|is_a|Y, storing the negated claim as fact (audit F-20).
+            # Windows containing a negator emit nothing (see neg below).
+            bridge["always"]=1; bridge["thus"]=1
+            neg["not"]=1; neg["never"]=1; neg["no"]=1; neg["nor"]=1
+            # Contractions arrive split by the tr above ("isn t").
+            neg["cannot"]=1; neg["isn"]=1; neg["aren"]=1; neg["wasn"]=1
+            neg["weren"]=1; neg["doesn"]=1; neg["don"]=1; neg["didn"]=1
             bridge["the"]=1; bridge["a"]=1; bridge["an"]=1
             bridge["in"]=1; bridge["of"]=1; bridge["from"]=1
             is_form["is"]=1; is_form["are"]=1; is_form["be"]=1
@@ -357,6 +364,8 @@ awk -v MAX="$MAX_TRIPLES" '
         # Second pass: slide a 6-word window and extract candidate triples.
         {
             w[5]=w[4]; w[4]=w[3]; w[3]=w[2]; w[2]=w[1]; w[1]=w[0]; w[0]=$0
+            # Skip any window with a negator between subject and object.
+            if ((w[1] in neg) || (w[2] in neg) || (w[3] in neg)) next
             # --- causal: "X causes Y", and with 1-2 word bridges -----------
             if (w[1] in cause_form)                       emit(w[2], "causal", w[0])
             if ((w[2] in cause_form) && (w[1] in bridge)) emit(w[3], "causal", w[0])
