@@ -52,7 +52,9 @@ zero**; a rising number is a bug against the grammar and the
 templater, not a normal operating state. Full contract in
 ADR-0211; sidecar boundary role in ADR-0201.
 
-**Latency parity with LLMs is a hard requirement.** CrossEngin's
+**Latency parity with LLMs is a hard requirement** (a goal, not yet met
+or measured: `bench/latency_v1/baseline.json` has no results, and the audit
+measured p99 ~1 s against a 500 ms budget). CrossEngin's
 answers arrive in the same wall-clock envelope users expect from
 hosted LLM APIs. Inspectability, updatability, and deterministic
 "unknown" cannot cost a five-second turnaround. The performance
@@ -93,8 +95,8 @@ For the full architectural decision, see
 | Update cost | Retrain (weeks) | Re-embed (hours) | Ingest one record (seconds) |
 | Reasoning | Weight-implicit | Weight-implicit + similarity | Explicit engines |
 | Inspectability | Opaque | Retrieval-visible, reasoning-opaque | End-to-end inspectable |
-| Hallucination risk | High | Medium | Zero (says "unknown" instead) |
-| Vendor lock | Provider API | Embedding model + LLM | Self-hosted, no external deps |
+| Hallucination risk | High | Medium | Lower by design (abstains with no supporting chain), not zero: extraction and NL fallbacks can store or return wrong facts |
+| Vendor lock | Provider API | Embedding model + LLM | Self-hosted; optional tools (curl, openssl, python3, ffmpeg, whisper/vosk, Ollama) for some features |
 | Domain focus | General | General | Per-child domain-scoped |
 | Multi-user | External auth | External auth | Native (cap tokens + ownership) |
 
@@ -118,8 +120,8 @@ The tighter head-to-head against every LLM-adjacent shape:
 | Knowledge storage | Frozen weights | Weights + vector index | Weights + adapter | Explicit KG + capsules |
 | Update cost | Retrain (weeks) | Re-embed (hours) | Re-tune (days) | Ingest one record (seconds) |
 | Reasoning inspectability | Opaque | Retrieval visible, reasoning opaque | Opaque | End-to-end inspectable |
-| Hallucination risk | High | Medium | High (novel-domain) | Zero (returns "unknown") |
-| Vendor lock | Provider API | Embed model + LLM | Base model + tuner | Self-hosted, no external deps |
+| Hallucination risk | High | Medium | High (novel-domain) | Lower by design, not zero (see above) |
+| Vendor lock | Provider API | Embed model + LLM | Base model + tuner | Self-hosted; optional external tools |
 | Prompt-injection surface | Whole prompt | Prompt + retrieved docs | Whole prompt | NL parser only; reasoning is unreachable |
 
 The last row is the one competitors cannot close by iteration:
