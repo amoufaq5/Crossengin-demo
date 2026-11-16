@@ -40,6 +40,7 @@ Diagnostic endpoints:
 Requires: Python 3.7+ (for ThreadingHTTPServer). No third-party libraries.
 """
 
+import hashlib
 import http.server
 import json
 import os
@@ -336,15 +337,17 @@ class SessionStore:
             self.atoms_cache[cookie] = (now + ATOMS_CACHE_S, parsed)
         return list(parsed)
 
-    def snapshot(self):
-        """Return a JSON-serializable list of session diagnostics."""
+    def snapshot(self, raw=False):
+        """Return a JSON-serializable list of session diagnostics. `id` is
+        an opaque hash of the cookie unless raw=True (internal use only:
+        the metrics probe needs the real cookie to reach the child)."""
         now_ms = int(time.time() * 1000)
         with self.lock:
             out = []
             for cookie, entry in self.children.items():
                 _child, created_ms, last_active_ms = entry
                 out.append({
-                    "id": cookie,
+                    "id": cookie if raw else _opaque(cookie),
                     "last_active_ms": last_active_ms,
                     "age_ms": now_ms - created_ms,
                 })
@@ -525,12 +528,13 @@ def render_prometheus(store):
     # Walk the live children with their cookies; the probe is cached per
     # cookie so a tight scrape loop only round-trips into the child once
     # per METRICS_CACHE_S.
-    sessions = store.snapshot()
-    per_sid_metrics = []  # [(sid, parsed_dict)]
+    sessions = store.snapshot(raw=True)
+    per_sid_metrics = []  # [(sid, parsed_dict)] -- sid is the opaque label
     for sess in sessions:
-        sid = sess["id"]
+        cookie = sess["id"]
+        sid = _opaque(cookie)
         try:
-            parsed = store.probe_metrics(sid, now)
+            parsed = store.probe_metrics(cookie, now)
         except Exception:
             # A child that has exited mid-probe shouldn't poison the whole
             # response; just skip its row.
@@ -637,7 +641,7 @@ def render_prometheus(store):
     # ---- per-cookie request counter ------------------------------------
     request_total, durations = store.request_metrics_snapshot()
     request_rows = [
-        (f'cookie="{_esc_label(c)}"', float(n))
+        (f'session="{_esc_label(_opaque(c))}"', float(n))
         for c, n in request_total.items()
     ]
     emit("crossengin_request_total",
@@ -941,6 +945,28 @@ def _valid_uuid(s):
         return False
 
 
+def _opaque(cookie):
+    """Stable non-reversible id for a session cookie. /api/sessions and
+    /metrics used to publish the raw ce_sid value -- the only session
+    credential -- so anyone who could read them could take over any
+    session (audit F-18)."""
+    return "s-" + hashlib.sha256(cookie.encode("utf-8")).hexdigest()[:12]
+
+
+def _allowed_hosts():
+    """Host header values this server answers to. Rejecting anything else
+    blocks DNS rebinding against the loopback bind (audit F-18). Extend
+    with CE_ALLOWED_HOSTS=host:port,host:port when serving another name."""
+    hosts = {f"127.0.0.1:{PORT}", f"localhost:{PORT}", f"[::1]:{PORT}"}
+    if BIND not in ("127.0.0.1", "0.0.0.0", "::", ""):
+        hosts.add(f"{BIND}:{PORT}")
+    for h in os.environ.get("CE_ALLOWED_HOSTS", "").split(","):
+        h = h.strip()
+        if h:
+            hosts.add(h)
+    return hosts
+
+
 def make_handler(store):
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -989,7 +1015,29 @@ def make_handler(store):
             self.end_headers()
             self.wfile.write(data)
 
+        def _host_ok(self):
+            host = (self.headers.get("Host") or "").strip().lower()
+            if host in {h.lower() for h in _allowed_hosts()}:
+                return True
+            self._send_json(403, {"error": "host not allowed"})
+            return False
+
+        def _origin_ok(self):
+            """Same-origin check for state-changing requests (CSRF). A
+            browser always sends Origin on a cross-site POST; it must name
+            one of our hosts. Requests without Origin (curl, scripts) pass."""
+            origin = (self.headers.get("Origin") or "").strip().lower()
+            if not origin:
+                return True
+            for h in _allowed_hosts():
+                if origin in (f"http://{h.lower()}", f"https://{h.lower()}"):
+                    return True
+            self._send_json(403, {"error": "cross-origin request refused"})
+            return False
+
         def do_GET(self):
+            if not self._host_ok():
+                return
             cookie, is_new = self._cookie_for()
             set_cookie = cookie if is_new else None
             if self.path in ("/", "/index", "/index.html"):
@@ -1086,6 +1134,16 @@ def make_handler(store):
             return self._send_json(404, {"error": "not found"}, set_cookie=set_cookie)
 
         def do_POST(self):
+            if not self._host_ok():
+                return
+            if not self._origin_ok():
+                return
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                # A cross-site form or text/plain POST is a "simple"
+                # request that skips CORS preflight; requiring JSON forces
+                # a preflight this server never answers.
+                return self._send_json(415, {"error": "Content-Type must be application/json"})
             cookie, is_new = self._cookie_for()
             set_cookie = cookie if is_new else None
             if self.path != "/api/chat":

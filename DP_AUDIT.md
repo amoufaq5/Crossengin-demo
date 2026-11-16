@@ -1,5 +1,22 @@
 # Differential Privacy Audit
 
+> **Correction (2026-11-16, audit F-09).** The implementation described below
+> gave no privacy in practice, and it has been rewritten:
+> - The noise came from a 15-bit LCG seeded with `budget + 7919`, so every
+>   session with the same budget produced the identical noise stream. Noise
+>   now comes from OS entropy via `src/safety/rng.nova` (`dp_new` fails
+>   closed without it); `dp_new_seeded` uses a seeded ChaCha20 stream for
+>   tests.
+> - The sampler capped its scale at 100000 and drew 10-bit uniforms, so
+>   noise stopped growing below epsilon = 0.01. Uniforms are now 32-bit and
+>   the cap is gone.
+> - `dp_noisy_mean` added noise in whole units to a milli-valued mean
+>   (1000x too little, usually 0). Fixed.
+> - `/dp_query` printed the true count next to the noisy one. It no longer
+>   does.
+> The remaining text describes the original design; where it says "LCG",
+> read "rng.nova draw".
+
 **Phase:** P3.6 — minimum viable DP at the KG-query surface
 **ADR:** ADR-0053 — differential privacy at the knowledge-graph-query surface
 **Module:** `src/safety/differential_privacy.nova`

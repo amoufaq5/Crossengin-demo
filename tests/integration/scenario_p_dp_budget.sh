@@ -56,8 +56,10 @@ assert_match "$OUT" "dp budget: 0 / 10000 milli-eps consumed.*remaining 10000 mi
 assert_match "$OUT" "0 queries\\)" \
     "initial /dp_status reports 0 queries"
 
-# 2. /dp_query atoms outputs both true and noisy fields.
-assert_match "$OUT" "dp_query atoms: true=[0-9]+ noisy=-?[0-9]+" \
+# 2. /dp_query atoms outputs only the noisy field (audit F-09).
+assert_nomatch "$OUT" "dp_query atoms: true=" \
+    "/dp_query no longer prints the true count (audit F-09)"
+assert_match "$OUT" "dp_query atoms: noisy=-?[0-9]+" \
     "/dp_query atoms prints true=... noisy=... format"
 
 # 3. Each /dp_query atoms call lists the epsilon and remaining.
@@ -82,15 +84,13 @@ assert_match "$OUT" "/dp_status +print the session.*differential-privacy budget"
 assert_match "$OUT" "/dp_query TARGET +run a DP-noised KG query" \
     "/help advertises /dp_query"
 
-# 7. Variance check: across all calls, at least one noisy answer should
-#    differ from the true count (otherwise variance is zero and the
-#    privacy claim is empty). Extract every `true=N noisy=M` pair and
-#    count those where N != M.
-NONZERO=$(echo "$OUT" | grep -oE "true=[0-9]+ noisy=-?[0-9]+" \
-    | awk -F'[= ]+' '{ if ($2 != $4) print }' | wc -l)
-if [ "$NONZERO" -ge 5 ]; then
+# 7. Variance check: the true count is no longer printed (audit F-09), and
+#    it is constant across these queries, so the noisy answers themselves
+#    must vary -- at least 3 distinct values across the drained queries.
+NONZERO=$(echo "$OUT" | grep -oE "dp_query atoms: noisy=-?[0-9]+" | sort -u | wc -l)
+if [ "$NONZERO" -ge 3 ]; then
     PASS=$((PASS+1))
-    printf "  ${C_GRN}PASS${C_RST}  noise variance > 0 across drained queries (%d distinct from true)\n" "$NONZERO"
+    printf "  ${C_GRN}PASS${C_RST}  noise variance > 0 across drained queries (%d distinct noisy values)\n" "$NONZERO"
 else
     FAIL=$((FAIL+1))
     printf "  ${C_RED}FAIL${C_RST}  noise variance was zero -- DP mechanism is degenerate\n"

@@ -22,11 +22,11 @@ Modes:
              detect the closed fd as a dropout and broadcast
              FED_DROPOUT to the surviving peers.
 
-The Python script uses the SAME 15-bit LCG mask derivation as the NOVA
-`src/learning/secure_aggregation.nova` module so a survivor's
-FED_RECON_MASKED line will arithmetically cancel against the
-coordinator's expected sum. The hash function and LCG iteration count
-are mirrored verbatim.
+The Python script uses the SAME mask derivation as the NOVA
+`src/learning/secure_aggregation.nova` module (audit F-09 rewrite): a
+32-bit mask = first 4 bytes of SHA-256("ce-secagg-v2|secret|round|source|dim"),
+and all masked arithmetic modulo 2^32, so a survivor's FED_RECON_MASKED
+line cancels against the coordinator's expected sum.
 """
 
 import argparse
@@ -35,40 +35,23 @@ import sys
 import time
 
 
-# Mirrored from src/learning/secure_aggregation.nova (P3.8 / ADR-0055).
-_LCG_MUL = 6917
-_LCG_INC = 31
-_LCG_MASK = 32767  # 2^15 - 1
+import hashlib
+
+# Mirrored from src/learning/secure_aggregation.nova (_sa_mask32, SA_MOD).
+SA_MOD = 1 << 32
 
 
-def _hash_str(s: str) -> int:
-    h = 1
-    for c in s.encode("ascii", errors="strict"):
-        h = (h * 31) & _LCG_MASK
-        h = (h + c) & _LCG_MASK
-    return 1 if h == 0 else h
+def _kdf_field(v: str) -> str:
+    return f"{len(v)}:{v}|"
 
 
-def _lcg_step(seed: int) -> int:
-    p1 = (seed * _LCG_MUL) & _LCG_MASK
-    mid = (p1 + _LCG_INC) & _LCG_MASK
-    p2 = (mid * _LCG_MUL) & _LCG_MASK
-    nxt = (p2 + _LCG_INC) & _LCG_MASK
-    high = nxt // 256
-    mixed = (nxt ^ high) & _LCG_MASK
-    return 1 if mixed == 0 else mixed
-
-
-def _seed_for_pair(token: str, round_id: int) -> int:
-    return _hash_str(f"{token}:{round_id}")
-
-
-def mask_for_peer(token: str, round_id: int, k_dim: int) -> int:
-    """Same as sa_mask_for_peer in NOVA -- k+1 LCG iterations."""
-    cur = _seed_for_pair(token, round_id)
-    for _ in range(k_dim + 1):
-        cur = _lcg_step(cur)
-    return cur
+def mask_for_peer(id_a: str, id_b: str, token: str, round_id: int, k_dim: int,
+                  source: str = "") -> int:
+    """Same as _sa_mask32 / sa_mask_for_peer_src in NOVA (v3-sa)."""
+    lo, hi = (id_a, id_b) if id_a <= id_b else (id_b, id_a)
+    msg = ("ce-secagg-v3|" + _kdf_field(lo) + _kdf_field(hi) + _kdf_field(token)
+           + _kdf_field(str(round_id)) + _kdf_field(source) + _kdf_field(str(k_dim)))
+    return int.from_bytes(hashlib.sha256(msg.encode("ascii")).digest()[:4], "big")
 
 
 def id_compare(a: str, b: str) -> int:
@@ -79,32 +62,32 @@ def id_compare(a: str, b: str) -> int:
     return 0
 
 
-def apply_masks(soul_id: str, x: int, k_dim: int, peers):
-    """peers is a list of (peer_id, token); mirrors sa_apply_masks."""
-    masked = x
+def apply_masks(soul_id: str, x: int, k_dim: int, peers, source: str = ""):
+    """peers is a list of (peer_id, token); mirrors sa_apply_masks_src."""
+    masked = x % SA_MOD
     for peer_id, token in peers:
-        m = mask_for_peer(token, 1, k_dim)  # round_id fixed to 1 for the test
+        m = mask_for_peer(soul_id, peer_id, token, 1, k_dim, source)  # round_id fixed to 1 for the test
         cmp = id_compare(soul_id, peer_id)
         if cmp < 0:
-            masked += m
+            masked = (masked + m) % SA_MOD
         elif cmp > 0:
-            masked -= m
+            masked = (masked - m) % SA_MOD
     return masked
 
 
 def reconcile_for_dropped(soul_id: str, masked_x: int, dropped_id: str,
-                          k_dim: int, peers):
+                          k_dim: int, peers, source: str = ""):
     """Remove the dropped peer's mask contribution from a masked value."""
     for peer_id, token in peers:
         if peer_id == dropped_id:
-            m = mask_for_peer(token, 1, k_dim)
+            m = mask_for_peer(soul_id, dropped_id, token, 1, k_dim, source)
             cmp = id_compare(soul_id, dropped_id)
             if cmp < 0:
                 # soul ADDED +m -> remove it (subtract).
-                return masked_x - m
+                return (masked_x - m) % SA_MOD
             if cmp > 0:
                 # soul SUBTRACTED -m -> remove it (add back).
-                return masked_x + m
+                return (masked_x + m) % SA_MOD
     return masked_x
 
 
@@ -122,7 +105,8 @@ def recv_line(sock):
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["survivor", "dropout"], default="survivor")
-    p.add_argument("--peer", required=True)
+    p.add_argument("--peer", required=True,
+                   help="peer soul id; comma-separated for several peers")
     p.add_argument("--token", required=True)
     p.add_argument("--soul-id", required=True)
     p.add_argument("--host", default="127.0.0.1")
@@ -132,7 +116,7 @@ def main() -> int:
     p.add_argument("--tag", default="topic:test")
     args = p.parse_args()
 
-    peers = [(args.peer, args.token)]
+    peers = [(pid, args.token) for pid in args.peer.split(",") if pid]
 
     # Dial with a small retry budget so the coord has time to bind.
     sock = None
@@ -151,11 +135,12 @@ def main() -> int:
 
     try:
         # Handshake: SECAGG_HELLO + OK + FED_JOIN + SECAGG_PEER + ACK 0.
-        sock.sendall(b"SECAGG_HELLO ce-fed v2-sa\n")
+        sock.sendall(b"SECAGG_HELLO ce-fed v3-sa\n")
         ok = recv_line(sock)
         sys.stderr.write(f"secagg_smoke_soul[{args.soul_id}]: server replied {ok!r}\n")
         sock.sendall(f"FED_JOIN {args.soul_id} 1000\n".encode("ascii"))
-        sock.sendall(f"SECAGG_PEER {args.peer} {args.token}\n".encode("ascii"))
+        for pid, tok in peers:
+            sock.sendall(f"SECAGG_PEER {pid} {tok}\n".encode("ascii"))
         sock.sendall(b"ACK 0\n")
         if args.mode == "dropout":
             # Goal: drop AFTER the JOIN handshake but BEFORE the round
@@ -172,13 +157,14 @@ def main() -> int:
         rnd = recv_line(sock)
         sys.stderr.write(f"secagg_smoke_soul[{args.soul_id}]: round line {rnd!r}\n")
         # Mask + send the test stat.
-        mp = apply_masks(args.soul_id, args.x_promo, 0, peers)
-        ma = apply_masks(args.soul_id, args.x_atr, 1, peers)
+        mp = apply_masks(args.soul_id, args.x_promo, 0, peers, args.tag)
+        ma = apply_masks(args.soul_id, args.x_atr, 1, peers, args.tag)
         # NOVA round_id we always operate against is 1 for the test.
         sock.sendall(f"FED_STAT_MASKED 1 {args.tag} {mp} {ma}\n".encode("ascii"))
         sock.sendall(b"ACK 1\n")
         # Track the unreconciled stat in case the coord sends FED_DROPOUT.
         last_mp, last_ma = mp, ma
+        reconciled = []
         while True:
             line = recv_line(sock)
             if line is None:
@@ -191,10 +177,18 @@ def main() -> int:
                 parts = line.split(" ")
                 # FED_DROPOUT <round> <dropped_id>
                 dropped_id = parts[2]
+                # Same limits as fed_agg_emit_recon_masked: no duplicates,
+                # only known peers, and never strip the last remaining mask.
+                known = [pid for pid, _ in peers]
+                if (dropped_id in reconciled or dropped_id not in known
+                        or len(peers) - len(reconciled) - 1 < 1):
+                    sys.stderr.write(f"secagg_smoke_soul[{args.soul_id}]: refusing reconciliation for {dropped_id}\n")
+                    continue
+                reconciled.append(dropped_id)
                 adj_p = reconcile_for_dropped(args.soul_id, last_mp,
-                                              dropped_id, 0, peers)
+                                              dropped_id, 0, peers, args.tag)
                 adj_a = reconcile_for_dropped(args.soul_id, last_ma,
-                                              dropped_id, 1, peers)
+                                              dropped_id, 1, peers, args.tag)
                 sock.sendall(
                     f"FED_RECON_MASKED 1 {args.soul_id} {args.tag} {adj_p} {adj_a}\n".encode("ascii")
                 )

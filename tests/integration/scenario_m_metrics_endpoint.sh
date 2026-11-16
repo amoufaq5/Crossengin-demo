@@ -8,7 +8,7 @@
 #   - the response contains the mandated `# HELP` + `# TYPE` framing for
 #     every Prometheus metric family we publish
 #   - at least one `crossengin_*` metric sample line follows the framing
-#   - the per-cookie POST counter ticks (request_total{cookie="..."} >= 1)
+#   - the per-cookie POST counter ticks (request_total{session="..."} >= 1)
 #   - the process-wide active_session_count >= 1 after the chat round-trip
 #   - the per-sid atom_count (reasoning + language) gauges are present
 #   - the cached probe path serves a second /metrics call without spawning
@@ -187,7 +187,7 @@ assert_match "$BODY" 'crossengin_dlog_entries\{sid="' \
     "/metrics has a dlog_entries sample with sid label"
 assert_match "$BODY" 'crossengin_soul_mood_valence\{sid="' \
     "/metrics has a soul_mood_valence sample with sid label"
-assert_match "$BODY" 'crossengin_request_total\{cookie="' \
+assert_match "$BODY" 'crossengin_request_total\{session="' \
     "/metrics has a request_total sample with cookie label"
 
 # Process-wide gauges should be present and reflect the live session.
@@ -210,7 +210,7 @@ else
 fi
 
 # request_total per cookie should be >=1 after the POST.
-REQ_TOT=$(echo "$BODY" | grep -E '^crossengin_request_total\{cookie="' \
+REQ_TOT=$(echo "$BODY" | grep -E '^crossengin_request_total\{session="' \
     | awk '{print $2}' | head -1)
 if [ -n "$REQ_TOT" ]; then
     REQ_INT=${REQ_TOT%.*}

@@ -50,6 +50,7 @@
 import "std/string"
 import "std/syscall"
 import "std/io"
+import "./rng.nova"
 
 // ---- DP_STATE layout ------------------------------------------------------
 let DP_TAG          = 0
@@ -80,6 +81,18 @@ let DP_LAST_QUERY_NS   = 7
 let DP_WARN_THRESHOLD  = 8
 let DP_WARN_EMITTED    = 9
 let DP_RESET_COUNT     = 10
+// Audit F-09: noise now comes from an rng.nova context (OS entropy for
+// dp_new, a seeded ChaCha20 stream for dp_new_seeded). DP_SEED /
+// DP_INITIAL_SEED are kept for layout compatibility but no longer drive
+// the noise.
+let DP_RNG             = 11
+let DP_RNG_BUF         = 12   // 4-byte scratch for _dp_u32 (one per state)
+
+// Largest Laplace scale (milli) a single query may request. Sampling is
+// O(scale/1000) draws, and the threshold arithmetic must stay inside NOVA's
+// 62-bit ints; queries above this are refused (DP_REFUSED), never sampled
+// with less noise. 1e7 milli = mean geometric 10,000.
+let DP_MAX_SCALE_MILLI = 10000000
 
 // Per-entry layout of the query log. Each entry is a 3-element list.
 let DPQ_TS_NS    = 0
@@ -126,43 +139,21 @@ let _LCG_MASK = 32767     // 2^15 - 1
 // typical epsilon). Per-call timing: at typical epsilon = 1.0 (1000 milli)
 // the success probability is ~ 0.63 and the expected geometric length is
 // ~ 1.6, so 1000 iterations is generous (chance of truncation < 2^-300).
-let _DP_GEOM_MAX_ITERS = 1000
+let _DP_GEOM_MAX_ITERS = 10000000
 
-// ---- LCG (linear-congruential generator) ---------------------------------
-// Step the LCG one position, update the dp state's seed, and return the
-// fresh value. The mask is applied to BOTH the product and the post-add,
-// so the seed and every intermediate stays under the NOVA pointer
-// threshold (NOVA blocker bug #5/6). DO NOT remove the masks.
-//
-// To improve the low-bit bias inherent to a 15-bit LCG, we run TWO
-// short LCG steps per call and combine the high and low halves via XOR.
-// Each multiply uses MUL < 2^13 and seed < 2^15, so the intermediate
-// is < 2^28; we mask back to 15 bits immediately after each multiply.
-// The combined return value is the bottom 15 bits of the XOR'd mix --
-// callers consume 10 bits (`& 1023`) for the geometric coin-flip, so
-// the high-half avalanche reaches them.
-fn _lcg_step(dp) {
-    let s = dp[DP_SEED]
-    // Stage 1: standard LCG step.
-    let prod1 = s * _LCG_MUL
-    prod1 = prod1 & _LCG_MASK
-    let mid = prod1 + _LCG_INC
-    mid = mid & _LCG_MASK
-    // Stage 2: re-step the LCG over the intermediate; XOR the two halves
-    // (top 7 bits shifted down into the low 8) into the post-mix so the
-    // returned value has avalanche from both halves of the trajectory.
-    let prod2 = mid * _LCG_MUL
-    prod2 = prod2 & _LCG_MASK
-    let next = prod2 + _LCG_INC
-    next = next & _LCG_MASK
-    // Avalanche: XOR the top 7 bits into the low 8 (using a small constant
-    // shift via integer division -- NOVA has no `>>` operator in v0.x, so
-    // div by power-of-two stands in).
-    let high = next / 256          // top 7 bits (next is 15-bit)
-    let mixed = next ^ high
-    mixed = mixed & _LCG_MASK
-    list_set(dp, DP_SEED, mixed)
-    return mixed
+// ---- randomness ------------------------------------------------------------
+// (The 15-bit LCG that used to live here is gone -- audit F-09. The
+// _LCG_MASK constant above only normalises dp_new_seeded's seed slot.)
+
+// A uniform 32-bit draw from the state's RNG (OS entropy or the seeded
+// test stream). Replaces the 15-bit LCG (audit F-09).
+fn _dp_u32(dp) {
+    let b = dp[DP_RNG_BUF]
+    if rng_read(dp[DP_RNG], b, 4) != 1 {
+        println("FATAL: differential privacy RNG read failed")
+        exit(70)
+    }
+    return load8(b) + load8(b + 1) * 256 + load8(b + 2) * 65536 + load8(b + 3) * 16777216
 }
 
 // ---- constructors --------------------------------------------------------
@@ -177,19 +168,11 @@ fn dp_new(epsilon_budget_milli) {
     push(dp, DP_OBJ_TAG)
     push(dp, epsilon_budget_milli)      // DP_BUDGET_MILLI
     push(dp, epsilon_budget_milli)      // DP_REMAINING (initialized to budget)
-    // Build a safe tagged seed. Historic path `nanotime() & _LCG_MASK`
-    // leaves the result UNTAGGED (NOVA's `&` does not re-tag the raw
-    // int from `nanotime`), and the subsequent `*` in `_lcg_step`
-    // segfaults on an untagged operand (new bug class, ADR-0106).
-    // Workaround: derive the seed from `epsilon_budget_milli` (an
-    // already-tagged caller-supplied int) perturbed by an addition.
-    // Minimum Viable DP: deterministic seed is acceptable (an explicit
-    // `dp_new_seeded` entry point remains for tests that need to pin
-    // the stream).
-    let seed = epsilon_budget_milli + 7919
-    if seed <= 0 { seed = 7919 }
-    push(dp, seed)                      // DP_SEED
-    push(dp, seed)                      // DP_INITIAL_SEED
+    // Audit F-09: the old seed was `budget + 7919`, so every session with
+    // the same budget produced the identical noise stream. Noise now comes
+    // from OS entropy; fail closed if it is unavailable.
+    push(dp, 0)                         // DP_SEED (unused)
+    push(dp, 0)                         // DP_INITIAL_SEED (unused)
     push(dp, 0)                         // DP_QUERY_COUNT
     // R12F: budget-UI slots. The query log is an empty list; warn threshold
     // defaults to 80% of the total budget (scaled to the new total so a
@@ -199,6 +182,13 @@ fn dp_new(epsilon_budget_milli) {
     push(dp, _dp_default_warn(epsilon_budget_milli))           // DP_WARN_THRESHOLD
     push(dp, 0)                                                // DP_WARN_EMITTED
     push(dp, 0)                                                // DP_RESET_COUNT
+    let rng = list_new()
+    if rng_os_new(rng) != 1 {
+        println("FATAL: differential privacy needs OS entropy (secure_random failed); refusing a deterministic noise stream")
+        exit(70)
+    }
+    push(dp, rng)                                              // DP_RNG
+    push(dp, alloc(5))                                         // DP_RNG_BUF
     return dp
 }
 
@@ -220,6 +210,16 @@ fn dp_new_seeded(epsilon_budget_milli, explicit_seed) {
     push(dp, _dp_default_warn(epsilon_budget_milli))           // DP_WARN_THRESHOLD
     push(dp, 0)                                                // DP_WARN_EMITTED
     push(dp, 0)                                                // DP_RESET_COUNT
+    // Deterministic ChaCha20 stream keyed by the seed: same seed -> same
+    // noise (tests only; a real session uses dp_new).
+    let sb = alloc(9)
+    let k = 0
+    let v = explicit_seed
+    while k < 8 { store8(sb + k, int_and(v, 255)) v = int_shr(v, 8) k = k + 1 }
+    let rng = list_new()
+    rng_test_new(rng, sb, 8)
+    push(dp, rng)                                              // DP_RNG
+    push(dp, alloc(5))                                         // DP_RNG_BUF
     return dp
 }
 
@@ -449,13 +449,20 @@ fn _dp_geometric(dp, scale_milli) {
     // 2^20 boundary. We compute via a safer split: t = (s * 1024) / denom,
     // but s * 1024 = s << 10. For s up to ~1000 (typical), s * 1024 is
     // ~1M; we keep s capped before the multiply to be safe.
-    if s > 100000 { s = 100000 }   // cap at 100x epsilon = 1; geometric
-                                   // beyond this is a degenerate use case
-    let t = (s * 1024) / denom
+    // Audit F-09: the old code capped s at 100000 and drew 10-bit uniforms,
+    // so t could never exceed 1023/1024 and noise stopped growing below
+    // epsilon = 0.01. Now t has 32-bit resolution and no cap (the loop is
+    // still bounded by _DP_GEOM_MAX_ITERS).
+    // t = 2^32 * s / (s + 1000), computed as 2^32 - floor(2^32 * 1000 / denom)
+    // so nothing overflows for any s (s * 2^32 overflowed NOVA's 62-bit ints
+    // for s >= 2^30, making t <= 0 and the noise exactly 0 -- fail open).
+    // Flooring the subtrahend rounds t UP, i.e. towards slightly more noise
+    // (the conservative direction for privacy).
+    let t = _dp_threshold(s)
     let g = 0
     let iters = 0
     while iters < _DP_GEOM_MAX_ITERS {
-        let u = _lcg_step(dp) & 1023   // 10-bit uniform on [0, 1023]
+        let u = _dp_u32(dp)            // uniform on [0, 2^32)
         if u >= t { return g }
         g = g + 1
         iters = iters + 1
@@ -463,6 +470,15 @@ fn _dp_geometric(dp, scale_milli) {
     // Truncation: pathological p ~ 1. Return the cap; the caller's
     // distribution will look saturated but the privacy bound still holds.
     return g
+}
+
+// Continue-probability threshold out of 2^32 for scale s (milli):
+// 2^32 * s / (s + 1000), computed without overflow (see _dp_geometric).
+fn _dp_threshold(s) {
+    if s < 0 { return 0 }
+    let denom = s + 1000
+    let sub = 4294967296000 / denom
+    return 4294967296 - sub
 }
 
 // ---- Laplace noise sampling ----------------------------------------------
@@ -500,6 +516,9 @@ let DP_REFUSED = 0 - 2147483647   // a value the noisy count cannot
 fn dp_noisy_count(dp, true_count, epsilon_milli) {
     // R12F: log the consume with the "count" label so /dp log groups
     // atom-count queries together.
+    let eps0 = epsilon_milli
+    if eps0 < 1 { eps0 = 1 }
+    if dp_scale_too_large(1000000 / eps0) == 1 { return DP_REFUSED }
     if dp_consume_labeled(dp, epsilon_milli, "count") == 0 { return DP_REFUSED }
     // Scale for Laplace mech with sensitivity 1 is 1 / epsilon. In milli
     // scale: scale_milli = 1000 * 1000 / epsilon_milli. Cap epsilon to
@@ -511,6 +530,13 @@ fn dp_noisy_count(dp, true_count, epsilon_milli) {
     let scale_milli = 1000000 / eps
     let noise = dp_laplace_noise(dp, scale_milli)
     return true_count + noise
+}
+
+// Would a query with this Laplace scale be refused? (Too large to sample
+// in bounded time; see DP_MAX_SCALE_MILLI.)
+fn dp_scale_too_large(scale_milli) {
+    if scale_milli > DP_MAX_SCALE_MILLI { return 1 }
+    return 0
 }
 
 // ---- noisy-mean helper ---------------------------------------------------
@@ -526,12 +552,23 @@ fn dp_noisy_count(dp, true_count, epsilon_milli) {
 fn dp_noisy_mean(dp, true_mean_milli, sensitivity_milli, epsilon_milli) {
     // R12F: log under "mean" so /dp log distinguishes belief means from
     // raw counts.
+    let eps0 = epsilon_milli
+    if eps0 < 1 { eps0 = 1 }
+    let sens0 = sensitivity_milli
+    if sens0 < 1 { sens0 = 1 }
+    // Refuse (without spending budget) rather than sample a scale too large
+    // to sample in bounded time.
+    if dp_scale_too_large((sens0 * 1000000) / eps0) == 1 { return DP_REFUSED }
     if dp_consume_labeled(dp, epsilon_milli, "mean") == 0 { return DP_REFUSED }
     let eps = epsilon_milli
     if eps < 1 { eps = 1 }
     let sens = sensitivity_milli
     if sens < 1 { sens = 1 }
-    let scale_milli = (sens * 1000) / eps
+    // Audit F-09: the geometric sampler returns whole units with mean
+    // scale/1000, and the mean is in milli -- so the old scale
+    // (sens * 1000 / eps) added 1000x too little noise (usually 0). The
+    // Laplace scale in milli is sens / (eps/1000); pass it x1000.
+    let scale_milli = (sens * 1000000) / eps
     let noise = dp_laplace_noise(dp, scale_milli)
     let noisy = true_mean_milli + noise
     if noisy < 0 { noisy = 0 }

@@ -1,5 +1,36 @@
 # Secure Aggregation (SecAgg) Audit
 
+> **Correction (2026-11-16, audit F-09).** The masking described below gave
+> no privacy in practice, and it has been rewritten:
+> - Masks were 15-bit (hash + LCG) and reused for every source in a round,
+>   so subtracting two rows revealed the difference of two stats. Masks are
+>   now 32 bits -- the first four bytes of SHA-256("ce-secagg-v2|secret|round|
+>   source|dim") -- with the source tag in the key, and all masked arithmetic
+>   (shares, accumulator, dropout reconciliation) is modulo 2^32, folded back
+>   to a signed sum at the end.
+> - DH private keys were `nanotime() & 32767` stretched by the LCG (32768
+>   possible keys, for both the 256-bit and 2048-bit groups). They now come
+>   from `secure_random` and fail closed.
+> - Still true: the 256-bit `2^255 - 19` DH group is too small; use
+>   `CE_SECAGG_DH_2048=1` (RFC 7919 group 14).
+> - An adversarial review of that rewrite found more, now fixed (v3-sa):
+>   the mask KDF includes the ordered pair ids, length-prefixed (one token
+>   shared by several pairs used to leave the middle soul unmasked); a soul
+>   refuses to mask a round id at or below one it already masked (a
+>   coordinator replaying FED_ROUND could subtract two shares); and dropout
+>   reconciliation refuses duplicates, unknown peers, and any dropout that
+>   would leave the soul's value with no remaining mask (a 2-soul dropout
+>   used to publish the survivor's raw value). The handshake is now
+>   "SECAGG_HELLO ce-fed v3-sa", so older souls are rejected.
+> - **Still open:** token mode (CE_FED_TOKEN_*) reuses masks across
+>   /fed_join sessions for the same round id, because the token is the only
+>   secret; prefer DH mode (fresh keys per session). And a malicious
+>   coordinator that falsely declares a live peer dropped can still learn
+>   that peer's value from the survivors' reconciliations -- real
+>   protection needs Bonawitz-style double masking. Treat SecAgg as
+>   honest-but-curious-coordinator protection only.
+> `scripts/secagg_smoke_soul.py` mirrors the new derivation.
+
 **Phase:** P3.8 — secure aggregation MVP (pairwise additive masking),
 extended to **P3.8r — dropout-resilient SecAgg (v2-sa-r)**, further
 extended to **P3.9 — DH key agreement (v2-sa-dh)** which replaces
