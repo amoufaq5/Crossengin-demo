@@ -64,13 +64,21 @@ BIND = os.environ.get("CE_BIND", "127.0.0.1")
 # small VMs; raise it if you need to host more concurrent users.
 MAX_SESSIONS = int(os.environ.get("CE_WEB_MAX_SESSIONS", 8))
 PROMPT_END = b"> "
+# The approval prompt (src/safety/approval_prompt.nova) asks its question on a
+# line of its own and then waits for the answer without printing "> ". It is a
+# prompt too: the reply ends there and the next message answers it.
+APPROVAL_PROMPT_ENDS = (b"approve? [y/N/why]\n", b"approve? [y/N]\n")
 READ_TIMEOUT = 30.0
 # Request limits. A POST body above CE_WEB_MAX_BODY is refused with 413 before
 # it is read; the chat message itself is clamped to MAX_MESSAGE characters and
-# CR/LF become spaces, so one request is always exactly one chat line (an
+# control characters become spaces, so one request is always exactly one chat line (an
 # embedded newline used to run as extra commands and desync the prompt).
 MAX_BODY = int(os.environ.get("CE_WEB_MAX_BODY", 65536))
 MAX_MESSAGE = 4096
+# Every C0 control character (CR, LF, NUL, ...) and DEL becomes a space: a NUL
+# used to end the chat line early on the NOVA side, so "x\0...A/status" ran
+# /status as a second line.
+_CONTROL_TO_SPACE = {c: " " for c in list(range(0x20)) + [0x7F]}
 # Writing to the child's stdin happens under this deadline; a child that
 # stops reading is killed instead of wedging the handler thread forever.
 WRITE_TIMEOUT = READ_TIMEOUT
@@ -98,6 +106,10 @@ ATOMS_RESPONSE_LIMIT = int(os.environ.get("CE_ATOMS_RESPONSE_LIMIT", 200))
 # `send` writes a line and waits until the buffer ends with "> " (the chat's
 # next prompt), then returns everything before that marker.
 
+class ChildRetired(Exception):
+    """The session's child was retired after a timeout; respawn and retry."""
+
+
 class ChatChild:
     def __init__(self, binary):
         if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
@@ -122,6 +134,11 @@ class ChatChild:
         # never consumes request A's reply or interleaves stdin bytes.
         self.lock = threading.Lock()
         self.request_lock = threading.Lock()
+        # Set (under request_lock) once a send times out: the child's prompt
+        # framing can no longer be trusted, so requests queued behind the
+        # timed-out one must not run on it (one of them would otherwise
+        # answer a pending approval prompt it never saw).
+        self.retired = False
         self.reader = threading.Thread(target=self._reader, daemon=True)
         self.reader.start()
         try:
@@ -149,6 +166,10 @@ class ChatChild:
                     out = self.buffer[:-len(PROMPT_END)]
                     self.buffer = b""
                     return out.decode("utf-8", errors="replace")
+                if self.buffer.endswith(APPROVAL_PROMPT_ENDS):
+                    out = self.buffer
+                    self.buffer = b""
+                    return out.decode("utf-8", errors="replace")
                 if self.proc.poll() is not None:
                     out = self.buffer
                     self.buffer = b""
@@ -161,33 +182,47 @@ class ChatChild:
         # callers. Without this, two threads writing to stdin in quick
         # succession would race for the same "> "-terminated reply.
         with self.request_lock:
+            if self.retired:
+                raise ChildRetired("chat session was reset after a timeout")
             if self.proc.poll() is not None:
                 raise RuntimeError("chat process has exited")
-            data = (message + "\n").encode("utf-8")
-            done = threading.Event()
-            err = []
-
-            def _write():
-                try:
-                    self.proc.stdin.write(data)
-                    self.proc.stdin.flush()
-                except Exception as e:      # broken pipe etc.
-                    err.append(e)
-                finally:
-                    done.set()
-
-            threading.Thread(target=_write, daemon=True).start()
-            if not done.wait(WRITE_TIMEOUT):
-                # The child is not draining stdin; kill it so the writer
-                # thread unblocks and the session can be recreated.
+            try:
+                return self._send_locked(message)
+            except TimeoutError:
+                self.retired = True
                 try:
                     self.proc.kill()
                 except Exception:
                     pass
-                raise TimeoutError(f"chat did not accept input within {WRITE_TIMEOUT:.0f}s")
-            if err:
-                raise RuntimeError(f"write to chat failed: {err[0]}")
-            return self._wait_for_prompt()
+                raise
+
+    def _send_locked(self, message):
+        # Caller holds request_lock.
+        data = (message + "\n").encode("utf-8")
+        done = threading.Event()
+        err = []
+
+        def _write():
+            try:
+                self.proc.stdin.write(data)
+                self.proc.stdin.flush()
+            except Exception as e:      # broken pipe etc.
+                err.append(e)
+            finally:
+                done.set()
+
+        threading.Thread(target=_write, daemon=True).start()
+        if not done.wait(WRITE_TIMEOUT):
+            # The child is not draining stdin; kill it so the writer
+            # thread unblocks and the session can be recreated.
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            raise TimeoutError(f"chat did not accept input within {WRITE_TIMEOUT:.0f}s")
+        if err:
+            raise RuntimeError(f"write to chat failed: {err[0]}")
+        return self._wait_for_prompt()
 
     def shutdown(self):
         try:
@@ -257,7 +292,7 @@ class SessionStore:
         """Return the ChatChild bound to `cookie`. Spawns one if absent."""
         with self.lock:
             entry = self.children.get(cookie)
-            if entry is not None and entry[0].proc.poll() is not None:
+            if entry is not None and (entry[0].retired or entry[0].proc.poll() is not None):
                 # The child exited (or was killed after a timeout): respawn.
                 del self.children[cookie]
                 entry = None
@@ -273,11 +308,16 @@ class SessionStore:
             self.children[cookie] = [child, now_ms, now_ms]
             return child
 
-    def drop(self, cookie):
+    def drop(self, cookie, child=None):
         """Forget `cookie`'s child and shut it down (after a timeout its
-        prompt framing can no longer be trusted)."""
+        prompt framing can no longer be trusted). With `child`, only that
+        child is dropped, never a fresh one spawned for the cookie since."""
         with self.lock:
-            entry = self.children.pop(cookie, None)
+            entry = self.children.get(cookie)
+            if entry is None or (child is not None and entry[0] is not child):
+                entry = None
+            else:
+                del self.children[cookie]
         if entry is not None:
             threading.Thread(target=entry[0].shutdown, daemon=True).start()
 
@@ -1208,7 +1248,7 @@ def make_handler(store):
             message = payload.get("message") if isinstance(payload, dict) else None
             if not isinstance(message, str):
                 message = ""
-            message = message.replace("\r", " ").replace("\n", " ").strip()[:MAX_MESSAGE]
+            message = message.translate(_CONTROL_TO_SPACE).strip()[:MAX_MESSAGE]
             if not message:
                 return self._send_json(400, {"error": "empty message"}, set_cookie=set_cookie)
             # P2.9: time the round-trip so /metrics can publish a request
@@ -1216,16 +1256,23 @@ def make_handler(store):
             # of outcome (a 504/500 is still a request the operator wanted to
             # count).
             t0 = time.time()
+            child = None
             try:
                 child = store.get_or_create(cookie)
-                reply = child.send(message)
+                try:
+                    reply = child.send(message)
+                except ChildRetired:
+                    # Queued behind a request that timed out: the old child is
+                    # gone, so run this message on a fresh one.
+                    child = store.get_or_create(cookie)
+                    reply = child.send(message)
                 return self._send_json(
                     200,
                     {"reply": reply.strip()},
                     set_cookie=set_cookie,
                 )
             except TimeoutError as e:
-                store.drop(cookie)
+                store.drop(cookie, child)
                 return self._send_json(504, {"error": str(e)}, set_cookie=set_cookie)
             except Exception as e:
                 return self._send_json(500, {"error": str(e)}, set_cookie=set_cookie)

@@ -159,6 +159,29 @@ FRESH_RESP=$(curl -s --max-time 10 --cookie-jar "$FRESH_JAR" --cookie "$FRESH_JA
     -d '{"message":"hello"}' "http://127.0.0.1:$PORT/api/chat")
 assert_match "$FRESH_RESP" '"reply"' "fresh-cookie follow-up gets a reply (server is healthy)"
 
+# Control characters in a message: a NUL used to end the chat line early on
+# the NOVA side, so "x\u0000" + 1021 x "A" + "/status" ran /status as a
+# second line in the same request.
+NUL_MSG=$(python3 -c 'import json; print(json.dumps({"message": "x\u0000" + "A" * 1021 + "/status"}))')
+NUL_RESP=$(curl -s --max-time 30 --cookie-jar "$FRESH_JAR" --cookie "$FRESH_JAR" \
+    -X POST -H 'Content-Type: application/json' \
+    -d "$NUL_MSG" "http://127.0.0.1:$PORT/api/chat")
+assert_match   "$NUL_RESP" '"reply"' "NUL-bearing message gets a reply"
+assert_nomatch "$NUL_RESP" 'soul +: Aurora' "NUL-bearing message runs as one chat line"
+
+# An approval prompt is a prompt: the reply ends at the question (no 30 s
+# timeout) and the next message, on the same session, answers it.
+AP_JAR=/tmp/ce_int_huge_ap_jar_$$.txt
+AP1=$(curl -s --max-time 20 --cookie-jar "$AP_JAR" --cookie "$AP_JAR" \
+    -X POST -H 'Content-Type: application/json' \
+    -d '{"message":"/learn http://127.0.0.1:9/x"}' "http://127.0.0.1:$PORT/api/chat")
+assert_match "$AP1" 'approve\? \[y/N/why\]' "approval question comes back as the reply"
+AP2=$(curl -s --max-time 20 --cookie-jar "$AP_JAR" --cookie "$AP_JAR" \
+    -X POST -H 'Content-Type: application/json' \
+    -d '{"message":"n"}' "http://127.0.0.1:$PORT/api/chat")
+assert_match "$AP2" 'declined \(fetch URL\)' "next message answers the approval prompt"
+rm -f "$AP_JAR"
+
 # Cleanup.
 kill -TERM "$SRV_PID" 2>/dev/null
 for i in 1 2 3 4 5; do
