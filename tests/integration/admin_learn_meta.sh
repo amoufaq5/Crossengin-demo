@@ -36,20 +36,37 @@ assert_match "$OUT" "learned about '$TOPIC_TAG' \\[topic\\]" "/learn TOPIC tagge
 # -------------------- /learn URL --------------------
 it_section "admin: /learn URL kind"
 
-# URL kind: argument starts with http(s)://. The tag is derived from
-# host+path by scripts/learn.sh AND by the chat helper _learn_tag_url
-# (they must agree). Use a fully-controlled fake URL so no network is hit;
-# pre-populate the cache file at the derived tag.
-URL_ARG='https://example.invalid/wiki/Adminurl'
-URL_TAG=$(echo "$URL_ARG" | sed -E 's|^https?://||; s|/|_|g; s|[^a-zA-Z0-9_-]||g' | cut -c1-64)
-URL_VOCAB="/tmp/crossengin_learn_${URL_TAG}.txt"
-URL_TRIPS="/tmp/crossengin_learn_${URL_TAG}_triples.txt"
-cat > "$URL_VOCAB" <<'EOF'
-adminword
-EOF
-
-OUT=$(run_chat "/learn $URL_ARG")
-assert_match "$OUT" "learned about '$URL_ARG' \\[url\\]" "/learn URL tagged as [url]"
+# URL kind: since R41 (ADR r41 sec. 5) /learn http(s)://... fetches LIVE in
+# process; URL cache files written by scripts/learn.sh are only read via
+# @batch. So this serves a tiny page from a loopback http.server and grants
+# the autonomous_fetch capability the fetch is gated on (non-interactive
+# runs would otherwise decline the approval prompt). The URL carries an
+# explicit port, which the fetch gate used to refuse.
+URL_VOCAB=""
+if command -v python3 >/dev/null 2>&1; then
+    URL_SRV_DIR=$(mktemp -d /tmp/ce_int_admin_url_XXXXXX)
+    cat > "$URL_SRV_DIR/adminurl.html" <<'HTML'
+<html><body><p>Adminword quokkas are marsupials. Quokkas live on islands.</p></body></html>
+HTML
+    URL_PORT=$(( 32000 + (RANDOM % 1000) ))
+    ( cd "$URL_SRV_DIR" && exec python3 -m http.server "$URL_PORT" --bind 127.0.0.1 ) >/dev/null 2>&1 &
+    URL_SRV_PID=$!
+    i=0
+    while [ $i -lt 50 ]; do
+        if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.2); sys.exit(s.connect_ex(('127.0.0.1', $URL_PORT)))" 2>/dev/null; then break; fi
+        sleep 0.1; i=$((i+1))
+    done
+    URL_ARG="http://127.0.0.1:${URL_PORT}/adminurl.html"
+    URL_CAPS=$(mktemp /tmp/ce_int_caps.XXXXXX)
+    printf 'autonomous_fetch=allow\n' > "$URL_CAPS"
+    OUT=$(CE_CAPS_CONF="$URL_CAPS" run_chat "/learn $URL_ARG")
+    rm -f "$URL_CAPS"
+    kill "$URL_SRV_PID" 2>/dev/null; wait "$URL_SRV_PID" 2>/dev/null
+    rm -rf "$URL_SRV_DIR"
+    assert_match "$OUT" "learned from $URL_ARG \\[url\\]: [1-9][0-9]* word" "/learn URL (live, loopback with port) tagged as [url]"
+else
+    printf "  SKIP  python3 not installed -- /learn URL live check skipped\n"
+fi
 
 # -------------------- /learn FILE --------------------
 it_section "admin: /learn FILE kind"

@@ -65,6 +65,15 @@ BIND = os.environ.get("CE_BIND", "127.0.0.1")
 MAX_SESSIONS = int(os.environ.get("CE_WEB_MAX_SESSIONS", 8))
 PROMPT_END = b"> "
 READ_TIMEOUT = 30.0
+# Request limits. A POST body above CE_WEB_MAX_BODY is refused with 413 before
+# it is read; the chat message itself is clamped to MAX_MESSAGE characters and
+# CR/LF become spaces, so one request is always exactly one chat line (an
+# embedded newline used to run as extra commands and desync the prompt).
+MAX_BODY = int(os.environ.get("CE_WEB_MAX_BODY", 65536))
+MAX_MESSAGE = 4096
+# Writing to the child's stdin happens under this deadline; a child that
+# stops reading is killed instead of wedging the handler thread forever.
+WRITE_TIMEOUT = READ_TIMEOUT
 COOKIE_NAME = "ce_sid"
 # P2.9: how long a /metrics probe response is reused before refreshing. The
 # probe is cheap (one round-trip into a chat child plus a ~few-line parse) but
@@ -154,8 +163,30 @@ class ChatChild:
         with self.request_lock:
             if self.proc.poll() is not None:
                 raise RuntimeError("chat process has exited")
-            self.proc.stdin.write((message + "\n").encode("utf-8"))
-            self.proc.stdin.flush()
+            data = (message + "\n").encode("utf-8")
+            done = threading.Event()
+            err = []
+
+            def _write():
+                try:
+                    self.proc.stdin.write(data)
+                    self.proc.stdin.flush()
+                except Exception as e:      # broken pipe etc.
+                    err.append(e)
+                finally:
+                    done.set()
+
+            threading.Thread(target=_write, daemon=True).start()
+            if not done.wait(WRITE_TIMEOUT):
+                # The child is not draining stdin; kill it so the writer
+                # thread unblocks and the session can be recreated.
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+                raise TimeoutError(f"chat did not accept input within {WRITE_TIMEOUT:.0f}s")
+            if err:
+                raise RuntimeError(f"write to chat failed: {err[0]}")
             return self._wait_for_prompt()
 
     def shutdown(self):
@@ -226,6 +257,10 @@ class SessionStore:
         """Return the ChatChild bound to `cookie`. Spawns one if absent."""
         with self.lock:
             entry = self.children.get(cookie)
+            if entry is not None and entry[0].proc.poll() is not None:
+                # The child exited (or was killed after a timeout): respawn.
+                del self.children[cookie]
+                entry = None
             if entry is not None:
                 # Bump last_active so the LRU eviction prefers idle children.
                 entry[2] = int(time.time() * 1000)
@@ -237,6 +272,14 @@ class SessionStore:
             now_ms = int(time.time() * 1000)
             self.children[cookie] = [child, now_ms, now_ms]
             return child
+
+    def drop(self, cookie):
+        """Forget `cookie`'s child and shut it down (after a timeout its
+        prompt framing can no longer be trusted)."""
+        with self.lock:
+            entry = self.children.pop(cookie, None)
+        if entry is not None:
+            threading.Thread(target=entry[0].shutdown, daemon=True).start()
 
     def _evict_lru_if_needed(self):
         # Caller holds self.lock.
@@ -1148,12 +1191,24 @@ def make_handler(store):
             set_cookie = cookie if is_new else None
             if self.path != "/api/chat":
                 return self._send_json(404, {"error": "not found"}, set_cookie=set_cookie)
-            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_BODY:
+                # Refuse before reading the body; close the connection so the
+                # unread body cannot be parsed as a next request.
+                self.close_connection = True
+                return self._send_json(413, {"error": f"request body over {MAX_BODY} bytes"},
+                                       set_cookie=set_cookie)
             try:
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
             except Exception as e:
                 return self._send_json(400, {"error": f"bad json: {e}"}, set_cookie=set_cookie)
-            message = (payload.get("message") or "").strip()
+            message = payload.get("message") if isinstance(payload, dict) else None
+            if not isinstance(message, str):
+                message = ""
+            message = message.replace("\r", " ").replace("\n", " ").strip()[:MAX_MESSAGE]
             if not message:
                 return self._send_json(400, {"error": "empty message"}, set_cookie=set_cookie)
             # P2.9: time the round-trip so /metrics can publish a request
@@ -1170,6 +1225,7 @@ def make_handler(store):
                     set_cookie=set_cookie,
                 )
             except TimeoutError as e:
+                store.drop(cookie)
                 return self._send_json(504, {"error": str(e)}, set_cookie=set_cookie)
             except Exception as e:
                 return self._send_json(500, {"error": str(e)}, set_cookie=set_cookie)
