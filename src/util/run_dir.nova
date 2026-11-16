@@ -3,7 +3,7 @@
 // Audit F-24: the chat, daemons and helpers used fixed world-writable
 // paths -- /tmp/crossengin_input (daemon command input), /tmp/crossengin.sock,
 // /tmp/crossengin.dlog, /tmp/crossengin.snap, /tmp/crossengin_learn_*.txt,
-// ... -- so another local user could inject commands, plant facts, read
+// ... (chat_state.dat stays at $HOME/.crossengin/ unless HOME is unset) -- so another local user could inject commands, plant facts, read
 // state, or pre-create a symlink and redirect a write.
 //
 // ce_run_dir() resolves, in order:
@@ -12,10 +12,12 @@
 //                               historical paths stay byte-identical)
 //   2. $XDG_RUNTIME_DIR/crossengin
 //   3. $HOME/.crossengin/run
-//   4. /tmp/crossengin-run
-// Cases 2-4 are created with mode 0700 and must be a directory with no
-// group/other permission bits; anything else is refused (fail closed:
-// exit 70 with a message naming CE_RUN_DIR). The result is cached.
+//   4. /tmp/crossengin-run-<euid>
+// ($XDG_RUNTIME_DIR is only used when it exists.) Cases 2-4 are created
+// with mode 0700 and must be a real directory (not a symlink) owned by our
+// effective uid with no group/other permission bits; anything else is
+// refused (fail closed: exit 70 with a message naming CE_RUN_DIR). The
+// result is cached.
 //
 // ce_run_path(name) = ce_run_dir() + "/" + name.
 
@@ -31,25 +33,86 @@ fn _ce_env(name) {
     return v
 }
 
-// st_mode of an open fd (x86-64 struct stat: st_mode is the u32 at offset
-// 24), or -1 if fstat fails.
-fn _ce_fd_mode(fd) {
-    let st = alloc(160)
-    if sys_fstat(fd, st) < 0 { return -1 }
-    return load8(st + 24) + load8(st + 25) * 256 + load8(st + 26) * 65536 + load8(st + 27) * 16777216
+// geteuid(2), tagged. Syscall 107 never fails.
+fn _ce_geteuid() {
+    asm {
+        "mov rax, 107"
+        "syscall"
+        "lea rax, [rax + rax + 1]"
+    }
 }
 
-// 1 if `d` is a directory accessible only by its owner (mode & 0o077 == 0).
-// A directory owned by another user with mode 0700 cannot be opened at all,
-// so it also fails here.
+// fchmod(2): fd raw, mode tagged. Returns tagged 0 / raw -errno.
+fn ce_fchmod(fd, mode) {
+    asm {
+        "mov rax, 91"
+        "mov rdi, [rbp-8]"
+        "mov rsi, [rbp-16]"
+        "sar rsi, 1"
+        "syscall"
+        "test rax, rax"
+        "js .cerd_fchmod_ret"
+        "lea rax, [rax + rax + 1]"
+        ".cerd_fchmod_ret:"
+    }
+}
+
+// rmdir(2): path tag-polymorphic. Returns tagged 0 / raw -errno.
+fn ce_rmdir(path) {
+    asm {
+        "mov rax, 84"
+        "mov rdi, [rbp-8]"
+        "test rdi, 1"
+        "jz .cerd_rmdir_raw"
+        "sar rdi, 1"
+        ".cerd_rmdir_raw:"
+        "syscall"
+        "test rax, rax"
+        "js .cerd_rmdir_ret"
+        "lea rax, [rax + rax + 1]"
+        ".cerd_rmdir_ret:"
+    }
+}
+
+fn _ce_u32_at(buf, off) {
+    return load8(buf + off) + load8(buf + off + 1) * 256
+        + load8(buf + off + 2) * 65536 + load8(buf + off + 3) * 16777216
+}
+
+// [st_mode, st_uid] of an open fd (x86-64 struct stat: st_mode is the u32
+// at offset 24, st_uid the u32 at offset 28), or 0 if fstat fails.
+fn _ce_fd_mode_uid(fd) {
+    let st = alloc(160)
+    if sys_fstat(fd, st) < 0 { return 0 }
+    return [_ce_u32_at(st, 24), _ce_u32_at(st, 28)]
+}
+
+let _CE_O_DIR_NOFOLLOW = 196608   // O_RDONLY | O_DIRECTORY | O_NOFOLLOW
+
+// 1 if `d` is a real directory (not a symlink) owned by our effective uid
+// with no group/other permission bits (mode & 0o077 == 0). The checks run
+// on one fd opened with O_NOFOLLOW, so a symlink is refused and a swap
+// between check and use cannot pass someone else's directory: ownership is
+// checked, not just the mode (root can open any 0700 directory).
 fn ce_dir_is_private(d) {
-    let fd = sys_open(d, 65536, 0)          // O_RDONLY | O_DIRECTORY
+    let fd = sys_open(d, _CE_O_DIR_NOFOLLOW, 0)
     if fd < 0 { return 0 }
-    let mode = _ce_fd_mode(fd)
+    let mu = _ce_fd_mode_uid(fd)
     sys_close(fd)
-    if mode < 0 { return 0 }
+    if mu == 0 { return 0 }
+    let mode = mu[0]
     if int_and(mode, 61440) != 16384 { return 0 }   // S_IFMT != S_IFDIR
     if int_and(mode, 63) != 0 { return 0 }          // any group/other bit
+    if mu[1] != _ce_geteuid() { return 0 }          // not ours
+    return 1
+}
+
+// 1 if `d` exists and is a directory (symlinks followed): used to decide
+// whether $XDG_RUNTIME_DIR is usable before creating our subdirectory in it.
+fn _ce_is_dir(d) {
+    let fd = sys_open(d, 65536, 0)          // O_RDONLY | O_DIRECTORY
+    if fd < 0 { return 0 }
+    sys_close(fd)
     return 1
 }
 
@@ -57,12 +120,15 @@ fn ce_run_dir() {
     if len(_ce_run_dir_cache) > 0 { return _ce_run_dir_cache }
     let explicit = _ce_env("CE_RUN_DIR")
     if len(explicit) > 0 {
-        sys_mkdir(explicit, 448)
+        sys_mkdir(explicit, 448)             // 0700 if we create it
         _ce_run_dir_cache = explicit
         return explicit
     }
     let d = ""
     let xdg = _ce_env("XDG_RUNTIME_DIR")
+    if len(xdg) > 0 {
+        if _ce_is_dir(xdg) == 0 { xdg = "" }
+    }
     if len(xdg) > 0 {
         d = xdg + "/crossengin"
     } else {
@@ -71,7 +137,7 @@ fn ce_run_dir() {
             sys_mkdir(home + "/.crossengin", 448)
             d = home + "/.crossengin/run"
         } else {
-            d = "/tmp/crossengin-run"
+            d = "/tmp/crossengin-run-" + int_to_str(_ce_geteuid())
         }
     }
     sys_mkdir(d, 448)                        // 0700; EEXIST is fine

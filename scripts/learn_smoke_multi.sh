@@ -28,10 +28,9 @@ set -uo pipefail
 
 # Audit F-24: learn caches live in the private per-user runtime dir (the
 # chat reads them from there); /tmp let another user plant "facts".
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" \&\& pwd)/_run_dir.sh"
-CE_LEARN_DIR="$(ce_run_dir)" || exit 70
-
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/_run_dir.sh"
+CE_LEARN_DIR="$(ce_run_dir)" || exit 70
 LEARN="$REPO_ROOT/scripts/learn.sh"
 
 if [ ! -x "$LEARN" ]; then

@@ -111,6 +111,7 @@ smoke-windows-ce:
 	@chmod 700 $${XDG_RUNTIME_DIR:-/tmp/xdg-runtime} 2>/dev/null || true
 	@pass=0; fail=0; failures=""; \
 	export XDG_RUNTIME_DIR=$${XDG_RUNTIME_DIR:-/tmp/xdg-runtime}; \
+	export CE_RUN_DIR=$${CE_RUN_DIR:-/tmp}; \
 	export WINEDEBUG=-all; \
 	check() { name="$$1"; cond="$$2"; \
 		if [ $$cond -eq 1 ]; then echo "  PASS  $$name"; pass=$$((pass+1)); \

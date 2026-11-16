@@ -1,31 +1,34 @@
 #!/usr/bin/env bash
 # Shell twin of src/util/run_dir.nova: the per-user runtime directory for
 # CrossEngin's default state and IPC files (audit F-24). Source this file,
-# then use "$(ce_run_dir)" / "$(ce_run_path NAME)".
+# then use:
+#     d="$(ce_run_dir)" || exit 70
+#     p="$(ce_run_path NAME)" || exit 70
 #
 #   1. $CE_RUN_DIR (used as given; the test harness sets /tmp)
-#   2. $XDG_RUNTIME_DIR/crossengin
+#   2. $XDG_RUNTIME_DIR/crossengin   (only when $XDG_RUNTIME_DIR exists)
 #   3. $HOME/.crossengin/run
-#   4. /tmp/crossengin-run
-# 2-4 are created 0700 and must not be accessible by group/other; otherwise
-# this exits 70 (fail closed).
+#   4. /tmp/crossengin-run-<euid>
+# Directories we create get mode 0700. 2-4 must be a real directory (not a
+# symlink) owned by the effective uid with no group/other bits; otherwise
+# this fails with status 70 (fail closed). Keep in sync with run_dir.nova.
 
 ce_run_dir() {
     if [ -n "${CE_RUN_DIR:-}" ]; then
-        mkdir -p "$CE_RUN_DIR" 2>/dev/null
+        [ -d "$CE_RUN_DIR" ] || (umask 077; mkdir -p "$CE_RUN_DIR") 2>/dev/null
         printf '%s\n' "$CE_RUN_DIR"
         return 0
     fi
     local d
-    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
         d="$XDG_RUNTIME_DIR/crossengin"
     elif [ -n "${HOME:-}" ]; then
-        (umask 077; mkdir -p "$HOME/.crossengin")
+        (umask 077; mkdir -p "$HOME/.crossengin") 2>/dev/null
         d="$HOME/.crossengin/run"
     else
-        d="/tmp/crossengin-run"
+        d="/tmp/crossengin-run-$(id -u)"
     fi
-    (umask 077; mkdir -p "$d") 2>/dev/null
+    (umask 077; mkdir "$d") 2>/dev/null
     if [ ! -d "$d" ] || [ -L "$d" ] || [ ! -O "$d" ] \
        || [ -n "$(find "$d" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
         echo "FATAL: runtime directory $d is not a private (0700) directory owned by you; fix it or set CE_RUN_DIR" >&2
@@ -35,5 +38,7 @@ ce_run_dir() {
 }
 
 ce_run_path() {
-    printf '%s/%s\n' "$(ce_run_dir)" "$1"
+    local d
+    d="$(ce_run_dir)" || return 70
+    printf '%s/%s\n' "$d" "$1"
 }

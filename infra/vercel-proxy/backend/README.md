@@ -35,8 +35,9 @@ curl -s -X POST http://localhost:8080/chat \
 
 The repo ships two chat surfaces:
 
-- `bin/crossengin` -- one-shot daemon driven by `scripts/chat.sh`. Reads
-  `/tmp/crossengin_input`, prints one `agent>` line, exits. Stateless.
+- `bin/crossengin` -- one-shot daemon. Reads `crossengin_input` from its
+  runtime dir (the backend writes it into a fresh private `mkdtemp` dir and
+  passes `CE_RUN_DIR`), prints one `agent>` line, exits. Stateless.
 - `bin/crossengin-chat` -- persistent REPL with admin commands. Driven
   by `scripts/web.py`. Holds cognitive state across turns.
 
@@ -50,7 +51,7 @@ match a stateless-batch use case.
 
 A future round (`R37F.2`?) could add a `scripts/chat.sh --batch` mode
 that takes input on stdin and emits the reply on stdout in a single
-process per call, removing the `/tmp/crossengin_input` choreography and
+process per call, removing the input-file choreography and
 unlocking simpler container builds. Not implemented in v0.1.
 
 ## Deploying to a real host

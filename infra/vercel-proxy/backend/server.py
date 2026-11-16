@@ -13,7 +13,7 @@ How `/chat` actually invokes CrossEngin
 ---------------------------------------
 The repo ships two chat surfaces in `bin/`:
 
-  - `bin/crossengin`       -- one-shot daemon. Reads /tmp/crossengin_input,
+  - `bin/crossengin`       -- one-shot daemon. Reads <run dir>/crossengin_input,
                               prints one `agent>` line, exits. This is what
                               `scripts/chat.sh` drives in a bash loop.
   - `bin/crossengin-chat`  -- persistent REPL with admin commands. This is
@@ -53,7 +53,9 @@ import http.server
 import json
 import os
 import subprocess
+import shutil
 import sys
+import tempfile
 import threading
 import time
 
@@ -164,32 +166,37 @@ class ChatChild:
 # Fallback: scripts/chat.sh-style one-shot invocation for `CE_BIN=bin/crossengin`
 # -----------------------------------------------------------------------------
 def chat_oneshot(binary, message):
-    """Spawn the one-shot daemon per turn (the scripts/chat.sh shape).
+    """Spawn the one-shot daemon per turn.
 
-    Each call writes `message` to /tmp/crossengin_input, runs the binary,
-    and extracts the first `agent>` line. Stateless across calls.
+    Each call writes `message` to `crossengin_input` in a fresh private
+    (0700, mkdtemp) directory, runs the binary with CE_RUN_DIR pointing at
+    it, and extracts the first `agent>` line. Stateless across calls.
+    Audit F-24: the daemon reads its command input from the runtime dir; a
+    fixed /tmp/crossengin_input let any local user inject commands.
     """
-    input_path = "/tmp/crossengin_input"
-    with open(input_path, "w", encoding="utf-8") as fp:
-        fp.write(message)
+    run_dir = tempfile.mkdtemp(prefix="crossengin-oneshot-")
+    input_path = os.path.join(run_dir, "crossengin_input")
     try:
+        fd = os.open(input_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fp.write(message)
+        env = dict(os.environ)
+        env["CE_RUN_DIR"] = run_dir
         result = subprocess.run(
             [binary],
             capture_output=True,
             timeout=REQUEST_TIMEOUT_S,
+            env=env,
         )
         out = (result.stdout or b"").decode("utf-8", errors="replace")
         for line in out.splitlines():
             if line.startswith("agent> "):
                 return line
-        # No agent line -- return the tail for diagnosis (mirrors chat.sh).
+        # No agent line -- return the tail for diagnosis.
         tail = "\n".join(out.splitlines()[-5:])
         return f"agent> [no response -- daemon trace:]\n{tail}"
     finally:
-        try:
-            os.unlink(input_path)
-        except OSError:
-            pass
+        shutil.rmtree(run_dir, ignore_errors=True)
 
 
 # -----------------------------------------------------------------------------

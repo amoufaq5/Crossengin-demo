@@ -490,7 +490,7 @@ scripts/learn.sh rss:https://feeds.example.com/atom.xml
 scripts/learn.sh dir:/tmp/corpus/
 ```
 
-Each call writes `/tmp/crossengin_learn_<tag>.txt` plus a
+Each call writes `<run dir>/crossengin_learn_<tag>.txt` plus a
 `...<tag>_triples.txt`. Then in the chat:
 
 ```text
@@ -708,21 +708,26 @@ This is the area with the most planned R40 work. Today (post-R39C, pre-R40):
 
 ### Runtime directory (audit F-24)
 
-Default state and IPC files (decision log, snapshots, `chat_state.dat`,
-learn caches, the daemon command inputs `crossengin_input` /
-`crossengin_fed_input`, `crossengin.sock`, the Ollama compose input) live
-in a private per-user directory, not in world-writable `/tmp`:
+Default state and IPC files (decision log, snapshots, learn caches, the
+daemon command inputs `crossengin_input` / `crossengin_fed_input`,
+`crossengin.sock`, the Ollama compose input) live in a private per-user
+directory, not in world-writable `/tmp`:
 
 1. `$CE_RUN_DIR` if set (used as given -- the test harnesses set `/tmp`),
-2. else `$XDG_RUNTIME_DIR/crossengin`,
+2. else `$XDG_RUNTIME_DIR/crossengin` (when `$XDG_RUNTIME_DIR` exists),
 3. else `$HOME/.crossengin/run`,
-4. else `/tmp/crossengin-run`.
+4. else `/tmp/crossengin-run-<uid>`.
 
-Cases 2-4 are created `0700`. If the directory exists but is not a
-directory owned by you with no group/other permission bits, the binary
-exits 70 with a message rather than using it. Every explicit per-file
-env override (`CE_SNAP_PATH`, `CE_DLOG_PATH`, ...) still wins. The shell
-helpers use the same rules via `scripts/_run_dir.sh`.
+Cases 2-4 are created `0700`. If the directory exists but is not a real
+directory (not a symlink) owned by you with no group/other permission
+bits, the binary exits 70 with a message rather than using it. Every
+explicit per-file env override (`CE_SNAP_PATH`, `CE_DLOG_PATH`, ...) still
+wins. The shell helpers use the same rules via `scripts/_run_dir.sh`, and
+`scripts/crossengin-doctor.sh` reports the directory it resolves.
+`CE_RUN_DIR` is trusted as given: point it only at a directory you own.
+`chat_state.dat` is separate: it stays at `$HOME/.crossengin/` (see below).
+The ownership check uses Linux syscalls; Windows builds should set
+`CE_RUN_DIR`.
 
 ### What persists today
 

@@ -31,8 +31,9 @@ implements.
      bound to that `session_id`, writing the input to stdin and
      blocking until the next prompt token.
    - (one-shot fallback when `CE_BIN=bin/crossengin`) runs the
-     `scripts/chat.sh` algorithm: write input to `/tmp/crossengin_input`,
-     run the binary, grep the `agent>` line.
+     one-shot algorithm: write input to `crossengin_input` in a fresh
+     private `mkdtemp` dir, run the binary with `CE_RUN_DIR` set to it,
+     grep the `agent>` line.
 5. Reply text is written as the HTTP response body.
 6. Vercel Function streams the body back to the browser; `page.tsx`
    renders it as the next agent turn.
