@@ -100,3 +100,22 @@ Any failure aborts the fetch with `cert-verify-failed`. `learn_pipeline` /
   attestation) wherever RSA PKI appears.
 - Follow-ups: ECDSA CertVerify wiring for non-RSA leaves; a pluggable trust
   store (PEM bundle) so anchors aren't hard-coded; name-constraints / revocation.
+
+## Update (PR 4b, audit F-17 follow-up)
+
+RSA verification now runs on `src/safety/bignum_rsa.nova`, a width-generic
+(64/96/128-limb) Montgomery implementation with a variable-time public
+exponent modpow (16 squarings + 1 multiply for e = 65537). Every input to a
+signature verify is public, so constant time is not needed there; the
+constant-time `bignum_2048` ladder stays for the DH users. Effects:
+
+- RSA-2048/3072/4096 keys; certificate signatures sha256/384/512WithRSA;
+  TLS 1.3 CertificateVerify rsa_pss_rsae_sha256/384/512 (new
+  `src/safety/sha512.nova` for SHA-384/512).
+- A verify takes milliseconds instead of seconds.
+- 86 of the 122 roots in `/etc/ssl/certs/ca-certificates.crt` load (all RSA
+  roots and the P-256 ones); P-384 / P-521 are PR 4c.
+- Anchor matching compares widths and the exponent (`bnr_eq`), so keys of
+  different sizes can never match on their low limbs (the F-17 failure mode).
+- Not supported: RSASSA-PSS *certificate* signatures (none in the system
+  bundle) and SHA-1 signatures.

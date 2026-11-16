@@ -1,0 +1,417 @@
+// SHA-512 and SHA-384 (FIPS 180-4) over raw byte buffers.
+//
+// PR 4b (audit F-17 follow-up): RSA certificate and TLS CertificateVerify
+// signatures use SHA-384/512 (sha384WithRSAEncryption, rsa_pss_rsae_sha384,
+// ...). The SHA-512 core is a renamed copy of the one in ed25519.nova:
+// NOVA links every import into one unit with no private-name mangling, and
+// crossengin_chat / crossengin_fed_daemon import both ed25519 and the RSA
+// code, so the helpers here carry a distinct `_s512_` prefix. 64-bit words
+// are [lo32, hi32] pairs because NOVA ints are 62-bit and int_shr
+// sign-extends.
+//
+// API (same shape as sha256_oneshot: alloc'd buffer, digest + NUL):
+//   sha512_oneshot(buf, n) -> 65-byte buffer (64-byte digest)
+//   sha384_oneshot(buf, n) -> 49-byte buffer (48-byte digest)
+
+let _S512_MASK32 = 4294967295    // 2^32 - 1; 32-bit word mask
+let _S512_BLOCK_BYTES = 128      // SHA-512 block size = 1024 bits
+let _S512_HASH_BYTES  = 64       // SHA-512 output = 512 bits
+let _S512_ROUNDS      = 80       // FIPS 180-4 round count
+
+// --- 64-bit-as-[lo32, hi32] helpers ---------------------------------------
+
+// Construct a 64-bit word from two 32-bit halves (lo first).
+fn _s512_w64(lo, hi) {
+    let p = list_new()
+    push(p, int_and(lo, _S512_MASK32))
+    push(p, int_and(hi, _S512_MASK32))
+    return p
+}
+
+// 64-bit modular addition: returns ((a + b) mod 2^64) as [lo, hi].
+fn _s512_add64(a, b) {
+    let sum_lo = int_add(a[0], b[0])
+    let carry  = int_shr(sum_lo, 32)
+    let sum_hi = int_add(int_add(a[1], b[1]), carry)
+    return _s512_w64(sum_lo, sum_hi)
+}
+
+// 64-bit bitwise XOR.
+fn _s512_xor64(a, b) {
+    return _s512_w64(int_xor(a[0], b[0]), int_xor(a[1], b[1]))
+}
+
+// 64-bit bitwise AND.
+fn _s512_and64(a, b) {
+    return _s512_w64(int_and(a[0], b[0]), int_and(a[1], b[1]))
+}
+
+// 64-bit bitwise NOT (mod 2^64).
+fn _s512_not64(a) {
+    return _s512_w64(int_xor(a[0], _S512_MASK32),
+                int_xor(a[1], _S512_MASK32))
+}
+
+// 64-bit right rotate by n bits (0 < n < 64). Three cases:
+//   n in [1..31]: (x >> n) | (x << (64 - n))   -- straddles a limb
+//   n == 32:      swap the two halves
+//   n in [33..63]: ROTR(x, n) = ROTR(swap_halves(x), n - 32)
+fn _s512_rotr64(x, n) {
+    let lo = x[0]
+    let hi = x[1]
+    if n < 32 {
+        if n == 0 { return _s512_w64(lo, hi) }
+        // r_hi = (hi >> n) | (lo << (32 - n))
+        let r_hi = int_and(int_or(int_shr(hi, n),
+                                  int_shl(lo, 32 - n)), _S512_MASK32)
+        let r_lo = int_and(int_or(int_shr(lo, n),
+                                  int_shl(hi, 32 - n)), _S512_MASK32)
+        return _s512_w64(r_lo, r_hi)
+    }
+    if n == 32 { return _s512_w64(hi, lo) }
+    // n in [33..63]: rotate the swapped value by n - 32.
+    let m = n - 32
+    let r_hi = int_and(int_or(int_shr(lo, m),
+                              int_shl(hi, 32 - m)), _S512_MASK32)
+    let r_lo = int_and(int_or(int_shr(hi, m),
+                              int_shl(lo, 32 - m)), _S512_MASK32)
+    return _s512_w64(r_lo, r_hi)
+}
+
+// 64-bit right shift by n bits (0 < n < 64). NO rotation; high bits
+// fill with zero.
+fn _s512_shr64(x, n) {
+    let lo = x[0]
+    let hi = x[1]
+    if n == 0 { return _s512_w64(lo, hi) }
+    if n < 32 {
+        let r_hi = int_shr(hi, n)
+        let r_lo = int_and(int_or(int_shr(lo, n),
+                                  int_shl(hi, 32 - n)), _S512_MASK32)
+        return _s512_w64(r_lo, r_hi)
+    }
+    if n == 32 { return _s512_w64(hi, 0) }
+    // n in [33..63]: r_lo = hi >> (n - 32); r_hi = 0.
+    return _s512_w64(int_shr(hi, n - 32), 0)
+}
+
+// FIPS 180-4 round constants K[0..79] (first 64 bits of the fractional
+// parts of the cube roots of the first 80 primes 2..409). Returned as
+// [lo32, hi32] pairs. The values are HARD-CODED -- no algorithm to
+// derive them inside the runtime. Spelled out as hex constants split
+// into two 32-bit halves.
+fn _s512_k(i) {
+    if i ==  0 { return _s512_w64(3609767458, 1116352408) }  // 428a2f98 d728ae22
+    if i ==  1 { return _s512_w64(602891725, 1899447441) }   // 71374491 23ef65cd
+    if i ==  2 { return _s512_w64(3964484399, 3049323471) }  // b5c0fbcf ec4d3b2f
+    if i ==  3 { return _s512_w64(2173295548, 3921009573) }  // e9b5dba5 8189dbbc
+    if i ==  4 { return _s512_w64(4081628472, 961987163) }   // 3956c25b f348b538
+    if i ==  5 { return _s512_w64(3053834265, 1508970993) }  // 59f111f1 b605d019
+    if i ==  6 { return _s512_w64(2937671579, 2453635748) }  // 923f82a4 af194f9b
+    if i ==  7 { return _s512_w64(3664609560, 2870763221) }  // ab1c5ed5 da6d8118
+    if i ==  8 { return _s512_w64(2734883394, 3624381080) }  // d807aa98 a3030242
+    if i ==  9 { return _s512_w64(1164996542, 310598401) }   // 12835b01 45706fbe
+    if i == 10 { return _s512_w64(1323610764, 607225278) }   // 243185be 4ee4b28c
+    if i == 11 { return _s512_w64(3590304994, 1426881987) }  // 550c7dc3 d5ffb4e2
+    if i == 12 { return _s512_w64(4068182383, 1925078388) }  // 72be5d74 f27b896f
+    if i == 13 { return _s512_w64(991336113, 2162078206) }   // 80deb1fe 3b1696b1
+    if i == 14 { return _s512_w64(633803317, 2614888103) }   // 9bdc06a7 25c71235
+    if i == 15 { return _s512_w64(3479774868, 3248222580) }  // c19bf174 cf692694
+    if i == 16 { return _s512_w64(2666613458, 3835390401) }  // e49b69c1 9ef14ad2
+    if i == 17 { return _s512_w64(944711139, 4022224774) }   // efbe4786 384f25e3
+    if i == 18 { return _s512_w64(2341262773, 264347078) }   // 0fc19dc6 8b8cd5b5
+    if i == 19 { return _s512_w64(2007800933, 604807628) }   // 240ca1cc 77ac9c65
+    if i == 20 { return _s512_w64(1495990901, 770255983) }   // 2de92c6f 592b0275
+    if i == 21 { return _s512_w64(1856431235, 1249150122) }  // 4a7484aa 6ea6e483
+    if i == 22 { return _s512_w64(3175218132, 1555081692) }  // 5cb0a9dc bd41fbd4
+    if i == 23 { return _s512_w64(2198950837, 1996064986) }  // 76f988da 831153b5
+    if i == 24 { return _s512_w64(3999719339, 2554220882) }  // 983e5152 ee66dfab
+    if i == 25 { return _s512_w64(766784016, 2821834349) }   // a831c66d 2db43210
+    if i == 26 { return _s512_w64(2566594879, 2952996808) }  // b00327c8 98fb213f
+    if i == 27 { return _s512_w64(3203337956, 3210313671) }  // bf597fc7 beef0ee4
+    if i == 28 { return _s512_w64(1034457026, 3336571891) }  // c6e00bf3 3da88fc2
+    if i == 29 { return _s512_w64(2466948901, 3584528711) }  // d5a79147 930aa725
+    if i == 30 { return _s512_w64(3758326383, 113926993) }   // 06ca6351 e003826f
+    if i == 31 { return _s512_w64(168717936, 338241895) }    // 14292967 0a0e6e70
+    if i == 32 { return _s512_w64(1188179964, 666307205) }   // 27b70a85 46d22ffc
+    if i == 33 { return _s512_w64(1546045734, 773529912) }   // 2e1b2138 5c26c926
+    if i == 34 { return _s512_w64(1522805485, 1294757372) }  // 4d2c6dfc 5ac42aed
+    if i == 35 { return _s512_w64(2643833823, 1396182291) }  // 53380d13 9d95b3df
+    if i == 36 { return _s512_w64(2343527390, 1695183700) }  // 650a7354 8baf63de
+    if i == 37 { return _s512_w64(1014477480, 1986661051) }  // 766a0abb 3c77b2a8
+    if i == 38 { return _s512_w64(1206759142, 2177026350) }  // 81c2c92e 47edaee6
+    if i == 39 { return _s512_w64(344077627, 2456956037) }   // 92722c85 1482353b
+    if i == 40 { return _s512_w64(1290863460, 2730485921) }  // a2bfe8a1 4cf10364
+    if i == 41 { return _s512_w64(3158454273, 2820302411) }  // a81a664b bc423001
+    if i == 42 { return _s512_w64(3505952657, 3259730800) }  // c24b8b70 d0f89791
+    if i == 43 { return _s512_w64(106217008, 3345764771) }   // c76c51a3 0654be30
+    if i == 44 { return _s512_w64(3606008344, 3516065817) }  // d192e819 d6ef5218
+    if i == 45 { return _s512_w64(1432725776, 3600352804) }  // d6990624 5565a910
+    if i == 46 { return _s512_w64(1467031594, 4094571909) }  // f40e3585 5771202a
+    if i == 47 { return _s512_w64(851169720, 275423344) }    // 106aa070 32bbd1b8
+    if i == 48 { return _s512_w64(3100823752, 430227734) }   // 19a4c116 b8d2d0c8
+    if i == 49 { return _s512_w64(1363258195, 506948616) }   // 1e376c08 5141ab53
+    if i == 50 { return _s512_w64(3750685593, 659060556) }   // 2748774c df8eeb99
+    if i == 51 { return _s512_w64(3785050280, 883997877) }   // 34b0bcb5 e19b48a8
+    if i == 52 { return _s512_w64(3318307427, 958139571) }   // 391c0cb3 c5c95a63
+    if i == 53 { return _s512_w64(3812723403, 1322822218) }  // 4ed8aa4a e3418acb
+    if i == 54 { return _s512_w64(2003034995, 1537002063) }  // 5b9cca4f 7763e373
+    if i == 55 { return _s512_w64(3602036899, 1747873779) }  // 682e6ff3 d5a06d39
+    if i == 56 { return _s512_w64(1575990012, 1955562222) }  // 748f82ee 5defb2fc
+    if i == 57 { return _s512_w64(1125592928, 2024104815) }  // 78a5636f 43172f60
+    if i == 58 { return _s512_w64(2716904306, 2227730452) }  // 84c87814 a1f0ab72
+    if i == 59 { return _s512_w64(442776044, 2361852424) }   // 8cc70208 1a6439ec
+    if i == 60 { return _s512_w64(593698344, 2428436474) }   // 90befffa 23631e28
+    if i == 61 { return _s512_w64(3733110249, 2756734187) }  // a4506ceb de82bde9
+    if i == 62 { return _s512_w64(2999351573, 3204031479) }  // bef9a3f7 b2c67915
+    if i == 63 { return _s512_w64(3815920427, 3329325298) }  // c67178f2 e372532b
+    if i == 64 { return _s512_w64(3928383900, 3391569614) }  // ca273ece ea26619c
+    if i == 65 { return _s512_w64(566280711, 3515267271) }   // d186b8c7 21c0c207
+    if i == 66 { return _s512_w64(3454069534, 3940187606) }  // eada7dd6 cde0eb1e
+    if i == 67 { return _s512_w64(4000239992, 4118630271) }  // f57d4f7f ee6ed178
+    if i == 68 { return _s512_w64(1914138554, 116418474) }   // 06f067aa 72176fba
+    if i == 69 { return _s512_w64(2731055270, 174292421) }   // 0a637dc5 a2c898a6
+    if i == 70 { return _s512_w64(3203993006, 289380356) }   // 113f9804 bef90dae
+    if i == 71 { return _s512_w64(320620315, 460393269) }    // 1b710b35 131c471b
+    if i == 72 { return _s512_w64(587496836, 685471733) }    // 28db77f5 23047d84
+    if i == 73 { return _s512_w64(1086792851, 852142971) }   // 32caab7b 40c72493
+    if i == 74 { return _s512_w64(365543100, 1017036298) }   // 3c9ebe0a 15c9bebc
+    if i == 75 { return _s512_w64(2618297676, 1126000580) }  // 431d67c4 9c100d4c
+    if i == 76 { return _s512_w64(3409855158, 1288033470) }  // 4cc5d4be cb3e42b6
+    if i == 77 { return _s512_w64(4234509866, 1501505948) }  // 597f299c fc657e2a
+    if i == 78 { return _s512_w64(987167468, 1607167915) }   // 5fcb6fab 3ad6faec
+    if i == 79 { return _s512_w64(1246189591, 1816402316) }  // 6c44198c 4a475817
+    return _s512_w64(0, 0)
+}
+
+// SHA-512 initial hash values H[0..7]: first 64 bits of the fractional
+// parts of the square roots of the first 8 primes 2..19 (FIPS 180-4 5.3.5).
+fn _s512_init_h() {
+    let h = list_new()
+    push(h, _s512_w64(4089235720, 1779033703))   // 6a09e667 f3bcc908
+    push(h, _s512_w64(2227873595, 3144134277))   // bb67ae85 84caa73b
+    push(h, _s512_w64(4271175723, 1013904242))   // 3c6ef372 fe94f82b
+    push(h, _s512_w64(1595750129, 2773480762))   // a54ff53a 5f1d36f1
+    push(h, _s512_w64(2917565137, 1359893119))   // 510e527f ade682d1
+    push(h, _s512_w64(725511199, 2600822924))    // 9b05688c 2b3e6c1f
+    push(h, _s512_w64(4215389547, 528734635))    // 1f83d9ab fb41bd6b
+    push(h, _s512_w64(327033209, 1541459225))    // 5be0cd19 137e2179
+    return h
+}
+
+// Big-endian 64-bit load from a byte list at offset off.
+fn _s512_load_be64(buf, off) {
+    let b0 = buf[off + 0]
+    let b1 = buf[off + 1]
+    let b2 = buf[off + 2]
+    let b3 = buf[off + 3]
+    let b4 = buf[off + 4]
+    let b5 = buf[off + 5]
+    let b6 = buf[off + 6]
+    let b7 = buf[off + 7]
+    let hi = int_and(int_or(int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)),
+                                          int_shl(b2, 8)), b3), _S512_MASK32)
+    let lo = int_and(int_or(int_or(int_or(int_shl(b4, 24), int_shl(b5, 16)),
+                                          int_shl(b6, 8)), b7), _S512_MASK32)
+    return _s512_w64(lo, hi)
+}
+
+// Big-endian 64-bit store into a byte list at offset off.
+fn _s512_store_be64(buf, off, w) {
+    let lo = w[0]
+    let hi = w[1]
+    list_set(buf, off + 0, int_and(int_shr(hi, 24), 255))
+    list_set(buf, off + 1, int_and(int_shr(hi, 16), 255))
+    list_set(buf, off + 2, int_and(int_shr(hi, 8), 255))
+    list_set(buf, off + 3, int_and(hi, 255))
+    list_set(buf, off + 4, int_and(int_shr(lo, 24), 255))
+    list_set(buf, off + 5, int_and(int_shr(lo, 16), 255))
+    list_set(buf, off + 6, int_and(int_shr(lo, 8), 255))
+    list_set(buf, off + 7, int_and(lo, 255))
+    return 1
+}
+
+// SHA-512 compression: process one 128-byte block. Updates h (length-8
+// list of 64-bit words) in place. blk is a byte list at the block's
+// start offset (we pass [buf, off] separately).
+fn _s512_compress(h, buf, off) {
+    // Build the 80-word message schedule W[0..79].
+    let w = list_new()
+    let i = 0
+    while i < 16 {
+        push(w, _s512_load_be64(buf, off + int_mul(i, 8)))
+        i = i + 1
+    }
+    while i < 80 {
+        // s0 = ROTR(W[i-15], 1) XOR ROTR(W[i-15], 8) XOR SHR(W[i-15], 7)
+        let w15 = w[i - 15]
+        let s0 = _s512_xor64(_s512_xor64(_s512_rotr64(w15, 1), _s512_rotr64(w15, 8)),
+                        _s512_shr64(w15, 7))
+        // s1 = ROTR(W[i-2], 19) XOR ROTR(W[i-2], 61) XOR SHR(W[i-2], 6)
+        let w2 = w[i - 2]
+        let s1 = _s512_xor64(_s512_xor64(_s512_rotr64(w2, 19), _s512_rotr64(w2, 61)),
+                        _s512_shr64(w2, 6))
+        let v = _s512_add64(_s512_add64(_s512_add64(w[i - 16], s0), w[i - 7]), s1)
+        push(w, v)
+        i = i + 1
+    }
+    // Working variables initialised from the current hash state.
+    let a = h[0]; let b = h[1]; let c = h[2]; let d = h[3]
+    let e = h[4]; let f = h[5]; let g = h[6]; let hh = h[7]
+    let t = 0
+    while t < _S512_ROUNDS {
+        // S1 = ROTR(e,14) XOR ROTR(e,18) XOR ROTR(e,41)
+        let bs1 = _s512_xor64(_s512_xor64(_s512_rotr64(e, 14), _s512_rotr64(e, 18)),
+                         _s512_rotr64(e, 41))
+        // Ch = (e AND f) XOR ((NOT e) AND g)
+        let ch = _s512_xor64(_s512_and64(e, f), _s512_and64(_s512_not64(e), g))
+        // T1 = hh + S1 + Ch + K[t] + W[t]
+        let t1 = _s512_add64(_s512_add64(_s512_add64(_s512_add64(hh, bs1), ch),
+                               _s512_k(t)), w[t])
+        // S0 = ROTR(a,28) XOR ROTR(a,34) XOR ROTR(a,39)
+        let bs0 = _s512_xor64(_s512_xor64(_s512_rotr64(a, 28), _s512_rotr64(a, 34)),
+                         _s512_rotr64(a, 39))
+        // Maj = (a AND b) XOR (a AND c) XOR (b AND c)
+        let maj = _s512_xor64(_s512_xor64(_s512_and64(a, b), _s512_and64(a, c)),
+                         _s512_and64(b, c))
+        // T2 = S0 + Maj
+        let t2 = _s512_add64(bs0, maj)
+        // Rotate: hh = g; g = f; f = e; e = d + T1; d = c; c = b; b = a; a = T1 + T2.
+        hh = g
+        g = f
+        f = e
+        e = _s512_add64(d, t1)
+        d = c
+        c = b
+        b = a
+        a = _s512_add64(t1, t2)
+        t = t + 1
+    }
+    list_set(h, 0, _s512_add64(h[0], a))
+    list_set(h, 1, _s512_add64(h[1], b))
+    list_set(h, 2, _s512_add64(h[2], c))
+    list_set(h, 3, _s512_add64(h[3], d))
+    list_set(h, 4, _s512_add64(h[4], e))
+    list_set(h, 5, _s512_add64(h[5], f))
+    list_set(h, 6, _s512_add64(h[6], g))
+    list_set(h, 7, _s512_add64(h[7], hh))
+    return 1
+}
+
+// SHA-512 of a byte list. Returns a 64-byte byte list.
+//
+// FIPS 180-4 padding: append 0x80, zero-pad to (length mod 128 == 112),
+// then append the original message length in BITS as a 128-bit big-
+// endian integer. The high 64 bits are zero in practice (our messages
+// are << 2^61 bytes long); we emit them explicitly to honor the spec.
+fn _s512_digest(msg, h) {
+    let n = len(msg)
+    let full_blocks = int_shr(n, 7)             // n / 128
+    let i = 0
+    while i < full_blocks {
+        _s512_compress(h, msg, int_mul(i, _S512_BLOCK_BYTES))
+        i = i + 1
+    }
+    let consumed = int_mul(full_blocks, _S512_BLOCK_BYTES)
+    let rem = n - consumed
+    // Build the final padded block(s). Need one block if rem <= 111
+    // (1 byte for 0x80 + 16 bytes for the 128-bit length = 17, leaves
+    // up to 111 bytes for message tail); two blocks if rem >= 112.
+    let need_two = 0
+    if rem >= 112 { need_two = 1 }
+    let final_size = _S512_BLOCK_BYTES
+    if need_two == 1 { final_size = int_mul(_S512_BLOCK_BYTES, 2) }
+    let pad = list_new()
+    let j = 0
+    while j < final_size {
+        push(pad, 0)
+        j = j + 1
+    }
+    let k = 0
+    while k < rem {
+        list_set(pad, k, msg[consumed + k])
+        k = k + 1
+    }
+    list_set(pad, rem, 128)
+    // Zero bytes between rem+1 and final_size - 16 are already zero
+    // from the list initialisation above. Embed the 128-bit length:
+    // hi 64 bits = 0 (we don't support messages >= 2^61 bytes), lo 64
+    // bits = n * 8 (the message bit-length).
+    let total_bits_lo = int_and(int_shl(n, 3), _S512_MASK32)
+    let total_bits_hi = int_and(int_shr(n, 29), _S512_MASK32)
+    // length field is 16 bytes, big-endian, at offset final_size - 16.
+    // High 8 bytes (bits 127..64) are zero; already zero.
+    // Bytes [final_size-8 .. final_size-1] hold the low 64 bits of (n*8).
+    let off = final_size - 8
+    list_set(pad, off + 0, int_and(int_shr(total_bits_hi, 24), 255))
+    list_set(pad, off + 1, int_and(int_shr(total_bits_hi, 16), 255))
+    list_set(pad, off + 2, int_and(int_shr(total_bits_hi, 8), 255))
+    list_set(pad, off + 3, int_and(total_bits_hi, 255))
+    list_set(pad, off + 4, int_and(int_shr(total_bits_lo, 24), 255))
+    list_set(pad, off + 5, int_and(int_shr(total_bits_lo, 16), 255))
+    list_set(pad, off + 6, int_and(int_shr(total_bits_lo, 8), 255))
+    list_set(pad, off + 7, int_and(total_bits_lo, 255))
+    _s512_compress(h, pad, 0)
+    if need_two == 1 {
+        _s512_compress(h, pad, _S512_BLOCK_BYTES)
+    }
+    // Emit H[0..7] as 64 big-endian bytes.
+    let out = list_new()
+    let z = 0
+    while z < _S512_HASH_BYTES {
+        push(out, 0)
+        z = z + 1
+    }
+    let q = 0
+    while q < 8 {
+        _s512_store_be64(out, int_mul(q, 8), h[q])
+        q = q + 1
+    }
+    return out
+}
+
+
+// SHA-384 initial hash values (FIPS 180-4 5.3.4).
+fn _s512_init_h384() {
+    let h = list_new()
+    push(h, _s512_w64(3238371032, 3418070365))   // cbbb9d5d c1059ed8
+    push(h, _s512_w64(914150663, 1654270250))   // 629a292a 367cd507
+    push(h, _s512_w64(812702999, 2438529370))   // 9159015a 3070dd17
+    push(h, _s512_w64(4144912697, 355462360))   // 152fecd8 f70e5939
+    push(h, _s512_w64(4290775857, 1731405415))   // 67332667 ffc00b31
+    push(h, _s512_w64(1750603025, 2394180231))   // 8eb44a87 68581511
+    push(h, _s512_w64(1694076839, 3675008525))   // db0c2e0d 64f98fa7
+    push(h, _s512_w64(3204075428, 1203062813))   // 47b5481d befa4fa4
+    return h
+}
+
+// Copy n bytes of a raw buffer into a byte list for the list-based core.
+fn _s512_buf_to_list(buf, n) {
+    let out = list_new()
+    let i = 0
+    while i < n {
+        push(out, load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn _s512_list_to_buf(lst, k) {
+    let out = alloc(k + 1)
+    let i = 0
+    while i < k {
+        store8(out + i, lst[i])
+        i = i + 1
+    }
+    store8(out + k, 0)
+    return out
+}
+
+fn sha512_oneshot(buf, n) {
+    return _s512_list_to_buf(_s512_digest(_s512_buf_to_list(buf, n), _s512_init_h()), 64)
+}
+
+// SHA-384 = SHA-512 compression with the SHA-384 IV, truncated to 48 bytes.
+fn sha384_oneshot(buf, n) {
+    return _s512_list_to_buf(_s512_digest(_s512_buf_to_list(buf, n), _s512_init_h384()), 48)
+}
