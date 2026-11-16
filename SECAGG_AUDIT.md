@@ -13,6 +13,22 @@
 >   from `secure_random` and fail closed.
 > - Still true: the 256-bit `2^255 - 19` DH group is too small; use
 >   `CE_SECAGG_DH_2048=1` (RFC 7919 group 14).
+> - An adversarial review of that rewrite found more, now fixed (v3-sa):
+>   the mask KDF includes the ordered pair ids, length-prefixed (one token
+>   shared by several pairs used to leave the middle soul unmasked); a soul
+>   refuses to mask a round id at or below one it already masked (a
+>   coordinator replaying FED_ROUND could subtract two shares); and dropout
+>   reconciliation refuses duplicates, unknown peers, and any dropout that
+>   would leave the soul's value with no remaining mask (a 2-soul dropout
+>   used to publish the survivor's raw value). The handshake is now
+>   "SECAGG_HELLO ce-fed v3-sa", so older souls are rejected.
+> - **Still open:** token mode (CE_FED_TOKEN_*) reuses masks across
+>   /fed_join sessions for the same round id, because the token is the only
+>   secret; prefer DH mode (fresh keys per session). And a malicious
+>   coordinator that falsely declares a live peer dropped can still learn
+>   that peer's value from the survivors' reconciliations -- real
+>   protection needs Bonawitz-style double masking. Treat SecAgg as
+>   honest-but-curious-coordinator protection only.
 > `scripts/secagg_smoke_soul.py` mirrors the new derivation.
 
 **Phase:** P3.8 — secure aggregation MVP (pairwise additive masking),

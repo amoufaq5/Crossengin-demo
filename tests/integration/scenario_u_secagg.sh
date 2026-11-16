@@ -103,6 +103,7 @@ INPUT_B=$(
     export CE_SECAGG_PEERS="bob"
     export CE_FED_TOKEN_bob="$SHARED_TOKEN"
     export CE_SESSION_ID="alice"
+    export CE_FED_SOUL_ID="alice"
     export CE_SNAP_PATH="/tmp/crossengin_secagg_alice.snap"
     export CE_DLOG_PATH="/tmp/crossengin_secagg_alice.dlog"
     echo "$INPUT_A" | "$CHAT_BIN" >"$CHAT_A_OUT" 2>&1
@@ -119,6 +120,7 @@ sleep 1
     export CE_SECAGG_PEERS="alice"
     export CE_FED_TOKEN_alice="$SHARED_TOKEN"
     export CE_SESSION_ID="bob"
+    export CE_FED_SOUL_ID="bob"
     export CE_SNAP_PATH="/tmp/crossengin_secagg_bob.snap"
     export CE_DLOG_PATH="/tmp/crossengin_secagg_bob.dlog"
     echo "$INPUT_B" | "$CHAT_BIN" >"$CHAT_B_OUT" 2>&1
@@ -170,6 +172,14 @@ assert_match "$COORD_TXT" "masked-value-opaque" \
     "coordinator logged the masked-opaque flag"
 assert_match "$COORD_TXT" "\\[SECAGG\\] AGGREGATE_SUM round=1" \
     "coordinator broadcast a SUM aggregate (not avg)"
+# The souls must use distinct ids (otherwise no masks are applied at all),
+# and the masks must cancel: every summed rate is a sum of two milli rates,
+# so it lies in [0, 2000]. Uncancelled 32-bit masks would be far outside.
+assert_match "$CHAT_A_TXT" "as soul=alice" "alice chat used soul id alice"
+assert_match "$CHAT_B_TXT" "as soul=bob" "bob chat used soul id bob"
+BAD_SUMS=$(echo "$COORD_TXT" | grep -oE "sum_promo=-?[0-9]+ sum_atr=-?[0-9]+" \
+    | awk -F'[= ]' '{ if ($2 < 0 || $2 > 2000 || $4 < 0 || $4 > 2000) print }' | wc -l)
+assert_eq "$BAD_SUMS" "0" "all SecAgg sums are plausible (masks cancelled)"
 # Negative: the coordinator must NOT log the v1 STAT / AGGREGATE lines
 # in SecAgg mode -- those would imply it had access to per-soul raw stats.
 assert_nomatch "$COORD_TXT" "fed-coord: STAT soul=.*promo=" \
@@ -180,11 +190,11 @@ assert_nomatch "$COORD_TXT" "fed-coord: AGGREGATE round=1 tag=.*avg_promo=" \
 # Stage 7: chat-side (per-soul) invariants.
 assert_match "$CHAT_A_TXT" "fed_join: \\[SECAGG\\] enabled" \
     "alice chat entered SecAgg mode"
-assert_match "$CHAT_A_TXT" "fed_join: \\[SECAGG\\] HELLO ce-fed v2-sa \\+ FED_JOIN" \
+assert_match "$CHAT_A_TXT" "fed_join: \\[SECAGG\\] HELLO ce-fed v3-sa \\+ FED_JOIN" \
     "alice chat completed SecAgg handshake"
 assert_match "$CHAT_B_TXT" "fed_join: \\[SECAGG\\] enabled" \
     "bob chat entered SecAgg mode"
-assert_match "$CHAT_B_TXT" "fed_join: \\[SECAGG\\] HELLO ce-fed v2-sa \\+ FED_JOIN" \
+assert_match "$CHAT_B_TXT" "fed_join: \\[SECAGG\\] HELLO ce-fed v3-sa \\+ FED_JOIN" \
     "bob chat completed SecAgg handshake"
 assert_match "$CHAT_A_TXT" "fed: \\[SECAGG\\] round 1 complete" \
     "alice chat completed round 1"
@@ -241,7 +251,7 @@ rm -f "$COORD2_OUT" "$SOUL_A_OUT" "$SOUL_B_OUT"
 (
     export CE_FED_PORT="$PORT2"
     export CE_FED_BIND="127.0.0.1"
-    export CE_FED_SOULS=2
+    export CE_FED_SOULS=3
     export CE_FED_MAX_ROUNDS=1
     export CE_SECAGG_ENABLED=1
     "$COORD_BIN" >"$COORD2_OUT" 2>&1
@@ -266,12 +276,26 @@ SHARED_TOKEN2="ce-secagg-shared-token-2"
 (
     python3 "$SOUL_HELPER" \
         --mode survivor \
-        --soul-id alice --peer bob --token "$SHARED_TOKEN2" \
+        --soul-id alice --peer bob,carol --token "$SHARED_TOKEN2" \
         --host 127.0.0.1 --port "$PORT2" \
         --x-promo 100 --x-atr 50 --tag topic:test \
         >"$SOUL_A_OUT" 2>&1
 ) &
 SOUL_A_PID=$!
+
+# Soul C: second survivor. With the reconciliation limits (audit F-09
+# review) a lone survivor refuses to reconcile -- that would publish its
+# raw value -- so the dropout scenario needs two survivors.
+SOUL_C_OUT="/tmp/ce_int_secagg_drop_soul_c.out"
+(
+    python3 "$SOUL_HELPER" \
+        --mode survivor \
+        --soul-id carol --peer alice,bob --token "$SHARED_TOKEN2" \
+        --host 127.0.0.1 --port "$PORT2" \
+        --x-promo 30 --x-atr 20 --tag topic:test \
+        >"$SOUL_C_OUT" 2>&1
+) &
+SOUL_C_PID=$!
 
 sleep 1
 
@@ -279,7 +303,7 @@ sleep 1
 (
     python3 "$SOUL_HELPER" \
         --mode dropout \
-        --soul-id bob --peer alice --token "$SHARED_TOKEN2" \
+        --soul-id bob --peer alice,carol --token "$SHARED_TOKEN2" \
         --host 127.0.0.1 --port "$PORT2" \
         >"$SOUL_B_OUT" 2>&1
 ) &
@@ -293,6 +317,7 @@ while [ "$elapsed" -lt "$DEADLINE" ]; do
     kill -0 $COORD2_PID  2>/dev/null && coord_alive=1
     kill -0 $SOUL_A_PID  2>/dev/null && a_alive=1
     kill -0 $SOUL_B_PID  2>/dev/null && b_alive=1
+    kill -0 $SOUL_C_PID  2>/dev/null && b_alive=1
     if [ $coord_alive -eq 0 ] && [ $a_alive -eq 0 ] && [ $b_alive -eq 0 ]; then
         break
     fi
@@ -308,6 +333,7 @@ fi
 wait $COORD2_PID  2>/dev/null
 wait $SOUL_A_PID  2>/dev/null
 wait $SOUL_B_PID  2>/dev/null
+wait $SOUL_C_PID  2>/dev/null
 
 COORD2_TXT=$(cat "$COORD2_OUT"  2>/dev/null || true)
 SOUL_A_TXT=$(cat "$SOUL_A_OUT"  2>/dev/null || true)
@@ -328,11 +354,13 @@ assert_match "$COORD2_TXT" "RECON_MASKED soul=alice" \
     "coordinator received alice's reconciled stat"
 assert_match "$COORD2_TXT" "round 1 reconciled" \
     "coordinator round 1 reconciled (recon path)"
-# The coordinator's broadcast SUM after reconciliation should contain
-# alice's raw values exactly (since alice = sole survivor; her m_AB
-# contribution was removed). Promo=100, atr=50.
-assert_match "$COORD2_TXT" "AGGREGATE_SUM round=1 tag=topic:test sum_promo=100 sum_atr=50 n_part=1" \
-    "coordinator sum equals alice's raw values (recon worked, n=1)"
+# After reconciliation the sum is alice + carol: promo 100 + 30, atr
+# 50 + 20, from two participants -- the masks between the survivors still
+# cancel, and bob's were removed. (The old version had one survivor and
+# asserted its raw value came out -- exactly the leak the reconciliation
+# limits now refuse.)
+assert_match "$COORD2_TXT" "AGGREGATE_SUM round=1 tag=topic:test sum_promo=130 sum_atr=70 n_part=2" \
+    "coordinator sum equals alice + carol after bob's dropout (masks cancel)"
 
 # Survivor (alice) invariants -- recorded via stderr by the Python helper.
 assert_match "$SOUL_A_TXT" "FED_DROPOUT" \
@@ -415,6 +443,7 @@ INPUT_DB=$(
     export CE_SECAGG_DH=1
     export CE_SECAGG_PEERS="bob"
     export CE_SESSION_ID="alice"
+    export CE_FED_SOUL_ID="alice"
     export CE_SNAP_PATH="/tmp/crossengin_secagg_dh_alice.snap"
     export CE_DLOG_PATH="/tmp/crossengin_secagg_dh_alice.dlog"
     echo "$INPUT_DA" | "$CHAT_BIN" >"$CHAT_DA_OUT" 2>&1
@@ -429,6 +458,7 @@ sleep 1
     export CE_SECAGG_DH=1
     export CE_SECAGG_PEERS="alice"
     export CE_SESSION_ID="bob"
+    export CE_FED_SOUL_ID="bob"
     export CE_SNAP_PATH="/tmp/crossengin_secagg_dh_bob.snap"
     export CE_DLOG_PATH="/tmp/crossengin_secagg_dh_bob.dlog"
     echo "$INPUT_DB" | "$CHAT_BIN" >"$CHAT_DB_OUT" 2>&1
@@ -469,7 +499,7 @@ CHAT_DB_TXT=$(cat "$CHAT_DB_OUT" 2>/dev/null || true)
 # DH-scenario coordinator-side invariants.
 # NOTE: the bin/crossengin-chat binary hardcodes the session id "default"
 # at boot (CE_SESSION_ID is consumed only by snap-path resolution, not by
-# the SecAgg soul-id), so both chats announce themselves as soul=default.
+# the SecAgg soul-id); CE_FED_SOUL_ID gives each chat its own soul id.
 # The integration test asserts on the SECAGG-DH wire events, not on
 # per-soul identity (the soul-id is exercised by the dropout scenario
 # above via the Python helper which DOES take --soul-id).
@@ -479,7 +509,7 @@ assert_match "$COORD3_TXT" "fed-coord: SECAGG JOIN" \
 # pubkeys back -- this is the new v2-sa-dh wire phase. We assert the
 # event count rather than per-soul ids since both chats use the same
 # default soul_id.
-assert_match "$COORD3_TXT" "\\[SECAGG-DH\\] FED_DH_PUBLIC soul=default pubkey=" \
+assert_match "$COORD3_TXT" "\\[SECAGG-DH\\] FED_DH_PUBLIC soul=[a-z]+ pubkey=" \
     "DH-scenario coordinator received at least one FED_DH_PUBLIC"
 assert_match "$COORD3_TXT" "\\[SECAGG-DH\\] broadcasting 2 DH pubkey" \
     "DH-scenario coordinator broadcast both DH pubkeys"
@@ -491,6 +521,9 @@ assert_match "$COORD3_TXT" "\\[SECAGG-DH\\] DH key-exchange phase complete" \
 # identical. So we still expect the AGGREGATE_SUM broadcast.
 assert_match "$COORD3_TXT" "\\[SECAGG\\] AGGREGATE_SUM round=1" \
     "DH-scenario coordinator broadcast AGGREGATE_SUM"
+BAD_SUMS3=$(echo "$COORD3_TXT" | grep -oE "sum_promo=-?[0-9]+ sum_atr=-?[0-9]+" \
+    | awk -F'[= ]' '{ if ($2 < 0 || $2 > 2000 || $4 < 0 || $4 > 2000) print }' | wc -l)
+assert_eq "$BAD_SUMS3" "0" "DH-scenario sums are plausible (DH masks cancelled)"
 
 # Chat-side (per-soul) DH invariants. The chat boot banner contains
 # parentheses "enabled (v2-sa-dh ..." -- we use a `.` (any single char)
@@ -589,6 +622,7 @@ INPUT_EB=$(
     export CE_SECAGG_DH_2048=1
     export CE_SECAGG_PEERS="bob"
     export CE_SESSION_ID="alice"
+    export CE_FED_SOUL_ID="alice"
     export CE_SNAP_PATH="/tmp/crossengin_secagg_dh2048_alice.snap"
     export CE_DLOG_PATH="/tmp/crossengin_secagg_dh2048_alice.dlog"
     echo "$INPUT_EA" | "$CHAT_BIN" >"$CHAT_EA_OUT" 2>&1
@@ -604,6 +638,7 @@ sleep 1
     export CE_SECAGG_DH_2048=1
     export CE_SECAGG_PEERS="alice"
     export CE_SESSION_ID="bob"
+    export CE_FED_SOUL_ID="bob"
     export CE_SNAP_PATH="/tmp/crossengin_secagg_dh2048_bob.snap"
     export CE_DLOG_PATH="/tmp/crossengin_secagg_dh2048_bob.dlog"
     echo "$INPUT_EB" | "$CHAT_BIN" >"$CHAT_EB_OUT" 2>&1

@@ -56,7 +56,7 @@ assert_match "$OUT" "dp budget: 0 / 10000 milli-eps consumed.*remaining 10000 mi
 assert_match "$OUT" "0 queries\\)" \
     "initial /dp_status reports 0 queries"
 
-# 2. /dp_query atoms outputs both true and noisy fields.
+# 2. /dp_query atoms outputs only the noisy field (audit F-09).
 assert_nomatch "$OUT" "dp_query atoms: true=" \
     "/dp_query no longer prints the true count (audit F-09)"
 assert_match "$OUT" "dp_query atoms: noisy=-?[0-9]+" \

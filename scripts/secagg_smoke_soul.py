@@ -41,10 +41,17 @@ import hashlib
 SA_MOD = 1 << 32
 
 
-def mask_for_peer(token: str, round_id: int, k_dim: int, source: str = "") -> int:
-    """Same as sa_mask_for_peer_src in NOVA."""
-    msg = f"ce-secagg-v2|{token}|{round_id}|{source}|{k_dim}".encode("ascii")
-    return int.from_bytes(hashlib.sha256(msg).digest()[:4], "big")
+def _kdf_field(v: str) -> str:
+    return f"{len(v)}:{v}|"
+
+
+def mask_for_peer(id_a: str, id_b: str, token: str, round_id: int, k_dim: int,
+                  source: str = "") -> int:
+    """Same as _sa_mask32 / sa_mask_for_peer_src in NOVA (v3-sa)."""
+    lo, hi = (id_a, id_b) if id_a <= id_b else (id_b, id_a)
+    msg = ("ce-secagg-v3|" + _kdf_field(lo) + _kdf_field(hi) + _kdf_field(token)
+           + _kdf_field(str(round_id)) + _kdf_field(source) + _kdf_field(str(k_dim)))
+    return int.from_bytes(hashlib.sha256(msg.encode("ascii")).digest()[:4], "big")
 
 
 def id_compare(a: str, b: str) -> int:
@@ -59,7 +66,7 @@ def apply_masks(soul_id: str, x: int, k_dim: int, peers, source: str = ""):
     """peers is a list of (peer_id, token); mirrors sa_apply_masks_src."""
     masked = x % SA_MOD
     for peer_id, token in peers:
-        m = mask_for_peer(token, 1, k_dim, source)  # round_id fixed to 1 for the test
+        m = mask_for_peer(soul_id, peer_id, token, 1, k_dim, source)  # round_id fixed to 1 for the test
         cmp = id_compare(soul_id, peer_id)
         if cmp < 0:
             masked = (masked + m) % SA_MOD
@@ -73,7 +80,7 @@ def reconcile_for_dropped(soul_id: str, masked_x: int, dropped_id: str,
     """Remove the dropped peer's mask contribution from a masked value."""
     for peer_id, token in peers:
         if peer_id == dropped_id:
-            m = mask_for_peer(token, 1, k_dim, source)
+            m = mask_for_peer(soul_id, dropped_id, token, 1, k_dim, source)
             cmp = id_compare(soul_id, dropped_id)
             if cmp < 0:
                 # soul ADDED +m -> remove it (subtract).
@@ -98,7 +105,8 @@ def recv_line(sock):
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["survivor", "dropout"], default="survivor")
-    p.add_argument("--peer", required=True)
+    p.add_argument("--peer", required=True,
+                   help="peer soul id; comma-separated for several peers")
     p.add_argument("--token", required=True)
     p.add_argument("--soul-id", required=True)
     p.add_argument("--host", default="127.0.0.1")
@@ -108,7 +116,7 @@ def main() -> int:
     p.add_argument("--tag", default="topic:test")
     args = p.parse_args()
 
-    peers = [(args.peer, args.token)]
+    peers = [(pid, args.token) for pid in args.peer.split(",") if pid]
 
     # Dial with a small retry budget so the coord has time to bind.
     sock = None
@@ -127,11 +135,12 @@ def main() -> int:
 
     try:
         # Handshake: SECAGG_HELLO + OK + FED_JOIN + SECAGG_PEER + ACK 0.
-        sock.sendall(b"SECAGG_HELLO ce-fed v2-sa\n")
+        sock.sendall(b"SECAGG_HELLO ce-fed v3-sa\n")
         ok = recv_line(sock)
         sys.stderr.write(f"secagg_smoke_soul[{args.soul_id}]: server replied {ok!r}\n")
         sock.sendall(f"FED_JOIN {args.soul_id} 1000\n".encode("ascii"))
-        sock.sendall(f"SECAGG_PEER {args.peer} {args.token}\n".encode("ascii"))
+        for pid, tok in peers:
+            sock.sendall(f"SECAGG_PEER {pid} {tok}\n".encode("ascii"))
         sock.sendall(b"ACK 0\n")
         if args.mode == "dropout":
             # Goal: drop AFTER the JOIN handshake but BEFORE the round
@@ -155,6 +164,7 @@ def main() -> int:
         sock.sendall(b"ACK 1\n")
         # Track the unreconciled stat in case the coord sends FED_DROPOUT.
         last_mp, last_ma = mp, ma
+        reconciled = []
         while True:
             line = recv_line(sock)
             if line is None:
@@ -167,6 +177,14 @@ def main() -> int:
                 parts = line.split(" ")
                 # FED_DROPOUT <round> <dropped_id>
                 dropped_id = parts[2]
+                # Same limits as fed_agg_emit_recon_masked: no duplicates,
+                # only known peers, and never strip the last remaining mask.
+                known = [pid for pid, _ in peers]
+                if (dropped_id in reconciled or dropped_id not in known
+                        or len(peers) - len(reconciled) - 1 < 1):
+                    sys.stderr.write(f"secagg_smoke_soul[{args.soul_id}]: refusing reconciliation for {dropped_id}\n")
+                    continue
+                reconciled.append(dropped_id)
                 adj_p = reconcile_for_dropped(args.soul_id, last_mp,
                                               dropped_id, 0, peers, args.tag)
                 adj_a = reconcile_for_dropped(args.soul_id, last_ma,
