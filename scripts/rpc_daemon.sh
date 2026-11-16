@@ -12,8 +12,11 @@
 #   scripts/rpc_daemon.sh                       # loopback, port 9876
 #   CE_RPC_PORT=19876 scripts/rpc_daemon.sh     # custom port
 #   CE_RPC_BIND=192.168.1.10 CE_RPC_BIND_ALLOW_NON_LOOPBACK=1 \
-#       scripts/rpc_daemon.sh                   # LAN (only with the
-#                                               # explicit allow flag)
+#       CE_RPC_REQUIRE_TOKEN=1 CE_RPC_ADMIN_TOKEN_FILE=<path> \
+#       scripts/rpc_daemon.sh                   # LAN: needs the allow
+#                                               # flag AND token
+#                                               # enforcement (the binary
+#                                               # refuses otherwise)
 #
 # See docs/SHIP_AS_APP.md for the full operator manual.
 
@@ -45,7 +48,9 @@ case "$BIND" in
 ERROR: CE_RPC_BIND=$BIND is not a loopback address.
 The RPC wire executes named skills. Binding non-loopback exposes that
 to every host on the network. If you know what you're doing, re-run
-with CE_RPC_BIND_ALLOW_NON_LOOPBACK=1 . Consider layering TLS or an
+with CE_RPC_BIND_ALLOW_NON_LOOPBACK=1 plus CE_RPC_REQUIRE_TOKEN=1 and
+CE_RPC_ADMIN_TOKEN_FILE=<path> (the daemon itself refuses a non-loopback
+bind without token enforcement). Consider layering TLS or an
 SSH tunnel before doing this.
 EOF
             exit 2
