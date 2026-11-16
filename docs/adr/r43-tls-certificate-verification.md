@@ -119,3 +119,16 @@ constant-time `bignum_2048` ladder stays for the DH users. Effects:
   different sizes can never match on their low limbs (the F-17 failure mode).
 - Not supported: RSASSA-PSS *certificate* signatures (none in the system
   bundle) and SHA-1 signatures.
+
+## Update (PR 4c)
+
+P-384 (`src/safety/p384.nova`) on the same width-generic Montgomery code
+(12 limbs; Jacobian a = -3 formulas; Shamir's trick for u1*G + u2*Q;
+Fermat inversion; variable time -- public inputs only). Certificates may use
+ecdsa-with-SHA256/384/512 with a P-256 or P-384 key (a longer digest is
+truncated to the curve order's size, FIPS 186-4 6.4); the namedCurve OID
+must match the point length. TLS 1.3 CertificateVerify accepts
+ecdsa_secp384r1_sha384 (0x0503), and 0x0403 / 0x0503 are bound to their
+curve. The system bundle now loads 121 of 122 roots (all but P-521), and 118
+of them verify their own signature under this code (the other 3 are
+SHA-1-signed).
