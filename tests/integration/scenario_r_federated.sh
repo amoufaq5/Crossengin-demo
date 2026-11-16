@@ -84,6 +84,7 @@ rm -f /tmp/crossengin.snap /tmp/crossengin.default.snap \
 # Build the chat input. We /teach a few words first so the
 # meta_observer has live data the next FED_STAT batch can carry.
 INPUT=$(
+    printf '/cap grant network_send\n'
     printf '/teach widget\n'
     printf '/teach gadget\n'
     printf '/teach sprocket\n'

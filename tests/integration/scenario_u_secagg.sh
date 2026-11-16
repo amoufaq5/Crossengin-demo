@@ -82,6 +82,7 @@ SHARED_TOKEN="ce-secagg-shared-token"
 INPUT_A=$(
     printf '/teach widget\n'
     printf '/teach gadget\n'
+    printf '/cap grant network_send\n'
     printf "/fed_join 127.0.0.1:$PORT\n"
     printf '/fed_leave\n'
     printf '/quit\n'
@@ -89,6 +90,7 @@ INPUT_A=$(
 INPUT_B=$(
     printf '/teach widget\n'
     printf '/teach sprocket\n'
+    printf '/cap grant network_send\n'
     printf "/fed_join 127.0.0.1:$PORT\n"
     printf '/fed_leave\n'
     printf '/quit\n'
@@ -387,6 +389,7 @@ rm -f /tmp/crossengin_secagg_dh_alice.snap /tmp/crossengin_secagg_dh_bob.snap \
 INPUT_DA=$(
     printf '/teach widget\n'
     printf '/teach gadget\n'
+    printf '/cap grant network_send\n'
     printf "/fed_join 127.0.0.1:$PORT3\n"
     printf '/fed_leave\n'
     printf '/quit\n'
@@ -394,6 +397,7 @@ INPUT_DA=$(
 INPUT_DB=$(
     printf '/teach widget\n'
     printf '/teach sprocket\n'
+    printf '/cap grant network_send\n'
     printf "/fed_join 127.0.0.1:$PORT3\n"
     printf '/fed_leave\n'
     printf '/quit\n'
@@ -560,6 +564,7 @@ rm -f /tmp/crossengin_secagg_dh2048_alice.snap /tmp/crossengin_secagg_dh2048_bob
 INPUT_EA=$(
     printf '/teach widget\n'
     printf '/teach gadget\n'
+    printf '/cap grant network_send\n'
     printf "/fed_join 127.0.0.1:$PORT4\n"
     printf '/fed_leave\n'
     printf '/quit\n'
@@ -567,6 +572,7 @@ INPUT_EA=$(
 INPUT_EB=$(
     printf '/teach widget\n'
     printf '/teach sprocket\n'
+    printf '/cap grant network_send\n'
     printf "/fed_join 127.0.0.1:$PORT4\n"
     printf '/fed_leave\n'
     printf '/quit\n'
