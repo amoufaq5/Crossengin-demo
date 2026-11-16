@@ -10,6 +10,8 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+# Unit tests keep the historical /tmp paths (audit F-24 run dir).
+export CE_RUN_DIR="${CE_RUN_DIR:-/tmp}"
 
 NOVA_ROOT="${NOVA_ROOT:-$HOME/NOVA}"
 NOVA="$NOVA_ROOT/nova"

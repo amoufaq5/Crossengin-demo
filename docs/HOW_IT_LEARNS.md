@@ -210,7 +210,8 @@ git fetch && git checkout claude/phase-0-substrate && git pull --ff-only
 export NOVA_ROOT=$HOME/NOVA
 make install
 
-# Fresh dlog so counts start at 0
+# Fresh dlog so counts start at 0 (pin the runtime dir to /tmp for the demo)
+export CE_RUN_DIR=/tmp
 rm -f /tmp/crossengin.dlog
 
 # 10-query demo (feel free to extend to 20)

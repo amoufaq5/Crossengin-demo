@@ -148,12 +148,12 @@ The 272-not-300 mean (vs. the Phase 0 pt2 PR's 300) reflects the pre-session pac
 
 ```
 > learn antibiotics
-(no cache for 'antibiotics' [topic] at /tmp/crossengin_learn_antibiotics.txt)
+(no cache for 'antibiotics' [topic] at <run dir>/crossengin_learn_antibiotics.txt)
   run first:  scripts/learn.sh antibiotics
 ```
 
 - **Phase 3 pt1 (PR #22)** added `_try_auto_prefix` with an allowlist (`learn`, `teach`, `why`, `know`, …) + denylist (`halt`, `save`, `retract`, `fed_*`, `gossip_*`, …).
-- Topic-mode `/learn <topic>` already existed; it reads `/tmp/crossengin_learn_<tag>.txt` written by `scripts/learn.sh`.
+- Topic-mode `/learn <topic>` already existed; it reads `<run dir>/crossengin_learn_<tag>.txt` written by `scripts/learn.sh`.
 
 Try a denylisted verb bare — `retract fever` — and auto-prefix declines, letting NL handle the retract (which now goes through the pt1-safety cap gate, see §6).
 

@@ -13,7 +13,7 @@
 #
 # For each kind, drives scripts/learn.sh and asserts:
 #   - the script exits 0,
-#   - the expected /tmp/crossengin_learn_<tag>.txt was created,
+#   - the expected $CE_LEARN_DIR/crossengin_learn_<tag>.txt was created,
 #   - the file has >= the expected number of vocab lines (for offline kinds
 #     the lower bound is exact; for fetch kinds we just assert non-empty).
 #
@@ -26,7 +26,11 @@
 
 set -uo pipefail
 
+# Audit F-24: learn caches live in the private per-user runtime dir (the
+# chat reads them from there); /tmp let another user plant "facts".
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/_run_dir.sh"
+CE_LEARN_DIR="$(ce_run_dir)" || exit 70
 LEARN="$REPO_ROOT/scripts/learn.sh"
 
 if [ ! -x "$LEARN" ]; then
@@ -47,10 +51,10 @@ if ! curl -sLf --max-time 5 -A "crossengin-learn-smoke/0.1" \
     echo "NOTE: curl cannot reach en.wikipedia.org in 5s -- TOPIC and URL tests will SKIP."
 fi
 
-# --- helper: assert /tmp/crossengin_learn_<tag>.txt has >= 10 lines ---------
+# --- helper: assert $CE_LEARN_DIR/crossengin_learn_<tag>.txt has >= 10 lines ---------
 check_cache() {
     local label="$1" tag="$2" min="$3"
-    local cache="/tmp/crossengin_learn_${tag}.txt"
+    local cache="$CE_LEARN_DIR/crossengin_learn_${tag}.txt"
     if [ ! -f "$cache" ]; then
         echo "FAIL: $label: $cache not created"
         fail=$((fail + 1))
@@ -115,7 +119,7 @@ echo "[3/6] FILE: scripts/learn.sh /tmp/learn_smoke_corpus.txt"
 CORPUS="/tmp/learn_smoke_corpus.txt"
 # The trap covers every temp artefact produced from here on: per-kind logs
 # (file/topic/url/batch/rss/dir) and the fixture inputs (test_urls.txt and
-# the dir corpus). Caches under /tmp/crossengin_learn_* are LEFT in place so a
+# the dir corpus). Caches under $CE_LEARN_DIR/crossengin_learn_* are LEFT in place so a
 # subsequent chat session can /learn them by hand.
 trap 'rm -rf "$CORPUS" /tmp/learn_smoke_topic.log /tmp/learn_smoke_url.log /tmp/learn_smoke_file.log /tmp/learn_smoke_batch.log /tmp/learn_smoke_rss.log /tmp/learn_smoke_dir.log /tmp/test_urls.txt /tmp/test_corpus_dir' EXIT
 
@@ -173,12 +177,12 @@ if "$LEARN" @/tmp/test_urls.txt > /tmp/learn_smoke_batch.log 2>&1; then
         fail=$((fail + 1))
     else
         # The bash script derives tag=batch_test_urls (basename without .ext,
-        # prefixed batch_). The combined cache is /tmp/crossengin_learn_<tag>.txt.
+        # prefixed batch_). The combined cache is $CE_LEARN_DIR/crossengin_learn_<tag>.txt.
         if [ "$NET_OK" -eq 1 ]; then
             check_cache "BATCH @urls.txt" "batch_test_urls" 10
         else
             # No network -> file exists but empty; just assert presence.
-            if [ -f "/tmp/crossengin_learn_batch_test_urls.txt" ]; then
+            if [ -f "$CE_LEARN_DIR/crossengin_learn_batch_test_urls.txt" ]; then
                 echo "PASS: BATCH (network down) created combined cache file (no fetch)"
                 pass=$((pass + 1))
             else
@@ -209,8 +213,8 @@ if [ "$NET_OK" -eq 1 ]; then
         else
             # Combined cache may or may not have words depending on which
             # links the feed exposed; just assert the file exists.
-            if [ -f "/tmp/crossengin_learn_${RSS_TAG}.txt" ]; then
-                echo "PASS: RSS: combined cache /tmp/crossengin_learn_${RSS_TAG}.txt exists"
+            if [ -f "$CE_LEARN_DIR/crossengin_learn_${RSS_TAG}.txt" ]; then
+                echo "PASS: RSS: combined cache $CE_LEARN_DIR/crossengin_learn_${RSS_TAG}.txt exists"
                 pass=$((pass + 1))
             else
                 echo "FAIL: RSS: combined cache was not created"

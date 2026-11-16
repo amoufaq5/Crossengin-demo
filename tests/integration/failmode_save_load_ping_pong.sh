@@ -4,6 +4,7 @@
 # count, soul name, and a taught word must all still be consistent.
 
 . "$(dirname "$0")/_lib.sh"
+grant_caps delete   # /load is gated by CAP_DELETE
 require_chat
 
 PASS=0; FAIL=0

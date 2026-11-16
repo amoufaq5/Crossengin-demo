@@ -14,6 +14,11 @@
 # Convention: scripts use `set -uo pipefail` (NOT `set -e` -- we want to record
 # failures, not abort) and call `summary` as their last action.
 
+# Audit F-24: production defaults now live in a private per-user runtime
+# dir; the integration tests pin it to /tmp so the paths they inspect
+# (/tmp/crossengin.default.dlog, /tmp/crossengin_learn_*, ...) are unchanged.
+export CE_RUN_DIR="${CE_RUN_DIR:-/tmp}"
+
 set -uo pipefail
 
 PASS=${PASS:-0}
@@ -105,6 +110,18 @@ run_chat() {
     printf '%s\n' "$input" | "$CHAT" 2>&1
 }
 
+# Pre-grant capabilities for a scenario that exercises gated verbs
+# non-interactively. /load needs `delete` (CAP_DELETE -> approval prompt by
+# default), and the scripted stdin would otherwise answer the y/N prompt with
+# the next command line and decline. Usage: grant_caps delete [other ...]
+grant_caps() {
+    local f
+    f="$(mktemp /tmp/ce_int_caps.XXXXXX)"
+    for c in "$@"; do printf '%s=allow\n' "$c" >> "$f"; done
+    export CE_CAPS_CONF="$f"
+    _CE_INT_CAPS_FILE="$f"   # removed by summary()
+}
+
 it_section() {
     printf "%s== %s ==%s\n" "$C_DIM" "$1" "$C_RST"
 }
@@ -113,6 +130,7 @@ it_section() {
 # tests/integration/*.sh script ends with `summary <name>`.
 summary() {
     local name="$1"
+    if [ -n "${_CE_INT_CAPS_FILE:-}" ]; then rm -f -- "${_CE_INT_CAPS_FILE}"; fi
     if [ "$FAIL" -eq 0 ]; then
         printf "integration %s: ${C_GRN}pass=%d fail=%d${C_RST}\n" "$name" "$PASS" "$FAIL"
     else

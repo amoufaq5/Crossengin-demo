@@ -7,6 +7,7 @@
 # pack error path and the --reset force-install.
 
 . "$(dirname "$0")/_lib.sh"
+grant_caps delete   # /load is gated by CAP_DELETE
 require_chat
 
 PASS=0; FAIL=0
@@ -34,15 +35,17 @@ OUT=$(printf '/status
 /quit
 ' | "$CHAT" 2>&1)
 
-# 1. /seed (no arg) listed 3 packs.
-assert_match "$OUT" "domain seed packs \\(3 available\\)" \
-    "/seed lists 3 available packs"
+# 1. /seed (no arg) listed 4 packs (Phase 4 added logic).
+assert_match "$OUT" "domain seed packs \\(4 available\\)" \
+    "/seed lists 4 available packs"
 assert_match "$OUT" "medical \\(~[0-9]+ atoms\\)" \
     "/seed listing shows medical with atom count"
 assert_match "$OUT" "ops_runbook \\(~[0-9]+ atoms\\)" \
     "/seed listing shows ops_runbook with atom count"
 assert_match "$OUT" "code_review \\(~[0-9]+ atoms\\)" \
     "/seed listing shows code_review with atom count"
+assert_match "$OUT" "logic \\(~[0-9]+ atoms\\)" \
+    "/seed listing shows logic with atom count"
 
 # 2. /seed medical installed the pack: line of the form
 #    (seed pack 'medical' installed: N atoms + M operators; KG now K atoms)
