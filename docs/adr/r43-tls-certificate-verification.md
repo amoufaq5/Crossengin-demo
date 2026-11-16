@@ -132,3 +132,23 @@ ecdsa_secp384r1_sha384 (0x0503), and 0x0403 / 0x0503 are bound to their
 curve. The system bundle now loads 121 of 122 roots (all but P-521), and 118
 of them verify their own signature under this code (the other 3 are
 SHA-1-signed).
+
+## Update (PR 4d + 4e): issuer chaining, verification on by default
+
+- Path building: walking up from the leaf, the first cert that either IS an
+  anchor (same key) or is ISSUED BY an anchor carrying its cert (issuer Name
+  == anchor subject Name byte for byte, anchor is a CA allowed to sign at
+  that depth and valid now, signature verifies under its key) is the trust
+  point. Certs above it are ignored, so servers may omit the root or send
+  cross-signed extras. Adjacent certs must chain by name
+  (`XV_NAME_CHAIN`, "issuer-subject-mismatch"). PEM anchors carry their cert
+  record (`anchor[3]`); the built-in pins stay key-only.
+- `CE_TLS_STRICT` now defaults to verify; only `CE_TLS_STRICT=0` turns it off,
+  with a one-time stderr warning. Trust store: `CE_TLS_CA_BUNDLE`, else the
+  system bundle, else the pins; a set but unusable `CE_TLS_CA_BUNDLE` yields
+  no anchors (fail closed) instead of silently falling back to the pins.
+- Verified live in the sandbox (example.com, en.wikipedia.org,
+  api.dictionaryapi.dev: HTTP 200 by default; refused with an unrelated
+  bundle) and offline on captured real chains (Let's Encrypt via ISRG Root
+  X2 cross-signs, SSL.com, Google Trust Services, the gateway chain without
+  its root): tests/unit/test_real_chains.nova.

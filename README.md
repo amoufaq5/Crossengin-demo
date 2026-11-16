@@ -4439,6 +4439,20 @@ make install
 ./bin/crossengin-kg-subscriber    # distributed-substrate seam: subscriber
 ```
 
+### HTTPS and certificate verification
+
+`/learn https://...`, `/research` and `/define` fetch over CrossEngin's own
+TLS 1.3 client, which **verifies the server certificate by default**: the
+chain must lead to a trusted root (RSA-2048/3072/4096 or P-256/P-384;
+servers may omit the root), cover the host name and be in date, and the
+server's CertificateVerify signature must check out.
+
+| Variable | Effect |
+|---|---|
+| `CE_TLS_CA_BUNDLE=/path/ca.pem` | Trust exactly these roots. If the file is missing or holds no usable root, every server is refused. |
+| *(unset)* | Trust `/etc/ssl/certs/ca-certificates.crt`; if that is absent, the built-in sandbox-gateway pins. |
+| `CE_TLS_STRICT=0` | Turn verification off (encrypted but **not authenticated**); a warning is printed on stderr. |
+
 ### Operations utilities
 
 Three small shell tools cover the operations layer around the binaries:
