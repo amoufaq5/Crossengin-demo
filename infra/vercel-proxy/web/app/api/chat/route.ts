@@ -51,6 +51,21 @@ function jsonError(status: number, error: string, hint?: string) {
 }
 
 export async function POST(req: NextRequest): Promise<Response> {
+  // ---- disabled by default (audit F-18) -----------------------------------
+  // This route forwards any visitor's message to the backend with the
+  // server's bearer token, and the backend picks the session from the
+  // client-supplied session_id -- so anyone could drive anyone's session,
+  // slash commands included. The relay is not used, so it is off unless a
+  // deployer explicitly opts in. Re-enabling it needs real per-user auth
+  // and server-issued session ids first.
+  if (process.env.CROSSENGIN_RELAY_ENABLED !== "1") {
+    return jsonError(
+      503,
+      "relay disabled",
+      "this public relay is off by default; set CROSSENGIN_RELAY_ENABLED=1 only behind authentication",
+    );
+  }
+
   // ---- env-var sanity -----------------------------------------------------
   const backend = process.env.CROSSENGIN_URL;
   const token = process.env.CROSSENGIN_TOKEN;

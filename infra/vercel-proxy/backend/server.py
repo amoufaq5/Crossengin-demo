@@ -45,7 +45,7 @@ Env vars (read at startup)
   CROSSENGIN_TOKEN     required, the bearer this server validates
   CE_BIN               default: bin/crossengin-chat
   CE_PORT              default: 8080
-  CE_BIND              default: 0.0.0.0 (the proxy is the trust boundary)
+  CE_BIND              default: 127.0.0.1 (audit F-18; set 0.0.0.0 only behind auth)
   CE_MAX_SESSIONS      default: 8 (LRU cap; matches scripts/web.py)
   CE_REQUEST_TIMEOUT_S default: 30.0
 """
@@ -64,7 +64,7 @@ import time
 TOKEN = os.environ.get("CROSSENGIN_TOKEN", "")
 BIN = os.environ.get("CE_BIN", "bin/crossengin-chat")
 PORT = int(os.environ.get("CE_PORT", "8080"))
-BIND = os.environ.get("CE_BIND", "0.0.0.0")
+BIND = os.environ.get("CE_BIND", "127.0.0.1")
 MAX_SESSIONS = int(os.environ.get("CE_MAX_SESSIONS", "8"))
 REQUEST_TIMEOUT_S = float(os.environ.get("CE_REQUEST_TIMEOUT_S", "30.0"))
 
