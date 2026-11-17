@@ -21,6 +21,17 @@ chat prints one banner line at startup, for example
 | `CE_ABL_SYNW` | Router-table weights change no behaviour. The router ignores them when it scores candidate operators, and `/good` no longer compiles weight-gated A→C shortcut operators (the chain compiler). Edges still grow and `/good` still writes the weights. | `compiled_count=0` in `/__compiled__` |
 | `CE_ABL_BETA` | `/good` and `/bad` no longer update operator confidence. | `[conf=...]` in reasoning traces |
 
+## CE_HEBB (B3, audit F-03)
+
+`CE_HEBB=1` is not an ablation: it turns **on** a Hebbian step on the
+cognitive router's table after every routed reply, cache hit or miss
+(`cr_hebb_step`). It applies `syn_learn_one` to the existing router-table
+edges of the reply's chain (first premise activation 1000, each conclusion
+= premise activation × operator confidence, error 0, the turn's modulator).
+It never grows edges. It prints its own startup banner, adds `hebb_steps`
+and `hebb_updates` rows to `/__learning__`, and appears as `hebb` at the end
+of the `EXP` `flags` field. Off by default; with it off, output is unchanged.
+
 ## Trace
 
 `CE_EXP_TRACE=1` prints one line per conversational turn, including turns the
@@ -40,7 +51,7 @@ Fields:
 - **`router`:** 1 when the turn went through the cognitive router. When it is 0, the fields `ops`, `trace` and `category` are empty.
 - **`modulator` / `pc_error`:** the values passed to the turn's tick. The turn recomputes both after that tick, and the new values drive the next turn's tick.
 - **`fired`:** substrate nodes fired by the turn's tick. That tick runs before the turn's own input is injected, so it integrates the previous turn's stimulus; turn 0 always shows 0.
-- **`flags`:** the ablations that are on.
+- **`flags`:** the ablations that are on, then `hebb` when `CE_HEBB=1`.
 
 Wall time is not reported; measure it outside the process.
 
