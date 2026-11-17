@@ -19,11 +19,31 @@
 //        <avg_promo> <avg_atr> <n_participants> to every active soul.
 //     6. Loops.
 //
-//   This is a SIMPLE coordinator -- it does NOT support reconnect, does
-//   NOT persist round history, and does NOT do anything sophisticated
-//   for soul-side failures (a quiet soul just gets less weight in the
-//   next aggregate). The acceptance test asserts the round-trip flow.
-//   The audit doc walks the production gaps.
+//   This is a SIMPLE coordinator -- it does NOT support reconnect and
+//   does NOT do anything sophisticated for soul-side failures in v1 mode
+//   (a quiet soul just gets less weight in the next aggregate). In SecAgg
+//   mode it persists the last round id in the run dir (see below) and
+//   aborts a round on dropout unless reconciliation is opted in. The
+//   acceptance tests assert the round-trip flow. The audit docs
+//   (FEDERATED_AUDIT.md, SECAGG_AUDIT.md) walk the production gaps.
+//
+//   SecAgg mode (CE_SECAGG_ENABLED=1) speaks protocol v3n-sa:
+//     soul -> coord : SECAGG_HELLO ce-fed v3n-sa      (exact)
+//     coord -> soul : OK ce-fed v3n-sa protocol accepted
+//     soul -> coord : FED_JOIN <id> <eps>
+//                     SECAGG_PEER <peer_id> ...        (no token)
+//                     [FED_DH_PUBLIC <id> <hex>]       (DH mode)
+//                     SECAGG_NONCE <id> <32 hex>
+//                     ACK 0
+//     (after every soul joined, the peer sets checked, >= 2 souls)
+//     coord -> soul : [FED_DH_PUBLIC <other> <hex>]... SECAGG_NONCE <other> <hex>...
+//                     ACK 0                            (always)
+//     coord -> soul : FED_ROUND <rid> <deadline>       (rid persisted first)
+//     soul -> coord : FED_STAT_MASKED ... ACK <rid>
+//     coord -> soul : FED_AGGREGATE_SUM ...            (or BYE on abort)
+//   A handshake with a parse error / unknown line, a token-carrying
+//   3-field SECAGG_PEER, a duplicate soul id, no nonce or no peers is
+//   rejected (ERR + close).
 //
 //   stdin -> none consumed. The coordinator runs until SIGTERM / EOF
 //   on stdin (we read one line of stdin per round end so a script can
@@ -36,6 +56,17 @@
 //     CE_FED_TOKEN             -- shared auth token (default: anonymous)
 //     CE_FED_SOULS             -- expected initial soul count (default 1)
 //     CE_FED_MAX_ROUNDS        -- bound rounds (test mode; default 0 = forever)
+//     CE_SECAGG_ENABLED        -- 1 = SecAgg (v3n-sa) mode
+//     CE_SECAGG_ALLOW_RECON    -- "1" = on a dropout, run FED_DROPOUT /
+//                                 FED_RECON_MASKED reconciliation; default:
+//                                 ABORT the round (no sum, BYE, session ends)
+//     CE_SECAGG_ALLOW_WEAK_DH  -- "1" = accept FED_DH_PUBLIC (DH mode is
+//                                 relayed unauthenticated by this coordinator)
+//     CE_FED_WIRE_LOG          -- path: append every line sent/received
+//                                 ("C>S ..." / "S>C ...", mode 0600)
+//     CE_RUN_DIR               -- run dir holding the SecAgg round counter
+//                                 file crossengin_fed_secagg_round (0600,
+//                                 written durably before each FED_ROUND)
 //
 // ADRs exercised: ADR-0054 (federated multi-soul framework). NOVA
 //   dependencies: socket builtins, getenv, nanotime, read_line.
@@ -47,6 +78,8 @@ import "../src/io/transducers/kg_sync.nova"
 import "../src/learning/federated_aggregator.nova"
 import "../src/learning/secure_aggregation.nova"
 import "../src/util/str_safe.nova"
+import "../src/util/run_dir.nova"
+import "../src/util/sys_tagged.nova"
 import "std/syscall"
 import "std/string"
 
@@ -59,17 +92,14 @@ let CSOUL_ID       = 1
 let CSOUL_EPSILON  = 2
 let CSOUL_ACTIVE   = 3
 
-// P3.8r dropout-resilience state. The coordinator marks a soul as
-// "dropped this round" when the soul's recv-line returns 0 (EOF /
-// disconnect) before any FED_STAT_MASKED arrives. Maintained as a
-// list of soul_id strings reset each round. The brief calls for an
-// explicit deadline, but the NOVA single-thread blocking-IO model
-// can't enforce a sub-recv timeout without per-fd O_NONBLOCK, so we
-// detect the conventional dropout signal (peer-closed fd) and treat
-// the absence of a stat batch from a still-open peer as a
-// soft-dropout that the recon path then handles harmlessly (the
-// surviving souls still adjust their submissions, the dropped one
-// just contributes 0).
+// P3.8r dropout state. The coordinator marks a soul as "dropped this
+// round" when the soul's recv-line returns 0 (EOF / disconnect) before
+// any FED_STAT_MASKED arrives, when it ACKs the round with no masked stat
+// (soft dropout), or on a protocol error. Maintained as a list of soul_id
+// strings per round. The NOVA single-thread blocking-IO model can't
+// enforce a sub-recv timeout without per-fd O_NONBLOCK, so a silent but
+// open soul still blocks the round. v3n-sa: any dropout ABORTS the round
+// unless CE_SECAGG_ALLOW_RECON=1.
 
 fn _csoul_new(fd, soul_id, epsilon) {
     let s = list_new()
@@ -90,42 +120,42 @@ fn _auth_mode_str(token) {
 // Returns the [fd, soul_id, epsilon] tuple on success, or 0 on rejection
 // (and the fd is closed).
 fn _fed_accept_handshake(sub_fd, expected_token) {
-    let hello = _recv_line(sub_fd)
+    let hello = _cw_recv(sub_fd)
     if hello == 0 {
         close_fd(sub_fd)
         return 0
     }
     if _is_hello_fed(hello) == 0 {
-        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected HELLO ce-fed v1\n")
+        _cw_send(sub_fd, KGSYNC_ERR_PREFIX + "expected HELLO ce-fed v1\n")
         close_fd(sub_fd)
         return 0
     }
     if expected_token != 0 {
         let client_tok = _parse_hello_token(hello)
         if client_tok == 0 {
-            _send_all(sub_fd, KGSYNC_ERR_AUTH + "\n")
+            _cw_send(sub_fd, KGSYNC_ERR_AUTH + "\n")
             close_fd(sub_fd)
             return 0
         }
         if str_eq_bytes(client_tok, expected_token) == 0 {
-            _send_all(sub_fd, KGSYNC_ERR_AUTH + "\n")
+            _cw_send(sub_fd, KGSYNC_ERR_AUTH + "\n")
             close_fd(sub_fd)
             return 0
         }
     }
-    if _send_all(sub_fd, KGSYNC_OK_FED_V1_LINE + "\n") == 0 {
+    if _cw_send(sub_fd, KGSYNC_OK_FED_V1_LINE + "\n") == 0 {
         close_fd(sub_fd)
         return 0
     }
     // Expect FED_JOIN next.
-    let join_line = _recv_line(sub_fd)
+    let join_line = _cw_recv(sub_fd)
     if join_line == 0 {
         close_fd(sub_fd)
         return 0
     }
     let rec = _parse_fed_join_line(join_line)
     if rec == 0 {
-        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected FED_JOIN\n")
+        _cw_send(sub_fd, KGSYNC_ERR_PREFIX + "expected FED_JOIN\n")
         close_fd(sub_fd)
         return 0
     }
@@ -134,83 +164,348 @@ fn _fed_accept_handshake(sub_fd, expected_token) {
     return _csoul_new(sub_fd, soul_id, epsilon)
 }
 
-// SecAgg-mode handshake: expect SECAGG_HELLO ce-fed v2-sa, accept
-// a FED_JOIN, then drain SECAGG_PEER and (P3.9, additive) FED_DH_PUBLIC
-// lines until the ACK <round=0> sentinel. Returns
-// [fd, soul_id, epsilon, peer_count, dh_pubkey_or_0] on success, 0
-// on rejection. dh_pubkey_or_0 is the hex string of this soul's DH
-// public key when the soul opted into v2-sa-dh, or 0 when the soul
-// announced no FED_DH_PUBLIC (pre-shared-token v2-sa-r mode).
-fn _fed_accept_handshake_secagg(sub_fd) {
-    let hello = _recv_line(sub_fd)
+// ---- v3n-sa wire log + SIGPIPE ----------------------------------------------
+// CE_FED_WIRE_LOG=<path>: every line the coordinator sends or receives
+// through _cw_send / _cw_recv (the SecAgg path, and the shared v1 helpers)
+// is appended as "fd=<n> C>S <line>" (received from a soul) or
+// "fd=<n> S>C <line>" (sent to a soul). Opened once, O_APPEND|O_CREAT|O_NOFOLLOW, mode 0600
+// (an existing file is chmod'ed to 0600). Absent unless the env is set.
+let _cw_log_fd = 0 - 1
+
+fn _cw_log_open() {
+    let p = getenv("CE_FED_WIRE_LOG")
+    if p == 0 { return 0 }
+    if len(p) == 0 { return 0 }
+    let flags = O_WRONLY + O_CREAT + O_APPEND + 131072   // + O_NOFOLLOW
+    let fd = sys_open(p, flags, 384)                       // 0600
+    if fd < 0 {
+        println("fed-coord: FATAL cannot open CE_FED_WIRE_LOG " + p)
+        exit(70)
+    }
+    ce_fchmod(fd, 384)
+    _cw_log_fd = fd
+    println("fed-coord: wire log enabled (CE_FED_WIRE_LOG, mode 0600)")
+    return 1
+}
+
+fn _cw_log(dir, fd, line) {
+    if _cw_log_fd < 0 { return 0 }
+    let t = "fd=" + int_to_str(fd) + " " + dir + " " + line + "\n"
+    _sys_write_tagged(_cw_log_fd, t, len(t))
+    return 1
+}
+
+fn _cw_recv(fd) {
+    let l = _recv_line(fd)
+    if l == 0 {
+        _cw_log("C>S", fd, "<EOF>")
+        return 0
+    }
+    _cw_log("C>S", fd, l)
+    return l
+}
+
+fn _cw_send(fd, s) {
+    let r = _send_all(fd, s)
+    if r == 1 { _cw_log("S>C", fd, _strip_eol(s)) }
+    else { _cw_log("S>C", fd, "<SEND FAILED> " + _strip_eol(s)) }
+    return r
+}
+
+// rt_sigaction(SIGPIPE, {SIG_IGN}). send_data is a plain write(2): without
+// this, a second write to a soul that closed its socket kills the
+// coordinator (exit 141) instead of returning an error to _send_all.
+fn _cw_rt_sigaction(sig, act) {
+    asm {
+        "mov rax, 13"
+        "mov rdi, [rbp-8]"
+        "sar rdi, 1"
+        "mov rsi, [rbp-16]"
+        "test rsi, 1"
+        "jz .cw_sa_u"
+        "sar rsi, 1"
+        ".cw_sa_u:"
+        "xor rdx, rdx"
+        "mov r10, 8"
+        "syscall"
+        "test rax, rax"
+        "js .cw_sa_ret"
+        "lea rax, [rax + rax + 1]"
+        ".cw_sa_ret:"
+    }
+}
+
+fn _cw_ignore_sigpipe() {
+    let act = alloc(40)
+    let i = 0
+    while i < 40 { store8(act + i, 0) i = i + 1 }
+    store8(act, 1)                 // sa_handler = SIG_IGN
+    return _cw_rt_sigaction(13, act)
+}
+
+// ---- v3n-sa persisted SecAgg round counter ----------------------------------
+// The last SecAgg round id this coordinator opened, in the run dir
+// (ce_run_path; CE_RUN_DIR when set). Round ids continue from it across
+// processes (no clock). Missing file -> 0; any other content than digits
+// (plus an optional trailing newline) is fatal (fail closed: never reset).
+// Monotonic per run dir; _fed_round_lock() enforces one coordinator per run dir.
+let CE_FED_SECAGG_ROUND_FILE = "crossengin_fed_secagg_round"
+
+fn _fed_round_path() {
+    return ce_run_path(CE_FED_SECAGG_ROUND_FILE)
+}
+
+// errno of a failed sys_open: it returns a raw -errno (not a NOVA int), so
+// it is negated and tagged here before comparing or printing.
+fn _fed_errno(raw_neg) {
+    asm {
+        "mov rax, [rbp-8]"
+        "neg rax"
+        "lea rax, [rax + rax + 1]"
+    }
+}
+
+fn _fed_round_load() {
+    let path = _fed_round_path()
+    let fd = sys_open(path, O_RDONLY + 131072, 0)          // O_NOFOLLOW
+    if fd < 0 {
+        let e = _fed_errno(fd)
+        if e == 2 { return 0 }                               // ENOENT: no counter yet
+        // ELOOP (a symlink), EACCES, ... : never treat as "missing", which
+        // would silently restart at round 1.
+        println("fed-coord: FATAL cannot open SecAgg round counter " + path
+            + " (errno " + int_to_str(e) + ")")
+        exit(70)
+    }
+    let cap = 64
+    let buf = alloc(cap + 1)
+    let n = _sys_read_tagged(fd, buf, cap)
+    sys_close(fd)
+    if n < 0 {
+        println("fed-coord: FATAL cannot read SecAgg round counter " + path)
+        exit(70)
+    }
+    let txt = ""
+    let i = 0
+    while i < n {
+        txt = txt + chr(load8(buf + i))
+        i = i + 1
+    }
+    let t = _strip_eol(txt)
+    if len(t) == 0 {
+        println("fed-coord: FATAL SecAgg round counter " + path + " is empty or corrupt")
+        exit(70)
+    }
+    if n >= cap {
+        println("fed-coord: FATAL SecAgg round counter " + path + " is corrupt (too long)")
+        exit(70)
+    }
+    if _is_digits(t) == 0 {
+        println("fed-coord: FATAL SecAgg round counter " + path + " is corrupt")
+        exit(70)
+    }
+    // At most 15 digits: far beyond any real count, and safe from NOVA
+    // int overflow (a wrapped value would make round ids go backwards).
+    if len(t) > 15 {
+        println("fed-coord: FATAL SecAgg round counter " + path + " is out of range")
+        exit(70)
+    }
+    return _fed_str_to_int(t)
+}
+
+// One coordinator per run dir: an exclusive, non-blocking flock(2) on a
+// lock file, held (fd never closed) for the life of the process and
+// released by the kernel when it exits. Two coordinators sharing a run dir
+// would otherwise both load the same counter and reuse round ids.
+let _fed_round_lock_fd = 0 - 1
+
+fn _fed_flock_ex_nb(fd) {
+    asm {
+        "mov rax, 73"
+        "mov rdi, [rbp-8]"
+        "mov rsi, 6"
+        "syscall"
+        "test rax, rax"
+        "js .cefl_ret"
+        "lea rax, [rax + rax + 1]"
+        ".cefl_ret:"
+    }
+}
+
+fn _fed_round_lock() {
+    let path = _fed_round_path() + ".lock"
+    let fd = sys_open(path, 2 + 64 + 131072, 384)           // O_RDWR|O_CREAT|O_NOFOLLOW, 0600
+    if fd < 0 {
+        println("fed-coord: FATAL cannot open SecAgg lock " + path
+            + " (errno " + int_to_str(_fed_errno(fd)) + ")")
+        exit(70)
+    }
+    if _fed_flock_ex_nb(fd) != 0 {
+        println("fed-coord: FATAL another coordinator is using this run dir ("
+            + path + " is locked); give each coordinator its own CE_RUN_DIR")
+        exit(70)
+    }
+    _fed_round_lock_fd = fd
+    return 1
+}
+
+// Durable write: temp file (O_EXCL|O_NOFOLLOW, 0600) + fsync + rename +
+// fsync of the run dir. Returns 1 on success, 0 on any failure.
+fn _fed_round_save(round_id) {
+    let path = _fed_round_path()
+    let tmp = path + ".tmp." + int_to_str(getpid())
+    sys_unlink(tmp)
+    let flags = O_WRONLY + O_CREAT + 131200                 // + O_EXCL|O_NOFOLLOW
+    let fd = sys_open(tmp, flags, 384)
+    if fd < 0 { return 0 }
+    let text = int_to_str(round_id) + "\n"
+    let w = _sys_write_tagged(fd, text, len(text))
+    if w != len(text) {
+        sys_close(fd)
+        sys_unlink(tmp)
+        return 0
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    if sys_rename(tmp, path) != 0 {
+        sys_unlink(tmp)
+        return 0
+    }
+    let dfd = sys_open(ce_run_dir(), O_RDONLY, 0)
+    if dfd >= 0 {
+        sys_fsync(dfd)
+        sys_close(dfd)
+    }
+    return 1
+}
+
+// ---- v3n-sa soul record -----------------------------------------------------
+// SecAgg soul record: _csoul_new's 4 slots plus
+let CSOUL_PEERS    = 4   // number of announced SECAGG_PEER lines
+let CSOUL_DH       = 5   // DH public key hex, or 0 (token mode)
+let CSOUL_NONCE    = 6   // this soul's SECAGG_NONCE hex
+let CSOUL_PEER_IDS = 7   // list of announced peer ids
+
+fn _fed_hs_reject(sub_fd, why) {
+    _cw_send(sub_fd, KGSYNC_ERR_PREFIX + why + "\n")
+    close_fd(sub_fd)
+    println("fed-coord: [SECAGG] REJECT handshake: " + why)
+    return 0
+}
+
+fn _fed_list_has(lst, v) {
+    let i = 0
+    while i < len(lst) {
+        if str_eq_bytes(lst[i], v) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// SecAgg-mode handshake (v3n-sa). Expects, in order:
+//   SECAGG_HELLO ce-fed v3n-sa      (exact; replied with the exact OK line)
+//   FED_JOIN <soul_id> <eps>
+// then, in any order until "ACK 0":
+//   SECAGG_PEER <peer_id>           one per declared peer (no token)
+//   FED_DH_PUBLIC <soul_id> <hex>   DH mode only; needs CE_SECAGG_ALLOW_WEAK_DH=1
+//   SECAGG_NONCE <soul_id> <32 hex> exactly once
+// Any parse error or unknown line, a 3-token (token-carrying) SECAGG_PEER,
+// a peer equal to the soul or listed twice, a second nonce / DH key, an id
+// mismatch, an ACK other than 0, a missing nonce or zero peers rejects the
+// soul (ERR line + close). Returns
+//   [fd, soul_id, eps, active, peer_count, dh_pubkey_or_0, nonce_hex, peer_ids]
+// (see CSOUL_*), or 0 on rejection.
+fn _fed_accept_handshake_secagg(sub_fd, allow_weak_dh) {
+    let hello = _cw_recv(sub_fd)
     if hello == 0 {
         close_fd(sub_fd)
         return 0
     }
     if _is_hello_fed_secagg(hello) == 0 {
-        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected SECAGG_HELLO ce-fed v3-sa\n")
+        return _fed_hs_reject(sub_fd, "expected " + KGSYNC_HELLO_FED_V2SA_LINE)
+    }
+    if _cw_send(sub_fd, KGSYNC_OK_FED_V2SA_LINE + "\n") == 0 {
         close_fd(sub_fd)
         return 0
     }
-    if _send_all(sub_fd, KGSYNC_OK_FED_V2SA_LINE + "\n") == 0 {
-        close_fd(sub_fd)
-        return 0
-    }
-    // Expect FED_JOIN next.
-    let join_line = _recv_line(sub_fd)
+    let join_line = _cw_recv(sub_fd)
     if join_line == 0 {
         close_fd(sub_fd)
         return 0
     }
     let rec = _parse_fed_join_line(join_line)
-    if rec == 0 {
-        _send_all(sub_fd, KGSYNC_ERR_PREFIX + "expected FED_JOIN\n")
-        close_fd(sub_fd)
-        return 0
-    }
+    if rec == 0 { return _fed_hs_reject(sub_fd, "expected FED_JOIN") }
     let soul_id = rec[KGSYNC_FED_SOUL_ID]
     let epsilon = rec[KGSYNC_FED_EPSILON]
-    // Drain SECAGG_PEER and (P3.9, additive) FED_DH_PUBLIC lines until
-    // an ACK 0 sentinel. The coordinator does NOT validate the per-peer
-    // tokens / pubkeys -- the masks themselves enforce the pair-
-    // cancellation contract (a tampered peer line on one side just
-    // produces an uncancelled mask, leaving an arithmetic signature in
-    // the final sum that the audit doc walks).
-    let peer_count = 0
+    let peer_ids = list_new()
     let dh_pubkey = 0
+    let nonce = 0
     let done = 0
     while done == 0 {
-        let line = _recv_line(sub_fd)
+        let line = _cw_recv(sub_fd)
         if line == 0 {
             close_fd(sub_fd)
+            println("fed-coord: [SECAGG] REJECT handshake: soul=" + soul_id + " closed before ACK 0")
             return 0
         }
         let prec = _parse_line(line)
-        if prec == 0 { done = 1 }
-        else {
-            let t = prec[KGSYNC_R_TYPE]
-            if t == KGSYNC_EV_SECAGG_PEER {
-                peer_count = peer_count + 1
-                println("fed-coord: SECAGG_PEER soul=" + soul_id
-                    + " peer=" + prec[KGSYNC_SECAGG_PEER_ID])
-            } else {
-                if t == KGSYNC_EV_FED_DH_PUBLIC {
-                    // P3.9 v2-sa-dh: stash this soul's DH public key
-                    // so the coordinator can broadcast it to peers
-                    // after all souls have joined.
-                    dh_pubkey = prec[KGSYNC_FED_DH_PUBKEY]
-                    println("fed-coord: [SECAGG-DH] FED_DH_PUBLIC soul=" + soul_id
-                        + " pubkey=" + substr(dh_pubkey, 0, 16) + "...")
-                } else {
-                    if t == KGSYNC_EV_ACK { done = 1 }
-                    else { done = 1 }
-                }
+        if prec == 0 {
+            return _fed_hs_reject(sub_fd, "bad SecAgg setup line (v3n-sa: SECAGG_PEER <id>, SECAGG_NONCE <id> <32hex>)")
+        }
+        let t = prec[KGSYNC_R_TYPE]
+        let handled = 0
+        if t == KGSYNC_EV_SECAGG_PEER {
+            handled = 1
+            let pid = prec[KGSYNC_SECAGG_PEER_ID]
+            if str_eq_bytes(pid, soul_id) == 1 {
+                return _fed_hs_reject(sub_fd, "SECAGG_PEER names the soul itself")
             }
+            if _fed_list_has(peer_ids, pid) == 1 {
+                return _fed_hs_reject(sub_fd, "duplicate SECAGG_PEER " + pid)
+            }
+            push(peer_ids, pid)
+            println("fed-coord: SECAGG_PEER soul=" + soul_id + " peer=" + pid)
+        }
+        if t == KGSYNC_EV_SECAGG_NONCE {
+            handled = 1
+            if str_eq_bytes(prec[KGSYNC_SECAGG_NONCE_SOUL], soul_id) == 0 {
+                return _fed_hs_reject(sub_fd, "SECAGG_NONCE soul id does not match FED_JOIN")
+            }
+            if nonce != 0 { return _fed_hs_reject(sub_fd, "second SECAGG_NONCE") }
+            nonce = prec[KGSYNC_SECAGG_NONCE_HEX]
+            println("fed-coord: [SECAGG] SECAGG_NONCE soul=" + soul_id)
+        }
+        if t == KGSYNC_EV_FED_DH_PUBLIC {
+            handled = 1
+            if allow_weak_dh != 1 {
+                return _fed_hs_reject(sub_fd, "DH mode refused (unauthenticated relay; set CE_SECAGG_ALLOW_WEAK_DH=1)")
+            }
+            if str_eq_bytes(prec[KGSYNC_FED_DH_SOUL_ID], soul_id) == 0 {
+                return _fed_hs_reject(sub_fd, "FED_DH_PUBLIC soul id does not match FED_JOIN")
+            }
+            if dh_pubkey != 0 { return _fed_hs_reject(sub_fd, "second FED_DH_PUBLIC") }
+            // P3.9: stash this soul's DH public key so the coordinator
+            // can relay it to the other souls after all have joined.
+            dh_pubkey = prec[KGSYNC_FED_DH_PUBKEY]
+            println("fed-coord: [SECAGG-DH] FED_DH_PUBLIC soul=" + soul_id
+                + " pubkey=" + substr(dh_pubkey, 0, 16) + "...")
+        }
+        if t == KGSYNC_EV_ACK {
+            handled = 1
+            if prec[2] != 0 { return _fed_hs_reject(sub_fd, "expected ACK 0") }
+            done = 1
+        }
+        if handled == 0 {
+            return _fed_hs_reject(sub_fd, "unexpected line in SecAgg setup")
         }
     }
+    if nonce == 0 { return _fed_hs_reject(sub_fd, "SECAGG_NONCE required") }
+    if len(peer_ids) == 0 { return _fed_hs_reject(sub_fd, "empty peer set (no SECAGG_PEER)") }
     let s = _csoul_new(sub_fd, soul_id, epsilon)
-    push(s, peer_count)   // index 4 = peer count
-    push(s, dh_pubkey)    // index 5 = DH pubkey hex (0 if not DH mode)
+    push(s, len(peer_ids))   // CSOUL_PEERS
+    push(s, dh_pubkey)       // CSOUL_DH (0 if token mode)
+    push(s, nonce)           // CSOUL_NONCE
+    push(s, peer_ids)        // CSOUL_PEER_IDS
     return s
 }
 
@@ -238,9 +533,11 @@ fn _fed_accept_n(server_fd, n, expected_token) {
     return souls
 }
 
-// SecAgg-mode accept loop -- analogous to _fed_accept_n but uses the
-// v2-sa HELLO.
-fn _fed_accept_n_secagg(server_fd, n) {
+// SecAgg-mode accept loop -- analogous to _fed_accept_n but runs the
+// v3n-sa handshake. A second soul with an already-joined soul id is
+// refused (ERR + close): duplicate ids break mask cancellation and the
+// dropout bookkeeping.
+fn _fed_accept_n_secagg(server_fd, n, allow_weak_dh) {
     let souls = list_new()
     let attempts = 0
     let max_attempts = 3 * n + 4
@@ -248,13 +545,25 @@ fn _fed_accept_n_secagg(server_fd, n) {
         if attempts >= max_attempts { return souls }
         let fd = accept_conn(server_fd, 0, 0)
         if fd >= 0 {
-            let s = _fed_accept_handshake_secagg(fd)
+            let s = _fed_accept_handshake_secagg(fd, allow_weak_dh)
             if s != 0 {
-                push(souls, s)
-                println("fed-coord: SECAGG JOIN soul=" + s[CSOUL_ID]
-                    + " peers=" + int_to_str(s[4])
-                    + " (total " + int_to_str(len(souls)) + " of "
-                    + int_to_str(n) + ")")
+                let dup = 0
+                let k = 0
+                while k < len(souls) {
+                    if str_eq_bytes(souls[k][CSOUL_ID], s[CSOUL_ID]) == 1 { dup = 1 }
+                    k = k + 1
+                }
+                if dup == 1 {
+                    println("fed-coord: [SECAGG] REFUSE duplicate soul id " + s[CSOUL_ID])
+                    _cw_send(fd, KGSYNC_ERR_PREFIX + "duplicate soul id\n")
+                    close_fd(fd)
+                } else {
+                    push(souls, s)
+                    println("fed-coord: SECAGG JOIN soul=" + s[CSOUL_ID]
+                        + " peers=" + int_to_str(s[CSOUL_PEERS])
+                        + " (total " + int_to_str(len(souls)) + " of "
+                        + int_to_str(n) + ")")
+                }
             }
         }
         attempts = attempts + 1
@@ -262,182 +571,174 @@ fn _fed_accept_n_secagg(server_fd, n) {
     return souls
 }
 
-// P3.9 v2-sa-dh: after all souls have announced their DH public keys
-// during the handshake, the coordinator forwards every pubkey to every
-// other soul. Each soul then has the material it needs to derive a
-// pairwise shared secret with every peer via
-// `peer_pubkey ^ my_private mod p`.
-//
-// We do NOT forward a soul's own pubkey back to itself (a soul has no
-// pair to mask against itself). Sending one FED_DH_PUBLIC line per peer
-// per soul keeps the wire shape simple and audit-readable: the souls
-// just register each line they receive via sa_register_peer_dh.
-//
-// Returns the number of FED_DH_PUBLIC lines successfully sent. Returns
-// 0 if no soul announced a DH pubkey (then this function is a no-op and
-// the round proceeds in pre-shared-token v2-sa mode).
-fn _fed_broadcast_dh_pubkeys(souls) {
-    // Count how many souls announced a DH key (slot 5 != 0).
-    let dh_n = 0
+// Strict peer set: every soul's announced SECAGG_PEER ids must be exactly
+// the ids of all OTHER joined souls. Returns 0 when that holds, else a
+// reason naming the soul and the missing / extra id.
+fn _fed_peer_set_check(souls) {
     let i = 0
     while i < len(souls) {
         let s = souls[i]
-        if len(s) > 5 {
-            if s[5] != 0 { dh_n = dh_n + 1 }
+        let ann = s[CSOUL_PEER_IDS]
+        let j = 0
+        while j < len(souls) {
+            if j != i {
+                let other = souls[j][CSOUL_ID]
+                if _fed_list_has(ann, other) == 0 {
+                    return "soul " + s[CSOUL_ID] + " did not declare peer " + other
+                }
+            }
+            j = j + 1
+        }
+        let a = 0
+        while a < len(ann) {
+            let found = 0
+            let k = 0
+            while k < len(souls) {
+                if k != i {
+                    if str_eq_bytes(souls[k][CSOUL_ID], ann[a]) == 1 { found = 1 }
+                }
+                k = k + 1
+            }
+            if found == 0 {
+                return "soul " + s[CSOUL_ID] + " declared peer " + ann[a] + " which did not join"
+            }
+            a = a + 1
         }
         i = i + 1
     }
-    if dh_n == 0 { return 0 }
-    println("fed-coord: [SECAGG-DH] broadcasting " + int_to_str(dh_n)
-        + " DH pubkey(s) to " + int_to_str(len(souls)) + " soul(s)")
-    // For every soul SRC that announced a pubkey, send a FED_DH_PUBLIC
-    // line carrying SRC's id + pubkey to every OTHER soul (DST != SRC).
-    let sent = 0
+    return 0
+}
+
+// v3n-sa relay phase (replaces the DH-only _fed_broadcast_dh_pubkeys).
+// After all souls joined, each soul receives, for every OTHER soul SRC:
+//   FED_DH_PUBLIC <src> <hex>     (DH mode: SRC announced a key)
+//   SECAGG_NONCE <src> <32 hex>
+// and then ALWAYS a final "ACK 0", in every mode, so souls can drain the
+// relay deterministically. A soul's own nonce / key is never sent back.
+// Returns [dh_lines, nonce_lines, failures]; any failure means some soul
+// lacks a peer's nonce (its masks could not cancel), so the caller aborts.
+fn _fed_relay_setup(souls) {
+    let dh_n = 0
+    let i = 0
+    while i < len(souls) {
+        if souls[i][CSOUL_DH] != 0 { dh_n = dh_n + 1 }
+        i = i + 1
+    }
+    if dh_n > 0 {
+        println("fed-coord: [SECAGG-DH] broadcasting " + int_to_str(dh_n)
+            + " DH pubkey(s) to " + int_to_str(len(souls)) + " soul(s)")
+    }
+    let dh_sent = 0
+    let nonce_sent = 0
+    let fails = 0
     let src_i = 0
     while src_i < len(souls) {
         let src = souls[src_i]
-        let src_pub = 0
-        if len(src) > 5 { src_pub = src[5] }
-        if src_pub != 0 {
-            let line = sa_format_dh_public_line(src[CSOUL_ID], src_pub)
-            let dst_i = 0
-            while dst_i < len(souls) {
-                if dst_i != src_i {
-                    let dst = souls[dst_i]
-                    let dst_fd = dst[CSOUL_FD]
-                    if dst_fd >= 0 {
-                        if _send_all(dst_fd, line) == 0 {
-                            close_fd(dst_fd)
-                            list_set(dst, CSOUL_FD, 0 - 1)
-                        } else {
-                            sent = sent + 1
-                        }
+        let dh_line = 0
+        if src[CSOUL_DH] != 0 { dh_line = sa_format_dh_public_line(src[CSOUL_ID], src[CSOUL_DH]) }
+        let nonce_line = sa_format_nonce_line(src[CSOUL_ID], src[CSOUL_NONCE])
+        let dst_i = 0
+        while dst_i < len(souls) {
+            if dst_i != src_i {
+                let dst = souls[dst_i]
+                let dst_fd = dst[CSOUL_FD]
+                if dst_fd >= 0 {
+                    let ok = 1
+                    if dh_line != 0 {
+                        if _cw_send(dst_fd, dh_line) == 0 { ok = 0 }
+                        else { dh_sent = dh_sent + 1 }
                     }
+                    if ok == 1 {
+                        if _cw_send(dst_fd, nonce_line) == 0 { ok = 0 }
+                        else { nonce_sent = nonce_sent + 1 }
+                    }
+                    if ok == 0 {
+                        close_fd(dst_fd)
+                        list_set(dst, CSOUL_FD, 0 - 1)
+                        fails = fails + 1
+                    }
+                } else {
+                    fails = fails + 1
                 }
-                dst_i = dst_i + 1
             }
+            dst_i = dst_i + 1
         }
         src_i = src_i + 1
     }
-    // After broadcasting, send a sentinel ACK 0 to every soul so the
-    // soul-side receiver knows the DH-pubkey-broadcast phase is over
-    // and can transition to the round loop.
+    let acks = 0
     let si = 0
     while si < len(souls) {
         let s = souls[si]
         let fd = s[CSOUL_FD]
         if fd >= 0 {
-            _send_all(fd, "ACK 0\n")
+            if _cw_send(fd, "ACK 0\n") == 0 {
+                close_fd(fd)
+                list_set(s, CSOUL_FD, 0 - 1)
+                fails = fails + 1
+            } else {
+                acks = acks + 1
+            }
         }
         si = si + 1
     }
-    return sent
+    println("fed-coord: [SECAGG] relayed " + int_to_str(nonce_sent)
+        + " SECAGG_NONCE line(s); ACK 0 sent to " + int_to_str(acks) + " soul(s)")
+    let out = list_new()
+    push(out, dh_sent)
+    push(out, nonce_sent)
+    push(out, fails)
+    return out
 }
 
-// SecAgg-mode collect: read FED_STAT_MASKED lines from each soul and
-// SUM (not average) per source. The coordinator never sees individual
-// raw values -- only the masked submissions, whose sum equals the sum
-// of raw values via pairwise mask cancellation.
-//
-// CRITICAL audit property: at no point does the coordinator look at a
-// single soul's masked value as if it were the soul's true stat. The
-// only quantity the coordinator computes is the SUM across souls.
-// The println of "MASKED_STAT" below reports JUST the masked value
-// the soul sent (which is uninformative on its own) -- the coordinator
-// does NOT have access to per-soul x_i.
-fn _fed_collect_masked(souls, round_id) {
-    let acc = sa_acc_new(round_id)
+// Mark soul s dropped for this round (once), close its fd, log why.
+fn _fed_mark_dropped(s, dropped, round_id, why) {
+    if _fed_list_has(dropped, s[CSOUL_ID]) == 0 {
+        push(dropped, s[CSOUL_ID])
+        println("fed-coord: DROPOUT soul=" + s[CSOUL_ID]
+            + " round=" + int_to_str(round_id) + " (" + why + ")")
+    }
+    let fd = s[CSOUL_FD]
+    if fd >= 0 {
+        close_fd(fd)
+        list_set(s, CSOUL_FD, 0 - 1)
+    }
+    return 1
+}
+
+fn _fed_join_ids(ids) {
+    let out = ""
     let i = 0
-    while i < len(souls) {
-        let s = souls[i]
-        let fd = s[CSOUL_FD]
-        if fd >= 0 {
-            let done = 0
-            let read_n = 0
-            while done == 0 {
-                let line = _recv_line(fd)
-                if line == 0 {
-                    close_fd(fd)
-                    list_set(s, CSOUL_FD, 0 - 1)
-                    done = 1
-                } else {
-                    let rec = _parse_line(line)
-                    if rec == 0 { done = 1 }
-                    else {
-                        let t = rec[KGSYNC_R_TYPE]
-                        if t == KGSYNC_EV_FED_STAT_MASKED {
-                            let rid = rec[KGSYNC_FED_ROUND_ID]
-                            if rid == round_id {
-                                let tag = rec[KGSYNC_FED_TAG]
-                                let mp = rec[KGSYNC_FED_PROMO]
-                                let ma = rec[KGSYNC_FED_ATR]
-                                sa_acc_add_masked(acc, tag, mp, ma)
-                                read_n = read_n + 1
-                                println("fed-coord: MASKED_STAT soul=" + s[CSOUL_ID]
-                                    + " round=" + int_to_str(round_id)
-                                    + " tag=" + tag
-                                    + " [SECAGG] masked-value-opaque")
-                                list_set(s, CSOUL_ACTIVE, nanotime())
-                            }
-                        } else {
-                            if t == KGSYNC_EV_ACK { done = 1 }
-                            else {
-                                if t == KGSYNC_EV_FED_LEAVE {
-                                    println("fed-coord: LEAVE soul=" + rec[KGSYNC_FED_SOUL_ID])
-                                    close_fd(fd)
-                                    list_set(s, CSOUL_FD, 0 - 1)
-                                    done = 1
-                                } else { done = 1 }
-                            }
-                        }
-                    }
-                }
-            }
-            println("fed-coord: soul=" + s[CSOUL_ID] + " emitted "
-                + int_to_str(read_n) + " masked-stat(s)")
-        }
+    while i < len(ids) {
+        if i > 0 { out = out + "," }
+        out = out + ids[i]
         i = i + 1
     }
-    return acc
+    return out
 }
 
-// P3.8r SecAgg-mode collect WITH dropout-resilience.
+// SecAgg-mode collect WITH dropout handling (v3n-sa).
 //
-// Returns a list:
-//   [acc, dropped_soul_ids, recon_used]
-// where:
-//   acc            -- the per-tag SUM the coordinator wants to broadcast
-//                     (built from the RECONCILED submissions when at
-//                      least one soul dropped, else from the original
-//                      masked submissions).
-//   dropped_soul_ids -- list of soul_id strings that dropped this round.
-//   recon_used     -- 1 if the FED_DROPOUT + FED_RECON_MASKED path
-//                     was exercised, 0 if the round completed cleanly.
+// Returns [acc, dropped_soul_ids, status, expected_n, reason] where
+//   status 0 = clean round (acc = sum of every soul's masked rows,
+//              expected_n = souls live at round open),
+//   status 1 = reconciled (CE_SECAGG_ALLOW_RECON=1 only; acc = sum of the
+//              survivors' FED_RECON_MASKED rows, expected_n = survivors),
+//   status 2 = ABORTED (acc = 0; no sum may be published; reason says why).
 //
-// Flow:
-//   1. Iterate every soul; read its masked-stats batch (terminated by
-//      ACK / EOF / parse-error). A soul whose recv returns 0 BEFORE
-//      sending any FED_STAT_MASKED is recorded as DROPPED for this
-//      round. (NOVA blocking-IO + the brief's deadline mechanism: the
-//      conventional drop signal is a closed fd; an explicit ns
-//      deadline check is unreliable in the single-thread model. The
-//      tests/integration/scenario_u_secagg.sh dropout case kills the
-//      chat subprocess mid-round, which closes its fd cleanly.)
-//   2. Per-soul masked submissions are KEPT (per-row staging) so we
-//      can either ship the original sum (clean round) or rebuild
-//      the sum from FED_RECON_MASKED (dropout round).
-//   3. If any soul dropped, the coordinator broadcasts
-//      `FED_DROPOUT <round> <dropped_soul_id>` to every surviving
-//      soul, then reads exactly one FED_RECON_MASKED batch per
-//      survivor (terminated by ACK / EOF). Survivors recompute their
-//      submission with the dropped peer's mask contribution removed
-//      (sa_reconcile_for_dropped); the coordinator's new acc sums
-//      across survivors only. Mask cancellation holds because each
-//      surviving pair still has its +m_ij / -m_ji symmetry, and the
-//      dropped peer's now-uncancelled contribution was just removed.
+// A soul counts as DROPPED for the round when it closes / leaves before
+// any masked stat, ACKs the round without any masked stat (soft dropout:
+// the masks other souls added against it would never cancel), sends a
+// line that does not parse or does not belong to this round, or ACKs a
+// different round id. A dropped soul's fd is closed. A repeated
+// (soul, source tag) row is ignored, so a tag's participant count is a
+// count of distinct souls.
 //
-// Per-soul staging row: [soul_idx, soul_id, list_of[tag, mp, ma]].
-fn _fed_collect_masked_with_dropout(souls, round_id) {
+// Reconciliation is OFF by default: with any dropout and
+// allow_recon == 0 the coordinator sends NO FED_DROPOUT and aborts the
+// round. With allow_recon == 1 it needs at least 2 survivors, broadcasts
+// FED_DROPOUT and rebuilds the sum from the survivors' FED_RECON_MASKED
+// replies (whose soul ids must match the sender).
+fn _fed_collect_masked_with_dropout(souls, round_id, allow_recon) {
     let staging = list_new()
     let dropped = list_new()
     let i = 0
@@ -452,58 +753,87 @@ fn _fed_collect_masked_with_dropout(souls, round_id) {
             let done = 0
             let read_n = 0
             let saw_first = 0
+            let tags = list_new()
             while done == 0 {
-                let line = _recv_line(fd)
+                let line = _cw_recv(fd)
                 if line == 0 {
                     close_fd(fd)
                     list_set(s, CSOUL_FD, 0 - 1)
                     done = 1
                     if saw_first == 0 {
-                        push(dropped, s[CSOUL_ID])
-                        println("fed-coord: DROPOUT soul=" + s[CSOUL_ID]
-                            + " round=" + int_to_str(round_id)
-                            + " (peer closed fd before sending any masked stat)")
+                        _fed_mark_dropped(s, dropped, round_id,
+                            "peer closed fd before sending any masked stat")
                     }
                 } else {
                     let rec = _parse_line(line)
-                    if rec == 0 { done = 1 }
-                    else {
+                    if rec == 0 {
+                        done = 1
+                        _fed_mark_dropped(s, dropped, round_id, "protocol error: unparseable line")
+                    } else {
                         let t = rec[KGSYNC_R_TYPE]
+                        let handled = 0
                         if t == KGSYNC_EV_FED_STAT_MASKED {
+                            handled = 1
                             let rid = rec[KGSYNC_FED_ROUND_ID]
-                            if rid == round_id {
+                            if rid != round_id {
+                                done = 1
+                                _fed_mark_dropped(s, dropped, round_id,
+                                    "protocol error: masked stat for round " + int_to_str(rid))
+                            } else {
                                 let tag = rec[KGSYNC_FED_TAG]
-                                let mp = rec[KGSYNC_FED_PROMO]
-                                let ma = rec[KGSYNC_FED_ATR]
-                                let row = list_new()
-                                push(row, tag)
-                                push(row, mp)
-                                push(row, ma)
-                                push(stage[2], row)
-                                read_n = read_n + 1
-                                saw_first = 1
-                                println("fed-coord: MASKED_STAT soul=" + s[CSOUL_ID]
-                                    + " round=" + int_to_str(round_id)
-                                    + " tag=" + tag
-                                    + " [SECAGG] masked-value-opaque")
-                                list_set(s, CSOUL_ACTIVE, nanotime())
+                                if _fed_list_has(tags, tag) == 1 {
+                                    println("fed-coord: [SECAGG] ignoring duplicate tag " + tag
+                                        + " from soul=" + s[CSOUL_ID])
+                                } else {
+                                    push(tags, tag)
+                                    let row = list_new()
+                                    push(row, tag)
+                                    push(row, rec[KGSYNC_FED_PROMO])
+                                    push(row, rec[KGSYNC_FED_ATR])
+                                    push(stage[2], row)
+                                    read_n = read_n + 1
+                                    saw_first = 1
+                                    println("fed-coord: MASKED_STAT soul=" + s[CSOUL_ID]
+                                        + " round=" + int_to_str(round_id)
+                                        + " tag=" + tag
+                                        + " [SECAGG] masked-value-opaque")
+                                    list_set(s, CSOUL_ACTIVE, nanotime())
+                                }
                             }
-                        } else {
-                            if t == KGSYNC_EV_ACK { done = 1 }
-                            else {
-                                if t == KGSYNC_EV_FED_LEAVE {
-                                    println("fed-coord: LEAVE soul=" + rec[KGSYNC_FED_SOUL_ID])
-                                    close_fd(fd)
-                                    list_set(s, CSOUL_FD, 0 - 1)
-                                    done = 1
-                                    if saw_first == 0 {
-                                        push(dropped, s[CSOUL_ID])
-                                        println("fed-coord: DROPOUT soul=" + s[CSOUL_ID]
-                                            + " round=" + int_to_str(round_id)
-                                            + " (FED_LEAVE before any masked stat)")
-                                    }
-                                } else { done = 1 }
+                        }
+                        if t == KGSYNC_EV_ACK {
+                            handled = 1
+                            done = 1
+                            if rec[2] != round_id {
+                                _fed_mark_dropped(s, dropped, round_id,
+                                    "protocol error: ACK " + int_to_str(rec[2]))
+                            } else {
+                                if saw_first == 0 {
+                                    _fed_mark_dropped(s, dropped, round_id,
+                                        "ACK without any masked stat")
+                                }
                             }
+                        }
+                        if t == KGSYNC_EV_FED_LEAVE {
+                            handled = 1
+                            done = 1
+                            println("fed-coord: LEAVE soul=" + rec[KGSYNC_FED_SOUL_ID])
+                            // A soul that leaves before ACK is a dropout even if
+                            // it already sent masked stats: it is not a
+                            // survivor, so without this its pairwise masks
+                            // would never be stripped and a reconciled sum
+                            // would be wrong.
+                            if saw_first == 0 {
+                                _fed_mark_dropped(s, dropped, round_id,
+                                    "FED_LEAVE before any masked stat")
+                            } else {
+                                _fed_mark_dropped(s, dropped, round_id,
+                                    "FED_LEAVE before ACK")
+                            }
+                        }
+                        if handled == 0 {
+                            done = 1
+                            _fed_mark_dropped(s, dropped, round_id, "protocol error: unexpected line")
                         }
                     }
                 }
@@ -511,11 +841,7 @@ fn _fed_collect_masked_with_dropout(souls, round_id) {
             println("fed-coord: soul=" + s[CSOUL_ID] + " emitted "
                 + int_to_str(read_n) + " masked-stat(s)")
         } else {
-            // FD already closed pre-round -> count as dropped.
-            push(dropped, s[CSOUL_ID])
-            println("fed-coord: DROPOUT soul=" + s[CSOUL_ID]
-                + " round=" + int_to_str(round_id)
-                + " (fd was closed pre-round)")
+            _fed_mark_dropped(s, dropped, round_id, "fd was closed pre-round")
         }
         push(staging, stage)
         i = i + 1
@@ -537,22 +863,59 @@ fn _fed_collect_masked_with_dropout(souls, round_id) {
         }
         push(out, acc)
         push(out, dropped)
-        push(out, 0)        // recon_used = 0
+        push(out, 0)                 // clean
+        push(out, len(souls))        // every soul must be in every tag
+        push(out, "")
         return out
     }
-    // Dropout path: broadcast FED_DROPOUT to every survivor, then read
-    // FED_RECON_MASKED replies and build the sum from THOSE.
-    let acc = _fed_run_reconciliation(souls, round_id, dropped, staging)
+    let survivors = 0
+    let k = 0
+    while k < len(souls) {
+        if souls[k][CSOUL_FD] >= 0 { survivors = survivors + 1 }
+        k = k + 1
+    }
+    if allow_recon != 1 {
+        push(out, 0)
+        push(out, dropped)
+        push(out, 2)
+        push(out, 0)
+        push(out, "reconciliation disabled (CE_SECAGG_ALLOW_RECON unset)")
+        return out
+    }
+    if survivors < 2 {
+        push(out, 0)
+        push(out, dropped)
+        push(out, 2)
+        push(out, 0)
+        push(out, "fewer than 2 survivors; reconciliation would unmask a lone survivor")
+        return out
+    }
+    // Dropout path (opted in): broadcast FED_DROPOUT to every survivor,
+    // then read FED_RECON_MASKED replies and build the sum from THOSE.
+    let acc = _fed_run_reconciliation(souls, round_id, dropped)
+    if acc == 0 {
+        push(out, 0)
+        push(out, dropped)
+        push(out, 2)
+        push(out, 0)
+        push(out, "FED_RECON_MASKED soul id did not match its sender")
+        return out
+    }
     push(out, acc)
     push(out, dropped)
-    push(out, 1)            // recon_used = 1
+    push(out, 1)                     // reconciled
+    push(out, survivors)
+    push(out, "")
     return out
 }
 
 // Broadcast FED_DROPOUT for every dropped soul to every survivor, then
-// read a FED_RECON_MASKED batch from each survivor and build the sum
-// from those adjusted values. Returns a populated sa_acc.
-fn _fed_run_reconciliation(souls, round_id, dropped, staging) {
+// read, from each survivor, one ACK-terminated FED_RECON_MASKED batch per
+// FED_DROPOUT line (a soul's batches are cumulative, so the LAST batch is
+// its final submission) and sum the last batches. A row whose soul id is
+// not the sender's makes the whole reconciliation fail (returns 0).
+// Returns a populated sa_acc, or 0.
+fn _fed_run_reconciliation(souls, round_id, dropped) {
     // 1. Broadcast every FED_DROPOUT line to every survivor.
     let di = 0
     while di < len(dropped) {
@@ -563,7 +926,7 @@ fn _fed_run_reconciliation(souls, round_id, dropped, staging) {
             let s = souls[sj]
             let fd = s[CSOUL_FD]
             if fd >= 0 {
-                if _send_all(fd, line) == 0 {
+                if _cw_send(fd, line) == 0 {
                     close_fd(fd)
                     list_set(s, CSOUL_FD, 0 - 1)
                 }
@@ -574,60 +937,93 @@ fn _fed_run_reconciliation(souls, round_id, dropped, staging) {
             + " dropped=" + dropped_id + " broadcast to survivors")
         di = di + 1
     }
-    // 2. Read FED_RECON_MASKED from each survivor and sum.
+    // 2. Read the FED_RECON_MASKED batches from each survivor.
     let acc = sa_acc_new(round_id)
+    let bad = 0
     let i = 0
     while i < len(souls) {
         let s = souls[i]
-        let fd = s[CSOUL_FD]
-        if fd >= 0 {
-            let done = 0
-            let read_n = 0
-            while done == 0 {
-                let line = _recv_line(fd)
-                if line == 0 {
-                    close_fd(fd)
-                    list_set(s, CSOUL_FD, 0 - 1)
-                    done = 1
-                } else {
-                    let rec = _parse_line(line)
-                    if rec == 0 { done = 1 }
-                    else {
-                        let t = rec[KGSYNC_R_TYPE]
-                        if t == KGSYNC_EV_FED_RECON_MASKED {
-                            let rid = rec[KGSYNC_FED_ROUND_ID]
-                            if rid == round_id {
-                                let tag = rec[KGSYNC_FED_RECON_TAG]
-                                let mp = rec[KGSYNC_FED_RECON_PROMO]
-                                let ma = rec[KGSYNC_FED_RECON_ATR]
-                                sa_acc_add_masked(acc, tag, mp, ma)
-                                read_n = read_n + 1
-                                println("fed-coord: [SECAGG-R] RECON_MASKED soul="
-                                    + s[CSOUL_ID]
-                                    + " round=" + int_to_str(round_id)
-                                    + " tag=" + tag
-                                    + " (after dropped-peer mask removed)")
-                                list_set(s, CSOUL_ACTIVE, nanotime())
-                            }
-                        } else {
-                            if t == KGSYNC_EV_ACK { done = 1 }
-                            else {
-                                if t == KGSYNC_EV_FED_LEAVE {
-                                    println("fed-coord: LEAVE soul=" + rec[KGSYNC_FED_SOUL_ID])
-                                    close_fd(fd)
-                                    list_set(s, CSOUL_FD, 0 - 1)
+        let last_rows = list_new()
+        let batches = 0
+        while batches < len(dropped) {
+            let fd = s[CSOUL_FD]
+            if fd < 0 { batches = len(dropped) }
+            else {
+                let rows = list_new()
+                let tags = list_new()
+                let done = 0
+                while done == 0 {
+                    let line = _cw_recv(fd)
+                    if line == 0 {
+                        close_fd(fd)
+                        list_set(s, CSOUL_FD, 0 - 1)
+                        done = 1
+                        rows = list_new()
+                    } else {
+                        let rec = _parse_line(line)
+                        let handled = 0
+                        if rec != 0 {
+                            let t = rec[KGSYNC_R_TYPE]
+                            if t == KGSYNC_EV_FED_RECON_MASKED {
+                                handled = 1
+                                if str_eq_bytes(rec[KGSYNC_FED_RECON_SOUL], s[CSOUL_ID]) == 0 {
+                                    println("fed-coord: [SECAGG-R] FED_RECON_MASKED soul id "
+                                        + rec[KGSYNC_FED_RECON_SOUL] + " sent by soul=" + s[CSOUL_ID]
+                                        + "; aborting")
+                                    bad = 1
                                     done = 1
-                                } else { done = 1 }
+                                } else {
+                                    if rec[KGSYNC_FED_ROUND_ID] == round_id {
+                                        let tag = rec[KGSYNC_FED_RECON_TAG]
+                                        if _fed_list_has(tags, tag) == 0 {
+                                            push(tags, tag)
+                                            let row = list_new()
+                                            push(row, tag)
+                                            push(row, rec[KGSYNC_FED_RECON_PROMO])
+                                            push(row, rec[KGSYNC_FED_RECON_ATR])
+                                            push(rows, row)
+                                            println("fed-coord: [SECAGG-R] RECON_MASKED soul="
+                                                + s[CSOUL_ID]
+                                                + " round=" + int_to_str(round_id)
+                                                + " tag=" + tag
+                                                + " (after dropped-peer mask removed)")
+                                            list_set(s, CSOUL_ACTIVE, nanotime())
+                                        }
+                                    }
+                                }
                             }
+                            if t == KGSYNC_EV_ACK {
+                                handled = 1
+                                done = 1
+                            }
+                        }
+                        if handled == 0 {
+                            close_fd(fd)
+                            list_set(s, CSOUL_FD, 0 - 1)
+                            done = 1
+                            rows = list_new()
                         }
                     }
                 }
+                last_rows = rows
+                batches = batches + 1
+                if bad == 1 { batches = len(dropped) }
             }
-            println("fed-coord: [SECAGG-R] soul=" + s[CSOUL_ID] + " emitted "
-                + int_to_str(read_n) + " reconciled stat(s)")
         }
+        if s[CSOUL_FD] >= 0 {
+            let ri = 0
+            while ri < len(last_rows) {
+                let row = last_rows[ri]
+                sa_acc_add_masked(acc, row[0], row[1], row[2])
+                ri = ri + 1
+            }
+        }
+        println("fed-coord: [SECAGG-R] soul=" + s[CSOUL_ID] + " emitted "
+            + int_to_str(len(last_rows)) + " reconciled stat(s)")
+        if bad == 1 { i = len(souls) }
         i = i + 1
     }
+    if bad == 1 { return 0 }
     return acc
 }
 
@@ -647,7 +1043,7 @@ fn _fed_broadcast_sum(souls, round_id, sums) {
             let s = souls[j]
             let fd = s[CSOUL_FD]
             if fd >= 0 {
-                if _send_all(fd, line) == 0 {
+                if _cw_send(fd, line) == 0 {
                     close_fd(fd)
                     list_set(s, CSOUL_FD, 0 - 1)
                 } else {
@@ -677,7 +1073,7 @@ fn _fed_broadcast_round(souls, round_id, deadline_ns) {
         let s = souls[i]
         let fd = s[CSOUL_FD]
         if fd >= 0 {
-            if _send_all(fd, line) == 0 {
+            if _cw_send(fd, line) == 0 {
                 close_fd(fd)
                 list_set(s, CSOUL_FD, 0 - 1)
             } else {
@@ -711,7 +1107,7 @@ fn _fed_collect_stats(souls, round_id) {
             let done = 0
             let read_n = 0
             while done == 0 {
-                let line = _recv_line(fd)
+                let line = _cw_recv(fd)
                 if line == 0 {
                     // EOF / disconnect.
                     close_fd(fd)
@@ -782,7 +1178,7 @@ fn _fed_broadcast_aggregate(souls, round_id, averages) {
             let s = souls[j]
             let fd = s[CSOUL_FD]
             if fd >= 0 {
-                if _send_all(fd, line) == 0 {
+                if _cw_send(fd, line) == 0 {
                     close_fd(fd)
                     list_set(s, CSOUL_FD, 0 - 1)
                 } else {
@@ -808,7 +1204,7 @@ fn _fed_close_all(souls) {
         let s = souls[i]
         let fd = s[CSOUL_FD]
         if fd >= 0 {
-            _send_all(fd, KGSYNC_BYE_LINE + "\n")
+            _cw_send(fd, KGSYNC_BYE_LINE + "\n")
             close_fd(fd)
             list_set(s, CSOUL_FD, 0 - 1)
         }
@@ -849,9 +1245,18 @@ fn main() {
     let max_rounds = _fed_max_rounds()
     let round_interval = fed_round_interval_from_env()
     let secagg = sa_enabled_from_env()
+    let allow_recon = sa_recon_allowed_from_env()
+    let allow_weak_dh = sa_weak_dh_allowed_from_env()
+
+    // A soul that closes its socket must not kill the coordinator.
+    _cw_ignore_sigpipe()
+    _cw_log_open()
 
     let mode_str = "v1"
-    if secagg == 1 { mode_str = "v2-sa-r (SecAgg + dropout-resilient)" }
+    if secagg == 1 {
+        mode_str = "v3n-sa (SecAgg; recon=off)"
+        if allow_recon == 1 { mode_str = "v3n-sa (SecAgg; recon=on)" }
+    }
 
     let deadline_ms = sa_round_deadline_ms_from_env()
 
@@ -862,6 +1267,17 @@ fn main() {
         + " mode=" + mode_str
         + " round-interval-ns=" + int_to_str(round_interval)
         + " round-deadline-ms=" + int_to_str(deadline_ms))
+    if secagg == 1 {
+        let wd = "off"
+        if allow_weak_dh == 1 { wd = "on" }
+        println("fed-coord: [SECAGG] reconciliation=" + _fed_on_off(allow_recon)
+            + " weak-dh=" + wd + " round-counter=" + _fed_round_path())
+        if allow_weak_dh == 1 {
+            sa_stderr("fed-coord: [SECAGG-DH] WARNING: DH mode enabled by CE_SECAGG_ALLOW_WEAK_DH=1 -- "
+                + "public keys are relayed UNAUTHENTICATED by this coordinator (a malicious "
+                + "coordinator can MITM them); the 256-bit group is breakable")
+        }
+    }
 
     let server_fd = sync_pub_listen(port)
     if server_fd < 0 {
@@ -873,19 +1289,45 @@ fn main() {
         + int_to_str(n_souls) + " soul HELLO(s) ...")
 
     let souls = list_new()
+    let round_id = 1
     if secagg == 1 {
-        souls = _fed_accept_n_secagg(server_fd, n_souls)
-        // P3.9 DH key-exchange phase: if any soul announced a DH pubkey
-        // during the handshake, broadcast every pubkey to every other
-        // soul so each soul can derive pairwise shared secrets. Souls
-        // that did not announce a DH pubkey (pre-shared-token v2-sa mode)
-        // are unaffected. Returns the number of DH lines actually sent;
-        // 0 means no DH exchange happened and the round proceeds in
-        // pre-shared-token mode.
-        let dh_sent = _fed_broadcast_dh_pubkeys(souls)
-        if dh_sent > 0 {
+        // Round ids continue from the persisted counter (fails closed on
+        // a corrupt file). Read before accepting so a bad file stops us
+        // before any soul joins.
+        _fed_round_lock()
+        round_id = _fed_round_load() + 1
+        souls = _fed_accept_n_secagg(server_fd, n_souls, allow_weak_dh)
+        // Strict session checks BEFORE any relay: the expected number of
+        // souls (at least 2 -- a 1-soul "sum" is that soul's raw value)
+        // and every soul's declared peer set == the other joined souls.
+        let refuse = 0
+        if n_souls < 2 { refuse = "CE_FED_SOULS must be at least 2 in SecAgg mode" }
+        if refuse == 0 {
+            if len(souls) < n_souls {
+                refuse = "only " + int_to_str(len(souls)) + " of "
+                    + int_to_str(n_souls) + " souls joined"
+            }
+        }
+        if refuse == 0 { refuse = _fed_peer_set_check(souls) }
+        if refuse != 0 {
+            println("fed-coord: [SECAGG] REFUSE session: " + refuse)
+            _fed_close_all(souls)
+            sync_close(server_fd)
+            exit(1)
+        }
+        // Relay phase: every other soul's SECAGG_NONCE (and FED_DH_PUBLIC
+        // in DH mode), always ended by ACK 0.
+        let relay = _fed_relay_setup(souls)
+        if relay[0] > 0 {
             println("fed-coord: [SECAGG-DH] DH key-exchange phase complete ("
-                + int_to_str(dh_sent) + " pubkey line(s) broadcast)")
+                + int_to_str(relay[0]) + " pubkey line(s) broadcast)")
+        }
+        if relay[2] > 0 {
+            println("fed-coord: [SECAGG] REFUSE session: relay failed for "
+                + int_to_str(relay[2]) + " line(s); masks could not cancel")
+            _fed_close_all(souls)
+            sync_close(server_fd)
+            exit(1)
         }
     } else {
         souls = _fed_accept_n(server_fd, n_souls, token)
@@ -898,7 +1340,6 @@ fn main() {
     println("fed-coord: " + int_to_str(len(souls))
         + " soul(s) attached, running federated rounds")
 
-    let round_id = 1
     let rounds_done = 0
     let go = 1
     while go == 1 {
@@ -919,6 +1360,21 @@ fn main() {
             println("fed-coord: no active souls; exiting")
             go = 0
         } else {
+            if secagg == 1 {
+                // Durable write BEFORE the FED_ROUND broadcast, so a crash
+                // after sending can never reuse this round id.
+                if _fed_round_save(round_id) == 0 {
+                    println("fed-coord: [SECAGG] REFUSE round " + int_to_str(round_id)
+                        + ": cannot persist the round counter " + _fed_round_path())
+                    _fed_close_all(souls)
+                    exit(70)
+                } else {
+                    println("fed-coord: [SECAGG] round-counter=" + int_to_str(round_id)
+                        + " persisted")
+                }
+            }
+        }
+        if go == 1 {
             println("fed-coord: opening round " + int_to_str(round_id)
                 + " with " + int_to_str(active_count) + " soul(s)")
             let sent = _fed_broadcast_round(souls, round_id, deadline_ns)
@@ -926,50 +1382,58 @@ fn main() {
                 println("fed-coord: no souls received the round line; exiting")
                 go = 0
             } else {
+                let counted = 1
                 if secagg == 1 {
-                    // SecAgg path with P3.8r dropout-resilience: SUM the
-                    // masked submissions, detect any soul that dropped
-                    // mid-round, broadcast FED_DROPOUT + collect
-                    // FED_RECON_MASKED replies, then broadcast the
-                    // FED_AGGREGATE_SUM. The coordinator never sees
-                    // raw per-soul values; only the sum (which equals
-                    // Σ x_i over survivors via mask cancellation across
-                    // the SHRUNK set).
-                    let drop_res = _fed_collect_masked_with_dropout(souls, round_id)
-                    let acc = drop_res[0]
+                    // SecAgg path: SUM the masked submissions. On a dropout
+                    // the round is ABORTED (no sum) unless reconciliation
+                    // is opted in (CE_SECAGG_ALLOW_RECON=1). The coordinator
+                    // never sees raw per-soul values; only the sum.
+                    let drop_res = _fed_collect_masked_with_dropout(souls, round_id, allow_recon)
+                    let status = drop_res[2]
                     let dropped_ids = drop_res[1]
-                    let recon_used = drop_res[2]
-                    if recon_used == 1 {
-                        println("fed-coord: [SECAGG-R] round " + int_to_str(round_id)
-                            + " reconciled (dropped=" + int_to_str(len(dropped_ids))
-                            + ", survivors used FED_RECON_MASKED)")
-                    }
-                    let sums_all = sa_acc_sums(acc)
-                    // A source tag submitted by only some souls has
-                    // uncancelled masks (its "sum" is noise near +/-2^31).
-                    // Publish only tags every contributing soul submitted.
-                    let full_n = 0
-                    let si = 0
-                    while si < len(sums_all) {
-                        if sums_all[si][3] > full_n { full_n = sums_all[si][3] }
-                        si = si + 1
-                    }
-                    let sums = list_new()
-                    si = 0
-                    while si < len(sums_all) {
-                        if sums_all[si][3] == full_n { push(sums, sums_all[si]) }
-                        else {
-                            println("fed-coord: [SECAGG] dropping tag " + sums_all[si][0]
-                                + " (submitted by " + int_to_str(sums_all[si][3]) + " of "
-                                + int_to_str(full_n) + " souls; masks would not cancel)")
-                        }
-                        si = si + 1
-                    }
-                    if len(sums) == 0 {
+                    if status == 2 {
                         println("fed-coord: [SECAGG] round " + int_to_str(round_id)
-                            + " produced no aggregates (no soul stats)")
+                            + " ABORTED: dropped=" + _fed_join_ids(dropped_ids)
+                            + "; " + drop_res[4] + "; no sum published")
+                        _fed_close_all(souls)
+                        counted = 0
+                        go = 0
                     } else {
-                        _fed_broadcast_sum(souls, round_id, sums)
+                        let acc = drop_res[0]
+                        let expected_n = drop_res[3]
+                        if status == 1 {
+                            println("fed-coord: [SECAGG-R] round " + int_to_str(round_id)
+                                + " reconciled (dropped=" + int_to_str(len(dropped_ids))
+                                + ", survivors used FED_RECON_MASKED)")
+                        }
+                        let sums_all = sa_acc_sums(acc)
+                        // Publish only tags submitted by EVERY expected
+                        // soul (all live souls, or all survivors after a
+                        // reconciliation): any other "sum" carries
+                        // uncancelled masks.
+                        let sums = list_new()
+                        let si = 0
+                        while si < len(sums_all) {
+                            if sums_all[si][3] == expected_n { push(sums, sums_all[si]) }
+                            else {
+                                println("fed-coord: [SECAGG] dropping tag " + sums_all[si][0]
+                                    + " (submitted by " + int_to_str(sums_all[si][3]) + " of "
+                                    + int_to_str(expected_n) + " souls; masks would not cancel)")
+                            }
+                            si = si + 1
+                        }
+                        if len(sums) == 0 {
+                            println("fed-coord: [SECAGG] round " + int_to_str(round_id)
+                                + " produced no aggregates (no soul stats)")
+                        } else {
+                            _fed_broadcast_sum(souls, round_id, sums)
+                        }
+                        if status == 1 {
+                            // The peer set is broken for every later round
+                            // (masks against the dropped soul never cancel).
+                            println("fed-coord: [SECAGG-R] ending session after a reconciled round")
+                            go = 0
+                        }
                     }
                 } else {
                     let acc = _fed_collect_stats(souls, round_id)
@@ -981,7 +1445,7 @@ fn main() {
                         _fed_broadcast_aggregate(souls, round_id, averages)
                     }
                 }
-                rounds_done = rounds_done + 1
+                if counted == 1 { rounds_done = rounds_done + 1 }
                 round_id = round_id + 1
                 if max_rounds > 0 {
                     if rounds_done >= max_rounds {
@@ -997,6 +1461,11 @@ fn main() {
     _fed_close_all(souls)
     sync_close(server_fd)
     println("fed-coord: closed (" + int_to_str(rounds_done) + " round(s) done)")
+}
+
+fn _fed_on_off(v) {
+    if v == 1 { return "on" }
+    return "off"
 }
 
 main()
