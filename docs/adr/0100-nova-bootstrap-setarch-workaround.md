@@ -1,5 +1,11 @@
 # ADR-0100: NOVA bootstrap setarch -R workaround
 
+> **Superseded (2026-11).** NOVA #32 regenerated the bootstrap seed from the
+> tagged compiler, so the bootstrap is no longer ASLR-dependent and the
+> `*-setarch` Makefile targets described below were removed. Build NOVA with
+> plain `make`; CrossEngin pins a NOVA_REF that includes #32. The text below
+> is kept for history.
+
 > ## ⚠ NON-STANDARD WORKAROUND — READ THIS ⚠
 >
 > This ADR introduces a Makefile wrapper layer that runs the NOVA
