@@ -1,9 +1,9 @@
 # NOVA Upstream Fixes — Status
 
 The eight NOVA runtime gaps CrossEngin's Phase 0-7 work surfaced landed
-upstream in `amoufaq5/NOVA` (PRs #13-#20). PRs #21-#28 followed from the
+upstream in `amoufaq5/NOVA` (PRs #13-#20). PRs #21-#32 followed from the
 2026-11-15 audit (secure_random, assert, CI, syscall tagging, time(), dead
-code + licence, tagged runtime constants/maps). This doc is the pointer from
+code + licence, tagged runtime constants/maps, bounds checks, runtime/allocator fixes, LSP/versions, reseed). This doc is the pointer from
 each NOVA fix to the CrossEngin workaround it retires. Remaining gaps are
 listed under "Remaining NOVA gaps" below.
 
@@ -25,7 +25,11 @@ listed under "Remaining NOVA gaps" below.
 | [NOVA #25](https://github.com/amoufaq5/NOVA/pull/25) | **syscall tagging** | The remaining `src/runtime/syscall.nova` wrappers follow one convention: fd raw, pointer args tag-polymorphic, int args untagged, results tagged when >= 0 and raw -errno when negative. Covers `sys_read`/`sys_write` returns, `sys_mkdir`, `sys_unlink`, `sys_lseek`, `sys_pread`/`sys_pwrite`, `sys_ftruncate`, `sys_getcwd`, `sys_fstat`. Before, `sys_mkdir` never created the requested directory and read/write counts came back halved. | CrossEngin #66 adopts it (`session.save` / `admin.bake_child` RPC writes, wake-word templates, truststore dir now work). The F-24 runtime dir relies on `sys_mkdir` + `sys_fstat`. |
 | [NOVA #26](https://github.com/amoufaq5/NOVA/pull/26) | **time()** | `time()` returns the tagged epoch; it returned raw seconds, which NOVA code read as epoch/2. | X.509 validity checks see the real date (needed before strict TLS). CI pins NOVA at #26 (`NOVA_REF`). `nanotime()` had the same bug -- fixed in NOVA #28 (not yet in `NOVA_REF`). |
 | [NOVA #27](https://github.com/amoufaq5/NOVA/pull/27) | **F-33 / F-29** (audit) | Dead IR/regalloc/lowering code and the unused `llm`/`python`/`blas`/`gpu`/`effects`/`http` runtime bridges removed; NOVA licensed Apache-2.0. | `nova-deps.toml` no longer lists the removed modules. |
-| [NOVA #28](https://github.com/amoufaq5/NOVA/pull/28) | **F-12** (audit) | Tagged constants for enum values, sum-type tags, `?` and `let [a, b]`; `x / 2^k` truncates for negative `x`; maps grow past 16 entries, tombstone removals, return a tagged 0 for a missing key and tagged counts; `float_cmp` tagged; `nanotime()` = sec*1e9+nsec; `sleep_ms(n)` sleeps n ms (it slept 2n+1). | Picked up by the next CrossEngin `NOVA_REF` bump: `nanotime`/`sleep_ms` callers (realtime pacer, gossip/NAT connect delays) get correct units. CrossEngin does not use the built-in maps. |
+| [NOVA #28](https://github.com/amoufaq5/NOVA/pull/28) | **F-12** (audit) | Tagged constants for enum values, sum-type tags, `?` and `let [a, b]`; `x / 2^k` truncates for negative `x`; maps grow past 16 entries, tombstone removals, return a tagged 0 for a missing key and tagged counts; `float_cmp` tagged; `nanotime()` = sec*1e9+nsec; `sleep_ms(n)` sleeps n ms (it slept 2n+1). | Pinned since the `NOVA_REF` bump to 858be31: `nanotime`/`sleep_ms` callers (realtime pacer, gossip/NAT connect delays) get correct units; the realtime pacer's raw-imul shim (which computed ~3x the budget, hidden by the old units) is replaced by `*`. CrossEngin does not use the built-in maps. |
+| [NOVA #29](https://github.com/amoufaq5/NOVA/pull/29) | **F-13** (audit) | Checked index assignment (`xs[i] = v`, `list_set`): out-of-range / non-list writes abort instead of writing past the list; `char_at`/`substr` negative-argument guards; OOB message shows the index as written. | No out-of-range CrossEngin write: unit suite 493/493 and no integration scenario newly failing at the bump to 858be31. |
+| [NOVA #30](https://github.com/amoufaq5/NOVA/pull/30) | **F-31** + runtime | `sys_mmap`/`brk`/`munmap` tag-correct; `split()` returned half-length pieces; `char_code` returned a raw byte; `stdin_eof()` builtin; `make test`/`make agent`. | `src/util/str_safe.nova` documents the old `split` bug; `split_char` stays (callers rely on its trailing-empty rule), and the audio commands that use `split` now get whole tokens (scenario_aaa_psola and scenario_hhh_dsp pass for the first time). |
+| [NOVA #31](https://github.com/amoufaq5/NOVA/pull/31) | **F-27 / F-28** | LSP shows the compiler's real syntax errors; one version number (0.1.0). | None. |
+| [NOVA #32](https://github.com/amoufaq5/NOVA/pull/32) | **F-14** | Bootstrap seed regenerated from the tagged compiler; no `setarch -R` needed. | ADR-0100 (setarch workaround) superseded. |
 
 ## When to retire the workarounds
 
