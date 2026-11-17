@@ -593,6 +593,9 @@ transcript's verdicts by item id (missing -> LLM_DENY). Verified: `llm_transcrip
 6 checks (inline parse, lookups, default); `reasoning_bench` 45 (incl. a
 transcript-driven head-to-head: engine all-correct + zero false proofs, LLM
 >=1 false-confident).
+(Audit F-02 correction: the "transcripts" used here were made-up verdicts, not
+recordings; the placeholder data files and `/vs` were removed. The inline test
+fixtures exercise the parser and the scoring arithmetic only.)
 
 **Increment 25 (landed): unification-driven search (instantiation discovery).**
 `src/mind/unify.nova` is standard first-order syntactic unification (vars,

@@ -127,9 +127,12 @@ compile_threshold=500
   cc:symptom->headache [via fever] (symptom -> headache)
 ```
 
-Every number here comes from a specific pt wire-up:
+Every number here comes from a specific pt wire-up. They are counters: CI
+checks them as regression invariants, and they show that each wire-up ran, not
+that the system learned anything (mc_hits counts memoised replies; see
+docs/HOW_IT_LEARNS.md and audit F-03):
 
-| Metric | What it proves | Shipped by |
+| Metric | What it counts | Shipped by |
 |---|---|---|
 | `mc_hits=9 / mc_misses=1` | HDC moment cache (Phase 0 pt4) short-circuits 9 of 10 near-identical queries via `hdc_cosine >= 900` | PR #20 |
 | `ff_goodness=605000` | Forward-Forward layer (Phase 0 pt3) trains on the active moment via `ff_train_pair` on `/good` | PR #19 |
@@ -281,7 +284,7 @@ bye.
 
 ## Phase / PR cross-reference
 
-| Phase + part | PR | What this transcript proves |
+| Phase + part | PR | What this transcript exercises |
 |---|---|---|
 | Phase 0 pt1-pt3 | #19 | synapse-weighted retrieval, chain compiler, Forward-Forward, HDC |
 | Phase 0 pt4 | #20 | moment cache LRU, kg_router, intent-adaptive prototypes |

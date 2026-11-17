@@ -4121,7 +4121,11 @@ See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 > the daemon can run continuously across real restarts. NEXT_SESSION.md records
 > exactly what works, what does not, and where to continue.
 
-## What works now (v1.0)
+## What is implemented (module inventory)
+
+> Modules listed here exist and have unit tests. Listing one is not a claim
+> that the chat uses it or that it meets its ADR exit criterion; see the
+> claims check at the top of this README and docs/HOW_IT_LEARNS.md.
 
 The Phase 1 substrate kernel (`src/substrate/`):
 

@@ -60,12 +60,13 @@ Backed by ADR-0207.
 | vs | Where CrossEngin wins |
 |---|---|
 | LLM SaaS (hosted) | Data never leaves customer infra; deterministic reasoning; audit-log native; no per-token vendor bill |
-| Self-hosted LLM | Explicit KG updates in seconds instead of days of tuning; end-to-end inspectable reasoning; hallucination floor is "unknown" |
+| Self-hosted LLM | Explicit KG updates in seconds instead of days of tuning; end-to-end inspectable reasoning; with no matching atom it answers "unknown" (it can still be wrong when atoms are wrong or loosely matched -- audit F-20, §2 #16) |
 | LLM + RAG | Retrieval is a graph walk against explicit atoms, not similarity over opaque embeddings; reasoning is not a prompt, so prompt injection has no target |
 | LLM + fine-tune | No gradients, no retraining cycle; new knowledge is a signed KG-delta that lands atomically |
 
-Latency parity with hosted LLMs is a hard requirement (ADR-0208);
-sovereignty and inspectability do not cost a five-second turnaround.
+Latency parity with hosted LLMs is a goal (ADR-0208), not a measured
+result: `bench/latency_v1/baseline.json` has no results yet, and the audit
+measured a p99 of ~1 s against a 500 ms budget.
 
 ## Where it fits (uses)
 

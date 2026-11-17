@@ -18,11 +18,11 @@
 > replies. Read the rest of this page as a description of the wiring, not as
 > a demonstration of learning.
 
-This document shows, on a running build, how the symbolic knowledge agent gets faster the more you use it — the mechanism that makes the system *not just a database*.
+This document walks through, on a running build, the wiring that runs when the same question is asked repeatedly: reply memoisation, `/good` reinforcement of chain edges, and the substrate counters that move with them.
 
 The demo is reproducible on any machine with the current `claude/phase-0-substrate` branch built. It runs in ~15 seconds and uses only the shipped `fever` seed vocabulary — no corpora required.
 
-> **Status**: Phase 0 parts 1–3 landed. All six substrate wire-ups are live: predictive-coding learner, synapse-weighted forward-chain retrieval, lazy synapse growth, direct `/good` reinforcement, episodic consolidation, HDC embed mode, and Forward-Forward goodness on moments. The first self-indexing acceleration module — the chain compiler — is also live. The remaining three acceleration modules (`kg_router`, `moment_cache`, `intent_adaptive`) are scheduled for part 4.
+> **Status**: the wire-ups below are called on the chat path: predictive-coding learner, synapse-weighted forward-chain retrieval, lazy synapse growth, direct `/good` reinforcement, episodic consolidation, HDC embed mode, Forward-Forward goodness on moments, the chain compiler, `kg_router`, `moment_cache` and `intent_adaptive`. "Called" is not "effective": the tick Hebbian update computes Δw = 0 on the live path (slot/atom-id mismatch, audit F-03), and the Forward-Forward and predictive-coding outputs are not read by anything that changes a reply. The visible speed-up is the moment cache returning memoised replies.
 
 ---
 
@@ -237,4 +237,4 @@ You should see the `fever → headache` weight climb from 0 to 1000 and the mome
 - **Phase 4 (bulk encyclopedic seed)**: synapse graph scales with KG; the per-tenant working set stays hot without reloading corpora.
 - **Phase 5 (agent provider platform)**: a baked agent ships its synapse graph alongside its atoms. The receiving customer gets a pre-warmed hot-path layout; their own `/good` feedback then specialises further to their domain.
 
-Everything that follows in the plan rests on this layer being live and inspectable. It is.
+Everything that follows in the plan rests on this layer. It is inspectable today; whether it learns anything beyond `/good` reinforcement and memoisation is what experiment E1 (ablations) is set up to measure.

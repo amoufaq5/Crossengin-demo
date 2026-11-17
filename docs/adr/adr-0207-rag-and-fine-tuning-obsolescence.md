@@ -153,11 +153,12 @@ guessing at any step.
   proprietary embedding format, no re-embed cost on updates.
 - No fine-tune platform dependency. Domain specialization is a
   bake, not a training run; no GPU cluster required.
-- Zero hallucination by construction. The daemon cannot invent
-  facts because there is no weight-implicit generator in the
-  answer path. The templater (ADR-0104) constructs answers from
-  ProposalResult data; if the ProposalResult has no data, the
-  answer says so.
+- No weight-implicit generator in the answer path. The templater
+  (ADR-0104) constructs answers from ProposalResult data; if the
+  ProposalResult has no data, the answer says so. This is not "zero
+  hallucination": answers are only as right as the atoms and the
+  matching, and the 2026-11 audit found wrong answers from loose
+  matching and from ingestion errors (F-20, §2 #16).
 - Auditable end-to-end. Every fact traces to a source atom with
   provenance; every answer traces to the atoms and skill runs that
   produced it.

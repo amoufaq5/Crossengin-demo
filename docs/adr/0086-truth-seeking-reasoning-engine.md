@@ -208,6 +208,15 @@ a controlled 3-item bank's LLM verdicts exactly; the default pairs show the gap)
 Broadening the bank beyond the seed rules and capturing REAL LLM transcripts is
 the remaining expansion -- the harness is ready for them.
 
+> **Correction (audit F-02, 2026-11).** The "LLM" column above was never an LLM:
+> `bench_default_pairs` hard-coded the verdicts and no model was queried or
+> recorded, so the 11/11 vs 8/11 figures compare the engine with a made-up
+> column and measure nothing. `/vs`, `bench_default_pairs`,
+> `bench_compare_report` and the `data/llm_baseline_*.txt` placeholder files
+> were removed. The scoring harness (`bench_compare`,
+> `bench_compare_transcript`) and the transcript parser remain; no head-to-head
+> result exists until a real transcript is recorded (docs/bench-capture.md).
+
 **Epistemic-status capstone (landed): "how do I know this?"**
 `src/parts/reasoning/epistemic_status.nova` synthesizes every layer's signal
 into ONE calibrated, honest classification per atom: EP_PROVEN (a VERIFIED
