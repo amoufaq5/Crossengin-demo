@@ -70,6 +70,12 @@ printf '/load %s\n/save %s\n/quit\n' "$WORK/legacy.snap" "$WORK/resaved.snap" | 
 assert_eq "$(grep -c '^synapses.parts\[[0-9]*\].label reasoning$' "$WORK/resaved.snap")" "0" "legacy edges not in the reasoning pool graph after re-save"
 assert_eq "$(grep -c '^synapses.parts\[[0-9]*\].label router$' "$WORK/resaved.snap")" "1" "re-save writes them as the router entry"
 assert_eq "$(grep '^synapses.count ' "$WORK/resaved.snap")" "synapses.count 0" "re-save legacy block empty"
+assert_eq "$(grep -E '^synapses.parts\[[0-9]+\].synapses.count ' "$WORK/resaved.snap" | awk '{print $2}')" "3" "re-saved router entry keeps all 3 edges"
+
+# /good right after /switch must not apply the left session's ops
+OUT=$( (echo fever; echo "/switch alice"; echo /good; echo /__learning__; echo /quit) \
+       | timeout 120 "$CHAT" 2>&1 | tr -d '\r')
+assert_nomatch "$OUT" "reinforced 3 inference" "/good after /switch does not reuse the old session's ops"
 
 # 3b. per-session tables: a /switch tenant starts with an empty router table
 #     and does not disturb the default session's table.
