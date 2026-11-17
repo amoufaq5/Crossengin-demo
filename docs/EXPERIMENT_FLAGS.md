@@ -25,12 +25,25 @@ chat prints one banner line at startup, for example
 
 `CE_HEBB=1` is not an ablation: it turns **on** a Hebbian step on the
 cognitive router's table after every routed reply, cache hit or miss
-(`cr_hebb_step`). It applies `syn_learn_one` to the existing router-table
-edges of the reply's chain (first premise activation 1000, each conclusion
-= premise activation × operator confidence, error 0, the turn's modulator).
-It never grows edges. It prints its own startup banner, adds `hebb_steps`
-and `hebb_updates` rows to `/__learning__`, and appears as `hebb` at the end
-of the `EXP` `flags` field. Off by default; with it off, output is unchanged.
+(`cr_hebb_step`). It runs once per turn, on the chain behind the final reply
+(after any same-turn re-answer), and applies `syn_learn_one` to that chain's
+existing router-table edges: premise activation 1000, conclusion activation
+1000 × operator confidence, error 0. It never grows edges.
+
+- **Rate:** a leg gains about 20 × confidence / 1000 milli per step at a
+  neutral modulator (10 at the seed confidence of 500). Legs with
+  confidence below 50 milli truncate to 0.
+- **Modulator:** the value recomputed from the turn's affect during the
+  drain. In the `EXP` trace that value is reported as the *next* turn's
+  `modulator`.
+- **Chain compiler:** Hebbian weight counts toward the 500-milli threshold at
+  which `/good` compiles a shortcut operator, so with `CE_HEBB=1` fewer
+  `/good` presses mint one. Under `CE_ABL_SYNW` compilation stays off.
+- **Output:** a startup banner; `hebb_steps` (routed replies with a chain)
+  and `hebb_updates` (edges whose weight changed) rows in `/__learning__`,
+  counted per session; `hebb` at the end of the `EXP` `flags` field.
+
+Off by default; with it off, output is unchanged.
 
 ## Trace
 

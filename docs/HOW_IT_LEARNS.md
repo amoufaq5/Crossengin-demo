@@ -29,13 +29,16 @@
 > step on the cognitive router's own table (`cr_hebb_step` in
 > `src/agent/cognitive_router.nova`). After every routed reply, cache hit or
 > miss, it applies the ADR-0007 rule (`syn_learn_one`, error term 0) to the
-> router-table edges of the chain behind the reply, keyed by atom id. The
-> first premise has activation 1000, and each leg's conclusion is the
-> premise activation times the operator's confidence. It scales with the
-> turn's plasticity modulator and never grows edges. With it on, ten
-> `fever` turns and no `/good` move `synapse_mean_weight` from 0 to 15
-> (CI step "CE_HEBB smoke"). It is **off by default** and stays off until
-> E1 shows whether it helps; with it off, nothing in this document changes.
+> router-table edges of the chain behind the final reply, keyed by atom id.
+> Every leg was traversed, so each premise is fully active (1000) and each
+> conclusion is active in proportion to the operator's confidence. The step
+> is scaled by the plasticity modulator recomputed during the turn, and it
+> never grows edges. With it on, ten `fever` turns and no `/good` raise each
+> leg of infection→symptom→fever→headache from 0 to 130 (mean weight 0 → 39;
+> CI step "CE_HEBB smoke"). Because `/good` compiles a shortcut once both legs
+> pass 500, Hebbian weight also brings that compile forward. It is **off by
+> default** and stays off until E1 shows whether it helps; with it off,
+> nothing in this document changes.
 
 This document walks through, on a running build, the wiring that runs when the same question is asked repeatedly: reply memoisation, `/good` reinforcement of chain edges, and the substrate counters that move with them.
 
