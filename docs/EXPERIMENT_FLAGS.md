@@ -21,6 +21,30 @@ chat prints one banner line at startup, for example
 | `CE_ABL_SYNW` | Router-table weights change no behaviour. The router ignores them when it scores candidate operators, and `/good` no longer compiles weight-gated A→C shortcut operators (the chain compiler). Edges still grow and `/good` still writes the weights. | `compiled_count=0` in `/__compiled__` |
 | `CE_ABL_BETA` | `/good` and `/bad` no longer update operator confidence. | `[conf=...]` in reasoning traces |
 
+## CE_HEBB (B3, audit F-03)
+
+`CE_HEBB=1` is not an ablation: it turns **on** a Hebbian step on the
+cognitive router's table after every routed reply, cache hit or miss
+(`cr_hebb_step`). It runs once per turn, on the chain behind the final reply
+(after any same-turn re-answer), and applies `syn_learn_one` to that chain's
+existing router-table edges: premise activation 1000, conclusion activation
+1000 × operator confidence, error 0. It never grows edges.
+
+- **Rate:** a leg gains about 20 × confidence / 1000 milli per step at a
+  neutral modulator (10 at the seed confidence of 500). Legs with
+  confidence below 50 milli truncate to 0.
+- **Modulator:** the value recomputed from the turn's affect during the
+  drain. In the `EXP` trace that value is reported as the *next* turn's
+  `modulator`.
+- **Chain compiler:** Hebbian weight counts toward the 500-milli threshold at
+  which `/good` compiles a shortcut operator, so with `CE_HEBB=1` fewer
+  `/good` presses mint one. Under `CE_ABL_SYNW` compilation stays off.
+- **Output:** a startup banner; `hebb_steps` (routed replies with a chain)
+  and `hebb_updates` (edges whose weight changed) rows in `/__learning__`,
+  counted per session; `hebb` at the end of the `EXP` `flags` field.
+
+Off by default; with it off, output is unchanged.
+
 ## Trace
 
 `CE_EXP_TRACE=1` prints one line per conversational turn, including turns the
@@ -40,7 +64,7 @@ Fields:
 - **`router`:** 1 when the turn went through the cognitive router. When it is 0, the fields `ops`, `trace` and `category` are empty.
 - **`modulator` / `pc_error`:** the values passed to the turn's tick. The turn recomputes both after that tick, and the new values drive the next turn's tick.
 - **`fired`:** substrate nodes fired by the turn's tick. That tick runs before the turn's own input is injected, so it integrates the previous turn's stimulus; turn 0 always shows 0.
-- **`flags`:** the ablations that are on.
+- **`flags`:** the ablations that are on, then `hebb` when `CE_HEBB=1`.
 
 Wall time is not reported; measure it outside the process.
 

@@ -25,11 +25,26 @@
 > replies. Read the rest of this page as a description of the wiring, not as
 > a demonstration of learning.
 
+> **B3 update (audit F-03 fix, opt-in).** `CE_HEBB=1` turns on a Hebbian
+> step on the cognitive router's own table (`cr_hebb_step` in
+> `src/agent/cognitive_router.nova`). After every routed reply, cache hit or
+> miss, it applies the ADR-0007 rule (`syn_learn_one`, error term 0) to the
+> router-table edges of the chain behind the final reply, keyed by atom id.
+> Every leg was traversed, so each premise is fully active (1000) and each
+> conclusion is active in proportion to the operator's confidence. The step
+> is scaled by the plasticity modulator recomputed during the turn, and it
+> never grows edges. With it on, ten `fever` turns and no `/good` raise each
+> leg of infection→symptom→fever→headache from 0 to 130 (mean weight 0 → 39;
+> CI step "CE_HEBB smoke"). Because `/good` compiles a shortcut once both legs
+> pass 500, Hebbian weight also brings that compile forward. It is **off by
+> default** and stays off until E1 shows whether it helps; with it off,
+> nothing in this document changes.
+
 This document walks through, on a running build, the wiring that runs when the same question is asked repeatedly: reply memoisation, `/good` reinforcement of chain edges, and the substrate counters that move with them.
 
 The demo is reproducible on any machine with the current `claude/phase-0-substrate` branch built. It runs in ~15 seconds and uses only the shipped `fever` seed vocabulary — no corpora required.
 
-> **Status**: the wire-ups below are called on the chat path: predictive-coding learner, synapse-weighted forward-chain retrieval, lazy synapse growth, direct `/good` reinforcement, episodic consolidation, HDC embed mode, Forward-Forward goodness on moments, the chain compiler, `kg_router`, `moment_cache` and `intent_adaptive`. "Called" is not "effective": the tick Hebbian update computes Δw = 0 on the live path (slot/atom-id mismatch, audit F-03), and the Forward-Forward and predictive-coding outputs are not read by anything that changes a reply. The visible speed-up is the moment cache returning memoised replies.
+> **Status**: the wire-ups below are called on the chat path: predictive-coding learner, synapse-weighted forward-chain retrieval, lazy synapse growth, direct `/good` reinforcement, episodic consolidation, HDC embed mode, Forward-Forward goodness on moments, the chain compiler, `kg_router`, `moment_cache` and `intent_adaptive`. "Called" is not "effective": the tick Hebbian update computes Δw = 0 on the live path (slot/atom-id mismatch, audit F-03; the opt-in `CE_HEBB=1` router-table step is the fix under test), and the Forward-Forward and predictive-coding outputs are not read by anything that changes a reply. The visible speed-up is the moment cache returning memoised replies.
 
 ---
 
@@ -83,7 +98,8 @@ Each message passes through five layers. Three of them *write state* that persis
 │  │ 5. Learning rules     plasticity_modulation + predictive_    │   │
 │  │                       coding_runtime + forward_forward       │   │
 │  │    Hebbian (via emotion_modulate_plasticity → pm_modulator): │   │
-│  │       called each tick; dw = 0 on the live path (F-03).      │   │
+│  │       called each tick; dw = 0 on the live path (F-03);      │   │
+│  │       opt-in CE_HEBB=1 router-table step (B3) learns.        │   │
 │  │    Predictive coding (pc_pred_learn): called; its output is  │   │
 │  │       not read by anything that changes a reply.             │   │
 │  │    Forward-Forward (ff_train_pair): called on /good, /bad;   │   │
@@ -158,7 +174,7 @@ A graph database can store (`fever`, `treats`, `aspirin`). It cannot:
 2. **Preserve audit while adapting.** The underlying atoms and provenance don't change. Only the per-session weights do. `/why` still cites the same source for the fact; `/synapse` shows the learned preference.
 3. **Learn without gradient descent.** Every weight update is `O(1)` and happens in the forward pass. No backward pass. No GPU. The whole 10-synapse state is a few hundred bytes.
 
-What this amounts to today is `/good` reinforcement of chain edges plus reply memoisation. The tick Hebbian rule that was meant to provide frequency-adaptive weights computes no change on the live path (audit F-03).
+What this amounts to today is `/good` reinforcement of chain edges plus reply memoisation. The tick Hebbian rule that was meant to provide frequency-adaptive weights computes no change on the live path (audit F-03). The opt-in `CE_HEBB=1` router-table step (B3) is the candidate fix; E1 tests whether it helps.
 
 ---
 
@@ -171,6 +187,7 @@ What this amounts to today is `/good` reinforcement of chain edges plus reply me
 | Synapse graph | **yes** (lazy grow + direct `/good` reinforcement) | `syn_grow_if_absent` + `syn_set_weight` |
 | Moments / tick | yes | `loop_memory_step_with_episodic` + `tick_driver` |
 | Hebbian plasticity | called; dw = 0 on the live path (F-03) | `emotion_modulate_plasticity → pm_modulator` |
+| Router-table Hebbian step (B3) | opt-in, `CE_HEBB=1`; off by default | `cr_hebb_step` → `syn_learn_one` |
 | Predictive coding (learner) | called; output unused by replies | `pc_pred_learn` + `pc_pred_predict` |
 | Forward-Forward | called; `ff_goodness` unused by replies | `ff_layer_new` + `ff_train_pair` + `ff_goodness` |
 | Chain compiler | **yes** (pt3) | `chain_compile_from_ops_csv` on `/good` |
