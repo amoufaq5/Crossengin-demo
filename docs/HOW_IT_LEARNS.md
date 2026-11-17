@@ -18,8 +18,8 @@
 >   reasoning part's *pool* graph, where atom ids below the pool size aliased
 >   real node slots. They now live in a separate per-session **router table**
 >   (atom-id keyed) that no tick runs over. Its weights change only through
->   `/good` / `/bad`. This removes the aliasing; it does not by itself make
->   the tick learn (that is B3, behind `CE_HEBB=1`).
+>   `/good` / `/bad` (and snapshot `/load`). This removes the aliasing; it
+>   does not make anything learn from the tick.
 >
 > "Gets faster the more you use it" is true only in the sense of memoising
 > replies. Read the rest of this page as a description of the wiring, not as

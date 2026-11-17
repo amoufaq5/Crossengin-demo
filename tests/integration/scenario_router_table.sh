@@ -62,9 +62,14 @@ for l in lines:
 open(dst, 'w').write('\n'.join(out))
 EOF
 OUT=$(printf '/load %s\n/synapse fever\n/__learning__\n/quit\n' "$WORK/legacy.snap" | timeout 120 "$CHAT" 2>&1 | tr -d '\r')
-assert_match "$OUT" "router: 3, dropped: 0, migrated from pre-router snapshot" "legacy reasoning edges migrated to the router table"
+assert_match "$OUT" "restored \(parts: 0, router: 3, dropped: 0, migrated from pre-router snapshot;" "legacy reasoning edges migrated to the router table only"
 assert_match "$OUT" "[-]> headache \(node [0-9]+\) weight=300" "migrated weight readable by the router"
 assert_nomatch "$OUT" "unknown part" "no unknown-part warning"
+# re-save after the legacy load: nothing may have landed in the pool graph
+printf '/load %s\n/save %s\n/quit\n' "$WORK/legacy.snap" "$WORK/resaved.snap" | timeout 120 "$CHAT" >/dev/null 2>&1
+assert_eq "$(grep -c '^synapses.parts\[[0-9]*\].label reasoning$' "$WORK/resaved.snap")" "0" "legacy edges not in the reasoning pool graph after re-save"
+assert_eq "$(grep -c '^synapses.parts\[[0-9]*\].label router$' "$WORK/resaved.snap")" "1" "re-save writes them as the router entry"
+assert_eq "$(grep '^synapses.count ' "$WORK/resaved.snap")" "synapses.count 0" "re-save legacy block empty"
 
 # 3b. per-session tables: a /switch tenant starts with an empty router table
 #     and does not disturb the default session's table.
@@ -72,6 +77,13 @@ OUT=$( (for i in 1 2 3; do echo fever; echo /good; done
         echo "/switch alice"; echo /__learning__
         echo "/switch default"; echo /__learning__; echo /quit) | timeout 120 "$CHAT" 2>&1 | tr -d '\r')
 assert_eq "$(grep -oE 'synapse_live=[0-9]+' <<<"$OUT" | tr '\n' ' ')" "synapse_live=0 synapse_live=10 " "alice's table empty, default's intact"
+# a query another session answered first must still grow + reinforce edges
+# in this session's table (the moment cache is per session too)
+OUT=$( (echo fever; echo "/switch alice"; echo fever; echo /good; echo /good; echo /__learning__; echo /quit) \
+       | timeout 120 "$CHAT" 2>&1 | tr -d '\r')
+assert_match "$OUT" "synapse_live=10$" "alice grows her own router edges for a query default answered"
+assert_match "$OUT" "^synapse_mean_weight=60$" "alice's /good reinforces her table (3 legs x 200 / 10)"
+assert_match "$OUT" "^mc_hits=0$" "alice's moment cache is her own (no hit from default's entry)"
 
 # 4. Phase 0 counters (same run as CI's fever smoke)
 OUT=$( (for i in $(seq 1 10); do echo fever; echo /good; done; echo /__learning__; echo /quit) \
