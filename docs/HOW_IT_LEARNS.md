@@ -14,6 +14,13 @@
 >   counters that grow with each query or `/good`. They are a regression pin
 >   for this code path, **not evidence that the system learns**.
 >
+> - **Update (B1, audit C12):** the router's chain edges used to live in the
+>   reasoning part's *pool* graph, where atom ids below the pool size aliased
+>   real node slots. They now live in a separate per-session **router table**
+>   (atom-id keyed) that no tick runs over. Its weights change only through
+>   `/good` / `/bad`. This removes the aliasing; it does not by itself make
+>   the tick learn (that is B3, behind `CE_HEBB=1`).
+>
 > "Gets faster the more you use it" is true only in the sense of memoising
 > replies. Read the rest of this page as a description of the wiring, not as
 > a demonstration of learning.
@@ -53,11 +60,12 @@ Each message passes through five layers. Three of them *write state* that persis
 │         │                                                            │
 │         ▼                                                            │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │ 3. Synapse graph      src/substrate/synapse_graph.nova       │   │
-│  │    Weighted directed edges between atom nodes.               │   │
-│  │    Phase 0: grown lazily when _cr_chain picks an edge, so    │   │
-│  │    the chat path actually populates it. Weights change only  │   │
-│  │    by direct /good, /bad reinforcement (tick Hebbian: dw=0). │   │
+│  │ 3. Router table       src/substrate/synapse_graph.nova       │   │
+│  │    Weighted directed edges between ATOM ids, one table per   │   │
+│  │    session, separate from the substrate's pool graphs (B1).  │   │
+│  │    Grown lazily (weight 0) when _cr_chain picks an edge.     │   │
+│  │    No tick runs over it: weights change only by direct       │   │
+│  │    /good, /bad reinforcement (+/-100 milli per leg).         │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │         │                                                            │
 │         ▼                                                            │
@@ -136,7 +144,7 @@ Repeat `fever` + `/good` nine more times. Weight climb:
 Observations:
 
 - **Weight climbs linearly** with each `/good` (+100 milli per reinforcement) until it saturates at `W_MAX=1000`.
-- **Mean weight across all 10 synapses climbs to 300** — not 1000 — because only the two edges actually traversed on this chain (`fever → headache`, and the premise→conclusion pair of the two rop_* operators backing it) are reinforced. The seven other synapses in the chain's neighbourhood stay at 0 and anchor the average.
+- **Mean weight across all 10 synapses climbs to 300** — not 1000 — because only the chain's three legs (`infection → symptom`, `symptom → fever`, `fever → headache`) are reinforced, each to `W_MAX=1000`. The seven other edges grown while searching stay at 0: (3 × 1000 + 7 × 0) / 10 = 300.
 - **Episodic consolidation**: 10 moments produced 10 episodes — one per unique moment signature. If you ran `/status`, memory would show the live episode count.
 - **`fever → infection` stays at 0**: the chain is `infection → symptom → fever → headache`. The forward step from `fever` is to `headache`, so that's the edge that gets reinforced. Semantically correct.
 

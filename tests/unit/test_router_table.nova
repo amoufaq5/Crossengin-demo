@@ -1,0 +1,376 @@
+// Unit tests for B1 (audit C12): the cognitive router keeps its OWN synapse
+// table, separate from every part's pool graph.
+//
+// Before B1 the chat bound `cr_set_syn_g(part_syn(reasoning))`, so the
+// router's atom-id edges (premise atom -> conclusion atom) lived in a graph
+// whose pre/post the tick driver reads as POOL NODE ids. Atom ids below the
+// pool cap aliased live slots: a fired first node delivered "spikes" along an
+// edge that meant "atom 0 -> atom 1", and tick plasticity rewrote router
+// weights from unrelated pool activity.
+//
+// Covers:
+//   - the router writes only its table, never the part graph
+//   - a tick on the reasoning pool does not deliver along router edges and
+//     does not touch router weights
+//   - control: binding the part graph (the pre-B1 wiring) DOES alias, so the
+//     isolation assertions above are sensitive
+//   - snapshot: "router" entry round trip, label remap across id changes,
+//     unresolvable records dropped, legacy files migrated (multi-part and
+//     pre-multi), post-B1 files not migrated, "router" is not a part name.
+
+import "../ce_test.nova"
+import "../../src/agent/cognitive_router.nova"
+import "../../src/substrate/tick_driver.nova"
+import "../../src/persistence/snapshot_disk.nova"
+import "../../src/substrate/part_lifecycle.nova"
+import "../../src/util/str_safe.nova"
+import "std/syscall"
+import "std/string"
+import "std/io"
+
+// morning(0) -> breakfast(1) -> energy(2) -> work(3), all causal. Ids are
+// deliberately below the pool's first-node count so they alias live slots.
+fn rt_build_kg() {
+    let reg = kg_registry_new()
+    let rkg = reasoning_kg_init(reg)
+    kg_add_atom(rkg, ATOM_CONCEPT, "morning", 0)     // 0
+    kg_add_atom(rkg, ATOM_CONCEPT, "breakfast", 0)   // 1
+    kg_add_atom(rkg, ATOM_CONCEPT, "energy", 0)      // 2
+    kg_add_atom(rkg, ATOM_CONCEPT, "work", 0)        // 3
+    rop_new(rkg, ROP_CAUSAL, 0, 1, "morning->breakfast", 0)
+    rop_new(rkg, ROP_CAUSAL, 1, 2, "breakfast->energy", 0)
+    rop_new(rkg, ROP_CAUSAL, 2, 3, "energy->work", 0)
+    return rkg
+}
+
+fn rt_build_lang() {
+    let reg = kg_registry_new()
+    let lang = lang_kg_init(reg)
+    word_intern(lang, "morning", 0)
+    return lang
+}
+
+fn rt_percept_of(cid) {
+    let p = list_new()
+    let e = list_new() push(e, "tok") push(e, cid)
+    push(p, e)
+    return p
+}
+
+// The chat's substrate shape: fixed parts, cap 128, 8 first nodes.
+fn rt_chat_reg() {
+    let reg = part_registry_new()
+    registry_spawn_fixed(reg, 128, 8)
+    return reg
+}
+
+// Grow the 3 router edges and reinforce them 3x (+100 each) -> weight 300.
+fn rt_learn(kg, lang) {
+    let r = router_reply(CAT_ACADEMIC, "why morning", kg, lang, rt_percept_of(0), 0)
+    let ops = rr_ops(r)
+    router_apply_feedback(kg, ops, 1)
+    router_apply_feedback(kg, ops, 1)
+    router_apply_feedback(kg, ops, 1)
+    return ops
+}
+
+fn test_router_writes_only_router_table() {
+    let kg = rt_build_kg()
+    let lang = rt_build_lang()
+    let reg = rt_chat_reg()
+    let rid = registry_find(reg, "reasoning")
+    let pg = part_syn(registry_get(reg, rid))
+    let pool_before = syn_live(pg)
+    let router_g = syn_graph_new()
+    cr_set_syn_g(router_g)
+    rt_learn(kg, lang)
+    ce_eq("part graph unchanged by router", syn_live(pg), pool_before)
+    ce_eq("part graph has no 0->1 edge", syn_find(pg, 0, 1), 0 - 1)
+    let e01 = syn_find(router_g, 0, 1)
+    let e12 = syn_find(router_g, 1, 2)
+    let e23 = syn_find(router_g, 2, 3)
+    ce_check("router 0->1 grown", e01 >= 0)
+    ce_check("router 1->2 grown", e12 >= 0)
+    ce_check("router 2->3 grown", e23 >= 0)
+    ce_eq("router 0->1 weight after 3x /good", syn_weight(router_g, e01), 300)
+    ce_eq("router 2->3 weight after 3x /good", syn_weight(router_g, e23), 300)
+    cr_set_syn_g(0)
+}
+
+fn test_tick_does_not_touch_router_edges() {
+    let kg = rt_build_kg()
+    let lang = rt_build_lang()
+    let reg = rt_chat_reg()
+    let rid = registry_find(reg, "reasoning")
+    let pool = part_pool(registry_get(reg, rid))
+    let router_g = syn_graph_new()
+    cr_set_syn_g(router_g)
+    rt_learn(kg, lang)
+    let e01 = syn_find(router_g, 0, 1)
+
+    // Slot 0 fires; slots 0 and 1 are co-active in the tick-start snapshot.
+    npm_node_input(pool, 0, 700)
+    npm_set_activation(pool, 1, 600)
+    td_tick_part(reg, rid, 1, TD_MOD_NEUTRAL, 0)
+    ce_eq("slot 0 fired", npm_last_fired(pool, 0), 1)
+    ce_eq("no spike along atom edge 0->1", npm_inbox(pool, 1), 0)
+    ce_eq("router edge never stamped by the tick", syn_last(router_g, e01), 0 - 1)
+    let t = 2
+    while t <= 6 {
+        npm_set_activation(pool, 0, 600)
+        npm_set_activation(pool, 1, 600)
+        td_tick_part(reg, rid, t, TD_MOD_NEUTRAL, 0)
+        t = t + 1
+    }
+    ce_eq("router weight unchanged after 6 ticks", syn_weight(router_g, e01), 300)
+    cr_set_syn_g(0)
+}
+
+// Control: the pre-B1 wiring (router bound to the part's pool graph). The
+// same steps DO deliver a spike along the atom edge and DO move its weight,
+// which proves the two isolation tests above can fail.
+fn test_control_shared_graph_aliases() {
+    let kg = rt_build_kg()
+    let lang = rt_build_lang()
+    let reg = rt_chat_reg()
+    let rid = registry_find(reg, "reasoning")
+    let part = registry_get(reg, rid)
+    let pool = part_pool(part)
+    let pg = part_syn(part)
+    cr_set_syn_g(pg)
+    rt_learn(kg, lang)
+    let e01 = syn_find(pg, 0, 1)
+    ce_check("control: router edge landed in the pool graph", e01 >= 0)
+    npm_node_input(pool, 0, 700)
+    npm_set_activation(pool, 1, 600)
+    td_tick_part(reg, rid, 1, TD_MOD_NEUTRAL, 0)
+    ce_check("control: spike delivered along atom edge", npm_inbox(pool, 1) > 0)
+    let t = 2
+    while t <= 6 {
+        npm_set_activation(pool, 0, 600)
+        npm_set_activation(pool, 1, 600)
+        td_tick_part(reg, rid, t, TD_MOD_NEUTRAL, 0)
+        t = t + 1
+    }
+    ce_check("control: ticks rewrote the router weight", syn_weight(pg, e01) != 300)
+    cr_set_syn_g(0)
+}
+
+// ---- snapshot -------------------------------------------------------------
+
+fn rt_rec(src, dst, w, e) {
+    let r = list_new()
+    push(r, src) push(r, dst) push(r, w) push(r, e)
+    return r
+}
+
+fn rt_entry(label, recs) {
+    let e = list_new()
+    push(e, label) push(e, recs)
+    return e
+}
+
+fn rt_blob(legacy, parts) {
+    let b = list_new()
+    push(b, SYN_SNAP_MIN) push(b, legacy) push(b, parts)
+    return b
+}
+
+// KGS blob with [kg, id, kind, label] records in the "reasoning" KG.
+fn rt_kgs(ids, labels) {
+    let recs = list_new()
+    let i = 0
+    while i < len(ids) {
+        let r = list_new()
+        push(r, "reasoning") push(r, ids[i]) push(r, ATOM_CONCEPT) push(r, labels[i])
+        push(r, 1) push(r, 1)
+        push(recs, r)
+        i = i + 1
+    }
+    let b = list_new()
+    push(b, len(ids)) push(b, recs)
+    return b
+}
+
+fn rt_wrap(blob) {
+    let s = snap_new(1, 100)
+    let sb = list_new()
+    push(sb, "Aurora") push(sb, 0)
+    snap_put_section(s, SEC_SOUL, sb)
+    let kb = list_new()
+    push(kb, 0) push(kb, list_new())
+    snap_put_section(s, SEC_KGS, kb)
+    snap_put_section(s, SEC_SYNAPSES, blob)
+    return snap_section(snap_from_text(snap_to_text(s)), SEC_SYNAPSES)
+}
+
+fn test_build_router_zero_is_identical() {
+    let reg = part_registry_new()
+    registry_add(reg, "reasoning", FN_PRESET_REASONING, 64, 4)
+    syn_new(part_syn(registry_get(reg, 0)), 1, 2, 500, 0)
+    let a = synapses_section_build_multi(reg)
+    let b = synapses_section_build_multi_router(reg, 0)
+    ce_eq("same threshold", a[0], b[0])
+    ce_eq("same legacy block", len(a[1]), len(b[1]))
+    ce_eq("same parts", len(a[2]), len(b[2]))
+    ce_eq("no router entry", synapses_section_has_router(b), 0)
+}
+
+fn test_router_entry_round_trip() {
+    let reg = part_registry_new()
+    registry_add(reg, "reasoning", FN_PRESET_REASONING, 64, 4)
+    let rg = syn_graph_new()
+    syn_new(rg, 66, 4, 300, 0)
+    syn_new(rg, 4, 3, 1000, 0)
+    syn_set_eligibility(rg, 1, 250)
+    syn_new(rg, 3, 66, 0, 0)          // weight 0: below threshold, not saved
+    let blob = rt_wrap(synapses_section_build_multi_router(reg, rg))
+    ce_eq("has router entry", synapses_section_has_router(blob), 1)
+    ce_eq("router not mirrored into legacy block", len(blob[1]), 0)
+    let recs = synapses_section_router_records(blob)
+    ce_eq("2 router records saved", len(recs), 2)
+    ce_eq("parts install nothing", synapses_section_apply_parts_routed(reg, blob), 0)
+    ce_eq("reasoning pool graph untouched", syn_live(part_syn(registry_get(reg, 0))), 0)
+    // Old-style apply must skip "router" (no install into a part).
+    ce_eq("apply_multi skips router", synapses_section_apply_multi(reg, blob), 0)
+
+    // Restore into a KG where the labels keep their ids.
+    let kreg = kg_registry_new()
+    let kg = reasoning_kg_init(kreg)
+    let i = 0
+    while i < 67 { kg_add_atom(kg, ATOM_CONCEPT, "a" + int_to_str(i), 0); i = i + 1 }
+    let ids = list_new() push(ids, 3) push(ids, 4) push(ids, 66)
+    let lbls = list_new() push(lbls, "a3") push(lbls, "a4") push(lbls, "a66")
+    let g2 = syn_graph_new()
+    let res = router_section_apply(g2, recs, rt_kgs(ids, lbls), kg)
+    ce_eq("2 installed", res[0], 2)
+    ce_eq("0 dropped", res[1], 0)
+    let e = syn_find(g2, 4, 3)
+    ce_check("4->3 restored", e >= 0)
+    ce_eq("4->3 weight", syn_weight(g2, e), 1000)
+    ce_eq("4->3 eligibility", syn_elig(g2, e), 250)
+}
+
+fn test_router_remap_by_label() {
+    // Saved ids 10 -> 11 for labels "x" -> "y"; in the live KG "x" is 1 and
+    // "y" is 0. The edge must land on the LIVE ids.
+    let kreg = kg_registry_new()
+    let kg = reasoning_kg_init(kreg)
+    kg_add_atom(kg, ATOM_CONCEPT, "y", 0)   // 0
+    kg_add_atom(kg, ATOM_CONCEPT, "x", 0)   // 1
+    let recs = list_new() push(recs, rt_rec(10, 11, 400, 0))
+    let ids = list_new() push(ids, 10) push(ids, 11)
+    let lbls = list_new() push(lbls, "x") push(lbls, "y")
+    let g = syn_graph_new()
+    let res = router_section_apply(g, recs, rt_kgs(ids, lbls), kg)
+    ce_eq("remap installed", res[0], 1)
+    ce_check("edge on live ids 1->0", syn_find(g, 1, 0) >= 0)
+    ce_eq("not on saved ids", syn_find(g, 10, 11), 0 - 1)
+}
+
+fn test_router_unresolvable_dropped() {
+    let kreg = kg_registry_new()
+    let kg = reasoning_kg_init(kreg)
+    kg_add_atom(kg, ATOM_CONCEPT, "x", 0)
+    let recs = list_new()
+    push(recs, rt_rec(10, 12, 400, 0))   // 12 not in the KGS records
+    push(recs, rt_rec(10, 13, 400, 0))   // 13 has a label the KG lacks
+    push(recs, rt_rec(10, 14, 400, 0))   // 14 is unlabeled
+    let ids = list_new() push(ids, 10) push(ids, 13) push(ids, 14)
+    let lbls = list_new() push(lbls, "x") push(lbls, "gone") push(lbls, "")
+    let g = syn_graph_new()
+    let res = router_section_apply(g, recs, rt_kgs(ids, lbls), kg)
+    ce_eq("nothing installed", res[0], 0)
+    ce_eq("3 dropped", res[1], 3)
+    ce_eq("graph empty", syn_live(g), 0)
+}
+
+fn test_router_raw_ids_without_kgs_records() {
+    // Legacy metadata-only KGS: no per-atom records -> ids used raw.
+    let kreg = kg_registry_new()
+    let kg = reasoning_kg_init(kreg)
+    let recs = list_new() push(recs, rt_rec(5, 6, 300, 0))
+    let g = syn_graph_new()
+    let res = router_section_apply(g, recs, 0, kg)
+    ce_eq("raw install", res[0], 1)
+    ce_check("raw 5->6", syn_find(g, 5, 6) >= 0)
+}
+
+fn test_legacy_single_block_migrates() {
+    let reg = rt_chat_reg()
+    let rp = part_syn(registry_get(reg, registry_find(reg, "reasoning")))
+    let before = syn_live(rp)
+    let legacy = list_new() push(legacy, rt_rec(4, 3, 300, 0))
+    let blob = rt_blob(legacy, list_new())
+    ce_eq("no router entry", synapses_section_has_router(blob), 0)
+    ce_eq("parts install nothing", synapses_section_apply_parts_routed(reg, blob), 0)
+    ce_eq("pool graph untouched", syn_live(rp), before)
+    let recs = synapses_section_router_records(blob)
+    ce_eq("legacy block becomes router records", len(recs), 1)
+    let g = syn_graph_new()
+    router_section_apply(g, recs, 0, reasoning_kg_init(kg_registry_new()))
+    ce_check("4->3 in router table", syn_find(g, 4, 3) >= 0)
+}
+
+fn test_legacy_multi_part_migrates_reasoning_only() {
+    let reg = rt_chat_reg()
+    let rp = part_syn(registry_get(reg, registry_find(reg, "reasoning")))
+    let ep = part_syn(registry_get(reg, registry_find(reg, "episodic")))
+    let before_r = syn_live(rp)
+    let before_e = syn_live(ep)
+    let r1 = list_new() push(r1, rt_rec(4, 3, 300, 0))
+    let r2 = list_new() push(r2, rt_rec(20, 21, 500, 0))
+    let parts = list_new()
+    push(parts, rt_entry("reasoning", r1))
+    push(parts, rt_entry("episodic", r2))
+    let blob = rt_wrap(rt_blob(r1, parts))
+    ce_eq("episodic entry installed", synapses_section_apply_parts_routed(reg, blob), 1)
+    ce_eq("reasoning pool graph untouched", syn_live(rp), before_r)
+    ce_eq("episodic got its edge", syn_live(ep), before_e + 1)
+    let recs = synapses_section_router_records(blob)
+    ce_eq("reasoning entry becomes router records", len(recs), 1)
+    ce_eq("router record src", recs[0][0], 4)
+}
+
+fn test_post_b1_file_no_migration() {
+    let reg = rt_chat_reg()
+    let rp = part_syn(registry_get(reg, registry_find(reg, "reasoning")))
+    let before = syn_live(rp)
+    let rx = list_new() push(rx, rt_rec(90, 91, 500, 0))
+    let ry = list_new() push(ry, rt_rec(4, 3, 300, 0))
+    let parts = list_new()
+    push(parts, rt_entry("reasoning", rx))
+    push(parts, rt_entry("router", ry))
+    let blob = rt_wrap(rt_blob(rx, parts))
+    ce_eq("has router entry", synapses_section_has_router(blob), 1)
+    ce_eq("reasoning entry installed as a part", synapses_section_apply_parts_routed(reg, blob), 1)
+    ce_eq("reasoning pool graph got its own edge", syn_live(rp), before + 1)
+    ce_check("pool edge 90->91", syn_find(rp, 90, 91) >= 0)
+    ce_eq("router edge not in pool graph", syn_find(rp, 4, 3), 0 - 1)
+    let recs = synapses_section_router_records(blob)
+    ce_eq("router records are the router entry", len(recs), 1)
+    ce_eq("router record src", recs[0][0], 4)
+}
+
+fn test_router_label_reserved() {
+    let reg = rt_chat_reg()
+    pl_spawn_kg(reg, "world", 128, 8)
+    ce_eq("no part is named router", registry_find(reg, "router"), 0 - 1)
+}
+
+fn main() {
+    test_router_writes_only_router_table()
+    test_tick_does_not_touch_router_edges()
+    test_control_shared_graph_aliases()
+    test_build_router_zero_is_identical()
+    test_router_entry_round_trip()
+    test_router_remap_by_label()
+    test_router_unresolvable_dropped()
+    test_router_raw_ids_without_kgs_records()
+    test_legacy_single_block_migrates()
+    test_legacy_multi_part_migrates_reasoning_only()
+    test_post_b1_file_no_migration()
+    test_router_label_reserved()
+    ce_summary("router_table")
+}
+main()

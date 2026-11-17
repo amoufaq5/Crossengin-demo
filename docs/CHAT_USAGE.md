@@ -623,7 +623,7 @@ mood     : valence=500 arousal=400
 knowledge: 412 atoms in shared KG, 7 in reflection KG
 audit    : 22 decision-log entries
 moments  : 4 moment(s), 0 archived
-synapses : 1284 live edge(s) (reasoning part)
+synapses : 1284 live edge(s) (cognitive router)
 selfmodel: 6 competence record(s)
 scheduler: tick=215 rate=10Hz
 dp_status: budget OK
