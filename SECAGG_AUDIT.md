@@ -1,11 +1,75 @@
 # Secure Aggregation (SecAgg) Audit
 
+> **Correction (2026-11-17, A1: protocol v3n-sa).**
+> - **The pairwise tokens WERE on the wire.** Under v2-sa and v3-sa every
+>   soul sent `SECAGG_PEER <peer_id> <token>` to the coordinator, so the
+>   coordinator (and any passive observer of the plaintext link) received
+>   every pair secret and could recompute every mask and unmask every soul.
+>   The earlier statement in this document that the tokens were "NEVER on
+>   the wire" was false. From v3n-sa on, `SECAGG_PEER <peer_id>` carries the
+>   id only and `CE_FED_TOKEN_<peer>` stays local. **Operators must rotate
+>   every `CE_FED_TOKEN_*` value that was used with v2-sa or v3-sa.**
+> - **Session nonces (the replay fix).** Every soul, in token and DH mode,
+>   draws a fresh 16-byte nonce per session from `secure_random` (fails
+>   closed; never a clock) and sends `SECAGG_NONCE <soul_id> <32 hex>`; the
+>   coordinator relays every other soul's nonce and always ends the relay
+>   with `ACK 0`. The mask KDF is now
+>   SHA-256(`"ce-secagg-v3n|"` + length-prefixed id_lo, id_hi, secret,
+>   nonce_lo, nonce_hi, round, source, dim)[0..4], nonces ordered with the
+>   ids. A coordinator that reuses a round id in a new session therefore
+>   gets different masks (this closes the "token mode reuses masks across
+>   /fed_join sessions" item below).
+> - **Fail closed.** Masking refuses (and the soul sends no stats for the
+>   round) with zero peers, an unset own nonce, or a peer without a nonce or
+>   secret; there is no longer a silent raw value or silent 0 mask. The
+>   soul's peer set is exactly `CE_SECAGG_PEERS` (no duplicates, not its own
+>   id); nonces and DH keys are accepted only for those ids, and
+>   `sa_register_peer_dh` refuses the soul's own id. The coordinator rejects
+>   a handshake with a parse error or unknown line (including the old
+>   3-field SECAGG_PEER), a duplicate soul id, a missing nonce or no peers,
+>   and refuses a session with fewer than 2 souls or mismatching peer sets.
+> - **Round ids** are a monotonic counter persisted by the coordinator in
+>   the run dir (`crossengin_fed_secagg_round`, 0600, written durably before
+>   each FED_ROUND, continued across processes; a corrupt, unreadable,
+>   symlinked or out-of-range file is fatal, as is failing to persist).
+>   Monotonic per run dir: a coordinator takes an exclusive flock on
+>   `crossengin_fed_secagg_round.lock` for its lifetime, so a second
+>   coordinator on the same run dir refuses to start. Deleting the counter
+>   file resets it; the per-session nonces are what prevent mask reuse.
+> - **A soul that sends FED_LEAVE before ACK is a dropout**, even after
+>   sending masked stats (it is not a survivor, so its masks could not be
+>   stripped from a reconciled sum).
+>   The soul keeps only its in-memory per-session replay guard.
+> - **Reconciliation is off by default.** On a dropout the coordinator
+>   aborts the round (no FED_DROPOUT, logs ABORTED, publishes no sum, sends
+>   BYE, ends the session) and the soul refuses FED_DROPOUT, unless
+>   `CE_SECAGG_ALLOW_RECON=1` is set (coordinator and soul). With it, the
+>   old reconciliation runs (FED_RECON_MASKED soul ids are checked against
+>   the sender; at least 2 survivors; the session ends after the round) and
+>   the false-dropout attack described below remains possible.
+> - **DH needs `CE_SECAGG_ALLOW_WEAK_DH=1`** in every DH mode, 2048-bit
+>   included, on the chat (which otherwise refuses to join) and on the
+>   coordinator (which otherwise rejects FED_DH_PUBLIC); both print a
+>   banner that DH via the coordinator is UNAUTHENTICATED: the coordinator
+>   relays the public keys and can MITM them. DH souls also send the
+>   token-free SECAGG_PEER lines.
+> - The coordinator can write a wire log (`CE_FED_WIRE_LOG=<path>`, 0600)
+>   of every line it sends and receives; Scenario U uses it to assert that
+>   no token crosses the wire.
+> - **Remaining limits:** the privacy is COMPUTATIONAL (SHA-256 as a PRF
+>   over secrets that stay off the wire), not information-theoretic; a
+>   curious coordinator still sees every published aggregate; DH is
+>   unauthenticated; and full Bonawitz double masking (which would make
+>   dropout recovery safe against a lying coordinator) is A2, not done.
+>
 > **Correction (2026-11-16, audit F-09).** The masking described below gave
 > no privacy in practice, and it has been rewritten:
 > - Masks were 15-bit (hash + LCG) and reused for every source in a round,
 >   so subtracting two rows revealed the difference of two stats. Masks are
->   now 32 bits -- the first four bytes of SHA-256("ce-secagg-v2|secret|round|
->   source|dim") -- with the source tag in the key, and all masked arithmetic
+>   now 32 bits -- the first four bytes of SHA-256 over a length-prefixed
+>   KDF input (today "ce-secagg-v3n|" id_lo, id_hi, secret, nonce_lo,
+>   nonce_hi, round, source, dim; see the A1 correction above) -- with the
+>   source tag in the key, and all masked arithmetic
 >   (shares, accumulator, dropout reconciliation) is modulo 2^32, folded back
 >   to a signed sum at the end.
 > - DH private keys were `nanotime() & 32767` stretched by the LCG (32768
@@ -22,9 +86,10 @@
 >   would leave the soul's value with no remaining mask (a 2-soul dropout
 >   used to publish the survivor's raw value). The handshake is now
 >   "SECAGG_HELLO ce-fed v3-sa", so older souls are rejected.
-> - **Still open:** token mode (CE_FED_TOKEN_*) reuses masks across
->   /fed_join sessions for the same round id, because the token is the only
->   secret; prefer DH mode (fresh keys per session). And a malicious
+> - **Was open, fixed in v3n-sa (A1):** token mode (CE_FED_TOKEN_*) reused
+>   masks across /fed_join sessions for the same round id, because the token
+>   was the only secret; the per-session nonces in the KDF fix this. **Still
+>   open:** a malicious
 >   coordinator that falsely declares a live peer dropped can still learn
 >   that peer's value from the survivors' reconciliations -- real
 >   protection needs Bonawitz-style double masking. Treat SecAgg as
@@ -99,9 +164,10 @@ coordinator never sees raw rates — but it does see each soul's
 DP-noised contribution. A curious coordinator (or any traffic
 inspector) learns the noised distribution per soul.
 
-P3.8 adds an *information-theoretic* privacy layer on top: **pairwise
-additive masking**. For every pair of souls (A, B), the pair shares a
-deterministic mask `m_AB`. A adds `+m_AB` to its share; B adds
+P3.8 adds a *computational* privacy layer on top (see "Security model"
+below; an earlier version of this document wrongly called it
+information-theoretic): **pairwise additive masking**. For every pair
+of souls (A, B), the pair shares a deterministic mask `m_AB`. A adds `+m_AB` to its share; B adds
 `-m_AB`. When the coordinator sums every soul's masked share, the
 `+m_AB / -m_AB` pair cancels — so the coordinator recovers the sum of
 raw values but cannot read any single soul's contribution.
@@ -137,11 +203,9 @@ math, and no authenticated channel primitive today; adding any one
 of those is its own multi-week project before we'd get to compose
 them. The MVP picks the layer that ships the headline property
 (`coord_sees_only_sum == TRUE`) with the smallest possible new
-primitive surface: a 15-bit LCG + a string-hash + an additive sum
-accumulator. Every line of that stack already has a working
-analogue in the differential-privacy module — the same LCG with the
-same NOVA pointer-threshold bug workarounds — so the implementation
-risk is bounded.
+primitive surface: originally a 15-bit LCG + a string-hash (replaced
+by the 32-bit SHA-256 KDF in audit F-09, plus per-session nonces in
+v3n-sa) and an additive sum accumulator.
 
 ## Security model
 
@@ -150,32 +214,36 @@ risk is bounded.
 **Property:** given N souls with raw stats x₁, …, x_N, the
 coordinator computes Σᵢ xᵢ but for any single soul i the
 coordinator's view of soul i's contribution `masked_x_i = x_i +
-Σ_{j>i} m_{ij} - Σ_{j<i} m_{ji}` is information-theoretically
-indistinguishable from a uniform draw over the mask domain
-(2¹⁵ = 32 768) — because the masks are uniform 15-bit LCG outputs
-seeded by a fresh per-round hash. The coordinator sees a number that
-is uniformly distributed in the mask domain conditional on the sum;
-it gains exactly the information needed to compute the sum and
-nothing more about any individual contribution. This is
-*information-theoretic*, not just computational: even with unbounded
-compute, the coordinator cannot recover `x_i` from `masked_x_i`
-alone.
+Σ_{j>i} m_{ij} - Σ_{j<i} m_{ji}` (mod 2³²) is COMPUTATIONALLY
+indistinguishable from a uniform draw over Z/2³² — because each mask
+is the first 32 bits of SHA-256 over the pair secret, both souls'
+per-session nonces, the round, the source and the dimension, and the
+pair secret never leaves the souls (v3n-sa). The hiding holds only
+while SHA-256 behaves as a PRF and the pair secrets (tokens or DH
+shared secrets) stay secret: it is *computational*, not
+information-theoretic — an adversary who learns a pair secret (for
+example a token sent under v2-sa/v3-sa, or a DH exchange the
+coordinator MITMed) can recompute the masks. The coordinator still
+learns every published sum.
 
 **The collusion caveat.** If any (N-1) of N souls collude with the
 coordinator, the holdout is unmasked: the colluders can subtract
 their own (known) masks from the sum and recover the holdout's raw
-value. This is the standard MPC threshold — no information-theoretic
-scheme over N parties tolerates more than (N-2) corruptions for the
-sum-recovery primitive. SecAgg-with-Shamir lifts this to a tunable
+value. This is the standard threshold for pairwise masking -- no
+masking scheme over N parties hides the holdout once the other N-1
+reveal their inputs, because the sum itself determines it. SecAgg-with-Shamir lifts this to a tunable
 threshold k of n (the coordinator + N-k souls), but the MVP ships
 the (N-1)-honest threshold.
 
 **Passive eavesdropper on the wire.** A network observer who sees
 every masked submission learns the same thing the coordinator does:
-the sum, and nothing about per-soul values. The pre-shared tokens
-are NEVER on the wire; only the masked values are. This is one step
-better than P3.7's DP-noised submissions (which leak the noised
-distribution per soul on the wire).
+the sum, and nothing about per-soul values -- **from v3n-sa on**.
+Before v3n-sa this paragraph claimed the pre-shared tokens were never
+on the wire; that was FALSE: v2-sa/v3-sa sent `SECAGG_PEER <peer_id>
+<token>` in plaintext, so the coordinator and any eavesdropper got every
+pair secret. Rotate every `CE_FED_TOKEN_*` used with those versions.
+v3n-sa sends only `SECAGG_PEER <peer_id>` and a random per-session
+nonce (which is public by design: it adds freshness, not secrecy).
 
 ## What this MVP does not do
 
@@ -261,13 +329,18 @@ protocol — the v1 lines are unchanged. New lines:
 
 | Line | Direction | Meaning |
 |---|---|---|
-| `SECAGG_HELLO ce-fed v2-sa` | client → server | opt-in to SecAgg mode |
-| `OK ce-fed v2-sa protocol accepted` | server → client | accept |
-| `SECAGG_PEER <peer_id> <token>` | client → server | announce one peer pair |
+| `SECAGG_HELLO ce-fed v3n-sa` | client → server | opt-in to SecAgg mode (exact match; older versions rejected) |
+| `OK ce-fed v3n-sa protocol accepted` | server → client | accept (the soul requires this exact line) |
+| `SECAGG_PEER <peer_id>` | client → server | declare one peer (id only; **no token** -- v2-sa/v3-sa's `SECAGG_PEER <peer_id> <token>` is rejected) |
+| `SECAGG_NONCE <soul_id> <32 hex>` | client → server | this soul's fresh per-session nonce (before `ACK 0`) |
+| `ACK 0` | client → server | end of the soul's setup lines |
+| `SECAGG_NONCE <peer_id> <32 hex>` | server → client | relay of every OTHER soul's nonce |
+| `ACK 0` | server → client | always ends the relay phase (every mode) |
+| `FED_ROUND <round> <deadline>` | server → client | round id from the persisted counter |
 | `FED_STAT_MASKED <round> <tag> <mp> <ma>` | client → server | masked stats |
 | `FED_AGGREGATE_SUM <round> <tag> <sp> <sa> <n>` | server → client | coord sum |
-| `FED_DROPOUT <round> <dropped_soul_id>` | server → client | a soul vanished; survivors reconcile (**P3.8r**) |
-| `FED_RECON_MASKED <round> <soul_id> <tag> <ap> <aa>` | client → server | reconciled stat (dropped peer's mask removed) (**P3.8r**) |
+| `FED_DROPOUT <round> <dropped_soul_id>` | server → client | a soul vanished; survivors reconcile (**P3.8r**; only with `CE_SECAGG_ALLOW_RECON=1` -- by default the round is aborted with `BYE` and no sum) |
+| `FED_RECON_MASKED <round> <soul_id> <tag> <ap> <aa>` | client → server | reconciled stat (dropped peer's mask removed) (**P3.8r**; only with `CE_SECAGG_ALLOW_RECON=1` on the soul; soul id must match the sender) |
 
 The coordinator broadcasts the **sum** (not the average) so the
 audit-readable contract is clean: the coordinator only ever computes
@@ -276,22 +349,29 @@ the average if it wants one (helper: `sa_sum_to_avg`).
 
 ## Shipped: dropout resilience (P3.8r / v2-sa-r)
 
-**Status:** shipped. Previously documented as a limitation (see "What
-this MVP does not do" -- now moved to the production-ready row).
+**Status:** shipped, **off by default since v3n-sa (A1)**: it only runs
+when the coordinator and the souls set `CE_SECAGG_ALLOW_RECON=1`;
+otherwise a dropout aborts the round (no FED_DROPOUT, no sum, BYE). The
+opt-in keeps the false-dropout attack (a coordinator declaring a live
+soul dropped learns its value from the survivors' replies) until A2's
+double masking.
 **Verified by:** `test_secagg_three_soul_dropout_demo` in
 `tests/unit/test_secure_aggregation.nova` (the 3-soul A/B/C round
 where B drops; A + C reconcile by removing m_AB and m_BC from their
 masked submissions; the coordinator's sum equals x_A + x_C exactly),
 and `tests/integration/scenario_u_secagg.sh` "scenario U.r" (a real
 2-soul TCP round-trip where a Python soul-helper acts as the dropout
-peer -- handshake then close -- and the coordinator's
-FED_AGGREGATE_SUM line carries the surviving soul's raw values
-exactly, n_part=1).
+peer -- handshake then close -- and, with `CE_SECAGG_ALLOW_RECON=1`,
+the coordinator's FED_AGGREGATE_SUM line carries the sum of the two
+survivors, n_part=2; U.r0 / U.r1 assert the default abort and the
+soul-side refusal).
 
 ### Protocol flow (extension of v2-sa)
 
 1. Round begins with N expected souls and a list of their ids
-   (collected at JOIN time via SECAGG_PEER announcements).
+   (collected at JOIN time via the token-free SECAGG_PEER
+   announcements; the coordinator checks that every soul's declared
+   peer set is exactly the other joined souls).
 2. Each soul computes `masked_x_i` as in P3.8 and sends
    `FED_STAT_MASKED <round> <tag> <mp> <ma>`.
 3. If soul k disconnects mid-round (the coord's `recv_line` returns 0
@@ -357,9 +437,9 @@ peer-closed-fd signal is the production failure mode that matters).
 
 ## How this composes with P3.7's DP
 
-In v2-sa mode the soul does NOT apply DP noise to its raw stats —
-the pairwise mask provides information-theoretic privacy for the
-sum. The DP budget is left untouched (and so a v2-sa session can
+In SecAgg mode the soul does NOT apply DP noise to its raw stats —
+the pairwise mask provides computational privacy for the individual
+values (the sum itself is published). The DP budget is left untouched (and so a v2-sa session can
 afford strictly more `/dp_query` operations than a v1 session of the
 same length). A future round may add DP-noise-on-top-of-SecAgg
 ("local DP plus secure aggregation") for the stricter regime where
@@ -394,9 +474,19 @@ masks; the coordinator's AGGREGATE_SUM still equals Σ raw values).
 
 | Line | Direction | Meaning |
 |---|---|---|
-| `FED_DH_PUBLIC <soul_id> <pubkey_hex>` | client → server (during handshake) | soul announces its DH public key |
-| `FED_DH_PUBLIC <soul_id> <pubkey_hex>` | server → client (after all join) | coord broadcasts every peer's pubkey |
-| `ACK 0` | server → client | sentinel: DH-broadcast phase ended |
+| `FED_DH_PUBLIC <soul_id> <pubkey_hex>` | client → server (during handshake) | soul announces its DH public key (needs `CE_SECAGG_ALLOW_WEAK_DH=1` on the coordinator) |
+| `FED_DH_PUBLIC <soul_id> <pubkey_hex>` | server → client (after all join) | coord relays every other soul's pubkey, together with its SECAGG_NONCE |
+| `ACK 0` | server → client | ends the combined relay phase (DH pubkeys + nonces); sent in every mode since v3n-sa |
+
+**v3n-sa (A1):** every DH mode (256-bit and 2048-bit) requires
+`CE_SECAGG_ALLOW_WEAK_DH=1`. The public keys are relayed by the
+coordinator without authentication, so the coordinator -- the very
+party SecAgg hides values from -- can substitute its own keys and
+learn every pair secret (MITM); the 256-bit group is also breakable.
+Without the flag the chat refuses to join and the coordinator rejects
+FED_DH_PUBLIC. DH souls also send token-free `SECAGG_PEER <id>` lines
+and a `SECAGG_NONCE`, and accept relayed keys only for ids in
+`CE_SECAGG_PEERS`.
 
 ### Protocol flow
 
@@ -405,14 +495,15 @@ masks; the coordinator's AGGREGATE_SUM still equals Σ raw values).
    weak-random caveat below) and computes its public key
    `P_i = g^d_i mod p` via `bn_modpow_ct` (the constant-time
    Montgomery ladder).
-2. During the v2-sa handshake (after FED_JOIN), each soul sends
-   `FED_DH_PUBLIC <soul_id> <pubkey_hex>` instead of (or alongside
-   nothing — the DH mode does NOT load `CE_FED_TOKEN_<peer>` env
-   vars) `SECAGG_PEER` lines.
+2. During the handshake (after FED_JOIN), each soul sends
+   `FED_DH_PUBLIC <soul_id> <pubkey_hex>` in addition to its
+   token-free `SECAGG_PEER <peer_id>` lines and its `SECAGG_NONCE`
+   (the DH mode does NOT load `CE_FED_TOKEN_<peer>` env vars).
 3. The coordinator collects each soul's pubkey during the handshake
    drain, then after all N souls have joined, broadcasts every
    pubkey to every OTHER soul (one `FED_DH_PUBLIC` line per peer
-   per soul), then sends a sentinel `ACK 0`.
+   per soul, each followed by that peer's `SECAGG_NONCE`), then sends
+   the sentinel `ACK 0`.
 4. Each soul receives the peer pubkeys and registers them via
    `sa_register_peer_dh(s, peer_id, peer_pubkey_hex)`. The shared
    secret with peer j is `s_ij = P_j^d_i mod p`, derived on demand

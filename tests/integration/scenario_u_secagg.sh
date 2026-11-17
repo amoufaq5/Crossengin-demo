@@ -1,37 +1,61 @@
 #!/usr/bin/env bash
-# Scenario U -- secure aggregation (SecAgg) round-trip (P3.8 / ADR-0055).
+# Scenario U -- secure aggregation (SecAgg) protocol v3n-sa (P3.8 / ADR-0055,
+# A1 interim fixes).
 #
-# Two chat souls join a SecAgg-mode federated coordinator. Each soul
-# sends FED_STAT_MASKED records (raw stats masked by pairwise additive
-# masks). The coordinator SUMS the masked submissions per source and
-# broadcasts FED_AGGREGATE_SUM. Because each pair's +mask / -mask
-# pair cancels in the sum, the coordinator's sum equals Σ raw stats --
-# but it never sees any individual soul's raw stat. The integration
-# test asserts:
-#   1) the coordinator boots in SecAgg mode (mode=v2-sa).
-#   2) both souls complete the SECAGG_HELLO handshake.
-#   3) the coordinator's stdout shows MASKED_STAT lines (NOT FED_STAT).
-#   4) the coordinator's stdout shows the AGGREGATE_SUM line (NOT
-#      AGGREGATE -- the SecAgg path emits sums, not averages).
-#   5) the coordinator's stdout does NOT include the raw per-soul values
-#      anywhere (we verify by negative grep on values that the soul-side
-#      meta_observer would have produced if it had to ship raw).
-#   6) the chat-side logs show "[SECAGG]" markers in the join + round
-#      messages.
+# Souls join a SecAgg-mode federated coordinator, mask their stats with
+# pairwise masks and the coordinator publishes only the SUM. v3n-sa:
+#   - SECAGG_PEER carries the peer id only; the pair token stays local.
+#   - every soul sends a fresh SECAGG_NONCE that enters the mask KDF; the
+#     coordinator relays the other souls' nonces and always ends with ACK 0.
+#   - the coordinator persists its SecAgg round counter in the run dir.
+#   - reconciliation is off by default: a dropout aborts the round.
+#   - DH mode needs CE_SECAGG_ALLOW_WEAK_DH=1 (unauthenticated relay).
 #
-# KNOWN LIMITATIONS:
-#   - accept_conn is blocking; the script uses a generous startup grace +
-#     hard deadline (same as scenario_r).
-#   - If socket(2,1,0) is denied by the sandbox, the script SKIPs.
+# Sub-scenarios (each with its own fresh CE_RUN_DIR under one mktemp dir):
+#   U         two chat souls, token mode; coordinator wire log
+#             (CE_FED_WIRE_LOG) shows no token anywhere, token-free
+#             SECAGG_PEER, nonces sent + relayed, ACK 0; sums cancel.
+#   U.parity  scripts/secagg_smoke_soul.py --selftest / --print-mask match
+#             the fixed KDF vector pinned in test_secure_aggregation.nova.
+#   U.leave   FED_LEAVE after a masked stat counts as a dropout (correct
+#             reconciled sum with a second dropout).
+#   U.round   the round counter persists: a second coordinator run in the
+#             same run dir opens round 2; a corrupt, overflowing or
+#             symlinked counter is fatal; a second coordinator on the same
+#             run dir is refused (flock).
+#   U.replay  two sessions with the same round id, tokens and values:
+#             nonces and FED_STAT_MASKED shares differ, both sums correct.
+#   U.r0      dropout with default env -> round ABORTED, no FED_DROPOUT,
+#             no sum.
+#   U.r1      coordinator allows recon but the survivors do not -> they
+#             refuse, nothing reconciled, no sum.
+#   U.r       dropout with CE_SECAGG_ALLOW_RECON=1 everywhere -> reconciled
+#             sum of the survivors.
+#   U.peerset handshake refusals: old HELLO, 3-field SECAGG_PEER, no nonce,
+#             no peers, DH key without the weak-DH flag, duplicate soul id,
+#             CE_FED_SOULS=1.
+#   U.dh      DH without CE_SECAGG_ALLOW_WEAK_DH is refused by the chat;
+#             with it (chats + coordinator) the round completes.
+#   U.dh2048  same with the 2048-bit group -- slow, only when CE_IT_SLOW=1.
+#
+# Env: CE_IT_STRICT=1 (CI) turns every environment SKIP (socket bind
+# denied, python3 missing) into a FAIL, so a broken environment cannot
+# report green. CE_IT_SLOW=1 adds the U.dh2048 stage.
+#
+# KNOWN LIMITATIONS: accept_conn is blocking; every stage has a hard
+# deadline and force-kills stragglers.
 
 . "$(dirname "$0")/_lib.sh"
 
 PASS=0; FAIL=0
+STRICT="${CE_IT_STRICT:-0}"
+SLOW="${CE_IT_SLOW:-0}"
 
-it_section "scenario U: secure aggregation round-trip (ADR-0055)"
+it_section "scenario U: secure aggregation v3n-sa (ADR-0055 / A1)"
 
 COORD_BIN="$REPO_ROOT/bin/crossengin-fed-coordinator"
 CHAT_BIN="$REPO_ROOT/bin/crossengin-chat"
+SOUL_HELPER="$REPO_ROOT/scripts/secagg_smoke_soul.py"
 
 if [ ! -x "$COORD_BIN" ] || [ ! -x "$CHAT_BIN" ]; then
     printf "  ${C_RED}ERROR${C_RST}: %s or %s missing. Run: make install\n" \
@@ -41,661 +65,567 @@ if [ ! -x "$COORD_BIN" ] || [ ! -x "$CHAT_BIN" ]; then
     exit $?
 fi
 
-# Per-run port (avoid 8777 to dodge collisions with the v1 demo / scenario R).
-PORT=$(( 32000 + (RANDOM % 1000) ))
-COORD_OUT="/tmp/ce_int_secagg_coord.out"
-CHAT_A_OUT="/tmp/ce_int_secagg_chat_a.out"
-CHAT_B_OUT="/tmp/ce_int_secagg_chat_b.out"
-trap 'kill -9 $COORD_PID 2>/dev/null; kill -9 $CHAT_A_PID 2>/dev/null; kill -9 $CHAT_B_PID 2>/dev/null; rm -f "$COORD_OUT" "$CHAT_A_OUT" "$CHAT_B_OUT"' EXIT
-rm -f "$COORD_OUT" "$CHAT_A_OUT" "$CHAT_B_OUT"
+SCEN_TMP="$(mktemp -d)"
+chmod 700 "$SCEN_TMP"
+PIDS=()
+cleanup() {
+    local p
+    for p in "${PIDS[@]}"; do pkill -9 -P "$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; done
+    rm -rf "$SCEN_TMP"
+}
+trap cleanup EXIT
 
-# Stage 1: launch the coordinator in SecAgg mode. CE_FED_SOULS=2 + one
-# round + CE_SECAGG_ENABLED=1.
-(
-    export CE_FED_PORT="$PORT"
-    export CE_FED_BIND="127.0.0.1"
-    export CE_FED_SOULS=2
-    export CE_FED_MAX_ROUNDS=1
-    export CE_SECAGG_ENABLED=1
-    "$COORD_BIN" >"$COORD_OUT" 2>&1
-) &
-COORD_PID=$!
-
-# Stage 2: startup grace.
-sleep 1
-if grep -q "ERROR cannot bind / listen" "$COORD_OUT" 2>/dev/null; then
-    printf "  ${C_YEL}SKIP${C_RST}  socket bind denied by sandbox -- SecAgg test skipped\n"
-    PASS=$((PASS+1))
-    wait $COORD_PID 2>/dev/null
-    summary "scenario_u_secagg"
-    exit $?
-fi
-
-# Stage 3: prep two chat sessions. Each soul has its own snapshot path
-# (CE_SNAP_PATH) so they don't trample each other's state.
-rm -f /tmp/crossengin_secagg_alice.snap /tmp/crossengin_secagg_bob.snap \
-      /tmp/crossengin_secagg_alice.dlog  /tmp/crossengin_secagg_bob.dlog
-
-# Pre-shared token for the alice <-> bob pair.
-SHARED_TOKEN="ce-secagg-shared-token"
-
-INPUT_A=$(
-    printf '/teach widget\n'
-    printf '/teach gadget\n'
-    printf '/cap grant network_send\n'
-    printf "/fed_join 127.0.0.1:$PORT\n"
-    printf '/fed_leave\n'
-    printf '/quit\n'
-)
-INPUT_B=$(
-    printf '/teach widget\n'
-    printf '/teach sprocket\n'
-    printf '/cap grant network_send\n'
-    printf "/fed_join 127.0.0.1:$PORT\n"
-    printf '/fed_leave\n'
-    printf '/quit\n'
-)
-
-# Stage 4: launch the two chat instances with their own SecAgg config.
-(
-    export CE_FED_PORT="$PORT"
-    export CE_SECAGG_ENABLED=1
-    export CE_SECAGG_PEERS="bob"
-    export CE_FED_TOKEN_bob="$SHARED_TOKEN"
-    export CE_SESSION_ID="alice"
-    export CE_FED_SOUL_ID="alice"
-    export CE_SNAP_PATH="/tmp/crossengin_secagg_alice.snap"
-    export CE_DLOG_PATH="/tmp/crossengin_secagg_alice.dlog"
-    echo "$INPUT_A" | "$CHAT_BIN" >"$CHAT_A_OUT" 2>&1
-) &
-CHAT_A_PID=$!
-
-# Small offset so the alice <-> coord handshake completes first, making
-# the bob-side accept loop deterministic.
-sleep 1
-
-(
-    export CE_FED_PORT="$PORT"
-    export CE_SECAGG_ENABLED=1
-    export CE_SECAGG_PEERS="alice"
-    export CE_FED_TOKEN_alice="$SHARED_TOKEN"
-    export CE_SESSION_ID="bob"
-    export CE_FED_SOUL_ID="bob"
-    export CE_SNAP_PATH="/tmp/crossengin_secagg_bob.snap"
-    export CE_DLOG_PATH="/tmp/crossengin_secagg_bob.dlog"
-    echo "$INPUT_B" | "$CHAT_BIN" >"$CHAT_B_OUT" 2>&1
-) &
-CHAT_B_PID=$!
-
-# Stage 5: wait for completion with a hard deadline.
-DEADLINE=20
-elapsed=0
-while [ "$elapsed" -lt "$DEADLINE" ]; do
-    coord_alive=0; a_alive=0; b_alive=0
-    kill -0 $COORD_PID  2>/dev/null && coord_alive=1
-    kill -0 $CHAT_A_PID 2>/dev/null && a_alive=1
-    kill -0 $CHAT_B_PID 2>/dev/null && b_alive=1
-    if [ $coord_alive -eq 0 ] && [ $a_alive -eq 0 ] && [ $b_alive -eq 0 ]; then
-        break
+# An environment SKIP: never a PASS; a FAIL under CE_IT_STRICT=1.
+skip() {
+    if [ "$STRICT" = "1" ]; then
+        FAIL=$((FAIL+1))
+        printf "  ${C_RED}FAIL${C_RST}  (strict) SKIP not allowed: %s\n" "$1"
+    else
+        printf "  ${C_YEL}SKIP${C_RST}  %s\n" "$1"
     fi
+}
+
+finish() { summary "scenario_u_secagg"; exit $?; }
+
+# wait_all <deadline_s> <pid>... ; force-kills on deadline, returns 1 then.
+wait_all() {
+    local deadline="$1"; shift
+    local elapsed=0 alive p
+    while [ "$elapsed" -lt "$deadline" ]; do
+        alive=0
+        for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done
+        [ "$alive" -eq 0 ] && break
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    local rc=0
+    if [ "$elapsed" -ge "$deadline" ]; then
+        # A hang is a failure (a coordinator or soul that never exits must
+        # not pass just because its earlier output looked right).
+        FAIL=$((FAIL+1))
+        printf "  ${C_RED}FAIL${C_RST}  process(es) hung past %ss, force-killed\n" "$deadline"
+        for p in "$@"; do kill -9 "$p" 2>/dev/null; done
+        rc=1
+    fi
+    for p in "$@"; do wait "$p" 2>/dev/null; done
+    return $rc
+}
+
+# Per-stage files: $SCEN_TMP/<stage>/{run,coord.out,wire.log,...}
+stage_dir() { mkdir -p "$SCEN_TMP/$1/run"; chmod 700 "$SCEN_TMP/$1" "$SCEN_TMP/$1/run"; echo "$SCEN_TMP/$1"; }
+
+# start_coord <stage_dir> <port> <souls> [ENV=VAL ...] -> sets COORD_PID.
+# The run dir (round counter) is <stage_dir>/run unless RUN_DIR overrides.
+start_coord() {
+    local d="$1" port="$2" souls="$3"; shift 3
+    local run="${RUN_DIR:-$d/run}"
+    (
+        export CE_RUN_DIR="$run"
+        export CE_FED_PORT="$port"
+        export CE_FED_BIND="127.0.0.1"
+        export CE_FED_SOULS="$souls"
+        export CE_FED_MAX_ROUNDS=1
+        export CE_SECAGG_ENABLED=1
+        export CE_FED_WIRE_LOG="$d/wire.log"
+        for kv in "$@"; do export "$kv"; done
+        "$COORD_BIN" >>"$d/coord.out" 2>&1
+        echo "coord-exit=$?" >>"$d/coord.out"
+    ) &
+    COORD_PID=$!
+    PIDS+=("$COORD_PID")
+}
+
+# Returns 1 (and SKIPs) when the coordinator could not bind.
+bind_ok() {
+    local d="$1" what="$2"
+    local i=0
+    while [ $i -lt 20 ]; do
+        grep -q "fed-coord: listening\|ERROR cannot bind\|FATAL" "$d/coord.out" 2>/dev/null && break
+        sleep 0.25; i=$((i+1))
+    done
+    if grep -q "ERROR cannot bind / listen" "$d/coord.out" 2>/dev/null; then
+        skip "socket bind denied by sandbox -- $what skipped"
+        return 1
+    fi
+    return 0
+}
+
+# py_soul <outfile> [args...] -> sets PY_PID (python soul in background).
+py_soul() {
+    local out="$1"; shift
+    python3 -I "$SOUL_HELPER" --host 127.0.0.1 "$@" >"$out" 2>&1 &
+    PY_PID=$!
+    PIDS+=("$PY_PID")
+}
+
+sums_plausible() {
+    echo "$1" | grep -oE "sum_promo=-?[0-9]+ sum_atr=-?[0-9]+" \
+        | awk -F'[= ]' '{ if ($2 < 0 || $2 > 2000 || $4 < 0 || $4 > 2000) print }' | wc -l
+}
+
+SHARED_TOKEN="ce-secagg-shared-token-u1"
+SHARED_TOKEN2="ce-secagg-shared-token-u2"
+PORT_BASE=$(( 32000 + (RANDOM % 900) * 4 ))
+NEXT_PORT=$PORT_BASE
+# Call as a plain command (not in $(...)), then read $NEXT_PORT.
+next_port() { NEXT_PORT=$((NEXT_PORT + 1)); }
+
+# chat_input <port> <second-topic>
+chat_input() {
+    printf '/teach widget\n/teach %s\n/cap grant network_send\n/fed_join 127.0.0.1:%s\n/fed_leave\n/quit\n' "$2" "$1"
+}
+
+# start_chat <stage_dir> <soul> <peer> <port> <topic> [ENV=VAL ...] -> CHAT_PID
+start_chat() {
+    local d="$1" soul="$2" peer="$3" port="$4" topic="$5"; shift 5
+    local input; input="$(chat_input "$port" "$topic")"
+    (
+        export CE_RUN_DIR="$d/run_$soul"
+        mkdir -p "$CE_RUN_DIR"; chmod 700 "$CE_RUN_DIR"
+        export CE_SECAGG_ENABLED=1
+        export CE_SECAGG_PEERS="$peer"
+        export CE_SESSION_ID="$soul"
+        export CE_FED_SOUL_ID="$soul"
+        export CE_SNAP_PATH="$d/$soul.snap"
+        export CE_DLOG_PATH="$d/$soul.dlog"
+        for kv in "$@"; do export "$kv"; done
+        echo "$input" | "$CHAT_BIN" >"$d/chat_$soul.out" 2>&1
+    ) &
+    CHAT_PID=$!
+    PIDS+=("$CHAT_PID")
+}
+
+HAVE_PY=1
+if [ ! -x "$SOUL_HELPER" ] || ! command -v python3 >/dev/null 2>&1; then HAVE_PY=0; fi
+
+# ===========================================================================
+# U: two chat souls, token mode, coordinator wire log.
+# ===========================================================================
+D=$(stage_dir u)
+next_port; PORT=$NEXT_PORT
+start_coord "$D" "$PORT" 2
+CP=$COORD_PID
+if bind_ok "$D" "SecAgg scenario"; then
+    start_chat "$D" alice bob "$PORT" gadget "CE_FED_TOKEN_bob=$SHARED_TOKEN"
+    CA=$CHAT_PID
     sleep 1
-    elapsed=$((elapsed + 1))
-done
-if [ "$elapsed" -ge "$DEADLINE" ]; then
-    printf "  ${C_YEL}WARN${C_RST}  process(es) hung past %ds, force-killing\n" "$DEADLINE"
-    kill -9 $COORD_PID  2>/dev/null
-    kill -9 $CHAT_A_PID 2>/dev/null
-    kill -9 $CHAT_B_PID 2>/dev/null
-fi
-wait $COORD_PID  2>/dev/null
-wait $CHAT_A_PID 2>/dev/null
-wait $CHAT_B_PID 2>/dev/null
+    start_chat "$D" bob alice "$PORT" sprocket "CE_FED_TOKEN_alice=$SHARED_TOKEN"
+    CB=$CHAT_PID
+    wait_all 30 "$CP" "$CA" "$CB"
+    COORD_TXT=$(cat "$D/coord.out" 2>/dev/null || true)
+    CHAT_A_TXT=$(cat "$D/chat_alice.out" 2>/dev/null || true)
+    CHAT_B_TXT=$(cat "$D/chat_bob.out" 2>/dev/null || true)
+    WIRE=$(cat "$D/wire.log" 2>/dev/null || true)
 
-COORD_TXT=$(cat "$COORD_OUT"  2>/dev/null || true)
-CHAT_A_TXT=$(cat "$CHAT_A_OUT" 2>/dev/null || true)
-CHAT_B_TXT=$(cat "$CHAT_B_OUT" 2>/dev/null || true)
-
-# Stage 6: coordinator-side invariants.
-assert_match "$COORD_TXT" "mode=v2-sa" \
-    "coordinator started in SecAgg mode"
-assert_match "$COORD_TXT" "fed-coord: listening" \
-    "coordinator entered listen state"
-assert_match "$COORD_TXT" "fed-coord: SECAGG JOIN" \
-    "coordinator saw at least one SECAGG JOIN"
-assert_match "$COORD_TXT" "opening round 1" \
-    "coordinator opened round 1"
-# The coordinator-side log must show MASKED_STAT (and the masked-value-opaque
-# flag), NOT FED_STAT (the v1 line shape).
-assert_match "$COORD_TXT" "MASKED_STAT" \
-    "coordinator received masked stat lines"
-assert_match "$COORD_TXT" "masked-value-opaque" \
-    "coordinator logged the masked-opaque flag"
-assert_match "$COORD_TXT" "\\[SECAGG\\] AGGREGATE_SUM round=1" \
-    "coordinator broadcast a SUM aggregate (not avg)"
-# The souls must use distinct ids (otherwise no masks are applied at all),
-# and the masks must cancel: every summed rate is a sum of two milli rates,
-# so it lies in [0, 2000]. Uncancelled 32-bit masks would be far outside.
-assert_match "$CHAT_A_TXT" "as soul=alice" "alice chat used soul id alice"
-assert_match "$CHAT_B_TXT" "as soul=bob" "bob chat used soul id bob"
-BAD_SUMS=$(echo "$COORD_TXT" | grep -oE "sum_promo=-?[0-9]+ sum_atr=-?[0-9]+" \
-    | awk -F'[= ]' '{ if ($2 < 0 || $2 > 2000 || $4 < 0 || $4 > 2000) print }' | wc -l)
-assert_eq "$BAD_SUMS" "0" "all SecAgg sums are plausible (masks cancelled)"
-# Negative: the coordinator must NOT log the v1 STAT / AGGREGATE lines
-# in SecAgg mode -- those would imply it had access to per-soul raw stats.
-assert_nomatch "$COORD_TXT" "fed-coord: STAT soul=.*promo=" \
-    "coordinator did NOT log v1 raw-promo STAT lines"
-assert_nomatch "$COORD_TXT" "fed-coord: AGGREGATE round=1 tag=.*avg_promo=" \
-    "coordinator did NOT log v1 AVG aggregate lines"
-
-# Stage 7: chat-side (per-soul) invariants.
-assert_match "$CHAT_A_TXT" "fed_join: \\[SECAGG\\] enabled" \
-    "alice chat entered SecAgg mode"
-assert_match "$CHAT_A_TXT" "fed_join: \\[SECAGG\\] HELLO ce-fed v3-sa \\+ FED_JOIN" \
-    "alice chat completed SecAgg handshake"
-assert_match "$CHAT_B_TXT" "fed_join: \\[SECAGG\\] enabled" \
-    "bob chat entered SecAgg mode"
-assert_match "$CHAT_B_TXT" "fed_join: \\[SECAGG\\] HELLO ce-fed v3-sa \\+ FED_JOIN" \
-    "bob chat completed SecAgg handshake"
-assert_match "$CHAT_A_TXT" "fed: \\[SECAGG\\] round 1 complete" \
-    "alice chat completed round 1"
-assert_match "$CHAT_B_TXT" "fed: \\[SECAGG\\] round 1 complete" \
-    "bob chat completed round 1"
-assert_match "$CHAT_A_TXT" "masked stats sent" \
-    "alice chat printed masked-stats sent"
-assert_match "$CHAT_B_TXT" "masked stats sent" \
-    "bob chat printed masked-stats sent"
-assert_match "$COORD_TXT" "mode=v2-sa-r" \
-    "coordinator reports dropout-resilient mode (v2-sa-r)"
-assert_match "$COORD_TXT" "round-deadline-ms=5000" \
-    "coordinator reports default 5000 ms round deadline"
-
-# Stage 8: P3.8r dropout-resilience scenario. Two souls join; one drops
-# mid-round (closes its socket after the JOIN handshake). The survivor
-# reconciles (FED_RECON_MASKED with the dropped peer's mask
-# contribution removed) and the round completes with just the
-# survivor's contribution in the sum.
-#
-# We use a Python soul-helper for both souls (scripts/secagg_smoke_soul.py)
-# so the dropout timing is deterministic. The Python script mirrors the
-# 15-bit LCG mask derivation from src/learning/secure_aggregation.nova
-# so the wire arithmetic exactly matches what the NOVA-side coordinator
-# expects. The chat binary itself cannot be killed at a deterministic
-# moment (its inline /fed_join completes the round too quickly), so the
-# Python helper acts as the "dropout" soul and runs both halves of the
-# brief's check: JOIN + close (dropout), and JOIN + FED_STAT_MASKED +
-# FED_RECON_MASKED (survivor).
-it_section "scenario U.r: secure aggregation DROPOUT (P3.8r / ADR-0055r)"
-
-SOUL_HELPER="$REPO_ROOT/scripts/secagg_smoke_soul.py"
-if [ ! -x "$SOUL_HELPER" ]; then
-    printf "  ${C_YEL}SKIP${C_RST}  $SOUL_HELPER not executable; dropout scenario skipped\n"
-    PASS=$((PASS+1))
-    summary "scenario_u_secagg"
-    exit $?
-fi
-if ! command -v python3 >/dev/null 2>&1; then
-    printf "  ${C_YEL}SKIP${C_RST}  python3 not on PATH; dropout scenario skipped\n"
-    PASS=$((PASS+1))
-    summary "scenario_u_secagg"
-    exit $?
-fi
-
-PORT2=$(( 33000 + (RANDOM % 1000) ))
-COORD2_OUT="/tmp/ce_int_secagg_drop_coord.out"
-SOUL_A_OUT="/tmp/ce_int_secagg_drop_soul_a.out"
-SOUL_B_OUT="/tmp/ce_int_secagg_drop_soul_b.out"
-trap 'kill -9 $COORD_PID 2>/dev/null; kill -9 $CHAT_A_PID 2>/dev/null; kill -9 $CHAT_B_PID 2>/dev/null; kill -9 $COORD2_PID 2>/dev/null; kill -9 $SOUL_A_PID 2>/dev/null; kill -9 $SOUL_B_PID 2>/dev/null; rm -f "$COORD_OUT" "$CHAT_A_OUT" "$CHAT_B_OUT" "$COORD2_OUT" "$SOUL_A_OUT" "$SOUL_B_OUT"' EXIT
-rm -f "$COORD2_OUT" "$SOUL_A_OUT" "$SOUL_B_OUT"
-
-# Launch coord for the dropout scenario in SecAgg-r mode.
-(
-    export CE_FED_PORT="$PORT2"
-    export CE_FED_BIND="127.0.0.1"
-    export CE_FED_SOULS=3
-    export CE_FED_MAX_ROUNDS=1
-    export CE_SECAGG_ENABLED=1
-    "$COORD_BIN" >"$COORD2_OUT" 2>&1
-) &
-COORD2_PID=$!
-
-sleep 1
-if grep -q "ERROR cannot bind / listen" "$COORD2_OUT" 2>/dev/null; then
-    printf "  ${C_YEL}SKIP${C_RST}  socket bind denied by sandbox -- dropout scenario skipped\n"
-    PASS=$((PASS+1))
-    wait $COORD2_PID 2>/dev/null
-    summary "scenario_u_secagg"
-    exit $?
-fi
-
-SHARED_TOKEN2="ce-secagg-shared-token-2"
-
-# Soul A: survivor. x_promo=100, x_atr=50 -> coordinator should see
-# exactly these values in its sum (the SHRUNK set after B drops has
-# only A, and the m_AB mask contribution on A's submission is removed
-# by reconciliation).
-(
-    python3 "$SOUL_HELPER" \
-        --mode survivor \
-        --soul-id alice --peer bob,carol --token "$SHARED_TOKEN2" \
-        --host 127.0.0.1 --port "$PORT2" \
-        --x-promo 100 --x-atr 50 --tag topic:test \
-        >"$SOUL_A_OUT" 2>&1
-) &
-SOUL_A_PID=$!
-
-# Soul C: second survivor. With the reconciliation limits (audit F-09
-# review) a lone survivor refuses to reconcile -- that would publish its
-# raw value -- so the dropout scenario needs two survivors.
-SOUL_C_OUT="/tmp/ce_int_secagg_drop_soul_c.out"
-(
-    python3 "$SOUL_HELPER" \
-        --mode survivor \
-        --soul-id carol --peer alice,bob --token "$SHARED_TOKEN2" \
-        --host 127.0.0.1 --port "$PORT2" \
-        --x-promo 30 --x-atr 20 --tag topic:test \
-        >"$SOUL_C_OUT" 2>&1
-) &
-SOUL_C_PID=$!
-
-sleep 1
-
-# Soul B: dropout. JOIN handshake then immediately closes the socket.
-(
-    python3 "$SOUL_HELPER" \
-        --mode dropout \
-        --soul-id bob --peer alice,carol --token "$SHARED_TOKEN2" \
-        --host 127.0.0.1 --port "$PORT2" \
-        >"$SOUL_B_OUT" 2>&1
-) &
-SOUL_B_PID=$!
-
-# Wait for coord + alice + bob to drain.
-DEADLINE=20
-elapsed=0
-while [ "$elapsed" -lt "$DEADLINE" ]; do
-    coord_alive=0; a_alive=0; b_alive=0
-    kill -0 $COORD2_PID  2>/dev/null && coord_alive=1
-    kill -0 $SOUL_A_PID  2>/dev/null && a_alive=1
-    kill -0 $SOUL_B_PID  2>/dev/null && b_alive=1
-    kill -0 $SOUL_C_PID  2>/dev/null && b_alive=1
-    if [ $coord_alive -eq 0 ] && [ $a_alive -eq 0 ] && [ $b_alive -eq 0 ]; then
-        break
+    assert_match "$COORD_TXT" "mode=v3n-sa \\(SecAgg; recon=off\\)" \
+        "coordinator started in SecAgg v3n-sa mode, reconciliation off by default"
+    assert_match "$COORD_TXT" "round-deadline-ms=5000" \
+        "coordinator reports default 5000 ms round deadline"
+    assert_match "$COORD_TXT" "fed-coord: SECAGG JOIN soul=alice peers=1" "coordinator joined alice"
+    assert_match "$COORD_TXT" "fed-coord: SECAGG JOIN soul=bob peers=1" "coordinator joined bob"
+    assert_match "$COORD_TXT" "relayed 2 SECAGG_NONCE line\\(s\\); ACK 0 sent to 2 soul" \
+        "coordinator relayed both nonces and ended the relay with ACK 0"
+    assert_match "$COORD_TXT" "round-counter=1 persisted" "coordinator persisted round 1 before opening it"
+    assert_match "$COORD_TXT" "opening round 1" "coordinator opened round 1"
+    assert_match "$COORD_TXT" "MASKED_STAT soul=.*masked-value-opaque" \
+        "coordinator received masked stat lines"
+    assert_match "$COORD_TXT" "\\[SECAGG\\] AGGREGATE_SUM round=1" \
+        "coordinator broadcast a SUM aggregate (not avg)"
+    assert_eq "$(sums_plausible "$COORD_TXT")" "0" "all SecAgg sums are plausible (masks cancelled)"
+    assert_nomatch "$COORD_TXT" "fed-coord: STAT soul=.*promo=" \
+        "coordinator did NOT log v1 raw-promo STAT lines"
+    assert_nomatch "$COORD_TXT" "fed-coord: AGGREGATE round=1 tag=.*avg_promo=" \
+        "coordinator did NOT log v1 AVG aggregate lines"
+    # Wire log: what actually crossed the coordinator's sockets.
+    assert_match "$WIRE" "C>S SECAGG_HELLO ce-fed v3n-sa$" "wire: souls sent the v3n-sa HELLO"
+    assert_match "$WIRE" "S>C OK ce-fed v3n-sa protocol accepted$" "wire: exact v3n-sa OK reply"
+    assert_match "$WIRE" "C>S SECAGG_PEER bob$" "wire: alice's SECAGG_PEER carries the id only"
+    assert_match "$WIRE" "C>S SECAGG_PEER alice$" "wire: bob's SECAGG_PEER carries the id only"
+    assert_nomatch "$WIRE" "SECAGG_PEER [^ ]+ [^ ]+" "wire: no 3-field (token-carrying) SECAGG_PEER"
+    assert_nomatch "$WIRE" "$SHARED_TOKEN" "wire: the pair token never appears on the wire"
+    assert_nomatch "$COORD_TXT$CHAT_A_TXT$CHAT_B_TXT" "$SHARED_TOKEN" \
+        "the pair token appears in no coordinator or chat log"
+    assert_match "$WIRE" "C>S SECAGG_NONCE alice [0-9a-f]{32}$" "wire: alice sent a 32-hex nonce"
+    assert_match "$WIRE" "C>S SECAGG_NONCE bob [0-9a-f]{32}$" "wire: bob sent a 32-hex nonce"
+    BOB_NONCE=$(echo "$WIRE" | sed -n 's/.*C>S SECAGG_NONCE bob \([0-9a-f]*\)$/\1/p' | head -1)
+    assert_match "$WIRE" "S>C SECAGG_NONCE bob ${BOB_NONCE:-MISSING}$" \
+        "wire: bob's nonce was relayed unchanged (to alice)"
+    assert_eq "$(echo "$WIRE" | grep -c 'S>C ACK 0$')" "2" "wire: ACK 0 ended the relay for both souls"
+    assert_match "$WIRE" "S>C FED_ROUND 1 " "wire: FED_ROUND 1 broadcast"
+    if [ -f "$D/wire.log" ]; then
+        assert_eq "$(stat -c %a "$D/wire.log")" "600" "wire log is mode 0600"
+    else
+        assert_eq "missing" "present" "wire log written"
     fi
+    assert_eq "$(cat "$D/run/crossengin_fed_secagg_round" 2>/dev/null)" "1" "round counter file holds 1"
+    assert_eq "$(stat -c %a "$D/run/crossengin_fed_secagg_round" 2>/dev/null)" "600" "round counter file is mode 0600"
+    # Chat-side invariants.
+    assert_match "$CHAT_A_TXT" "as soul=alice" "alice chat used soul id alice"
+    assert_match "$CHAT_B_TXT" "as soul=bob" "bob chat used soul id bob"
+    assert_match "$CHAT_A_TXT" "fed_join: \\[SECAGG\\] enabled .v3n-sa" "alice chat entered SecAgg v3n-sa mode"
+    assert_match "$CHAT_A_TXT" "HELLO ce-fed v3n-sa \\+ FED_JOIN exchange complete, peers=1 nonces=1 recon=0" \
+        "alice chat completed the v3n-sa handshake with bob's nonce"
+    assert_match "$CHAT_B_TXT" "HELLO ce-fed v3n-sa \\+ FED_JOIN exchange complete, peers=1 nonces=1 recon=0" \
+        "bob chat completed the v3n-sa handshake with alice's nonce"
+    assert_match "$CHAT_A_TXT" "fed: \\[SECAGG\\] round 1 complete" "alice chat completed round 1"
+    assert_match "$CHAT_B_TXT" "fed: \\[SECAGG\\] round 1 complete" "bob chat completed round 1"
+fi
+
+# ===========================================================================
+# Python-soul stages.
+# ===========================================================================
+if [ "$HAVE_PY" -ne 1 ]; then
+    skip "python3 or $SOUL_HELPER unavailable -- Python-soul stages skipped"
+    finish
+fi
+
+it_section "scenario U.parity: Python mirror of the v3n-sa mask KDF"
+PAR=$(python3 -I "$SOUL_HELPER" --selftest 2>&1)
+assert_match "$PAR" "selftest parity .* OK$" "secagg_smoke_soul.py --selftest (fixed vector, symmetry, nonce sensitivity)"
+PM=$(python3 -I "$SOUL_HELPER" --print-mask --soul-id alice --peer bob --token tok-ab \
+    --nonce 00000000000000000000000000000001 --peer-nonce 00000000000000000000000000000002 \
+    --round 1 --dim 0 --tag topic:test 2>&1)
+assert_eq "$PM" "4135031036" "Python mask == the vector pinned in test_secure_aggregation.nova"
+
+# py_pair_session <stage_dir> <port> -> alice(100,50) + bob(30,20)
+py_pair_session() {
+    local d="$1" port="$2"
+    start_coord "$d" "$port" 2
+    local cp=$COORD_PID
+    bind_ok "$d" "Python pair session" || return 1
+    py_soul "$d/alice.out" --soul-id alice --peer bob --token "$SHARED_TOKEN2" --port "$port" \
+        --x-promo 100 --x-atr 50 --wire-log "$d/alice.wire"
+    local pa=$PY_PID
+    sleep 0.5
+    py_soul "$d/bob.out" --soul-id bob --peer alice --token "$SHARED_TOKEN2" --port "$port" \
+        --x-promo 30 --x-atr 20 --wire-log "$d/bob.wire"
+    local pb=$PY_PID
+    wait_all 25 "$cp" "$pa" "$pb"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+it_section "scenario U.round: persisted SecAgg round counter"
+D=$(stage_dir round)
+next_port
+if RUN_DIR="$D/run" py_pair_session "$D" "$NEXT_PORT"; then
+    T1=$(cat "$D/coord.out")
+    assert_match "$T1" "opening round 1 " "first coordinator run opens round 1"
+    assert_eq "$(cat "$D/run/crossengin_fed_secagg_round" 2>/dev/null)" "1" "counter holds 1 after the first run"
+    : >"$D/coord.out"; : >"$D/wire.log"
+    next_port
+    RUN_DIR="$D/run" py_pair_session "$D" "$NEXT_PORT"
+    T2=$(cat "$D/coord.out")
+    W2=$(cat "$D/wire.log" 2>/dev/null || true)
+    assert_match "$T2" "opening round 2 " "second coordinator process continues at round 2"
+    assert_match "$W2" "S>C FED_ROUND 2 " "wire: FED_ROUND 2 broadcast"
+    assert_match "$W2" "C>S FED_STAT_MASKED 2 topic:test " "Python soul parsed the round id from FED_ROUND"
+    assert_match "$T2" "AGGREGATE_SUM round=2 tag=topic:test sum_promo=130 sum_atr=70 n_part=2" \
+        "round-2 sum is correct"
+    assert_eq "$(cat "$D/run/crossengin_fed_secagg_round" 2>/dev/null)" "2" "counter holds 2 after the second run"
+    assert_nomatch "$W2" "$SHARED_TOKEN2" "wire: no token on the wire (Python souls)"
+    # A corrupt counter is fatal (fail closed, never reset to round 1).
+    printf 'garbage\n' >"$D/run/crossengin_fed_secagg_round"
+    D3=$(stage_dir round_corrupt)
+    next_port
+    RUN_DIR="$D/run" start_coord "$D3" "$NEXT_PORT" 2
+    wait_all 10 "$COORD_PID"
+    TC=$(cat "$D3/coord.out")
+    assert_match "$TC" "FATAL SecAgg round counter .* corrupt" "corrupt round counter is refused"
+    assert_match "$TC" "coord-exit=70" "coordinator exits 70 on a corrupt counter"
+    assert_nomatch "$TC" "opening round" "no round opened with a corrupt counter"
+    # A counter too large for a NOVA int is fatal (it would wrap backwards).
+    D4=$(stage_dir round_overflow)
+    printf '9223372036854775807\n' >"$D4/run/crossengin_fed_secagg_round"
+    next_port
+    start_coord "$D4" "$NEXT_PORT" 2
+    wait_all 10 "$COORD_PID"
+    TO=$(cat "$D4/coord.out")
+    assert_match "$TO" "FATAL SecAgg round counter .* out of range" "overflowing counter is refused"
+    assert_match "$TO" "coord-exit=70" "coordinator exits 70 on an overflowing counter"
+    # A symlink at the counter path is fatal, not "missing" (ELOOP), so the
+    # counter cannot be silently reset to round 1.
+    D5=$(stage_dir round_symlink)
+    printf '5\n' >"$D5/target"
+    ln -s "$D5/target" "$D5/run/crossengin_fed_secagg_round"
+    next_port
+    start_coord "$D5" "$NEXT_PORT" 2
+    wait_all 10 "$COORD_PID"
+    TS=$(cat "$D5/coord.out")
+    assert_match "$TS" "FATAL cannot open SecAgg round counter .*errno 40" "symlinked counter is refused (ELOOP)"
+    assert_match "$TS" "coord-exit=70" "coordinator exits 70 on a symlinked counter"
+    # One coordinator per run dir: a second one on the same run dir refuses
+    # to start while the first holds the lock.
+    D6=$(stage_dir round_lock)
+    next_port
+    start_coord "$D6" "$NEXT_PORT" 2
+    FIRST_PID=$COORD_PID
     sleep 1
-    elapsed=$((elapsed + 1))
-done
-if [ "$elapsed" -ge "$DEADLINE" ]; then
-    printf "  ${C_YEL}WARN${C_RST}  dropout-scenario process(es) hung past %ds, force-killing\n" "$DEADLINE"
-    kill -9 $COORD2_PID  2>/dev/null
-    kill -9 $SOUL_A_PID  2>/dev/null
-    kill -9 $SOUL_B_PID  2>/dev/null
-fi
-wait $COORD2_PID  2>/dev/null
-wait $SOUL_A_PID  2>/dev/null
-wait $SOUL_B_PID  2>/dev/null
-wait $SOUL_C_PID  2>/dev/null
-
-COORD2_TXT=$(cat "$COORD2_OUT"  2>/dev/null || true)
-SOUL_A_TXT=$(cat "$SOUL_A_OUT"  2>/dev/null || true)
-
-# Dropout-scenario invariants (coord side).
-assert_match "$COORD2_TXT" "mode=v2-sa-r" \
-    "dropout-scenario coordinator boots in v2-sa-r mode"
-assert_match "$COORD2_TXT" "fed-coord: SECAGG JOIN soul=alice" \
-    "dropout-scenario coordinator accepted alice"
-assert_match "$COORD2_TXT" "fed-coord: SECAGG JOIN soul=bob" \
-    "dropout-scenario coordinator accepted bob"
-# The coord must log a DROPOUT line for bob.
-assert_match "$COORD2_TXT" "fed-coord: DROPOUT soul=bob" \
-    "coordinator detected bob's dropout"
-assert_match "$COORD2_TXT" "FED_DROPOUT round=1 dropped=bob broadcast to survivors" \
-    "coordinator broadcast FED_DROPOUT to survivors"
-assert_match "$COORD2_TXT" "RECON_MASKED soul=alice" \
-    "coordinator received alice's reconciled stat"
-assert_match "$COORD2_TXT" "round 1 reconciled" \
-    "coordinator round 1 reconciled (recon path)"
-# After reconciliation the sum is alice + carol: promo 100 + 30, atr
-# 50 + 20, from two participants -- the masks between the survivors still
-# cancel, and bob's were removed. (The old version had one survivor and
-# asserted its raw value came out -- exactly the leak the reconciliation
-# limits now refuse.)
-assert_match "$COORD2_TXT" "AGGREGATE_SUM round=1 tag=topic:test sum_promo=130 sum_atr=70 n_part=2" \
-    "coordinator sum equals alice + carol after bob's dropout (masks cancel)"
-
-# Survivor (alice) invariants -- recorded via stderr by the Python helper.
-assert_match "$SOUL_A_TXT" "FED_DROPOUT" \
-    "alice survivor saw FED_DROPOUT in its receive stream"
-
-# Stage 9: P3.9 DH key-exchange scenario (CE_SECAGG_DH=1).
-# Two chat souls join with DH enabled. No pre-shared CE_FED_TOKEN_*
-# env vars: the pairwise shared secrets are derived from the DH
-# exchange that happens during the handshake. The coordinator's sum
-# must still equal x_a + x_b because the DH-derived masks cancel
-# pairwise just like the token-derived ones did.
-#
-# We use the chat binary (not a Python helper) for both souls -- the
-# chat-side DH support is the focus of the scenario, and the wire
-# protocol already round-trips via the v2-sa-r path. The masks now
-# come from `peer_pubkey ^ my_private mod p` instead of
-# `hash(CE_FED_TOKEN_<peer> + ":" + round_id)`. The headline check is
-# that the coordinator's AGGREGATE_SUM line shows up exactly once, the
-# coordinator logs the SECAGG-DH broadcast phase, and neither soul
-# logs an error.
-it_section "scenario U.dh: secure aggregation DH KEY-EXCHANGE (P3.9 / v2-sa-dh)"
-
-PORT3=$(( 34000 + (RANDOM % 1000) ))
-COORD3_OUT="/tmp/ce_int_secagg_dh_coord.out"
-CHAT_DA_OUT="/tmp/ce_int_secagg_dh_chat_a.out"
-CHAT_DB_OUT="/tmp/ce_int_secagg_dh_chat_b.out"
-trap 'kill -9 $COORD_PID 2>/dev/null; kill -9 $CHAT_A_PID 2>/dev/null; kill -9 $CHAT_B_PID 2>/dev/null; kill -9 $COORD2_PID 2>/dev/null; kill -9 $SOUL_A_PID 2>/dev/null; kill -9 $SOUL_B_PID 2>/dev/null; kill -9 $COORD3_PID 2>/dev/null; kill -9 $CHAT_DA_PID 2>/dev/null; kill -9 $CHAT_DB_PID 2>/dev/null; rm -f "$COORD_OUT" "$CHAT_A_OUT" "$CHAT_B_OUT" "$COORD2_OUT" "$SOUL_A_OUT" "$SOUL_B_OUT" "$COORD3_OUT" "$CHAT_DA_OUT" "$CHAT_DB_OUT"' EXIT
-rm -f "$COORD3_OUT" "$CHAT_DA_OUT" "$CHAT_DB_OUT"
-
-# Launch coord for the DH scenario in SecAgg mode (the coord auto-detects
-# DH-mode from incoming FED_DH_PUBLIC lines during the handshake).
-(
-    export CE_FED_PORT="$PORT3"
-    export CE_FED_BIND="127.0.0.1"
-    export CE_FED_SOULS=2
-    export CE_FED_MAX_ROUNDS=1
-    export CE_SECAGG_ENABLED=1
-    "$COORD_BIN" >"$COORD3_OUT" 2>&1
-) &
-COORD3_PID=$!
-
-sleep 1
-if grep -q "ERROR cannot bind / listen" "$COORD3_OUT" 2>/dev/null; then
-    printf "  ${C_YEL}SKIP${C_RST}  socket bind denied by sandbox -- DH scenario skipped\n"
-    PASS=$((PASS+1))
-    wait $COORD3_PID 2>/dev/null
-    summary "scenario_u_secagg"
-    exit $?
+    D7=$(stage_dir round_lock2)
+    next_port
+    RUN_DIR="$D6/run" start_coord "$D7" "$NEXT_PORT" 2
+    wait_all 10 "$COORD_PID"
+    TL=$(cat "$D7/coord.out")
+    assert_match "$TL" "FATAL another coordinator is using this run dir" "second coordinator on one run dir is refused"
+    assert_match "$TL" "coord-exit=70" "second coordinator exits 70"
+    # FIRST_PID is the wrapper subshell; stop the coordinator it started too.
+    pkill -P "$FIRST_PID" 2>/dev/null
+    kill "$FIRST_PID" 2>/dev/null; wait "$FIRST_PID" 2>/dev/null
 fi
 
-rm -f /tmp/crossengin_secagg_dh_alice.snap /tmp/crossengin_secagg_dh_bob.snap \
-      /tmp/crossengin_secagg_dh_alice.dlog  /tmp/crossengin_secagg_dh_bob.dlog
+# ---------------------------------------------------------------------------
+it_section "scenario U.replay: same round id in two sessions -> different shares"
+DA=$(stage_dir replay_a)
+DB=$(stage_dir replay_b)
+next_port; PORT_A=$NEXT_PORT
+next_port; PORT_B=$NEXT_PORT
+if py_pair_session "$DA" "$PORT_A" && py_pair_session "$DB" "$PORT_B"; then
+    TA=$(cat "$DA/coord.out"); TB=$(cat "$DB/coord.out")
+    assert_match "$TA" "opening round 1 " "session A opened round 1 (fresh run dir)"
+    assert_match "$TB" "opening round 1 " "session B opened round 1 too (counter reset: worst case)"
+    NA=$(grep -oE "^> SECAGG_NONCE alice [0-9a-f]{32}" "$DA/alice.wire" | head -1)
+    NB=$(grep -oE "^> SECAGG_NONCE alice [0-9a-f]{32}" "$DB/alice.wire" | head -1)
+    SA=$(grep -oE "^> FED_STAT_MASKED 1 topic:test [0-9]+ [0-9]+" "$DA/alice.wire" | head -1)
+    SB=$(grep -oE "^> FED_STAT_MASKED 1 topic:test [0-9]+ [0-9]+" "$DB/alice.wire" | head -1)
+    assert_match "$SA" "FED_STAT_MASKED 1" "session A: alice's share captured"
+    assert_match "$SB" "FED_STAT_MASKED 1" "session B: alice's share captured"
+    if [ -n "$SA" ] && [ "$SA" != "$SB" ]; then R=differ; else R=same; fi
+    assert_eq "$R" "differ" "replayed round id: alice's masked shares differ between sessions"
+    if [ -n "$NA" ] && [ "$NA" != "$NB" ]; then R=differ; else R=same; fi
+    assert_eq "$R" "differ" "each session used a fresh nonce"
+    assert_match "$TA" "AGGREGATE_SUM round=1 tag=topic:test sum_promo=130 sum_atr=70 n_part=2" "session A sum correct"
+    assert_match "$TB" "AGGREGATE_SUM round=1 tag=topic:test sum_promo=130 sum_atr=70 n_part=2" "session B sum correct"
+fi
 
-INPUT_DA=$(
-    printf '/teach widget\n'
-    printf '/teach gadget\n'
-    printf '/cap grant network_send\n'
-    printf "/fed_join 127.0.0.1:$PORT3\n"
-    printf '/fed_leave\n'
-    printf '/quit\n'
-)
-INPUT_DB=$(
-    printf '/teach widget\n'
-    printf '/teach sprocket\n'
-    printf '/cap grant network_send\n'
-    printf "/fed_join 127.0.0.1:$PORT3\n"
-    printf '/fed_leave\n'
-    printf '/quit\n'
-)
-
-# Stage 10: launch the two chat instances with CE_SECAGG_DH=1.
-# CRITICAL: no CE_FED_TOKEN_* env vars -- the DH path replaces the
-# pre-shared tokens. CE_SECAGG_PEERS still names the peers (so the
-# soul knows which peer ids to expect FED_DH_PUBLIC from) but in DH
-# mode the chat does NOT call sa_peer_token_from_env at all (verified
-# by the chat boot log "[SECAGG-DH]").
-(
-    export CE_FED_PORT="$PORT3"
-    export CE_SECAGG_ENABLED=1
-    export CE_SECAGG_DH=1
-    export CE_SECAGG_PEERS="bob"
-    export CE_SESSION_ID="alice"
-    export CE_FED_SOUL_ID="alice"
-    export CE_SNAP_PATH="/tmp/crossengin_secagg_dh_alice.snap"
-    export CE_DLOG_PATH="/tmp/crossengin_secagg_dh_alice.dlog"
-    echo "$INPUT_DA" | "$CHAT_BIN" >"$CHAT_DA_OUT" 2>&1
-) &
-CHAT_DA_PID=$!
-
-sleep 1
-
-(
-    export CE_FED_PORT="$PORT3"
-    export CE_SECAGG_ENABLED=1
-    export CE_SECAGG_DH=1
-    export CE_SECAGG_PEERS="alice"
-    export CE_SESSION_ID="bob"
-    export CE_FED_SOUL_ID="bob"
-    export CE_SNAP_PATH="/tmp/crossengin_secagg_dh_bob.snap"
-    export CE_DLOG_PATH="/tmp/crossengin_secagg_dh_bob.dlog"
-    echo "$INPUT_DB" | "$CHAT_BIN" >"$CHAT_DB_OUT" 2>&1
-) &
-CHAT_DB_PID=$!
-
-# Stage 11: wait. DH-mode keygen + shared-secret derivation costs ~50-
-# 100 ms per op; total DH overhead for two souls is ~few hundred ms.
-# Add some slack to the deadline so the soul-side bn_modpow_ct runs
-# don't push us into a force-kill.
-DEADLINE=30
-elapsed=0
-while [ "$elapsed" -lt "$DEADLINE" ]; do
-    coord_alive=0; a_alive=0; b_alive=0
-    kill -0 $COORD3_PID  2>/dev/null && coord_alive=1
-    kill -0 $CHAT_DA_PID 2>/dev/null && a_alive=1
-    kill -0 $CHAT_DB_PID 2>/dev/null && b_alive=1
-    if [ $coord_alive -eq 0 ] && [ $a_alive -eq 0 ] && [ $b_alive -eq 0 ]; then
-        break
-    fi
+# py_dropout_session <stage_dir> <port> <soul-recon 0|1> [coord ENV=VAL ...]
+# alice(100,50) + carol(30,20) survive; bob drops after the relay.
+py_dropout_session() {
+    local d="$1" port="$2" srecon="$3"; shift 3
+    start_coord "$d" "$port" 3 "$@"
+    local cp=$COORD_PID
+    bind_ok "$d" "dropout session" || return 1
+    local env_recon=""
+    [ "$srecon" = "1" ] && env_recon="CE_SECAGG_ALLOW_RECON=1"
+    env $env_recon python3 -I "$SOUL_HELPER" --host 127.0.0.1 --mode survivor --soul-id alice \
+        --peer bob,carol --token "$SHARED_TOKEN2" --port "$port" --x-promo 100 --x-atr 50 \
+        --wire-log "$d/alice.wire" >"$d/alice.out" 2>&1 &
+    local pa=$!; PIDS+=("$pa")
+    env $env_recon python3 -I "$SOUL_HELPER" --host 127.0.0.1 --mode survivor --soul-id carol \
+        --peer alice,bob --token "$SHARED_TOKEN2" --port "$port" --x-promo 30 --x-atr 20 \
+        --wire-log "$d/carol.wire" >"$d/carol.out" 2>&1 &
+    local pc=$!; PIDS+=("$pc")
     sleep 1
-    elapsed=$((elapsed + 1))
-done
-if [ "$elapsed" -ge "$DEADLINE" ]; then
-    printf "  ${C_YEL}WARN${C_RST}  DH-scenario process(es) hung past %ds, force-killing\n" "$DEADLINE"
-    kill -9 $COORD3_PID  2>/dev/null
-    kill -9 $CHAT_DA_PID 2>/dev/null
-    kill -9 $CHAT_DB_PID 2>/dev/null
-fi
-wait $COORD3_PID  2>/dev/null
-wait $CHAT_DA_PID 2>/dev/null
-wait $CHAT_DB_PID 2>/dev/null
+    py_soul "$d/bob.out" --mode dropout --soul-id bob --peer alice,carol --token "$SHARED_TOKEN2" --port "$port"
+    local pb=$PY_PID
+    wait_all 25 "$cp" "$pa" "$pc" "$pb"
+    return 0
+}
 
-COORD3_TXT=$(cat "$COORD3_OUT"   2>/dev/null || true)
-CHAT_DA_TXT=$(cat "$CHAT_DA_OUT" 2>/dev/null || true)
-CHAT_DB_TXT=$(cat "$CHAT_DB_OUT" 2>/dev/null || true)
-
-# DH-scenario coordinator-side invariants.
-# NOTE: the bin/crossengin-chat binary hardcodes the session id "default"
-# at boot (CE_SESSION_ID is consumed only by snap-path resolution, not by
-# the SecAgg soul-id); CE_FED_SOUL_ID gives each chat its own soul id.
-# The integration test asserts on the SECAGG-DH wire events, not on
-# per-soul identity (the soul-id is exercised by the dropout scenario
-# above via the Python helper which DOES take --soul-id).
-assert_match "$COORD3_TXT" "fed-coord: SECAGG JOIN" \
-    "DH-scenario coordinator accepted at least one SECAGG JOIN"
-# Coordinator logged that it received FED_DH_PUBLIC lines and broadcast
-# pubkeys back -- this is the new v2-sa-dh wire phase. We assert the
-# event count rather than per-soul ids since both chats use the same
-# default soul_id.
-assert_match "$COORD3_TXT" "\\[SECAGG-DH\\] FED_DH_PUBLIC soul=[a-z]+ pubkey=" \
-    "DH-scenario coordinator received at least one FED_DH_PUBLIC"
-assert_match "$COORD3_TXT" "\\[SECAGG-DH\\] broadcasting 2 DH pubkey" \
-    "DH-scenario coordinator broadcast both DH pubkeys"
-assert_match "$COORD3_TXT" "\\[SECAGG-DH\\] DH key-exchange phase complete" \
-    "DH-scenario coordinator completed DH exchange phase"
-# The masked stats / aggregate sum still flow as in v2-sa: DH only
-# changes WHERE the per-pair mask seed comes from (LCG-fed-by-DH-secret
-# instead of LCG-fed-by-token-hash); the rest of the protocol is bit-
-# identical. So we still expect the AGGREGATE_SUM broadcast.
-assert_match "$COORD3_TXT" "\\[SECAGG\\] AGGREGATE_SUM round=1" \
-    "DH-scenario coordinator broadcast AGGREGATE_SUM"
-BAD_SUMS3=$(echo "$COORD3_TXT" | grep -oE "sum_promo=-?[0-9]+ sum_atr=-?[0-9]+" \
-    | awk -F'[= ]' '{ if ($2 < 0 || $2 > 2000 || $4 < 0 || $4 > 2000) print }' | wc -l)
-assert_eq "$BAD_SUMS3" "0" "DH-scenario sums are plausible (DH masks cancelled)"
-
-# Chat-side (per-soul) DH invariants. The chat boot banner contains
-# parentheses "enabled (v2-sa-dh ..." -- we use a `.` (any single char)
-# in place of `(` since _lib.sh's assert_match runs grep -E and the
-# parens would otherwise be alternation metacharacters.
-assert_match "$CHAT_DA_TXT" "\\[SECAGG\\] enabled .v2-sa-dh" \
-    "alice chat entered v2-sa-dh mode"
-assert_match "$CHAT_DB_TXT" "\\[SECAGG\\] enabled .v2-sa-dh" \
-    "bob chat entered v2-sa-dh mode"
-assert_match "$CHAT_DA_TXT" "\\[SECAGG-DH\\] generated keypair, sent FED_DH_PUBLIC" \
-    "alice chat generated + sent DH pubkey"
-assert_match "$CHAT_DB_TXT" "\\[SECAGG-DH\\] generated keypair, sent FED_DH_PUBLIC" \
-    "bob chat generated + sent DH pubkey"
-assert_match "$CHAT_DA_TXT" "\\[SECAGG-DH\\] received 1 peer pubkey" \
-    "alice chat received bob's DH pubkey from coord"
-assert_match "$CHAT_DB_TXT" "\\[SECAGG-DH\\] received 1 peer pubkey" \
-    "bob chat received alice's DH pubkey from coord"
-# Round-complete invariant: each chat finished round 1 cleanly under
-# DH mode -- the masks derived from DH shared secrets canceled
-# pairwise just like the token-derived ones would have.
-assert_match "$CHAT_DA_TXT" "fed: \\[SECAGG\\] round 1 complete" \
-    "alice chat completed round 1 under DH mode"
-assert_match "$CHAT_DB_TXT" "fed: \\[SECAGG\\] round 1 complete" \
-    "bob chat completed round 1 under DH mode"
-
-# Stage 12: P3.9 cont. DH-2048 key-exchange scenario (CE_SECAGG_DH_2048=1).
-# Same wire shape as the DH scenario above, but the RFC 7919 Group 14
-# 2048-bit prime replaces Curve25519's 256-bit field prime. Each modpow_ct
-# costs ~15s wall-clock on the dev sandbox (vs. ~40ms for the 256-bit
-# path), so the round-trip can take ~60s+. We bump the deadline to 180s
-# to give the keygens + shared-secret derivations time to land without a
-# force-kill.
-#
-# NOTE: this scenario may legitimately TIMEOUT on a slow sandbox -- the
-# timeout-and-WARN behavior is shared with the DH scenario above (see
-# its DEADLINE handling). The assertions below are SKIPPED if the
-# coordinator never logged a SECAGG JOIN (proxy for "the chats didn't
-# get far enough"); a real failure (e.g., wrong shared secret) shows
-# up as a "FAIL" in assert_match output.
-it_section "scenario U.dh2048: secure aggregation DH KEY-EXCHANGE 2048-bit (P3.9 cont. / v2-sa-dh-2048)"
-
-PORT4=$(( 35000 + (RANDOM % 1000) ))
-COORD4_OUT="/tmp/ce_int_secagg_dh2048_coord.out"
-CHAT_EA_OUT="/tmp/ce_int_secagg_dh2048_chat_a.out"
-CHAT_EB_OUT="/tmp/ce_int_secagg_dh2048_chat_b.out"
-trap 'kill -9 $COORD_PID 2>/dev/null; kill -9 $CHAT_A_PID 2>/dev/null; kill -9 $CHAT_B_PID 2>/dev/null; kill -9 $COORD2_PID 2>/dev/null; kill -9 $SOUL_A_PID 2>/dev/null; kill -9 $SOUL_B_PID 2>/dev/null; kill -9 $COORD3_PID 2>/dev/null; kill -9 $CHAT_DA_PID 2>/dev/null; kill -9 $CHAT_DB_PID 2>/dev/null; kill -9 $COORD4_PID 2>/dev/null; kill -9 $CHAT_EA_PID 2>/dev/null; kill -9 $CHAT_EB_PID 2>/dev/null; rm -f "$COORD_OUT" "$CHAT_A_OUT" "$CHAT_B_OUT" "$COORD2_OUT" "$SOUL_A_OUT" "$SOUL_B_OUT" "$COORD3_OUT" "$CHAT_DA_OUT" "$CHAT_DB_OUT" "$COORD4_OUT" "$CHAT_EA_OUT" "$CHAT_EB_OUT"' EXIT
-rm -f "$COORD4_OUT" "$CHAT_EA_OUT" "$CHAT_EB_OUT"
-
-(
-    export CE_FED_PORT="$PORT4"
-    export CE_FED_BIND="127.0.0.1"
-    export CE_FED_SOULS=2
-    export CE_FED_MAX_ROUNDS=1
-    export CE_SECAGG_ENABLED=1
-    "$COORD_BIN" >"$COORD4_OUT" 2>&1
-) &
-COORD4_PID=$!
-
-sleep 1
-if grep -q "ERROR cannot bind / listen" "$COORD4_OUT" 2>/dev/null; then
-    printf "  ${C_YEL}SKIP${C_RST}  socket bind denied by sandbox -- DH-2048 scenario skipped\n"
-    PASS=$((PASS+1))
-    wait $COORD4_PID 2>/dev/null
-    summary "scenario_u_secagg"
-    exit $?
+# ---------------------------------------------------------------------------
+it_section "scenario U.r0: dropout with default env -> round aborted"
+D=$(stage_dir r0)
+next_port
+if py_dropout_session "$D" "$NEXT_PORT" 0; then
+    T=$(cat "$D/coord.out"); W=$(cat "$D/wire.log" 2>/dev/null || true)
+    assert_match "$T" "mode=v3n-sa \\(SecAgg; recon=off\\)" "coordinator: reconciliation off"
+    assert_match "$T" "fed-coord: DROPOUT soul=bob" "coordinator detected bob's dropout"
+    assert_match "$T" "round 1 ABORTED: dropped=bob; reconciliation disabled" "round aborted (no reconciliation)"
+    assert_nomatch "$W" "FED_DROPOUT" "wire: no FED_DROPOUT sent"
+    assert_nomatch "$W" "FED_AGGREGATE_SUM" "wire: no sum published"
+    assert_nomatch "$T" "AGGREGATE_SUM" "coordinator log: no sum"
+    assert_match "$W" "S>C BYE$" "wire: session ended with BYE"
+    assert_match "$(cat "$D/alice.out" "$D/carol.out")" "BYE before FED_AGGREGATE_SUM: round aborted" \
+        "survivors saw the abort"
 fi
 
-rm -f /tmp/crossengin_secagg_dh2048_alice.snap /tmp/crossengin_secagg_dh2048_bob.snap \
-      /tmp/crossengin_secagg_dh2048_alice.dlog  /tmp/crossengin_secagg_dh2048_bob.dlog
+# ---------------------------------------------------------------------------
+it_section "scenario U.r1: coordinator allows recon, survivors refuse it"
+D=$(stage_dir r1)
+next_port
+if py_dropout_session "$D" "$NEXT_PORT" 0 CE_SECAGG_ALLOW_RECON=1; then
+    T=$(cat "$D/coord.out"); W=$(cat "$D/wire.log" 2>/dev/null || true)
+    assert_match "$T" "recon=on" "coordinator: reconciliation on"
+    assert_match "$W" "S>C FED_DROPOUT 1 bob$" "wire: FED_DROPOUT broadcast"
+    S=$(cat "$D/alice.out" "$D/carol.out")
+    assert_eq "$(echo "$S" | grep -c 'refusing reconciliation (CE_SECAGG_ALLOW_RECON not set)')" "2" \
+        "both survivors refused reconciliation"
+    assert_nomatch "$W" "FED_RECON_MASKED" "wire: no FED_RECON_MASKED sent"
+    assert_nomatch "$T" "AGGREGATE_SUM" "no sum published"
+fi
 
-INPUT_EA=$(
-    printf '/teach widget\n'
-    printf '/teach gadget\n'
-    printf '/cap grant network_send\n'
-    printf "/fed_join 127.0.0.1:$PORT4\n"
-    printf '/fed_leave\n'
-    printf '/quit\n'
-)
-INPUT_EB=$(
-    printf '/teach widget\n'
-    printf '/teach sprocket\n'
-    printf '/cap grant network_send\n'
-    printf "/fed_join 127.0.0.1:$PORT4\n"
-    printf '/fed_leave\n'
-    printf '/quit\n'
-)
+# ---------------------------------------------------------------------------
+it_section "scenario U.r: dropout with CE_SECAGG_ALLOW_RECON=1 -> reconciled sum"
+D=$(stage_dir r)
+next_port
+if py_dropout_session "$D" "$NEXT_PORT" 1 CE_SECAGG_ALLOW_RECON=1; then
+    T=$(cat "$D/coord.out"); W=$(cat "$D/wire.log" 2>/dev/null || true)
+    assert_match "$T" "mode=v3n-sa \\(SecAgg; recon=on\\)" "coordinator boots with reconciliation on"
+    assert_match "$T" "fed-coord: SECAGG JOIN soul=bob" "coordinator accepted bob"
+    assert_match "$T" "fed-coord: DROPOUT soul=bob" "coordinator detected bob's dropout"
+    assert_match "$T" "FED_DROPOUT round=1 dropped=bob broadcast to survivors" \
+        "coordinator broadcast FED_DROPOUT to survivors"
+    assert_match "$T" "RECON_MASKED soul=alice" "coordinator received alice's reconciled stat"
+    assert_match "$W" "C>S FED_RECON_MASKED 1 carol topic:test " "wire: carol's reconciled stat (soul id = sender)"
+    assert_match "$T" "round 1 reconciled" "coordinator round 1 reconciled (recon path)"
+    # alice + carol: promo 100 + 30, atr 50 + 20, from two participants.
+    assert_match "$T" "AGGREGATE_SUM round=1 tag=topic:test sum_promo=130 sum_atr=70 n_part=2" \
+        "coordinator sum equals alice + carol after bob's dropout (masks cancel)"
+    assert_match "$(cat "$D/alice.out")" "FED_DROPOUT" "alice survivor saw FED_DROPOUT"
+    assert_nomatch "$W" "$SHARED_TOKEN2" "wire: no token on the wire"
+fi
 
-# Launch the two chat instances with CE_SECAGG_DH_2048=1 (which
-# implies CE_SECAGG_DH=1 -- see sa_dh_2048_enabled_from_env in
-# secure_aggregation.nova). The chats announce themselves with the
-# [SECAGG-DH-2048] banner instead of [SECAGG-DH].
-(
-    export CE_FED_PORT="$PORT4"
-    export CE_SECAGG_ENABLED=1
-    export CE_SECAGG_DH=1
-    export CE_SECAGG_DH_2048=1
-    export CE_SECAGG_PEERS="bob"
-    export CE_SESSION_ID="alice"
-    export CE_FED_SOUL_ID="alice"
-    export CE_SNAP_PATH="/tmp/crossengin_secagg_dh2048_alice.snap"
-    export CE_DLOG_PATH="/tmp/crossengin_secagg_dh2048_alice.dlog"
-    echo "$INPUT_EA" | "$CHAT_BIN" >"$CHAT_EA_OUT" 2>&1
-) &
-CHAT_EA_PID=$!
+# ---------------------------------------------------------------------------
+it_section "scenario U.leave: FED_LEAVE after a masked stat is a dropout"
+# 4 souls with reconciliation opted in: carol sends her masked stat and then
+# FED_LEAVE instead of ACK; bob drops after the relay. Both must be treated
+# as dropped, so the reconciled sum is exactly alice + dave (100+30, 50+20).
+# Before the fix carol's masks with the survivors were never stripped and
+# the published sum was wrong.
+D=$(stage_dir leave)
+next_port
+start_coord "$D" "$NEXT_PORT" 4 CE_SECAGG_ALLOW_RECON=1
+CL=$COORD_PID
+if bind_ok "$D" "leave session"; then
+    for spec in "alice:100:50:bob,carol,dave" "dave:30:20:alice,bob,carol"; do
+        IFS=: read -r sid xp xa peers <<<"$spec"
+        CE_SECAGG_ALLOW_RECON=1 python3 -I "$SOUL_HELPER" --host 127.0.0.1 --mode survivor \
+            --soul-id "$sid" --peer "$peers" --token "$SHARED_TOKEN2" --port "$NEXT_PORT" \
+            --x-promo "$xp" --x-atr "$xa" --wire-log "$D/$sid.wire" >"$D/$sid.out" 2>&1 &
+        PIDS+=("$!"); eval "P_$sid=$!"
+    done
+    python3 -I "$SOUL_HELPER" --host 127.0.0.1 --mode survivor --fault leave-after-stat \
+        --soul-id carol --peer alice,bob,dave --token "$SHARED_TOKEN2" --port "$NEXT_PORT" \
+        --x-promo 7 --x-atr 7 >"$D/carol.out" 2>&1 &
+    PC=$!; PIDS+=("$PC")
+    sleep 1
+    py_soul "$D/bob.out" --mode dropout --soul-id bob --peer alice,carol,dave --token "$SHARED_TOKEN2" --port "$NEXT_PORT"
+    PB=$PY_PID
+    wait_all 30 "$CL" "$P_alice" "$P_dave" "$PC" "$PB"
+    T=$(cat "$D/coord.out")
+    assert_match "$T" "DROPOUT soul=carol round=1 \(FED_LEAVE before ACK\)" "FED_LEAVE after a stat counts as a dropout"
+    assert_match "$T" "DROPOUT soul=bob" "bob's dropout detected"
+    assert_match "$T" "AGGREGATE_SUM round=1 tag=topic:test sum_promo=130 sum_atr=70 n_part=2" \
+        "reconciled sum is exactly the survivors' (alice + dave)"
+fi
 
-sleep 1
+# ---------------------------------------------------------------------------
+it_section "scenario U.peerset: handshake refusals"
+D=$(stage_dir peerset)
+next_port; PORT=$NEXT_PORT
+start_coord "$D" "$PORT" 2
+CP=$COORD_PID
+if bind_ok "$D" "peer-set refusal scenario"; then
+    for f in legacy-hello legacy-peer no-nonce no-peer dh-public; do
+        python3 -I "$SOUL_HELPER" --host 127.0.0.1 --soul-id "f_$f" --peer alice --token tok \
+            --port "$PORT" --fault "$f" --timeout 5 >"$D/fault_$f.out" 2>&1
+        echo "exit=$?" >>"$D/fault_$f.out"
+    done
+    py_soul "$D/alice.out" --soul-id alice --peer bob --token tok --port "$PORT" --x-promo 1 --x-atr 1
+    PA=$PY_PID
+    sleep 1
+    python3 -I "$SOUL_HELPER" --host 127.0.0.1 --soul-id alice --peer bob --token tok \
+        --port "$PORT" --timeout 5 >"$D/dup.out" 2>&1
+    echo "exit=$?" >>"$D/dup.out"
+    py_soul "$D/bob.out" --soul-id bob --peer alice --token tok --port "$PORT" --x-promo 2 --x-atr 3
+    PB=$PY_PID
+    wait_all 25 "$CP" "$PA" "$PB"
+    T=$(cat "$D/coord.out"); W=$(cat "$D/wire.log" 2>/dev/null || true)
+    assert_match "$W" "S>C ERR expected SECAGG_HELLO ce-fed v3n-sa$" "old v3-sa HELLO rejected"
+    assert_match "$W" "S>C ERR bad SecAgg setup line" "3-field (token-carrying) SECAGG_PEER rejected"
+    assert_match "$W" "S>C ERR SECAGG_NONCE required$" "soul without SECAGG_NONCE rejected"
+    assert_match "$W" "S>C ERR empty peer set" "soul without SECAGG_PEER rejected"
+    assert_match "$W" "S>C ERR DH mode refused" "FED_DH_PUBLIC without CE_SECAGG_ALLOW_WEAK_DH rejected"
+    assert_match "$T" "REFUSE duplicate soul id alice" "duplicate soul id refused"
+    assert_nomatch "$T" "SECAGG JOIN soul=f_" "no faulty soul was admitted"
+    assert_match "$(cat "$D/fault_legacy-hello.out")" "server rejected HELLO" "legacy soul saw the HELLO rejection"
+    assert_match "$T" "AGGREGATE_SUM round=1 tag=topic:test sum_promo=3 sum_atr=4 n_part=2" \
+        "the valid pair still completed its round"
+fi
+D=$(stage_dir onesoul)
+next_port; PORT=$NEXT_PORT
+start_coord "$D" "$PORT" 1
+CP=$COORD_PID
+if bind_ok "$D" "single-soul refusal"; then
+    py_soul "$D/alice.out" --soul-id alice --peer bob --token tok --port "$PORT" --timeout 5
+    wait_all 15 "$CP" "$PY_PID"
+    T=$(cat "$D/coord.out"); W=$(cat "$D/wire.log" 2>/dev/null || true)
+    assert_match "$T" "REFUSE session: CE_FED_SOULS must be at least 2" "CE_FED_SOULS=1 refused in SecAgg mode"
+    assert_nomatch "$W" "FED_ROUND" "single-soul session: no FED_ROUND"
+    assert_nomatch "$W" "S>C SECAGG_NONCE" "single-soul session: nothing relayed"
+fi
 
-(
-    export CE_FED_PORT="$PORT4"
-    export CE_SECAGG_ENABLED=1
-    export CE_SECAGG_DH=1
-    export CE_SECAGG_DH_2048=1
-    export CE_SECAGG_PEERS="alice"
-    export CE_SESSION_ID="bob"
-    export CE_FED_SOUL_ID="bob"
-    export CE_SNAP_PATH="/tmp/crossengin_secagg_dh2048_bob.snap"
-    export CE_DLOG_PATH="/tmp/crossengin_secagg_dh2048_bob.dlog"
-    echo "$INPUT_EB" | "$CHAT_BIN" >"$CHAT_EB_OUT" 2>&1
-) &
-CHAT_EB_PID=$!
+# ===========================================================================
+it_section "scenario U.dh: DH key exchange needs CE_SECAGG_ALLOW_WEAK_DH=1"
+D=$(stage_dir dh_refused)
+next_port
+start_chat "$D" alice bob "$NEXT_PORT" gadget CE_SECAGG_DH=1
+wait_all 30 "$CHAT_PID"
+T=$(cat "$D/chat_alice.out")
+assert_match "$T" "\\[SECAGG-DH\\] refusing: DH mode is unauthenticated" "DH without the weak-DH flag refused"
+assert_nomatch "$T" "dialing 127" "refused before dialing"
+D=$(stage_dir dh2048_refused)
+next_port
+start_chat "$D" alice bob "$NEXT_PORT" gadget CE_SECAGG_DH_2048=1
+wait_all 30 "$CHAT_PID"
+assert_match "$(cat "$D/chat_alice.out")" "\\[SECAGG-DH\\] refusing: DH mode is unauthenticated" \
+    "DH-2048 without the weak-DH flag refused too"
 
-# Wait. 2048-bit DH costs ~15s per modpow_ct; a 2-soul round needs
-# 2 keygens + 2 shared-secret derivations on each side (LCG mask
-# derivation calls sa_dh_shared_secret_for_peer_2048) = ~60-120s. Bump
-# the deadline to 180s for headroom on a busy sandbox.
-DEADLINE=180
-elapsed=0
-while [ "$elapsed" -lt "$DEADLINE" ]; do
-    coord_alive=0; a_alive=0; b_alive=0
-    kill -0 $COORD4_PID  2>/dev/null && coord_alive=1
-    kill -0 $CHAT_EA_PID 2>/dev/null && a_alive=1
-    kill -0 $CHAT_EB_PID 2>/dev/null && b_alive=1
-    if [ $coord_alive -eq 0 ] && [ $a_alive -eq 0 ] && [ $b_alive -eq 0 ]; then
-        break
+# dh_session <stage> <deadline> <extra ENV...>
+dh_session() {
+    local name="$1" deadline="$2"; shift 2
+    local d; d=$(stage_dir "$name")
+    next_port
+    local port=$NEXT_PORT
+    start_coord "$d" "$port" 2 CE_SECAGG_ALLOW_WEAK_DH=1
+    local cp=$COORD_PID
+    bind_ok "$d" "$name scenario" || return 1
+    start_chat "$d" alice bob "$port" gadget CE_SECAGG_ALLOW_WEAK_DH=1 "$@"
+    local ca=$CHAT_PID
+    sleep 1
+    start_chat "$d" bob alice "$port" sprocket CE_SECAGG_ALLOW_WEAK_DH=1 "$@"
+    local cb=$CHAT_PID
+    wait_all "$deadline" "$cp" "$ca" "$cb"
+    DH_DIR="$d"
+    return 0
+}
+
+if dh_session dh 40 CE_SECAGG_DH=1; then
+    T=$(cat "$DH_DIR/coord.out"); A=$(cat "$DH_DIR/chat_alice.out"); B=$(cat "$DH_DIR/chat_bob.out")
+    W=$(cat "$DH_DIR/wire.log" 2>/dev/null || true)
+    assert_match "$T" "\\[SECAGG-DH\\] WARNING: DH mode enabled by CE_SECAGG_ALLOW_WEAK_DH=1" \
+        "coordinator printed the weak-DH banner"
+    assert_match "$A" "\\[SECAGG-DH\\] WARNING weak DH mode enabled .*UNAUTHENTICATED" \
+        "alice chat printed the unauthenticated-DH banner"
+    assert_match "$A" "\\[SECAGG\\] enabled .v3n-sa-dh" "alice chat entered DH mode"
+    assert_match "$T" "\\[SECAGG-DH\\] FED_DH_PUBLIC soul=[a-z]+ pubkey=" "coordinator received FED_DH_PUBLIC"
+    assert_match "$T" "\\[SECAGG-DH\\] broadcasting 2 DH pubkey" "coordinator relayed both DH pubkeys"
+    assert_match "$T" "\\[SECAGG-DH\\] DH key-exchange phase complete" "coordinator completed the DH relay"
+    assert_match "$W" "C>S SECAGG_PEER bob$" "DH souls also announce token-free SECAGG_PEER lines"
+    assert_match "$A" "\\[SECAGG-DH\\] received 1 peer pubkey" "alice received bob's DH pubkey"
+    assert_match "$B" "\\[SECAGG-DH\\] received 1 peer pubkey" "bob received alice's DH pubkey"
+    assert_match "$A" "exchange complete, peers=1 nonces=1" "alice received bob's nonce in DH mode"
+    assert_match "$B" "exchange complete, peers=1 nonces=1" "bob received alice's nonce in DH mode"
+    assert_match "$T" "\\[SECAGG\\] AGGREGATE_SUM round=1" "DH-scenario coordinator broadcast AGGREGATE_SUM"
+    assert_eq "$(sums_plausible "$T")" "0" "DH-scenario sums are plausible (DH masks cancelled)"
+    assert_match "$A" "fed: \\[SECAGG\\] round 1 complete" "alice completed round 1 under DH mode"
+    assert_match "$B" "fed: \\[SECAGG\\] round 1 complete" "bob completed round 1 under DH mode"
+fi
+
+# ===========================================================================
+it_section "scenario U.dh2048: DH key exchange, 2048-bit group (CE_IT_SLOW=1)"
+if [ "$SLOW" != "1" ]; then
+    printf "  ${C_DIM}INFO${C_RST}  U.dh2048 not selected (set CE_IT_SLOW=1 to run it)\n"
+else
+    if dh_session dh2048 240 CE_SECAGG_DH_2048=1; then
+        T=$(cat "$DH_DIR/coord.out"); A=$(cat "$DH_DIR/chat_alice.out"); B=$(cat "$DH_DIR/chat_bob.out")
+        assert_match "$A" "\\[SECAGG\\] enabled .v3n-sa-dh-2048" "alice chat entered DH-2048 mode"
+        assert_match "$B" "\\[SECAGG\\] enabled .v3n-sa-dh-2048" "bob chat entered DH-2048 mode"
+        assert_match "$A" "\\[SECAGG-DH-2048\\] generated keypair, sent FED_DH_PUBLIC" "alice sent a 2048-bit pubkey"
+        assert_match "$B" "\\[SECAGG-DH-2048\\] generated keypair, sent FED_DH_PUBLIC" "bob sent a 2048-bit pubkey"
+        assert_match "$T" "\\[SECAGG\\] AGGREGATE_SUM round=1" "DH-2048 coordinator broadcast AGGREGATE_SUM"
+        assert_eq "$(sums_plausible "$T")" "0" "DH-2048 sums are plausible"
+        assert_match "$A" "fed: \\[SECAGG\\] round 1 complete" "alice completed round 1 under DH-2048"
     fi
-    sleep 2
-    elapsed=$((elapsed + 2))
-done
-if [ "$elapsed" -ge "$DEADLINE" ]; then
-    printf "  ${C_YEL}WARN${C_RST}  DH-2048-scenario process(es) hung past %ds, force-killing\n" "$DEADLINE"
-    kill -9 $COORD4_PID  2>/dev/null
-    kill -9 $CHAT_EA_PID 2>/dev/null
-    kill -9 $CHAT_EB_PID 2>/dev/null
 fi
-wait $COORD4_PID  2>/dev/null
-wait $CHAT_EA_PID 2>/dev/null
-wait $CHAT_EB_PID 2>/dev/null
 
-COORD4_TXT=$(cat "$COORD4_OUT"   2>/dev/null || true)
-CHAT_EA_TXT=$(cat "$CHAT_EA_OUT" 2>/dev/null || true)
-CHAT_EB_TXT=$(cat "$CHAT_EB_OUT" 2>/dev/null || true)
-
-# DH-2048 chat-side assertions. The boot banner now shows the
-# v2-sa-dh-2048 label.
-assert_match "$CHAT_EA_TXT" "\\[SECAGG\\] enabled .v2-sa-dh-2048" \
-    "alice chat entered v2-sa-dh-2048 mode"
-assert_match "$CHAT_EB_TXT" "\\[SECAGG\\] enabled .v2-sa-dh-2048" \
-    "bob chat entered v2-sa-dh-2048 mode"
-assert_match "$CHAT_EA_TXT" "\\[SECAGG-DH-2048\\] generating 2048-bit keypair" \
-    "alice chat printed DH-2048 keygen banner"
-assert_match "$CHAT_EB_TXT" "\\[SECAGG-DH-2048\\] generating 2048-bit keypair" \
-    "bob chat printed DH-2048 keygen banner"
-assert_match "$CHAT_EA_TXT" "\\[SECAGG-DH-2048\\] generated keypair, sent FED_DH_PUBLIC" \
-    "alice chat generated + sent 2048-bit DH pubkey"
-assert_match "$CHAT_EB_TXT" "\\[SECAGG-DH-2048\\] generated keypair, sent FED_DH_PUBLIC" \
-    "bob chat generated + sent 2048-bit DH pubkey"
-# The coordinator's wire layer is bits-agnostic -- it just forwards
-# the FED_DH_PUBLIC line carrying a 512-char hex pubkey instead of a
-# 64-char one. So the coordinator's log shape is identical to the
-# 256-bit DH scenario above (same [SECAGG-DH] events; the difference
-# is the pubkey hex length, which we don't grep on here).
-assert_match "$COORD4_TXT" "fed-coord: SECAGG JOIN" \
-    "DH-2048-scenario coordinator accepted at least one SECAGG JOIN"
-
-summary "scenario_u_secagg"
+finish
