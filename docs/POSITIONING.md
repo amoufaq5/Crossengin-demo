@@ -33,7 +33,8 @@ outside the daemon.
 
 ### Individual power users
 
-Deterministic answers with a citation, or an honest "unknown."
+Deterministic answers with a citation, or an honest "unknown." (A cited answer
+can still be wrong if the atom it cites is wrong or loosely matched.)
 The personal KG stays personal — atoms carry ownership; reads that
 would cross a boundary without a merge capability return empty
 instead of leaking. The primary NL surface is LLM-free (ADR-0211),

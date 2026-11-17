@@ -110,8 +110,10 @@ mitigation:
   reasoning path is engines, not prompts.
 - **Vendor lock (LLM: provider API; LLM+RAG: embed model + LLM;
   LLM+fine-tune: fine-tune platform).** CrossEngin's daemon is
-  self-hosted; the only optional external hop is the ADR-0201
-  sidecar LLM fallback, and even that is operator-provisioned.
+  self-hosted. Optional external hops are all opt-in and
+  operator-provisioned: the ADR-0201 sidecar LLM fallback, the Ollama
+  reply composer and fact extractor, web fetch, and whisper/vosk
+  speech.
 - **Multi-tenant isolation (LLM: external auth service; RAG: shared
   index).** CrossEngin isolates via the ownership overlay
   (ADR-0205) and capability tokens (ADR-0105); every atom access

@@ -184,9 +184,11 @@ scorecard live. Verified via the bootstrap: `reasoning_bench` 27 checks (the
 perfect-soundness scorecard; the harness FLAGS a deliberately-mislabeled false
 proof and reports UNSOUND, so a kernel regression cannot hide behind a green
 bench; incompleteness is scored as missed, never as unsound; empty-bank guards).
-The gap an LLM cannot close: on the unprovable items, the engine refuses while a
-next-token model answers confidently -- its false-confident rate is bounded by
-training, not by a soundness guarantee.
+The intended contrast with an LLM: on the unprovable items the engine refuses,
+while a next-token model may answer confidently -- its false-confident rate is
+bounded by training, not by a soundness guarantee. (Hypothesis, not a
+measurement: no recorded LLM transcript has been scored; see the F-02
+correction below.)
 
 **Phase 7 (expanded): the head-to-head comparison harness.**
 `reasoning_bench.nova` now scores the SAME bank against a recorded LLM

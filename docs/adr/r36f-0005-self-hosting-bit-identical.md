@@ -66,12 +66,13 @@ a load-bearing CI gate for CrossEngin.** Concretely:
     about the fixed point.
 
 **Follow-up rounds.**
-  - R26F regression hunt added a CI script for `make self-host` on
-    every commit to NOVA's `main`.
+  - R26F regression hunt planned a CI script for `make self-host` on
+    every commit to NOVA's `main`; it was not running when the 2026-11
+    audit checked (§2 #21). NOVA #23 added it.
   - R37+: extend the invariant to cross-platform: stage2-on-Linux ==
-    stage3-on-Linux AND stage2-on-macOS == stage3-on-macOS. (Linux
-    already enforced; macOS / ARM64 has a separate invariant noted
-    in NOVA's `MACOS_AUDIT.md`.)
+    stage3-on-Linux AND stage2-on-macOS == stage3-on-macOS. (Linux is
+    enforced by NOVA CI since NOVA #23; macOS / ARM64 has a separate
+    invariant noted in NOVA's `MACOS_AUDIT.md`.)
 
 ## Alternatives considered
   - **Large test suite only.** Rejected as sole defence: tests catch

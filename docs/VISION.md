@@ -105,8 +105,10 @@ Two rows deserve emphasis:
 
 - **Hallucination risk.** CrossEngin's reasoning path is LLM-free
   (ADR-0013, ADR-0014). If the KG does not support an answer, the
-  answer is "unknown" with the sources it did consult. The NL adapter
-  renders that answer and does not add facts of its own. It can still
+  answer is "unknown" with the sources it did consult. The default NL
+  adapter renders that answer from templates and does not add facts of
+  its own (the opt-in Ollama reply composer rewrites it, guarded only
+  by a prompt instruction). It can still
   be confidently wrong when the atoms it matched are wrong or only
   loosely related to the question (audit §2 #16).
 - **Update cost.** A signed KG-delta from the mother propagates to

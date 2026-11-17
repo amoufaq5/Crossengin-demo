@@ -20,8 +20,9 @@ uniform computational units on a tick-driven core (100Hz; ADR-0037) and decodes
 responses from concept activation spreading through that fabric. Knowledge is an
 **explicit knowledge graph** of typed atoms (ADR-0016) carrying Bayesian beliefs
 (ADR-0023), augmented by HDC/VSA hyperdimensional embeddings (ADR-0051) and an
-episodic memory (ADR-0022). There is no neural network in the reply path and no
-LLM in cognition (ADR-0014).
+episodic memory (ADR-0022). By default there is no neural network in the reply
+path and no LLM in cognition (ADR-0014); opt-in hooks (Ollama reply composer,
+fact extractor, NL-parse fallback; whisper/vosk for speech) add one.
 
 ### Verified achievements
 
@@ -157,7 +158,7 @@ because it is the question everyone asks first.
 | Memory | Explicit episodic memory + persistent KG snapshots | Context window (+ external RAG); no native long-term store |
 | Explainability | Traceable -- can name the atom / triple / rule used | Opaque; post-hoc attribution at best |
 | Self-model | First-class (`selfmodel_identity/state/goals/activity`, ADR-0038) | Emergent / prompted persona; no introspective state |
-| Hallucination | Answers from stored beliefs; says "I don't know X yet" | Fluent fabrication is a known failure mode |
+| Hallucination | Answers from stored beliefs and says "I don't know X yet" when none match; can still be wrong from wrong or loosely matched atoms | Fluent fabrication is a known failure mode |
 | Compute cost | CPU, ~MB-scale state; runs on a ~5 EUR/mo VPS | GPU/TPU clusters for training; nontrivial inference cost |
 | Language fluency | Limited (template surface, English-only stopwords) | State-of-the-art, multilingual |
 | Breadth of knowledge | Narrow -- only what was taught / fetched | Vast, web-scale pretraining |

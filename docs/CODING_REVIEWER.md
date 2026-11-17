@@ -75,9 +75,9 @@ The atoms the reviewer leaned on are also surfaced by the moment cache so a repe
 
 ## 4. Tuning with feedback
 
-`/good` after a suggested remedy increments the `rop_*` operator's confidence AND its Hebbian synapse weight (Phase 0 pt2 `router_apply_feedback`). After 5 reinforcements the chain-compiler (Phase 0 pt3) mints a direct derived operator — so `null_deref` → `guard_clause` eventually compiles into a one-hop rule without needing to re-traverse the `smell → remedy` scaffold.
+`/good` after a suggested remedy increments the `rop_*` operator's confidence AND its synapse weight (a direct set by Phase 0 pt2 `router_apply_feedback`; the tick Hebbian rule does not contribute -- audit F-03). After 5 reinforcements the chain-compiler (Phase 0 pt3) mints a direct derived operator — so `null_deref` → `guard_clause` eventually compiles into a one-hop rule without needing to re-traverse the `smell → remedy` scaffold.
 
-`/bad` weakens the same edge. Combined with multiple-remedy smells (`sql_injection` → `parameterize_query` OR `sanitize_input`), the reviewer learns the operator's remedy preference over time. The synapse weight is session-local by default; `/save` persists it.
+`/bad` weakens the same edge. Combined with multiple-remedy smells (`sql_injection` → `parameterize_query` OR `sanitize_input`), the reviewer's ranking follows the remedies you reinforced: the stored weights and confidences change, nothing more. The synapse weight is session-local by default; `/save` persists it.
 
 ## 5. Baking a reviewer agent
 

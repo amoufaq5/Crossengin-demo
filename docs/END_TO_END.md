@@ -88,7 +88,7 @@ KG climbs from 584 → 668 → 730 → 846 as each pack lands. Idempotent: re-ru
 
 ---
 
-## 3. The frequency-adaptive-latency demo — Phase 0 pt1-pt4
+## 3. The repeated-question demo — Phase 0 pt1-pt4 (counters)
 
 10× `fever` + `/good`. Each cycle:
 
@@ -135,11 +135,11 @@ docs/HOW_IT_LEARNS.md and audit F-03):
 | Metric | What it counts | Shipped by |
 |---|---|---|
 | `mc_hits=9 / mc_misses=1` | HDC moment cache (Phase 0 pt4) short-circuits 9 of 10 near-identical queries via `hdc_cosine >= 900` | PR #20 |
-| `ff_goodness=605000` | Forward-Forward layer (Phase 0 pt3) trains on the active moment via `ff_train_pair` on `/good` | PR #19 |
+| `ff_goodness=605000` | Forward-Forward layer (Phase 0 pt3) is updated on `/good` via `ff_train_pair`; nothing reads the value to change a reply | PR #19 |
 | `ia_proto_strength_unknown=10` | Adaptive intent prototypes (pt4) bundle the user utterance HDC into the matched CAT_* prototype | PR #20 |
 | `routing_entries=1` | kg_router (pt4) records one (topic_hash, shape_hash) → (kg_label, hits, mean_lat) row | PR #20 |
 | `compiled_count=2` | Chain compiler (pt3) mints direct `A → C [via B]` operators once both legs clear `syn_weight ≥ 500` | PR #19 |
-| `synapse_mean_weight=272` | Hebbian plasticity via `router_apply_feedback` bumps each chain edge by +100 milli per `/good`; mean averages across live synapses | PR #19 |
+| `synapse_mean_weight=272` | `/good` reinforcement via `router_apply_feedback` bumps each chain edge by +100 milli (a direct set, not the tick Hebbian rule, which computes dw = 0 -- F-03); mean averages across live synapses | PR #19 |
 
 The 272-not-300 mean (vs. the Phase 0 pt2 PR's 300) reflects the pre-session pack-loading: more atoms exist, more synapses live, un-reinforced edges drag the mean down. The chain's reinforced edges still saturate at `W_MAX=1000`.
 

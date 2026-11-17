@@ -56,8 +56,8 @@ Each message passes through five layers. Three of them *write state* that persis
 │  │ 3. Synapse graph      src/substrate/synapse_graph.nova       │   │
 │  │    Weighted directed edges between atom nodes.               │   │
 │  │    Phase 0: grown lazily when _cr_chain picks an edge, so    │   │
-│  │    the chat path actually populates it. Weights change via   │   │
-│  │    Hebbian plasticity + direct /good reinforcement.          │   │
+│  │    the chat path actually populates it. Weights change only  │   │
+│  │    by direct /good, /bad reinforcement (tick Hebbian: dw=0). │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │         │                                                            │
 │         ▼                                                            │
@@ -65,7 +65,7 @@ Each message passes through five layers. Three of them *write state* that persis
 │  │ 4. Moments + tick     src/parts/episodic/moment_stream.nova  │   │
 │  │                       src/substrate/tick_driver.nova         │   │
 │  │    Working memory. Each message captures one moment; the     │   │
-│  │    tick-driver fires three-factor plasticity. Phase 0:       │   │
+│  │    three-factor plasticity rule is off. Phase 0:             │   │
 │  │    rate-limited consolidation sweep mints episodic atoms     │   │
 │  │    per recurring moment signature.                           │   │
 │  └──────────────────────────────────────────────────────────────┘   │
@@ -89,7 +89,7 @@ Each message passes through five layers. Three of them *write state* that persis
 
 ---
 
-## The frequency-adaptive latency demo
+## The repeated-question demo (counters, not a latency measurement)
 
 **Setup**: 10 identical queries of `fever` with `/good` after each. We watch the synapse weight on `fever → headache` and the mean weight across all 10 live synapses.
 
@@ -178,7 +178,7 @@ Observability commands:
 
 ## Chain compilation (Phase 0 pt3)
 
-The chain compiler watches `/good` reinforcement. When a two-hop segment `A → B → C` of the just-rewarded chain has both legs' Hebbian synapse weights at or above `CHAIN_COMPILE_THRESHOLD` (default 500 milli = half of `W_MAX`), the compiler mints a direct derived operator atom `A → C` labeled `cc:A->C [via B]`. The original chain stays in the KG, so `/why` still traces to the full path.
+The chain compiler watches `/good` reinforcement. When a two-hop segment `A → B → C` of the just-rewarded chain has both legs' synapse weights (set by `/good`) at or above `CHAIN_COMPILE_THRESHOLD` (default 500 milli = half of `W_MAX`), the compiler mints a direct derived operator atom `A → C` labeled `cc:A->C [via B]`. The original chain stays in the KG, so `/why` still traces to the full path.
 
 ```
 > /__compiled__                    # before any /good
