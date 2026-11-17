@@ -89,7 +89,7 @@ measured a p99 of ~1 s against a 500 ms budget.
   grounded question-answering; write-me-a-poem is outside the
   frame.
 - Tasks where a confident guess beats an honest "unknown."
-  CrossEngin will not guess.
+  CrossEngin is built to answer "unknown" rather than guess.
 - Multi-tenant SaaS in the vendor's shape. The mother is licensed
   and self-hosted; multi-tenancy is a customer choice inside their
   own deployment, not the product's shape.

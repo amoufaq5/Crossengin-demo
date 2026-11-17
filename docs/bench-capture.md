@@ -6,8 +6,10 @@ provable while withholding on what is not, never manufacturing a proof of a
 falsehood. The head-to-head harness scores the engine against a **recorded** LLM
 transcript over the same bank.
 
-> **Honest scope (Rule 1).** The engine never calls a third-party LLM. There is
-> no live-call path anywhere in this repo. A real transcript is therefore
+> **Honest scope (Rule 1).** The reasoning engine itself never calls an LLM;
+> the only LLM hooks in the repo are opt-in (the Ollama fact extractor and
+> reply composer, off by default) and none of them feeds this benchmark. A
+> real transcript is therefore
 > captured **separately and offline** with whatever LLM you choose, then pasted
 > in as a data file. This repo ships **no** transcript: the earlier
 > `data/llm_baseline_*.txt` files and the `/vs` command were made-up verdicts

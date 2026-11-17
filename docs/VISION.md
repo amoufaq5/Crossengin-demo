@@ -54,12 +54,13 @@ ADR-0211; sidecar boundary role in ADR-0201.
 
 **Latency parity with LLMs is a hard requirement** (a goal, not yet met
 or measured: `bench/latency_v1/baseline.json` has no results, and the audit
-measured p99 ~1 s against a 500 ms budget). CrossEngin's
-answers arrive in the same wall-clock envelope users expect from
-hosted LLM APIs. Inspectability, updatability, and deterministic
-"unknown" cannot cost a five-second turnaround. The performance
-harness that enforces this — budgets per verb, per query shape,
-per deployment mode — is ADR-0208.
+measured p99 ~1 s against a 500 ms budget). The target is for
+answers to arrive in the same wall-clock envelope users expect from
+hosted LLM APIs: inspectability, updatability, and deterministic
+"unknown" should not cost a five-second turnaround. The performance
+harness meant to enforce this — budgets per verb, per query shape,
+per deployment mode — is specified in ADR-0208 and has no recorded
+results yet.
 
 Consistent with the original elevator pitch that follows: CrossEngin
 is not an LLM. It is the substrate that builds them.
@@ -104,9 +105,10 @@ Two rows deserve emphasis:
 
 - **Hallucination risk.** CrossEngin's reasoning path is LLM-free
   (ADR-0013, ADR-0014). If the KG does not support an answer, the
-  answer is "unknown" with the sources it did consult — never a
-  confident guess. The NL adapter renders that answer; it cannot
-  invent a fact the substrate did not produce.
+  answer is "unknown" with the sources it did consult. The NL adapter
+  renders that answer and does not add facts of its own. It can still
+  be confidently wrong when the atoms it matched are wrong or only
+  loosely related to the question (audit §2 #16).
 - **Update cost.** A signed KG-delta from the mother propagates to
   child deployments through the same overlay machinery that today
   handles per-user ownership merges. No re-baking. No downtime.
@@ -166,7 +168,7 @@ signature model, and the roadmap.
   construction; a general child is possible but is not the design
   target.
 - Any task where a confident guess is preferred to "unknown."
-  CrossEngin will not guess.
+  CrossEngin is built to answer "unknown" rather than guess.
 
 ## Concrete use-case snapshots
 

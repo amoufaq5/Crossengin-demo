@@ -75,12 +75,11 @@ Each message passes through five layers. Three of them *write state* that persis
 │  │ 5. Learning rules     plasticity_modulation + predictive_    │   │
 │  │                       coding_runtime + forward_forward       │   │
 │  │    Hebbian (via emotion_modulate_plasticity → pm_modulator): │   │
-│  │       live.                                                  │   │
-│  │    Predictive coding (pc_pred_learn): live. Learns the       │   │
-│  │       arousal trajectory per familiar input.                 │   │
-│  │    Forward-Forward (ff_train_pair): live. Goodness over    │   │
-│  │       the current moment vector rises on /good, falls on    │   │
-│  │       /bad -- surfaced in /__learning__ as `ff_goodness`.   │   │
+│  │       called each tick; dw = 0 on the live path (F-03).      │   │
+│  │    Predictive coding (pc_pred_learn): called; its output is  │   │
+│  │       not read by anything that changes a reply.             │   │
+│  │    Forward-Forward (ff_train_pair): called on /good, /bad;   │   │
+│  │       `ff_goodness` in /__learning__ moves, nothing reads it.│   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │         │                                                            │
 │         ▼                                                            │
@@ -147,11 +146,11 @@ Observations:
 
 A graph database can store (`fever`, `treats`, `aspirin`). It cannot:
 
-1. **Get faster on hot queries.** Next time this chat is asked `fever`, `_cr_chain` scores candidate edges by `confidence × source_authority × (1000 + synapse_weight) / 1000`. With `fever → headache` at weight 1000, that edge scores 2× higher than at weight 0 — the chain picks it immediately, skipping fan-out exploration.
+1. **Prefer reinforced edges.** Next time this chat is asked `fever`, `_cr_chain` scores candidate edges by `confidence × source_authority × (1000 + synapse_weight) / 1000`. With `fever → headache` at weight 1000 (set directly by `/good`), that edge scores 2× higher than at weight 0. Repeat questions are answered faster mainly because the moment cache returns the memoised reply.
 2. **Preserve audit while adapting.** The underlying atoms and provenance don't change. Only the per-session weights do. `/why` still cites the same source for the fact; `/synapse` shows the learned preference.
 3. **Learn without gradient descent.** Every weight update is `O(1)` and happens in the forward pass. No backward pass. No GPU. The whole 10-synapse state is a few hundred bytes.
 
-This is the *frequency-adaptive latency* property. It's what you get from Hebbian plasticity + synapse-weighted retrieval, composed on the live tick substrate.
+What this amounts to today is `/good` reinforcement of chain edges plus reply memoisation. The tick Hebbian rule that was meant to provide frequency-adaptive weights computes no change on the live path (audit F-03).
 
 ---
 
@@ -163,9 +162,9 @@ This is the *frequency-adaptive latency* property. It's what you get from Hebbia
 | HDC | **yes** (embed mode set to HDC at session init) | `atom_set_embed_mode(ATOM_EMBED_MODE_HDC)` |
 | Synapse graph | **yes** (lazy grow + direct `/good` reinforcement) | `syn_grow_if_absent` + `syn_set_weight` |
 | Moments / tick | yes | `loop_memory_step_with_episodic` + `tick_driver` |
-| Hebbian plasticity | yes (modulator path) | `emotion_modulate_plasticity → pm_modulator` |
-| Predictive coding (learner) | **yes** | `pc_pred_learn` + `pc_pred_predict` |
-| Forward-Forward | **yes** | `ff_layer_new` + `ff_train_pair` + `ff_goodness` |
+| Hebbian plasticity | called; dw = 0 on the live path (F-03) | `emotion_modulate_plasticity → pm_modulator` |
+| Predictive coding (learner) | called; output unused by replies | `pc_pred_learn` + `pc_pred_predict` |
+| Forward-Forward | called; `ff_goodness` unused by replies | `ff_layer_new` + `ff_train_pair` + `ff_goodness` |
 | Chain compiler | **yes** (pt3) | `chain_compile_from_ops_csv` on `/good` |
 
 Observability commands:
@@ -237,4 +236,4 @@ You should see the `fever → headache` weight climb from 0 to 1000 and the mome
 - **Phase 4 (bulk encyclopedic seed)**: synapse graph scales with KG; the per-tenant working set stays hot without reloading corpora.
 - **Phase 5 (agent provider platform)**: a baked agent ships its synapse graph alongside its atoms. The receiving customer gets a pre-warmed hot-path layout; their own `/good` feedback then specialises further to their domain.
 
-Everything that follows in the plan rests on this layer. It is inspectable today; whether it learns anything beyond `/good` reinforcement and memoisation is what experiment E1 (ablations) is set up to measure.
+Everything that follows in the plan rests on this layer. It is inspectable today; whether it learns anything beyond `/good` reinforcement and memoisation has not been measured. An ablation experiment for that (E1, proposed by the 2026-11 audit) is planned but not yet in this repo.

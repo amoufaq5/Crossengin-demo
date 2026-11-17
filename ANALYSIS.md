@@ -28,7 +28,7 @@ LLM in cognition (ADR-0014).
 | Capability | Where it lives | Status |
 |---|---|---|
 | 10-phase agent assembled into one unified process | README R35A note | modules for all 10 phases exist (R35A); the ADR-0049/0050 capability exit tests were never run |
-| Node fabric on a tick-driven core | `src/substrate/` (node pool, synapse graph, gate router, tick driver) | the chat runs 64 nodes (`CE_CAP = 128`, 8 parts x 8); ~6M is the ADR-0003 planning target |
+| Node fabric on a tick-driven core | `src/substrate/` (node pool, synapse graph, gate router, tick driver) | the chat runs 64 nodes (`CE_CAP = 128`, 8 parts x 8); ~6M is the planning figure in r36f-0001 (ADR-0003 targets 1M nodes per part in v1) |
 | Hand-rolled RFC-grade federation transport | `src/federation/` | R30C..R38D |
 | -- DTLS 1.2 + ICE + STUN + TURN client + SRTP wire stack | `dtls12.nova`, `ice.nova`, `stun_rfc8489.nova`, `turn.nova`, `srtp.nova` | landed |
 | -- TURN **server**-side state machine (allocations/permissions/channels/tick) | `turn_server.nova` (~890 lines) | R38C |

@@ -77,8 +77,8 @@ selective load (ADR-0205); both operate on data, not weights.
 | Update cost | Retrain (weeks-months) | Re-embed (hours) | Retrain adapter (hours-days) | Ingest one record (seconds) |
 | Reasoning | Weight-implicit | Weight-implicit + similarity | Weight-implicit | Explicit engines |
 | Inspectability | Opaque | Retrieval visible, reasoning opaque | Opaque | End-to-end |
-| Hallucination risk | High | Medium | Medium | Zero (says "unknown") |
-| Vendor lock | Provider API | Embed model + LLM | Fine-tune platform | Self-hosted, no external |
+| Hallucination risk | High | Medium | Medium | Lower by design, not zero: "unknown" when no atom matches; can still be wrong from wrong or loosely matched atoms |
+| Vendor lock | Provider API | Embed model + LLM | Fine-tune platform | Self-hosted; optional features use external tools (Ollama, whisper/vosk, curl) |
 | Domain focus | General | General | Fine-tune per domain | Per-child domain-scoped |
 | Multi-user | External auth | External auth | Multi-adapter | Native (caps + ownership) |
 | Prompt-injection surface | Full user input | Retrieved docs + input | Full user input | Grammar-parsed query only |
@@ -91,8 +91,10 @@ mitigation:
 - **Hallucination (LLM, LLM+RAG, LLM+fine-tune).** CrossEngin's
   self-model (ADR-0206) enumerates known-unknowns. When the KG has
   no atom for a topic, the answer is "unknown," not a plausible
-  guess. There is no weight-implicit generation to hallucinate
-  from.
+  guess. There is no weight-implicit generation in the answer path.
+  This lowers the risk but does not remove it: loose matching and
+  ingestion errors still produce confident wrong answers (audit F-20,
+  §2 #16).
 - **Update lag (LLM: months; LLM+RAG: hours to re-embed; LLM+fine-
   tune: hours to days).** CrossEngin's update is one ingest turn:
   seconds from source to live answer once the review gate passes.

@@ -23,6 +23,12 @@ change that doesn't break correctness but breaks reproducibility.
 **The NOVA self-hosting invariant `stage2.s == stage3.s` is treated as
 a load-bearing CI gate for CrossEngin.** Concretely:
 
+> **Status (audit F-06, 2026-11).** This gate is enforced by NOVA's own CI
+> (`make self-host` on every NOVA PR) since the audit. CrossEngin's CI does
+> not run it; it builds against a pinned `NOVA_REF` that passed NOVA's CI.
+> `scripts/bootstrap.sh` does not check it (see the last bullet).
+
+
   - The NOVA compiler bootstraps via three stages: stage1 (handwritten
     x86-64 assembly seed) -> stage2 (stage1 compiles
     `compiler/main.nova`) -> stage3 (stage2 compiles
@@ -32,8 +38,9 @@ a load-bearing CI gate for CrossEngin.** Concretely:
   - Verified via `make self-host` in the NOVA repo; this is the
     pre-merge gate for any change to `parser.nova` / `codegen.nova` /
     `register_allocator.nova` / `x86_64_lowering.nova`.
-  - CrossEngin's `scripts/bootstrap.sh` verifies `$NOVA_ROOT` points
-    at a NOVA tree where `make self-host` passes.
+  - Intended: CrossEngin's `scripts/bootstrap.sh` verifies `$NOVA_ROOT`
+    points at a NOVA tree where `make self-host` passes. Not
+    implemented: bootstrap.sh only checks for `bin/nova` and runs `make`.
 
 ## Consequences
 **Positive.**
