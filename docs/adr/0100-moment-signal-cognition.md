@@ -176,8 +176,9 @@ vocabulary):
   user-facing path.
 - No "context window" — MSC's temporal analog is the moment stream,
   which is persistent, not sliding.
-- No "hallucination" — MSC's failure mode is *silence* on unknown
-  labels or *low-belief report*, both auditable.
+- No free-text generator — MSC's intended failure mode is *silence* on
+  unknown labels or a *low-belief report*, both auditable. (In practice
+  loose matching can also give a confident wrong answer -- audit §2 #16.)
 
 DEPENDS ON: ADR-0006 (node design), ADR-0007 (synapse design),
 ADR-0008 (signal taxonomy), ADR-0014 (no-LLM cognition),

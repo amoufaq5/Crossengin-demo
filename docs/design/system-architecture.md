@@ -12,12 +12,14 @@
 CrossEngin is a non-LLM cognitive substrate (ADR-0001) that has grown into a
 **truth-seeking reasoning engine** (ADR-0086): it reaches well-warranted
 conclusions and *shows its work*, beginning in domains where correctness is
-objectively checkable (math/logic/CS, ADR-0093). It never fabricates — every
-claim is traceable to graded, licensed evidence with a confidence (ADR-0087,
-ADR-0023). It reasons by structured argument adjudicated by probability
+objectively checkable (math/logic/CS, ADR-0093). It is designed not to
+fabricate — every claim is meant to be traceable to graded, licensed evidence
+with a confidence (ADR-0087, ADR-0023); the 2026-11 audit found wrong answers
+from loose matching and ingestion errors, so this is a goal, not a guarantee. It reasons by structured argument adjudicated by probability
 (ADR-0089), proves what can be proved (ADR-0088), simulates to plan (ADR-0032),
 researches its own gaps under governance (ADR-0092), and ships from embedded
-device to cluster (ADR-0091) on a zero-dependency NOVA stack (NOVA-0006…0008).
+device to cluster (ADR-0091) on a NOVA stack with no runtime library
+dependencies (NOVA-0006…0008); optional features call external tools.
 
 ## 2. The layered stack
 

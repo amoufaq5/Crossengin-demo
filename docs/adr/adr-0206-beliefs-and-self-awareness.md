@@ -171,9 +171,11 @@ budget per role.
 - Transparent cognitive state. Users and operators can inspect what
   the model believes and what it does not; auditors can walk from
   an answer to the belief surface that produced it.
-- Enables the ADR-0207 obsolescence claim. A model that can say
-  "unknown" credibly does not hallucinate; the self-model is the
-  primitive that makes "unknown" a first-class answer.
+- Supports the ADR-0207 comparison. A model that can say "unknown"
+  credibly hallucinates less; the self-model is the primitive that
+  makes "unknown" a first-class answer. (It does not make wrong
+  answers impossible: wrong or loosely matched atoms still produce
+  them -- audit §2 #16.)
 - Grounded volition. The model has a volitional capacity but the
   trigger is human; the two-party kill-switch and audit-logged
   belief-edit prevent unattended override.

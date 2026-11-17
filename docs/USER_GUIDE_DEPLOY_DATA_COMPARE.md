@@ -163,20 +163,19 @@ Feeding data into CrossEngin is **not** training in the ML sense:
 - No GPU is involved.
 - There is no epoch, no loss curve, no checkpoint file.
 
-What actually happens, per
-[`src/learning/forward_forward.nova`](../src/learning/forward_forward.nova)
-(lines 7–11): *"Hinton's Forward-Forward (2022) replaces
-backpropagation with a per-layer GOODNESS objective … There is no
-backward pass and no gradient flowing between layers … matching the
-substrate's design invariant (no global backprop, no offline training
-run)."*
+The substrate's design invariant is "no global backprop, no offline
+training run" (see the header of
+[`src/learning/forward_forward.nova`](../src/learning/forward_forward.nova)).
+The Forward-Forward layer exists and is updated on `/good`, but nothing
+reads its output to change a reply (audit F-03).
 
 Ingest produces:
 
 - new **atoms** in the knowledge graph, with
 - **source and provenance** attached to each,
 - **Bayesian belief updates** on existing claims,
-- narrow **local Hebbian / anti-Hebbian** weight tweaks,
+- direct synapse-weight changes from `/good` and `/bad` (the tick
+  Hebbian rule computes no change on the live path -- audit F-03),
 - **rule inference** that may fire on the new atoms.
 
 That means a single new fact can take effect instantly, and every
@@ -259,11 +258,11 @@ these are different tools.
 | Dimension | **CrossEngin** | **Standard LLM** |
 |---|---|---|
 | **Core representation** | Discrete atoms, typed signals, KG triples; symbolic. | Dense token embeddings; subsymbolic. |
-| **How it "learns"** | Online. Bayesian belief updates + local Hebbian + rule inference + source-authority weighting. One-shot ingest admissible. | Offline. Gradient descent across billions of parameters, big GPU clusters, days–weeks per training run. |
+| **How it "learns"** | Online. Bayesian belief updates + `/good`/`/bad` weight changes + rule inference + source-authority weighting (the tick Hebbian rule is wired but computes no change -- F-03). One-shot ingest admissible. | Offline. Gradient descent across billions of parameters, big GPU clusters, days–weeks per training run. |
 | **Hardware** | Single x86-64 ELF, no GPU, measured in MB. Runs on a 1 GB Oracle micro VM. | GB-scale weights, GPU/TPU required for training; non-trivial GPU for even local inference of good models. |
 | **Determinism** | Deterministic given the KG state and the seed. | Stochastic at generation time (temperature > 0); non-determinism baked in. |
 | **Auditability** | Every belief traces back to the specific atoms that support it, each with `provenance` and source tier (ADR-0028). | Opaque. No per-fact citation out of the box; RAG is a bolt-on, not a guarantee. |
-| **Hallucinations** | Structurally cannot invent atoms that no source backs. May be wrong, but each claim is traceable. | Known failure mode; mitigation (RAG, guardrails) is external. |
+| **Hallucinations** | No free-text generator by default, so it does not invent sentences; it can still answer wrongly from wrong or loosely matched atoms, and ingestion can store wrong atoms (audit §2 #16). Each claim is traceable. | Known failure mode; mitigation (RAG, guardrails) is external. |
 | **Fluency / open-ended generation** | Minimal — surface text comes from templates and KG queries. Not conversational in the GPT sense. | State of the art. The point of an LLM. |
 | **Multilingual / open-world coverage** | Only what has been ingested. English-first today. | Effectively unlimited, breadth-wise. |
 | **Updating knowledge** | Ingest a new feed; the new atom is live immediately. | Re-train or layer RAG; base weights are frozen. |

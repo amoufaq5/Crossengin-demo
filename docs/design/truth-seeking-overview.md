@@ -17,10 +17,12 @@ additive, not a rewrite.
 
 Five properties define the expanded engine, each anchored to ADRs:
 
-1. **Out-reasons LLMs on checkable questions** — via a structured debate engine
-   (ADR-0089), not next-token prediction.
-2. **Never fabricates** — every emitted claim is traceable to evidence with a
-   stated confidence (ADR-0087 provenance ledger; ADR-0023 beliefs).
+1. **Aims to out-reason LLMs on checkable questions** — via a structured debate
+   engine (ADR-0089), not next-token prediction. Not measured: no recorded LLM
+   comparison exists (the former `/vs` verdicts were made up and were removed).
+2. **Designed not to fabricate** — every emitted claim is meant to be traceable
+   to evidence with a stated confidence (ADR-0087 provenance ledger; ADR-0023
+   beliefs). Wrong atoms or loose matching can still produce wrong answers.
 3. **Stays current on its own** — autonomous research, gated by governance
    (ADR-0092) on top of the existing loop (r39, r50).
 4. **Scales from edge device to cluster** — tiered editions (ADR-0091) over a

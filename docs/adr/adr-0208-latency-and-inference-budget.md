@@ -6,7 +6,12 @@ Proposed. Establishes per-query-kind latency budgets that keep the
 daemon competitive with representative LLM chat latency, and locks a
 regression harness that fails any round shipping a slowdown beyond
 budget. ADR-0200 makes latency parity with LLMs a hard requirement;
-this ADR is how the requirement is enforced.
+this ADR is how the requirement is meant to be enforced.
+
+> **Status (audit §2 #17, 2026-11).** Not enforced yet:
+> `bench/latency_v1/baseline.json` has no results, the harness was
+> OOM-killed on a 1,000-atom KG, and the audit measured a p99 of ~1 s
+> against a 500 ms budget.
 
 ## Date
 

@@ -21,7 +21,8 @@
 > found several statements in this README and in `docs/VISION.md` that the
 > code does not support. They are corrected in place below; in short:
 > - The chat runs a 64-node fabric (`CE_CAP = 128`, 8 parts x 8 nodes). "~6M
->   nodes" is a planning target (ADR-0003), not what runs.
+>   nodes" is a planning figure (r36f-0001; ADR-0003 targets 1M nodes per
+>   part in v1), not what runs.
 > - "v1.0 -- all 10 phases complete" means the modules exist. The ADR-0049 /
 >   0050 capability exit tests were never run, and many phase modules are
 >   reachable only from tests.
@@ -53,7 +54,7 @@ computational units rather than orchestrating a pipeline of modules.
 
 | Track | Latest round | What landed |
 |---|---|---|
-| Substrate v1 | R0..R29 | 10-phase agent assembled on a tick-driven core. The chat runs 64 nodes; ~6M is a planning target (ADR-0003). |
+| Substrate v1 | R0..R29 | 10-phase agent assembled on a tick-driven core. The chat runs 64 nodes; ~6M is a planning figure (r36f-0001; ADR-0003: 1M nodes per part in v1). |
 | Federation transport | R30C / R31B / R32B / R33B / R34B / R34C / R35A / R35B / R35D / R36A / R36B / R38B / R38C / R38D | DTLS 1.2 + ICE + STUN + TURN + SRTP wire stack; DTLS-SRTP keying per RFC 5764 §4.2 with R36B keying-material cache; TURN client state machine; ICE-TURN escalation; TURN long-term-credential auth (RFC 5389 §10) + per-permission cadence + 401 auto-retry; R38B PRF rekey on `dtls_advance_epoch` (closes R33B's last DTLS caveat); R38C TURN SERVER-side state machine (allocations + permissions + channels + tick); R38D SCRAM-SHA-256 auth (RFC 7635) coexisting with the R36A MD5 auth path. |
 | IO / learning transport | R39B | HTTP/1.1-over-TCP transport seam for `src/learning/internet_fetch.nova` (NOVA enhancement #11 / ADR-0028): URL parser, status line parser, header parser (incl. multi-value `Set-Cookie` / `Cookie` via `http_header_get_all`), `Content-Length` trim, RFC 7230 sec 4.1 chunked-transfer decoder (with HTTP\_ERR\_CHUNKED + HTTP\_ERR\_TOO\_LARGE error signals), `_hc_set_recv_timeout` seam (no-op until `sys_setsockopt` builtin lands), and the `if_fetch(f, kg, url, now) -> [tag, status, body, bytes, err]` composer wiring `if_permit` -> `http_get` -> `if_complete` -> optional `if_ingest`. New IF\_ERR\_HTTP\_* sentinels (CONNECT / TIMEOUT / PARSE / OVERSIZE / DNS / SCHEME). HTTPS deferred to R39B.2 (needs client-mode TLS; DTLS is server-shaped today). |
 | Chat dispatcher | R39A | Intent dispatcher in `examples/crossengin_chat.nova` (ADR-0038 self-model query + ADR-0026 self-learning triggers): adds three reply paths AHEAD of the legacy ACK fallback so the REPL stops saying "okay" to everything. Self-identification queries ("who are you" / "what are your goals" / "how are you" / "what can you do" / "what are you doing") route to the real `selfmodel_identity` / `selfmodel_state` / `selfmodel_goals` / `selfmodel_activity` and a competence-count surface for capabilities; concept queries ("what is X" / "tell me about X" / bare "X") render the highest-belief triple from KG operator atoms as "X is a Y" / "X causes Y" / "X has Y"; inputs with `unk > 0` reply "I don't know X yet -- I'll look into it" and bump a `chat_stats_self_learning_triggers_filed` counter as `_submit_curiosity` files SLT signals. Helpers (`_intent_self_id_kind`, `_smq_extract_concept_query`, `_smq_relation_phrase`, `_smq_template_triple`, `_smq_unknown_reply`) live in `src/chat/helpers.nova` and are unit-tested via `tests/unit/test_chat_intent_dispatch.nova` (60+ assertions). |
@@ -4121,7 +4122,11 @@ See [`NEXT_SESSION.md`](NEXT_SESSION.md) for the per-round detail and
 > the daemon can run continuously across real restarts. NEXT_SESSION.md records
 > exactly what works, what does not, and where to continue.
 
-## What works now (v1.0)
+## What is implemented (module inventory)
+
+> Modules listed here exist and have unit tests. Listing one is not a claim
+> that the chat uses it or that it meets its ADR exit criterion; see the
+> claims check at the top of this README and docs/HOW_IT_LEARNS.md.
 
 The Phase 1 substrate kernel (`src/substrate/`):
 

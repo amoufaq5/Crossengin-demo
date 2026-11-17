@@ -30,9 +30,11 @@ counterfactual reasoning, long-horizon goals, self-awareness of identity
 and state — emerges from a fabric of uniform computational units
 (atoms, signals, synapses, KGs) rather than from sampling an LLM. The
 substrate is implemented entirely in NOVA, a self-hosting compiled
-language. Everything compiles to native x86-64 (and now arm64-linux,
-macOS, win-x64, win-arm64, and WASM) with zero external runtime
-dependencies.
+language. CrossEngin builds and is tested on x86-64 Linux only; NOVA's
+other targets (arm64, macOS, Windows, WASM) are not exercised for it.
+The core chat needs no external runtime; optional features shell out to
+external tools (curl, python3, openssl, ffmpeg, espeak, whisper, vosk,
+Ollama).
 
 ```
                     ┌─────────────────────────────────────────────┐

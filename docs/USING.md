@@ -392,9 +392,9 @@ first-class event you can act on.
 | Kernel-checked FALSE witnesses | Textual "I might be wrong" |
 | Retract → cascade → unretract | No retract; regeneration each turn |
 | Cross-KG belief disagreement first-class | Blends conflicting sources silently |
-| No hallucination surface (atoms exist only from observations) | Fluent text can invent facts |
+| Answers come only from stored atoms (no free-text generator unless the opt-in Ollama composer is on) -- but a wrong or loosely matched atom still gives a wrong answer | Fluent text can invent facts |
 | Fully inspectable — every atom, source, derivation | Weights are opaque |
-| Runs on your machine, no external calls | Cloud dependency |
+| Runs on your machine; the core chat makes no external calls (optional Ollama, web fetch, whisper/vosk features do) | Cloud dependency |
 
 **What Claude/ChatGPT do that CrossEngin does NOT do today:**
 

@@ -77,8 +77,8 @@ selective load (ADR-0205); both operate on data, not weights.
 | Update cost | Retrain (weeks-months) | Re-embed (hours) | Retrain adapter (hours-days) | Ingest one record (seconds) |
 | Reasoning | Weight-implicit | Weight-implicit + similarity | Weight-implicit | Explicit engines |
 | Inspectability | Opaque | Retrieval visible, reasoning opaque | Opaque | End-to-end |
-| Hallucination risk | High | Medium | Medium | Zero (says "unknown") |
-| Vendor lock | Provider API | Embed model + LLM | Fine-tune platform | Self-hosted, no external |
+| Hallucination risk | High | Medium | Medium | Lower by design, not zero: "unknown" when no atom matches; can still be wrong from wrong or loosely matched atoms |
+| Vendor lock | Provider API | Embed model + LLM | Fine-tune platform | Self-hosted; optional features use external tools (Ollama, whisper/vosk, curl) |
 | Domain focus | General | General | Fine-tune per domain | Per-child domain-scoped |
 | Multi-user | External auth | External auth | Multi-adapter | Native (caps + ownership) |
 | Prompt-injection surface | Full user input | Retrieved docs + input | Full user input | Grammar-parsed query only |
@@ -91,8 +91,10 @@ mitigation:
 - **Hallucination (LLM, LLM+RAG, LLM+fine-tune).** CrossEngin's
   self-model (ADR-0206) enumerates known-unknowns. When the KG has
   no atom for a topic, the answer is "unknown," not a plausible
-  guess. There is no weight-implicit generation to hallucinate
-  from.
+  guess. There is no weight-implicit generation in the answer path.
+  This lowers the risk but does not remove it: loose matching and
+  ingestion errors still produce confident wrong answers (audit F-20,
+  §2 #16).
 - **Update lag (LLM: months; LLM+RAG: hours to re-embed; LLM+fine-
   tune: hours to days).** CrossEngin's update is one ingest turn:
   seconds from source to live answer once the review gate passes.
@@ -108,8 +110,10 @@ mitigation:
   reasoning path is engines, not prompts.
 - **Vendor lock (LLM: provider API; LLM+RAG: embed model + LLM;
   LLM+fine-tune: fine-tune platform).** CrossEngin's daemon is
-  self-hosted; the only optional external hop is the ADR-0201
-  sidecar LLM fallback, and even that is operator-provisioned.
+  self-hosted. Optional external hops are all opt-in and
+  operator-provisioned: the ADR-0201 sidecar LLM fallback, the Ollama
+  reply composer and fact extractor, web fetch, and whisper/vosk
+  speech.
 - **Multi-tenant isolation (LLM: external auth service; RAG: shared
   index).** CrossEngin isolates via the ownership overlay
   (ADR-0205) and capability tokens (ADR-0105); every atom access
@@ -153,11 +157,12 @@ guessing at any step.
   proprietary embedding format, no re-embed cost on updates.
 - No fine-tune platform dependency. Domain specialization is a
   bake, not a training run; no GPU cluster required.
-- Zero hallucination by construction. The daemon cannot invent
-  facts because there is no weight-implicit generator in the
-  answer path. The templater (ADR-0104) constructs answers from
-  ProposalResult data; if the ProposalResult has no data, the
-  answer says so.
+- No weight-implicit generator in the answer path. The templater
+  (ADR-0104) constructs answers from ProposalResult data; if the
+  ProposalResult has no data, the answer says so. This is not "zero
+  hallucination": answers are only as right as the atoms and the
+  matching, and the 2026-11 audit found wrong answers from loose
+  matching and from ingestion errors (F-20, §2 #16).
 - Auditable end-to-end. Every fact traces to a source atom with
   provenance; every answer traces to the atoms and skill runs that
   produced it.

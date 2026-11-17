@@ -1,11 +1,11 @@
 # NOVA Upstream Fixes — Status
 
-**All eight NOVA runtime gaps CrossEngin's Phase 0-7 work surfaced have
-landed upstream** in `amoufaq5/NOVA` (PRs #13-#20). PRs #21-#23 followed
-from the 2026-11-15 audit. This doc is the
-pointer: the workarounds in CrossEngin can be retired on their
-respective PR branches in the next rebase pass. There is no remaining
-upstream blocker for in-process exec paths.
+The eight NOVA runtime gaps CrossEngin's Phase 0-7 work surfaced landed
+upstream in `amoufaq5/NOVA` (PRs #13-#20). PRs #21-#28 followed from the
+2026-11-15 audit (secure_random, assert, CI, syscall tagging, time(), dead
+code + licence, tagged runtime constants/maps). This doc is the pointer from
+each NOVA fix to the CrossEngin workaround it retires. Remaining gaps are
+listed under "Remaining NOVA gaps" below.
 
 ## Merged NOVA PRs
 
@@ -23,7 +23,9 @@ upstream blocker for in-process exec paths.
 | [NOVA #23](https://github.com/amoufaq5/NOVA/pull/23) | **F-06** (audit) | NOVA CI: build from the seed, self-host fixpoint, test suite against `tests/known_failures.txt`. | -- |
 | [NOVA #20](https://github.com/amoufaq5/NOVA/pull/20) | **N-2** | The `exit` shim untags its argument, so `exit(N)` exits with N instead of `2N+1`. `_nova_exit` stays raw for the runtime's own error paths. | Chat `/quit` now exits 0 (was 1). The `ollama_spawn.nova` child's `exit(127)` now reports the conventional 127 (was 255). The Makefile's Windows smoke step tolerates rc 0 or 1; it still passes. No code change needed. |
 | [NOVA #25](https://github.com/amoufaq5/NOVA/pull/25) | **syscall tagging** | The remaining `src/runtime/syscall.nova` wrappers follow one convention: fd raw, pointer args tag-polymorphic, int args untagged, results tagged when >= 0 and raw -errno when negative. Covers `sys_read`/`sys_write` returns, `sys_mkdir`, `sys_unlink`, `sys_lseek`, `sys_pread`/`sys_pwrite`, `sys_ftruncate`, `sys_getcwd`, `sys_fstat`. Before, `sys_mkdir` never created the requested directory and read/write counts came back halved. | CrossEngin #66 adopts it (`session.save` / `admin.bake_child` RPC writes, wake-word templates, truststore dir now work). The F-24 runtime dir relies on `sys_mkdir` + `sys_fstat`. |
-| [NOVA #26](https://github.com/amoufaq5/NOVA/pull/26) | **time()** | `time()` returns the tagged epoch; it returned raw seconds, which NOVA code read as epoch/2. | X.509 validity checks see the real date (needed before strict TLS). CI pins NOVA at #26 (`NOVA_REF`). `nanotime()` likely has the same bug -- not yet fixed. |
+| [NOVA #26](https://github.com/amoufaq5/NOVA/pull/26) | **time()** | `time()` returns the tagged epoch; it returned raw seconds, which NOVA code read as epoch/2. | X.509 validity checks see the real date (needed before strict TLS). CI pins NOVA at #26 (`NOVA_REF`). `nanotime()` had the same bug -- fixed in NOVA #28 (not yet in `NOVA_REF`). |
+| [NOVA #27](https://github.com/amoufaq5/NOVA/pull/27) | **F-33 / F-29** (audit) | Dead IR/regalloc/lowering code and the unused `llm`/`python`/`blas`/`gpu`/`effects`/`http` runtime bridges removed; NOVA licensed Apache-2.0. | `nova-deps.toml` no longer lists the removed modules. |
+| [NOVA #28](https://github.com/amoufaq5/NOVA/pull/28) | **F-12** (audit) | Tagged constants for enum values, sum-type tags, `?` and `let [a, b]`; `x / 2^k` truncates for negative `x`; maps grow past 16 entries, tombstone removals, return a tagged 0 for a missing key and tagged counts; `float_cmp` tagged; `nanotime()` = sec*1e9+nsec; `sleep_ms(n)` sleeps n ms (it slept 2n+1). | Picked up by the next CrossEngin `NOVA_REF` bump: `nanotime`/`sleep_ms` callers (realtime pacer, gossip/NAT connect delays) get correct units. CrossEngin does not use the built-in maps. |
 
 ## When to retire the workarounds
 
@@ -44,7 +46,7 @@ so the cleanup commits belong there.
 ## Remaining NOVA gaps
 
 The umbrella from `docs/NOVA_RUNTIME_GAPS.md §12` is fully closed for
-the Phase 0-7 arc. Four gaps that pre-date this session remain open
+the Phase 0-7 arc. Three gaps that pre-date this session remain open
 upstream; none of them block a currently-shipped CrossEngin surface,
 and Phase 3 pt2's search-engine effector is the only one that would
 require an additional upstream fix before shipping:
@@ -53,9 +55,8 @@ require an additional upstream fix before shipping:
   `Environment=`.
 - ~~`secure_random` seccomp-blocked in the dev sandbox~~ -- wrong diagnosis:
   it was a NOVA tagging bug (audit F-07), fixed in NOVA #21.
-- `sys_read` / `sys_write` return a raw byte count (22 bytes reads as 11
-  in NOVA). Exposed by NOVA #22's working `assert`; not yet fixed. Callers
-  that compare the count with a NOVA int are affected.
+- ~~`sys_read` / `sys_write` return a raw byte count~~ -- fixed in NOVA #25
+  (tag-correct syscall wrappers), adopted by CrossEngin #66.
 - `envp=NULL` for a *strict* empty-env exec form — a new 3-arg
   `exec_program(path, argv, envp)` would replace the current
   inherit-by-default. Cosmetic; no caller needs it today.

@@ -6,15 +6,18 @@ provable while withholding on what is not, never manufacturing a proof of a
 falsehood. The head-to-head harness scores the engine against a **recorded** LLM
 transcript over the same bank.
 
-> **Honest scope (Rule 1).** The engine never calls a third-party LLM. There is
-> no live-call path anywhere in this repo. A real transcript is therefore
+> **Honest scope (Rule 1).** The reasoning engine itself never calls an LLM;
+> the only LLM hooks in the repo are opt-in (the Ollama fact extractor, the
+> reply composer and the NL-parse sidecar fallback, all off by default) and
+> none of them feeds this benchmark. A
+> real transcript is therefore
 > captured **separately and offline** with whatever LLM you choose, then pasted
-> in as a data file. This repo ships only **illustrative** transcripts
-> (`data/llm_baseline_sample.txt` for the default bank,
-> `data/llm_baseline_ext.txt` for the extended bank) plus the ingestion + scoring
-> machinery (`src/bench/llm_transcript.nova`, `src/bench/reasoning_bench.nova`).
-> Swap an illustrative file for a real recording and the measurement becomes real;
-> the harness is unchanged.
+> in as a data file. This repo ships **no** transcript: the earlier
+> `data/llm_baseline_*.txt` files and the `/vs` command were made-up verdicts
+> presented as a recording (audit F-02) and were removed. What remains is the
+> ingestion + scoring machinery (`src/bench/llm_transcript.nova`,
+> `src/bench/reasoning_bench.nova`). Until someone records a real transcript,
+> there is no head-to-head result to report.
 
 ## 1. Each bench item is a yes/no question
 
@@ -64,7 +67,7 @@ can never inflate the LLM's false-confident count).
 2. Put each question to your chosen LLM **offline**, in its own context so earlier
    answers cannot leak. Record exactly one verdict per id.
 3. Map each answer to `affirm`/`deny` and write one `<id> <verdict>` line into a
-   file under `data/`, e.g. `data/llm_baseline_ext.txt`. Keep a `#` comment trail
+   file under `data/`, e.g. `data/llm_transcript_<model>_<date>.txt`. Keep a `#` comment trail
    noting the model, date, and prompt used, for reproducibility.
 4. Do **not** edit the engine to fetch the answers -- the capture is a manual /
    external step by construction (Rule 1).
@@ -78,7 +81,7 @@ import "src/bench/llm_transcript.nova"
 import "src/bench/reasoning_bench.nova"
 
 let reg = proof_registry_new()
-let tr  = llm_transcript_from_file("data/llm_baseline_ext.txt")  // or _parse(text)
+let tr  = llm_transcript_from_file("data/llm_transcript_<model>_<date>.txt")  // or _parse(text)
 let s   = bench_compare_transcript(reg, tr)
 print(bench_compare_render(s))
 ```

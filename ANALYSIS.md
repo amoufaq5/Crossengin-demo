@@ -14,21 +14,22 @@ deliberately avoided in favour of "what landed" versus "what is a known gap".
 
 CrossEngin is a **non-LLM cognitive substrate** written in
 [NOVA](https://github.com/amoufaq5/nova) (a self-hosting language whose
-`stage2.s == stage3.s` invariant is a load-bearing CI gate). Instead of
+`stage2.s == stage3.s` invariant NOVA's own CI checks since the 2026-11 audit). Instead of
 orchestrating a pipeline of modules around a transformer, it runs a fabric of
 uniform computational units on a tick-driven core (100Hz; ADR-0037) and decodes
 responses from concept activation spreading through that fabric. Knowledge is an
 **explicit knowledge graph** of typed atoms (ADR-0016) carrying Bayesian beliefs
 (ADR-0023), augmented by HDC/VSA hyperdimensional embeddings (ADR-0051) and an
-episodic memory (ADR-0022). There is no neural network in the reply path and no
-LLM in cognition (ADR-0014).
+episodic memory (ADR-0022). By default there is no neural network in the reply
+path and no LLM in cognition (ADR-0014); opt-in hooks (Ollama reply composer,
+fact extractor, NL-parse fallback; whisper/vosk for speech) add one.
 
 ### Verified achievements
 
 | Capability | Where it lives | Status |
 |---|---|---|
-| 10-phase agent assembled into one unified process | README R35A note | v1.0, all 10 phases complete (R35A) |
-| ~6M-node fabric on a tick-driven core | `src/substrate/` (node pool, synapse graph, gate router, tick driver) | R0..R29 |
+| 10-phase agent assembled into one unified process | README R35A note | modules for all 10 phases exist (R35A); the ADR-0049/0050 capability exit tests were never run |
+| Node fabric on a tick-driven core | `src/substrate/` (node pool, synapse graph, gate router, tick driver) | the chat runs 64 nodes (`CE_CAP = 128`, 8 parts x 8); ~6M is the planning figure in r36f-0001 (ADR-0003 targets 1M nodes per part in v1) |
 | Hand-rolled RFC-grade federation transport | `src/federation/` | R30C..R38D |
 | -- DTLS 1.2 + ICE + STUN + TURN client + SRTP wire stack | `dtls12.nova`, `ice.nova`, `stun_rfc8489.nova`, `turn.nova`, `srtp.nova` | landed |
 | -- TURN **server**-side state machine (allocations/permissions/channels/tick) | `turn_server.nova` (~890 lines) | R38C |
@@ -157,7 +158,7 @@ because it is the question everyone asks first.
 | Memory | Explicit episodic memory + persistent KG snapshots | Context window (+ external RAG); no native long-term store |
 | Explainability | Traceable -- can name the atom / triple / rule used | Opaque; post-hoc attribution at best |
 | Self-model | First-class (`selfmodel_identity/state/goals/activity`, ADR-0038) | Emergent / prompted persona; no introspective state |
-| Hallucination | Answers from stored beliefs; says "I don't know X yet" | Fluent fabrication is a known failure mode |
+| Hallucination | Answers from stored beliefs and says "I don't know X yet" when none match; can still be wrong from wrong or loosely matched atoms | Fluent fabrication is a known failure mode |
 | Compute cost | CPU, ~MB-scale state; runs on a ~5 EUR/mo VPS | GPU/TPU clusters for training; nontrivial inference cost |
 | Language fluency | Limited (template surface, English-only stopwords) | State-of-the-art, multilingual |
 | Breadth of knowledge | Narrow -- only what was taught / fetched | Vast, web-scale pretraining |

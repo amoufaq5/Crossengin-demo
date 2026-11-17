@@ -9,7 +9,9 @@ where the code lives.
 CrossEngin is a **non-LLM cognitive substrate**, written in
 [NOVA](https://github.com/amoufaq5/nova). Rather than orchestrating a pipeline
 of modules around a transformer, it runs a fabric of uniform computational
-units -- roughly 6M nodes on a tick-driven core (100Hz) -- and decodes
+units on a tick-driven core -- 64 nodes in the chat today (`CE_CAP = 128`;
+~6M is the planning figure in r36f-0001; ADR-0003 targets 1M nodes per
+part in v1) -- and decodes
 responses from concept activation spreading through that fabric. Knowledge is
 an **explicit knowledge graph** of typed atoms (ADR-0016) with Bayesian beliefs
 (ADR-0023), augmented by HDC/VSA hyperdimensional embeddings (ADR-0051) and
