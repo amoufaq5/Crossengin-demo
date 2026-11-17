@@ -70,7 +70,7 @@ chmod 700 "$SCEN_TMP"
 PIDS=()
 cleanup() {
     local p
-    for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null; done
+    for p in "${PIDS[@]}"; do pkill -9 -P "$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; done
     rm -rf "$SCEN_TMP"
 }
 trap cleanup EXIT
@@ -368,6 +368,8 @@ if RUN_DIR="$D/run" py_pair_session "$D" "$NEXT_PORT"; then
     TL=$(cat "$D7/coord.out")
     assert_match "$TL" "FATAL another coordinator is using this run dir" "second coordinator on one run dir is refused"
     assert_match "$TL" "coord-exit=70" "second coordinator exits 70"
+    # FIRST_PID is the wrapper subshell; stop the coordinator it started too.
+    pkill -P "$FIRST_PID" 2>/dev/null
     kill "$FIRST_PID" 2>/dev/null; wait "$FIRST_PID" 2>/dev/null
 fi
 
