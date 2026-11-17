@@ -280,7 +280,7 @@ def parse_output(raw):
 
 # ---------------------------------------------------------------- scoring
 
-SPEC_KINDS = {"about", "ops", "line", "prefix", "has", "differs", "nl", "cat"}
+SPEC_KINDS = {"about", "chain", "ops", "line", "prefix", "has", "differs", "nl", "cat"}
 
 
 def parse_spec(spec):
@@ -310,6 +310,8 @@ def eval_spec(spec, item, items):
         if k == "about":
             nodes = chain_nodes(agent)
             ok = bool(nodes) and v in (nodes[0], nodes[-1])
+        elif k == "chain":
+            ok = v in chain_nodes(agent)
         elif k == "ops":
             ok = exp is not None and exp.get("ops") == v
         elif k == "line":
@@ -394,7 +396,12 @@ def compute_stats(per_arm, arms, ids, perms, bodies):
 
 # ---------------------------------------------------------------- running
 
+def decode(raw_bytes):
+    return raw_bytes.decode("utf-8", "replace").replace("\r", "")
+
+
 def run_chat(chat, stdin_text, arm_env, caps=CAPS):
+    """Run one chat process; returns its raw stdout+stderr bytes."""
     d = tempfile.mkdtemp(prefix="e1-")
     os.chmod(d, 0o700)
     env = {"HOME": d, "CE_RUN_DIR": d, "CE_EXP_TRACE": "1", "CE_CAPS_CONF": caps}
@@ -402,7 +409,7 @@ def run_chat(chat, stdin_text, arm_env, caps=CAPS):
     try:
         p = subprocess.run([chat], input=stdin_text.encode(), stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, env=env, cwd=d, timeout=CHAT_TIMEOUT)
-        return p.stdout.decode("utf-8", "replace").replace("\r", "")
+        return p.stdout
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -422,30 +429,46 @@ def cmd_run(args):
         print("\n".join(errs), file=sys.stderr)
         return 2
     chat = os.path.abspath(args.chat)
+    partial = False
     if args.arms:
         want = args.arms.split(",")
+        unknown = [w for w in want if w not in {a["name"] for a in arms}]
+        if unknown:
+            print("unknown arm(s): %s" % ",".join(unknown), file=sys.stderr)
+            return 2
+        partial = len(want) < len(arms)
         arms = [a for a in arms if a["name"] in want]
-        names = {a["name"] for a in arms}
-        for a in arms:
-            if a["comparator"] and a["comparator"] not in names:
-                a["comparator"] = None
     pk = sorted(perms) if not args.perms else [int(x) for x in args.perms.split(",")]
+    bad = [k for k in pk if k not in perms]
+    if bad:
+        print("unknown perm(s): %s" % ",".join(map(str, bad)), file=sys.stderr)
+        return 2
+    partial = partial or pk != sorted(perms)
+    if partial and not args.partial:
+        print("a subset of arms or perms is not the pre-registered study; pass --partial", file=sys.stderr)
+        return 2
+    if not any(a["name"] == "full" for a in arms):
+        print("the full arm is required (determinism gate)", file=sys.stderr)
+        return 2
+    names = {a["name"] for a in arms}
+    for a in arms:
+        if a["comparator"] and a["comparator"] not in names:
+            a["comparator"] = None
     out = os.path.abspath(args.out)
     if os.path.exists(out) and os.listdir(out):
         print("refusing to write into non-empty %s" % out, file=sys.stderr)
         return 2
     os.makedirs(os.path.join(out, "raw"), exist_ok=True)
     jobs = [(a, k, "") for a in arms for k in pk]
-    if any(a["name"] == "full" for a in arms):
-        full = [a for a in arms if a["name"] == "full"][0]
-        jobs += [(full, k, ".rerun") for k in pk]
+    full = [a for a in arms if a["name"] == "full"][0]
+    jobs += [(full, k, ".rerun") for k in pk]
 
     def one(job):
         a, k, suffix = job
         raw = run_chat(chat, build_stdin(rows, perms[k]["episodes"]), a["env"])
         path = os.path.join(out, "raw", a["name"], "p%d%s.out" % (k, suffix))
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "wb") as f:
             f.write(raw)
         return path
 
@@ -454,30 +477,52 @@ def cmd_run(args):
     manifest = {
         "schema": "e1-results-v1",
         "chat_sha256": sha256_file(chat),
-        "inputs_sha256": {os.path.basename(p): sha256_file(p)
-                          for p in (REPLAY, GOLD, PERMS, ARMS, CAPS, os.path.abspath(__file__))},
+        "inputs_sha256": input_hashes(),
+        "git": git_state(),
+        "python": sys.version.split()[0],
         "arms": [a["name"] for a in arms], "perms": pk, "jobs": args.jobs,
-        "majority": MAJORITY, "alpha": ALPHA,
+        "partial": partial, "majority": MAJORITY, "alpha": ALPHA,
     }
     with open(os.path.join(out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1, sort_keys=True)
-    return analyse(out, rows, gold, arms, pk)
+    return analyse(out, rows, gold, arms, pk, partial)
 
 
-def analyse(out, rows, gold, arms, pk):
+def input_hashes():
+    return {os.path.relpath(p, HERE): sha256_file(p)
+            for p in (REPLAY, GOLD, PERMS, ARMS, CAPS, os.path.abspath(__file__),
+                      os.path.join(INPUTS, "gen_v1.py"))}
+
+
+def git_state():
+    root = os.path.dirname(os.path.dirname(HERE))
+    try:
+        rev = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=30).stdout.decode().strip()
+        dirty = subprocess.run(["git", "-C", root, "status", "--porcelain", "--", "src", "examples",
+                                "experiments/e1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               timeout=30).stdout.decode().strip() != ""
+        return {"rev": rev, "dirty": dirty}
+    except (OSError, subprocess.SubprocessError):
+        return {"rev": "", "dirty": None}
+
+
+def analyse(out, rows, gold, arms, pk, partial):
     # Determinism gate: the full arm, run twice, must be byte-identical.
     gate = []
     for k in pk:
         a = os.path.join(out, "raw", "full", "p%d.out" % k)
         b = os.path.join(out, "raw", "full", "p%d.rerun.out" % k)
-        if os.path.exists(a) and os.path.exists(b):
-            same = open(a, "rb").read() == open(b, "rb").read()
-            gate.append((k, same))
+        if not (os.path.exists(a) and os.path.exists(b)):
+            print("DETERMINISM GATE: missing full-arm output for perm %d" % k, file=sys.stderr)
+            return 3
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            gate.append((k, fa.read() == fb.read()))
     with open(os.path.join(out, "determinism.tsv"), "w") as f:
         f.write("perm\tidentical\n")
         for k, same in gate:
             f.write("%d\t%d\n" % (k, 1 if same else 0))
-    if not all(s for _, s in gate):
+    if not gate or not all(s for _, s in gate):
         print("DETERMINISM GATE FAILED: the full arm differs between two runs", file=sys.stderr)
         return 3
     ids = scored_ids(rows, gold)
@@ -488,7 +533,8 @@ def analyse(out, rows, gold, arms, pk):
         for a in arms:
             per_arm[a["name"]], bodies[a["name"]] = {}, {}
             for k in pk:
-                raw = open(os.path.join(out, "raw", a["name"], "p%d.out" % k), encoding="utf-8").read()
+                with open(os.path.join(out, "raw", a["name"], "p%d.out" % k), "rb") as rf:
+                    raw = decode(rf.read())
                 try:
                     items = parse_output(raw)
                 except ParseError as e:
@@ -504,6 +550,9 @@ def analyse(out, rows, gold, arms, pk):
                 for i in ids:
                     sf.write("%s\t%d\t%s\t%s\t%d\t%s\n" % (a["name"], k, i, blocks[i], sc[i],
                                                          items[i]["agent"].replace("\t", " ")))
+    if len(pk) < MAJORITY and not partial:
+        print("statistics need at least %d perms" % MAJORITY, file=sys.stderr)
+        return 5
     stats = compute_stats(per_arm, arms, ids, pk, bodies) if len(pk) >= MAJORITY else []
     cols = ["arm", "comparator", "n", "correct_arm", "correct_comp", "b_lost", "c_gained",
             "p_exact", "p_holm", "reject", "items_text_differs"]
@@ -518,7 +567,8 @@ def analyse(out, rows, gold, arms, pk):
                 bi = [i for i in ids if blocks[i] == b]
                 tot = sum(per_arm[a["name"]][k][i] for k in pk for i in bi)
                 f.write("%s\t%s\t%d\t%d\n" % (a["name"], b, len(bi) * len(pk), tot))
-    print("ok: %d arm(s) x %d perm(s); results in %s" % (len(arms), len(pk), out))
+    print("ok: %d arm(s) x %d perm(s)%s; results in %s" % (
+        len(arms), len(pk), " (partial)" if partial else "", out))
     return 0
 
 
@@ -526,12 +576,17 @@ def cmd_stats(args):
     rows, gold = load_replay(), load_gold()
     out = os.path.abspath(args.out)
     man = json.load(open(os.path.join(out, "manifest.json")))
+    now = input_hashes()
+    changed = [k for k, v in man["inputs_sha256"].items() if now.get(k) != v]
+    if changed:
+        print("inputs differ from the run's manifest: %s" % ", ".join(sorted(changed)), file=sys.stderr)
+        return 2
     arms = [a for a in load_arms() if a["name"] in man["arms"]]
     names = {a["name"] for a in arms}
     for a in arms:
         if a["comparator"] and a["comparator"] not in names:
             a["comparator"] = None
-    return analyse(out, rows, gold, arms, man["perms"])
+    return analyse(out, rows, gold, arms, man["perms"], man.get("partial", False))
 
 
 def cmd_refcheck(args):
@@ -545,11 +600,11 @@ def cmd_refcheck(args):
     file_order = [e for b in BLOCK_ORDER for e in order[b]]
 
     def one(u):
-        return u, parse_output(run_chat(chat, build_stdin(rows, u), {}))
+        return u, parse_output(decode(run_chat(chat, build_stdin(rows, u), {})))
 
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
         results = list(ex.map(one, units))
-    whole = parse_output(run_chat(chat, build_stdin(rows, file_order), {}))
+    whole = parse_output(decode(run_chat(chat, build_stdin(rows, file_order), {})))
     fails, n = 0, 0
     for u, items in results + [(order["H"], whole)]:
         for e in u:
@@ -614,6 +669,9 @@ def selftest():
     check("about head", eval_spec("about=virus", items["A1"], items) == 1)
     check("about tail", eval_spec("about=fever", items["A1"], items) == 1)
     check("about middle fails", eval_spec("about=symptom", items["A1"], items) == 0)
+    check("chain middle", eval_spec("chain=symptom", items["A1"], items) == 1)
+    check("chain absent", eval_spec("chain=pain", items["A1"], items) == 0)
+    check("decode strips CR", decode(b"a\r\nb") == "a\nb")
     check("ops", eval_spec("ops=542,543,544", items["A1"], items) == 1)
     check("ops wrong", eval_spec("ops=542", items["A1"], items) == 0)
     check("line", eval_spec("line== 4", items["A2"], items) == 1)
@@ -669,6 +727,8 @@ def main(argv=None):
     p.add_argument("--arms", default="")
     p.add_argument("--perms", default="")
     p.add_argument("--jobs", type=int, default=4)
+    p.add_argument("--partial", action="store_true",
+                   help="allow a subset of arms or perms (not the pre-registered study)")
     p = sub.add_parser("stats")
     p.add_argument("--out", required=True)
     args = ap.parse_args(argv)

@@ -19,8 +19,8 @@ trap 'rm -rf "$WORK"' EXIT
 assert_match "$(python3 -I "$E1" --selftest 2>&1)" "[-]> OK$" "e1 selftest"
 assert_eq "$(python3 -I "$E1" lint 2>&1)" "lint: ok" "e1 inputs lint clean"
 
-OUT=$(python3 -I "$E1" run --chat "$CHAT" --out "$WORK/r" --arms full --perms 1 --jobs 2 2>&1)
-assert_match "$OUT" "^ok: 1 arm\(s\) x 1 perm\(s\)" "full arm runs end to end"
+OUT=$(python3 -I "$E1" run --chat "$CHAT" --out "$WORK/r" --arms full --perms 1 --jobs 2 --partial 2>&1)
+assert_match "$OUT" "^ok: 1 arm\(s\) x 1 perm\(s\) \(partial\)" "full arm runs end to end"
 assert_eq "$(tail -n +2 "$WORK/r/determinism.tsv" 2>/dev/null)" "$(printf '1\t1')" "determinism gate: two runs identical"
 assert_eq "$(tail -n +2 "$WORK/r/scores.tsv" 2>/dev/null | wc -l | tr -d ' ')" "200" "all 200 scored items parsed"
 
