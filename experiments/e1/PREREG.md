@@ -47,8 +47,8 @@ That gives 13 comparisons.
 `inputs/gen_v1.py` generates both `inputs/replay_v1.tsv` and
 `inputs/gold_v1.tsv`, and holds every item and gold rule in one place. The
 replay has 262 lines: 200 scored items, 25 unscored probe items and 37 feedback
-lines. They are grouped into episodes, and the episodes into six blocks. The
-blocks always run in the order R, P, C, U, F, H.
+lines. They are grouped into episodes, and the episodes into seven blocks. The
+blocks always run in the order R, P, C, U, B, F, H.
 
 | Block | Scored | What it probes |
 |---|---|---|
@@ -56,27 +56,33 @@ blocks always run in the order R, P, C, U, F, H.
 | P: paraphrase | 30 | Rewordings that should reach the same reasoning chain as a canonical concept. |
 | C: category | 40 | Arithmetic, greetings, thanks and farewells, social and personal replies, refusals, self-description, NL-grammar research, procedural, financial, debatable, yes/no. |
 | U: unknown | 25 | Nonce words and unknown procedures. |
-| F: feedback | 25 | Three kinds of episode, described below. |
+| B: belief feedback | 16 | 15 hedge episodes and 1 intent-adaptive episode, described below. |
+| F: flip feedback | 9 | Flip episodes, described below. |
 | H: held-out retest | 40 | Earlier items asked again at the end of the session, after all feedback. |
 
-**R pairs.** The pairs are exercise/diet/vitamin, question/ask,
-infection/symptom, need/hello and wake/morning.
+**R pairs.** The two-item episodes are exercise/diet, diet/vitamin,
+vitamin/exercise, question/ask, ask/question, infection/symptom,
+symptom/infection, need/hello, wake/morning, happy/sad, sad/happy and
+response/answer. Repeats such as virus/virus are also two-item episodes.
 
 **U items.**
 - A first sight should give an honest gap that names the word.
 - The two words that are each asked twice should get the "say more" reply on
   the second sight.
 
-**F episodes.**
-- **Flip episodes (9).** The probe is followed by `/bad`, `/bad /bad` or
-  `/correct fever causes pain`, then the same input again.
+**B episodes** (before F, so flip feedback cannot reach a hedge operator
+before its item is scored).
 - **Hedge episodes (15).** A yes/no question is its own probe, so the feedback
   lands on the single operator it asks about. Each episode uses a different
   operator. The question is followed by `/good /good` (one item asks
   `is exercise healthy?` and expects an unhedged chain) or `/bad`, then the
   same question again.
-- **Intent-adaptive episode (1).** A debatable question gets one `/good`,
-  then `dream`, a plain concept query.
+- **Intent-adaptive episode (1).** The debatable question "what should i do
+  about my treat" gets one `/good`. Then the plain concept `treat`, asked
+  nowhere earlier, must not get a debatable reply.
+
+**F episodes (9 flips).** The probe is followed by `/bad`, `/bad /bad` or
+`/correct fever causes pain`, then the same input again.
 
 **H items.** Some check stability; others check whether the learned changes
 persist.
@@ -116,42 +122,55 @@ spec has several parts, all of them must hold. The kinds:
 | `ops=CSV` | The EXP trace's operator ids equal CSV. This is the paraphrase check: the same chain as the canonical concept. |
 | `line=TEXT` | The `agent>` line equals TEXT. |
 | `prefix=TEXT` | The `agent>` line starts with TEXT. |
+| `not=TEXT` | The `agent>` line is non-empty and does not start with TEXT. |
 | `differs=ID` | The `agent>` line differs from item ID's line in the same run. |
 | `nl=1` | The NL grammar answered. |
 
 The flip items and their H retests use `chain=<concept> && differs=<probe>`:
-after `/bad` the reply must change *and* stay on topic. A cached reply about
-another concept is wrong. F05 (`/correct fever causes pain`) requires `pain`
-in the chain.
+after `/bad` the reply must change *and* keep the concept in its chain. F05
+(`/correct fever causes pain`) requires `pain` in the chain.
+
+Limitation: in the infection/symptom/fever cluster, most chains contain all
+three concepts. So a cached reply that belongs to a neighbouring concept can
+still pass `chain=`. `about=` is not used for these items, because the fresh
+reply to `fever` never begins or ends at fever.
 
 **How the gold was written.**
 - The semantic kinds were not tuned to the system's output. These are
-  `about`, `chain`, `differs`, `ops` (the canonical concept's chain) and the
-  hedge prefixes (`yes [from seed]` after two `/good`, `tentatively, yes`
-  after one `/bad`).
+  `about`, `chain`, `differs`, `not`, `ops` (the canonical concept's chain)
+  and the hedge prefixes (`yes [from seed]` after two `/good`,
+  `tentatively, yes` after one `/bad`). `healthy` (P16) is the conclusion of
+  three seed operators, so it is scored `about=healthy`.
 - Exact reply texts (`line=`, and the other `prefix=` values) were transcribed
   from the chat's replies.
 
 **Reference check.** `e1.py refcheck` runs every episode alone in the full arm.
-At registration, 22 of 200 scored items fail their gold there:
-- cache collisions: R04b–R11b;
+At registration, 26 of 200 scored items fail their gold there:
+- cache collisions within a cluster: R04b–R11b;
 - a semantic miss: R22 "pain";
+- the intent-adaptive override: B16q, and its retest H40;
 - replays or off-topic replies after feedback: F01q, F02q, F04q, F05q, F06q,
   F07q, F09q;
-- late-session changes in the file-order run: H03, H04, H06, H25, H36, H39.
+- in the file-order run, cache replays and collisions late in the session:
+  H03, H04, H06, H07, H36, H37, H39;
+- the late arithmetic item H25.
+
+All 15 hedge items pass alone.
 
 **Full arm on all five permutations** (run before registration; the full arm
 only). It is byte-identical across reruns, and 164 of 200 items are correct by
 majority. Majority-wrong:
-- F: F01q–F09q, F14q, F15q, F18q, F19q, F22q, F23q;
-- H: H03, H04, H06, H07, H08, H25, H36, H39;
-- P: P16, P21;
+- B: B06q, B09q, B10q, B13q, B14q, B16q;
+- F: F01q–F09q;
+- H: H03, H04, H06, H07, H25, H36, H37, H39, H40;
+- P: P21;
 - R: R04a, R04b, R05a, R06b, R07b, R08a, R09a, R10b, R11b, R22;
 - U: U04.
 
-Several hedge follow-ups (F15q, F18q, F23q) repeat a question asked earlier in
-C or P, and in the full arm they are answered from the cache with the stale
-hedge.
+The five hedge items are wrong because `/good` and `/bad` do not invalidate
+the moment cache. When the probe brings in no new word, the follow-up gets the
+probe's own cached, pre-feedback reply. B06q, B09q and B14q also repeat a
+question asked earlier in C or P.
 
 Before registration:
 - two yes/no items were replaced, because the chat cannot parse them in any
@@ -190,21 +209,22 @@ discordant items is a behavioural effect worth reporting.
 
 - **H1: the moment cache costs correctness.** abl_cache is significantly better
   than full (c > b). The predicted gains are on cluster collisions (R, P, H),
-  colliding nonce words (U), flip re-asks (F, H), and hedge follow-ups that
-  repeat an earlier question.
+  colliding nonce words (U), flip re-asks (F, H), and hedge follow-ups in B
+  that the cache answers with the pre-feedback reply (it is not invalidated by
+  feedback).
 - **H2: three mechanisms change nothing a user can see.** For abl_substrate,
   abl_pc and abl_ff, `items_text_differs` = 0 and b = c = 0. A single
   differing item refutes H2 for that arm.
 - **H3: operator confidence (BETA) carries the hedge.**
   - The main test is nocache_beta vs abl_cache: significantly worse (b > c).
-    The losses should come from the hedge items F10q–F24q and from H38/H39.
+    The losses should come from the hedge items B01q–B15q and from H38/H39.
   - abl_beta vs full is predicted to point the same way (b > c), but its
     significance is not predicted, because the cache already makes many hedge
     items wrong in full.
   - Null predictions: abl_synw vs full and nocache_synw vs abl_cache, because
     compiled shortcuts are not expected to win a chain choice.
-  - IA: abl_ia and nocache_ia are predicted to differ on F25q, H40 and the
-    late arithmetic item H25, where reinforced intent prototypes misclassify
+  - IA: abl_ia and nocache_ia are predicted to gain on B16q, H40 and the late
+    arithmetic item H25, where reinforced intent prototypes misclassify
     `15% of 200`. That is at most 3 items, so a null prediction applies.
 - **H4: everything off.** No direction is predicted for abl_all vs full. It
   should gain where the cache hurts and lose where BETA helps. The result is

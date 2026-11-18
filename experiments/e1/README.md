@@ -11,7 +11,7 @@ The design, hypotheses and analysis are fixed in [PREREG.md](PREREG.md).
 | `PREREG.md` | Pre-registration (hypotheses, outcome, statistics) |
 | `arms.tsv` | The 14 arms: name, flags, comparator |
 | `inputs/gen_v1.py` | Generates the replay and the gold (every item and rule in one place) |
-| `inputs/replay_v1.tsv` | 262 replay lines: 200 scored items in six blocks |
+| `inputs/replay_v1.tsv` | 262 replay lines: 200 scored items in seven blocks |
 | `inputs/gold_v1.tsv` | One gold spec per item |
 | `inputs/perms_v1.tsv` | Five episode permutations (seeds 1–5) |
 | `inputs/caps_e1.conf` | Denies capabilities that would prompt or reach the network |

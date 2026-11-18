@@ -41,7 +41,7 @@ PERMS = os.path.join(INPUTS, "perms_v1.tsv")
 ARMS = os.path.join(HERE, "arms.tsv")
 CAPS = os.path.join(INPUTS, "caps_e1.conf")
 
-BLOCK_ORDER = ["R", "P", "C", "U", "F", "H"]
+BLOCK_ORDER = ["R", "P", "C", "U", "B", "F", "H"]
 MAJORITY = 3            # an item is correct in an arm if correct in >= 3 of 5 perms
 ALPHA = 0.05
 CHAT_TIMEOUT = 300
@@ -280,7 +280,7 @@ def parse_output(raw):
 
 # ---------------------------------------------------------------- scoring
 
-SPEC_KINDS = {"about", "chain", "ops", "line", "prefix", "has", "differs", "nl", "cat"}
+SPEC_KINDS = {"about", "chain", "ops", "line", "prefix", "not", "has", "differs", "nl", "cat"}
 
 
 def parse_spec(spec):
@@ -318,6 +318,8 @@ def eval_spec(spec, item, items):
             ok = agent == v
         elif k == "prefix":
             ok = agent.startswith(v)
+        elif k == "not":
+            ok = agent != "" and not agent.startswith(v)
         elif k == "has":
             ok = v in agent
         elif k == "differs":
@@ -436,9 +438,15 @@ def cmd_run(args):
         if unknown:
             print("unknown arm(s): %s" % ",".join(unknown), file=sys.stderr)
             return 2
-        partial = len(want) < len(arms)
+        if len(set(want)) != len(want):
+            print("duplicate arm names in --arms", file=sys.stderr)
+            return 2
+        partial = set(want) != {a["name"] for a in arms}
         arms = [a for a in arms if a["name"] in want]
     pk = sorted(perms) if not args.perms else [int(x) for x in args.perms.split(",")]
+    if len(set(pk)) != len(pk):
+        print("duplicate perms in --perms", file=sys.stderr)
+        return 2
     bad = [k for k in pk if k not in perms]
     if bad:
         print("unknown perm(s): %s" % ",".join(map(str, bad)), file=sys.stderr)
@@ -497,14 +505,17 @@ def input_hashes():
 def git_state():
     root = os.path.dirname(os.path.dirname(HERE))
     try:
-        rev = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, timeout=30).stdout.decode().strip()
-        dirty = subprocess.run(["git", "-C", root, "status", "--porcelain", "--", "src", "examples",
-                                "experiments/e1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               timeout=30).stdout.decode().strip() != ""
-        return {"rev": rev, "dirty": dirty}
+        r = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=30)
+        if r.returncode != 0:
+            return {"rev": None, "dirty": None}
+        st = subprocess.run(["git", "-C", root, "status", "--porcelain", "--", "src", "examples",
+                             "experiments/e1", ":!experiments/e1/results"], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=30)
+        dirty = None if st.returncode != 0 else st.stdout.decode().strip() != ""
+        return {"rev": r.stdout.decode().strip(), "dirty": dirty}
     except (OSError, subprocess.SubprocessError):
-        return {"rev": "", "dirty": None}
+        return {"rev": None, "dirty": None}
 
 
 def analyse(out, rows, gold, arms, pk, partial):
@@ -671,6 +682,8 @@ def selftest():
     check("about middle fails", eval_spec("about=symptom", items["A1"], items) == 0)
     check("chain middle", eval_spec("chain=symptom", items["A1"], items) == 1)
     check("chain absent", eval_spec("chain=pain", items["A1"], items) == 0)
+    check("not ok", eval_spec("not=that's", items["A1"], items) == 1)
+    check("not fails", eval_spec("not=virus", items["A1"], items) == 0)
     check("decode strips CR", decode(b"a\r\nb") == "a\nb")
     check("ops", eval_spec("ops=542,543,544", items["A1"], items) == 1)
     check("ops wrong", eval_spec("ops=542", items["A1"], items) == 0)
@@ -694,6 +707,7 @@ def selftest():
             {"id": "c", "block": "H", "episode": "E3", "text": "z", "line": 4}]
     check("perm deterministic", make_perm(rows, 7) == make_perm(rows, 7))
     check("perm keeps H last", make_perm(rows, 3)[-1] == "E3")
+    check("block order", BLOCK_ORDER == ["R", "P", "C", "U", "B", "F", "H"])
     s = build_stdin(rows, ["E2", "E1", "E3"])
     check("stdin layout", s == "/__e1_b\ny\n/__e1_a\nx\n/good\n/__e1_c\nz\n/__e1___end\n/__learning__\n/quit\n")
     sc = {1: {"i": 1}, 2: {"i": 1}, 3: {"i": 0}, 4: {"i": 0}, 5: {"i": 1}}
