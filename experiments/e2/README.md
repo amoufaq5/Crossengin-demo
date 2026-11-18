@@ -22,7 +22,12 @@ python3 -I experiments/e2/e2.py run --driver bin/e2-driver \
 ```
 
 `run` refuses anything other than the pre-registered design (modes M0–M4,
-seeds 1–20, 2,000 facts) unless `--partial` is given. It stops if the Python
-metric port disagrees with the driver's own `calibration.nova` output on any
-CrossEngin run. `stats --out DIR` recomputes the statistics, and refuses if
-`e2.py`, `e2_driver.nova` or `PREREG.md` changed since the run.
+seeds 1–20, 2,000 facts) unless `--partial` is given, and it also refuses
+duplicate seeds. If the Python metric port disagrees with the driver's own
+`calibration.nova` output on any CrossEngin run, no statistics are written.
+
+`stats --out DIR [--driver BIN]` recomputes the statistics. It refuses in
+three cases:
+- the run's metric cross-check failed;
+- `e2.py`, `e2_driver.nova` or `PREREG.md` changed since the run;
+- a `--driver` is given that differs from the run's driver.

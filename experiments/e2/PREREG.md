@@ -35,7 +35,7 @@ hidden reliability make conflicting yes/no claims:
 | Mode | What changes from M0 |
 |---|---|
 | M0 | nothing: independent errors |
-| M1 | copying: s01 and s02 copy s00 (the least reliable source) with probability 0.8 on every fact s00 claims |
+| M1 | copying: on every fact that s00 (the least reliable source) claims, s01 and s02 each claim s00's value with probability 0.8, whether or not they would otherwise have covered the fact; on the other facts they behave as in M0 |
 | M2 | a liar: s08 always asserts the false value and covers 60% of facts |
 | M3 | sparse experts: s08 and s09 cover 5% of facts; s00–s02 cover 60% |
 | M4 | collusion: s05–s07 assert the false value on every fact in a target 20% of facts; elsewhere they are honest |
@@ -92,7 +92,9 @@ from every method.
 **Primary:** the Brier score over the 2,000 facts, computed exactly as
 `src/bench/calibration.nova` computes it, in integer milli. Lower is better.
 The Python port is checked against the driver's own `calibration.nova` output
-on every CrossEngin run, and a single mismatch stops the study.
+on every CrossEngin run.
+- A single mismatch blocks the statistics. `run` writes no `stats.tsv`.
+- `stats` refuses such a run.
 
 **Secondary (descriptive):**
 - ECE (10 bins, as in `calibration.nova`);
@@ -134,11 +136,15 @@ These are based on the mechanism and on the development runs in §7.
   below the best source's, so its weight drops.
 - Not significantly better in M0, M1 and M3.
 
-**H3: Dawid–Skene beats the meta-observer** (mo vs dawid_skene).
-- mo is significantly worse in every mode.
+**H3: Dawid–Skene beats the meta-observer except under collusion**
+(mo vs dawid_skene).
+- mo is significantly worse in M0–M3.
 - Reason: every CrossEngin arm is under-confident by construction. The
   neutral declaration adds 5 pseudo-observations to about 3 claims, so means
   stay near the middle. Dawid–Skene produces a sharp posterior.
+- In M4, mo is significantly better. One-coin Dawid–Skene trusts the
+  agreeing colluders and becomes confidently wrong on the target facts. This
+  prediction was made after seeing the M4 development run (§7).
 
 **H4 and H5: majority and TruthFinder.** No direction is predicted. Both are
 reported.
@@ -151,10 +157,24 @@ source weight. Tuning the meta-observer would not be enough.
 ## 7. Development runs and disclosure
 
 The harness was tested only on development datasets: seeds 998 and 999, with
-150 or 2,000 facts, in modes M0 and M2. These are not study datasets. Seen
-there:
-- M0, seed 999, 150 facts: Dawid–Skene Brier 104, majority 158, flat 183.
-- M0, seed 998, 2,000 facts: flat Brier 181.
+150 or 2,000 facts, in modes M0, M2 and M4. These are not study datasets. The
+CI smoke test (`scenario_e2_harness.sh`) runs M0, M2 and M4 on seed 999 with
+150 facts.
+
+Brier scores on seed 999, 150 facts:
+
+| Mode | flat | graded | mo | majority | dawid_skene | truthfinder |
+|---|---|---|---|---|---|---|
+| M0 | 183 | 185 | 188 | 158 | 104 | 189 |
+| M2 | 221 | 238 | 217 | 217 | 36 | 218 |
+| M4 | 222 | 227 | 234 | 216 | 378 | 231 |
+
+M0, seed 998, 2,000 facts: flat Brier 181.
+
+After an adversarial review, and before registration, two things changed:
+- M1 was regenerated so that it matches the wording in §2. The copiers used
+  to copy only on facts they would have covered anyway.
+- H3 was restated for M4 in the light of the table above.
 
 The mo weight mapping (§3) was changed after the first development run, as
 described there. No run was made on seeds 1–20 before registration.

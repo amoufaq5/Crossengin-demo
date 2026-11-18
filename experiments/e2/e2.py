@@ -73,8 +73,9 @@ def generate(mode, seed, n_facts=FACTS):
 
     Modes (PREREG section 3):
       M0 independent errors.
-      M1 copying: s01 and s02 copy s00 (the least reliable) with prob 0.8 on
-         every fact s00 claims.
+      M1 copying: on every fact s00 (the least reliable) claims, s01 and s02
+         each copy s00's value with prob 0.8, whether or not they would have
+         covered the fact; otherwise they behave as in M0.
       M2 liar: s08 asserts the false value on every claim and covers 0.6 of
          the facts (its nominal tier is still A).
       M3 sparse experts: s08 and s09 cover 0.05 of facts; s00-s02 cover 0.6.
@@ -102,6 +103,9 @@ def generate(mode, seed, n_facts=FACTS):
         for s in range(N_SOURCES):
             covered = rng.random() < cov[s]
             r = rng.random()
+            if mode == "M1" and s in (1, 2) and fid in s00 and rng.random() < 0.8:
+                claims.append((fid, source_tag(s), s00[fid]))
+                continue
             if mode == "M4" and s in (5, 6, 7) and fid in target:
                 claims.append((fid, source_tag(s), 1 - truth))
                 continue
@@ -111,8 +115,6 @@ def generate(mode, seed, n_facts=FACTS):
                 val = 1 - truth
             else:
                 val = truth if r < rel[s] else 1 - truth
-            if mode == "M1" and s in (1, 2) and fid in s00 and rng.random() < 0.8:
-                val = s00[fid]
             if s == 0:
                 s00[fid] = val
             claims.append((fid, source_tag(s), val))
@@ -375,6 +377,13 @@ def cmd_run(args):
         return 2
     modes = args.modes.split(",")
     seeds = parse_seeds(args.seeds)
+    if len(set(seeds)) != len(seeds) or len(set(modes)) != len(modes):
+        print("duplicate seeds or modes", file=sys.stderr)
+        return 2
+    bad = [m for m in modes if m not in MODES]
+    if bad:
+        print("unknown mode(s): %s" % ",".join(bad), file=sys.stderr)
+        return 2
     partial = modes != MODES or seeds != list(range(1, 21)) or args.facts != FACTS
     if partial and not args.partial:
         print("not the pre-registered design (modes M0-M4, seeds 1-20, 2000 facts); pass --partial",
@@ -472,6 +481,12 @@ def write_stats(out, rows, modes, seeds):
 def cmd_stats(args):
     out = os.path.abspath(args.out)
     man = json.load(open(os.path.join(out, "manifest.json")))
+    if man.get("metric_crosscheck_failures", 1) != 0:
+        print("the run's metric cross-check failed; no statistics (PREREG section 4)", file=sys.stderr)
+        return 3
+    if args.driver and sha256_file(os.path.abspath(args.driver)) != man["driver_sha256"]:
+        print("driver differs from the run's manifest", file=sys.stderr)
+        return 2
     now = {n: sha256_file(os.path.join(HERE, n)) for n in man["inputs_sha256"]}
     changed = [n for n, h in man["inputs_sha256"].items() if now[n] != h]
     if changed:
@@ -521,6 +536,11 @@ def selftest():
     tr = dict(fm)
     liar = [(f, v) for f, s, v in cm if s == source_tag(8)]
     check("M2 liar always false", liar and all(v != tr[f] for f, v in liar))
+    f1m, c1m, _, _ = generate("M1", 3, 1500)
+    s0 = {f: v for f, s, v in c1m if s == source_tag(0)}
+    cop = {f: v for f, s, v in c1m if s == source_tag(1)}
+    share = sum(1 for f, v in s0.items() if cop.get(f) == v) / len(s0)
+    check("M1 copier claims s00's value on about 0.8+ of s00's facts", 0.8 <= share <= 0.92)
     fc, cc, _, mc = generate("M4", 3, 600)
     tr = dict(fc)
     tg = set(mc["target"])
@@ -575,6 +595,7 @@ def main(argv=None):
     p.add_argument("--partial", action="store_true")
     p = sub.add_parser("stats")
     p.add_argument("--out", required=True)
+    p.add_argument("--driver", default="", help="optional: refuse if it differs from the run's driver")
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
