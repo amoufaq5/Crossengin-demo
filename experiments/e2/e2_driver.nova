@@ -1,0 +1,199 @@
+// E2 driver: replays a conflicting-sources dataset through the production
+// ingest pipeline (pip_ingest_ex, B5) under one arm, then prints the final
+// belief of every fact and the calibration metrics computed by
+// src/bench/calibration.nova. See experiments/e2/PREREG.md.
+//
+// Environment (all required):
+//   E2_DIR    dataset directory with facts.tsv, claims.tsv, tiers.tsv
+//   E2_ARM    flat | graded | mo
+//   E2_BATCHES number of claim batches (the meta-observer arm re-weights
+//             sources between batches; other arms ignore batch boundaries)
+//
+// Input files (tab-separated, '#' comment lines allowed):
+//   facts.tsv   fact_id  truth(0|1)      -- truth is read only for metrics
+//   claims.tsv  fact_id  source_tag  value(0|1)   in arrival order
+//   tiers.tsv   source_tag  tier(1|2|3)  -- the graded arm's prior trust
+//
+// Output (stdout):
+//   P <fact_id> <belief_milli>     one line per fact, facts.tsv order
+//   W <batch> <source_tag> <weight_milli>   mo arm: weights used per batch
+//   M brier=<n> ece=<n> acc=<n> facts=<n> claims=<n>
+
+import "std/io"
+import "std/string"
+import "std/syscall"
+import "../../src/ingest/pipeline.nova"
+import "../../src/learning/source_authority.nova"
+import "../../src/bench/calibration.nova"
+import "../../src/util/sys_tagged.nova"
+import "../../src/util/str_safe.nova"
+
+let E2_KG = "e2"
+let E2_DECL = "src:e2:decl"
+
+fn _lines(path) {
+    let data = _read_file_tagged(path)
+    let out = list_new()
+    if data == 0 { return out }
+    let raw = split_char(data, 10)
+    let i = 0
+    while i < len(raw) {
+        let l = raw[i]
+        if len(l) > 0 { if char_at(l, 0) != 35 { push(out, split_char(l, 9)) } }
+        i = i + 1
+    }
+    return out
+}
+
+fn _die(msg) {
+    println("E2 ERROR: " + msg)
+    exit(2)
+    return 0
+}
+
+// Distinct source tags in first-appearance order.
+fn _sources(claims) {
+    let out = list_new()
+    let i = 0
+    while i < len(claims) {
+        let s = claims[i][1]
+        let seen = 0
+        let j = 0
+        while j < len(out) {
+            if str_eq_bytes(out[j], s) == 1 { seen = 1 }
+            j = j + 1
+        }
+        if seen == 0 { push(out, s) }
+        i = i + 1
+    }
+    return out
+}
+
+// mo arm: map a reliability estimate (milli) to an evidence weight,
+// relative to the best-estimated source: w = 1000 * (rel - 500) / (best - 500),
+// clamped to 0..1000. A source at or below chance (500) gets 0; the best
+// source gets 1000. When no source is above chance every weight is 1000.
+// (Reliability estimates are compressed toward 500 by the declaration prior,
+// so an absolute mapping would shrink every weight; see PREREG.md.)
+fn e2_weight_from_reliability(rel, best) {
+    if best <= 500 { return 1000 }
+    let w = (rel - 500) * 1000 / (best - 500)
+    if w < 0 { w = 0 }
+    if w > 1000 { w = 1000 }
+    return w
+}
+
+fn main() {
+    let dir = getenv("E2_DIR")
+    let arm = getenv("E2_ARM")
+    let nb_s = getenv("E2_BATCHES")
+    if dir == 0 { _die("E2_DIR not set") }
+    if arm == 0 { _die("E2_ARM not set") }
+    if nb_s == 0 { _die("E2_BATCHES not set") }
+    let is_flat = str_eq_bytes(arm, "flat")
+    let is_graded = str_eq_bytes(arm, "graded")
+    let is_mo = str_eq_bytes(arm, "mo")
+    if is_flat + is_graded + is_mo != 1 { _die("unknown arm " + arm) }
+    let nbatches = str_to_int(nb_s)
+    if nbatches < 1 { _die("E2_BATCHES must be >= 1") }
+    let facts = _lines(dir + "/facts.tsv")
+    let claims = _lines(dir + "/claims.tsv")
+    let tiers = _lines(dir + "/tiers.tsv")
+    if len(facts) == 0 { _die("no facts") }
+
+    let reg = kg_registry_new()
+    let mo = mo_new()
+    let sa = sa_new()
+    let flags = PIP_F_NO_RESEED + PIP_F_SIGNED_ATTR
+    if is_flat == 0 { flags = flags + PIP_F_TIER_WEIGHT }
+    if is_graded == 1 {
+        let t = 0
+        while t < len(tiers) {
+            sa_host_set_tier(sa, mo_tag_to_host(tiers[t][0]), str_to_int(tiers[t][1]))
+            t = t + 1
+        }
+    }
+    let sources = _sources(claims)
+    if is_mo == 1 {
+        let s0 = 0
+        while s0 < len(sources) {
+            sa_host_set_weight(sa, mo_tag_to_host(sources[s0]), 1000)
+            s0 = s0 + 1
+        }
+    }
+
+    // Declare every fact once at a neutral 500 (a declaration, not a claim).
+    let decl = cur_new(E2_KG, E2_DECL)
+    let f = 0
+    while f < len(facts) {
+        cur_add_atom(decl, facts[f][0], ATOM_FACT, 500)
+        f = f + 1
+    }
+    let ds = pip_ingest_ex(reg, decl, 0, 0, flags, sa)
+    if pip_ok(ds) != 1 { _die("declaration failed: " + pip_err_detail(ds)) }
+    let kg = kg_find(reg, E2_KG)
+
+    // Claims in arrival order, split into nbatches contiguous batches. Within
+    // a batch, each source's claims form one record.
+    let n = len(claims)
+    let b = 0
+    while b < nbatches {
+        let lo = n * b / nbatches
+        let hi = n * (b + 1) / nbatches
+        if is_mo == 1 {
+            let rels = list_new()
+            let best = 0
+            let s0b = 0
+            while s0b < len(sources) {
+                let r = mo_source_reliability(mo, sources[s0b], kg, reg)
+                push(rels, r)
+                if r > best { best = r }
+                s0b = s0b + 1
+            }
+            let s1 = 0
+            while s1 < len(sources) {
+                let w = 1000
+                if b > 0 { w = e2_weight_from_reliability(rels[s1], best) }
+                sa_host_set_weight(sa, mo_tag_to_host(sources[s1]), w)
+                println("W " + int_to_str(b) + " " + sources[s1] + " " + int_to_str(w))
+                s1 = s1 + 1
+            }
+        }
+        let s2 = 0
+        while s2 < len(sources) {
+            let rec = cur_new(E2_KG, sources[s2])
+            let any = 0
+            let c = lo
+            while c < hi {
+                if str_eq_bytes(claims[c][1], sources[s2]) == 1 {
+                    let sign = 1
+                    if str_to_int(claims[c][2]) == 0 { sign = 0 - 1 }
+                    cur_add_obs(rec, claims[c][0], sign, 1000)
+                    any = 1
+                }
+                c = c + 1
+            }
+            if any == 1 {
+                let st = pip_ingest_ex(reg, rec, mo, 0, flags, sa)
+                if pip_ok(st) != 1 { _die("ingest failed: " + pip_err_detail(st)) }
+            }
+            s2 = s2 + 1
+        }
+        b = b + 1
+    }
+
+    let samples = list_new()
+    let k = 0
+    while k < len(facts) {
+        let a = kg_find_atom(kg, facts[k][0])
+        let p = atom_confidence(a)
+        println("P " + facts[k][0] + " " + int_to_str(p))
+        push(samples, cal_sample(p, str_to_int(facts[k][1])))
+        k = k + 1
+    }
+    println("M brier=" + int_to_str(cal_brier(samples)) + " ece=" + int_to_str(cal_ece(samples))
+            + " acc=" + int_to_str(cal_accuracy(samples)) + " facts=" + int_to_str(len(facts))
+            + " claims=" + int_to_str(n))
+    return 0
+}
+main()
