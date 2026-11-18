@@ -43,7 +43,14 @@ express every source's claim as an `OBS` line.
   split, using the same rules as the poll.
 - **`mo_source_reliability(mo, tag, kg, kgreg)`.** A continuous reliability
   in milli: the smoothed mean of a source's effective means,
-  `(Σ eff + 500) / (n + 1)`. It is 500 for an unknown source.
+  `(Σ eff + 500) / (n + 1)`. It is 500 for an unknown source. The means
+  include the source's own (tier-weighted) evidence, so a loop that feeds
+  this back into `sa_host_set_weight` reinforces itself.
+- **`mo_attribute_note(mo, tag, kg_label, atom_id)`.** Records an atom whose
+  belief the pipeline seeded itself, such as a citation edge (900) or an
+  EMPIRICAL association (800), with stance 0. It counts in the sample but
+  never as a promotion or atrophy. A later claim on the same atom turns it
+  into an ordinary attribution.
 - **`mo_stance(mo, tag, kg_label, atom_id)`.**
 
 `sa_host_set_weight(sa, host, w)` and `sa_weight_for_host(sa, host)` are in
@@ -56,7 +63,9 @@ express every source's claim as an `OBS` line.
    daemon polled the reasoning KG. So an ingested atom was judged by whatever
    reasoning atom shared its id.
    - The pipeline now always attributes with the atom's KG label, using
-     `citations` for citation atoms.
+     `citations` for citation atoms. Citation and association atoms are
+     recorded as notes, because their beliefs are pipeline-seeded and would
+     otherwise count as instant promotions once resolved in the right KG.
    - `/meta`, `/__metrics__` and the daemon poll with the session's KG
      registry.
    - Scenario D checks this: two ingested atoms at 950 now show as durable.
