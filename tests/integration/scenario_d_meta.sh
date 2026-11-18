@@ -30,4 +30,15 @@ assert_match "$OUT" "  user-teach +2 +0 +2 +100\\.0" "user-teach row: 2 atoms / 
 # At least one /meta poll occurred.
 assert_match "$OUT" "[1-9][0-9]* poll\\(s\\) total" "/meta increments poll counter"
 
+# B5 (bug 1): atoms ingested into their own KG ("med") are resolved there,
+# not by bare id in the reasoning KG. Two atoms seeded at 950 are durable.
+D_WORK="$(mktemp -d)"
+trap 'rm -rf "$D_WORK"' EXIT
+printf 'KG med\nSRC src:e2:med\nATOM fever_sym 1 950\nATOM cough_sym 1 950\n' > "$D_WORK/med.cerec"
+OUT=$(run_chat "/ingest cerec $D_WORK/med.cerec med src:e2:med
+/ingest_approve 1
+/meta")
+assert_match "$OUT" "approved #1: ingested" "ingested record approved"
+assert_match "$OUT" "  src:e2:med +2 +0 +2 +100\\.0" "ingested source row: 2 atoms / 0 tentative / 2 durable / 100.0 promotion"
+
 summary "scenario_d_meta"
