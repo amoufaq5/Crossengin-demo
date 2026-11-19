@@ -12,8 +12,8 @@ This is the run `run-20261119` of the pre-registered study
 
 **Deviation: packaging only.** The per-dataset folder `data/` (datasets,
 beliefs per arm, mo weights per batch) is committed as one deterministic
-archive, `data.tar.xz` (SHA-256 `fbdbe7aa…f7ecb0ac9e3`), because it is 31 MB
-uncompressed. `e2.py stats` reads only `scores.tsv` and `manifest.json`, and
+archive, `data.tar.xz` (SHA-256 `fbdbe7aa…f7ecb0ac9e3`), because it is about
+28 MB uncompressed. `e2.py stats` reads only `scores.tsv` and `manifest.json`, and
 reproduces `stats.tsv` exactly. The datasets can also be regenerated with
 `e2.py gen`.
 
@@ -33,8 +33,9 @@ reproduces `stats.tsv` exactly. The datasets can also be regenerated with
 - **Why the CrossEngin arms are under-confident:** every arm is limited by the
   belief model's neutral declaration prior. That prior is worth five
   pseudo-observations, against about three claims per fact. Any weight below
-  1000 makes beliefs *less* sharp, so tier weighting raises accuracy but
-  worsens Brier.
+  1000 makes beliefs *less* sharp. So tier weighting usually raises accuracy
+  but worsens Brier. M2 is the exception: there the liar has tier A, and
+  accuracy falls too.
 
 ## Primary analysis
 
@@ -43,7 +44,8 @@ reproduces `stats.tsv` exactly. The datasets can also be regenerated with
   Negative means the arm is better.
 - 95% percentile CI from a paired bootstrap over seeds with 10,000 resamples;
   Holm-adjusted over 25 tests.
-- A `p_boot` of 0 means every resample fell on one side of 0, so p < 10⁻⁴.
+- A `p_boot` of 0 means every resample fell on one side of 0, so
+  p < 2·10⁻⁴ (the resolution of 10,000 resamples).
 
 | Mode | graded − flat | mo − flat | mo − dawid_skene | mo − majority | mo − truthfinder |
 |---|---|---|---|---|---|
@@ -59,27 +61,32 @@ is M1 mo vs truthfinder (Holm p = 0.28).
 ## Means per mode and arm
 
 `summary.tsv` holds these means. All values are in milli.
+- Brier is as printed in `summary.tsv`, to one decimal.
+- Accuracy is rounded to an integer.
+- Bold = best in the row: lowest Brier, highest accuracy.
 
 | Mode | Metric | flat | graded | mo | majority | dawid_skene | truthfinder |
 |---|---|---|---|---|---|---|---|
 | M0 | Brier | 177.5 | 186.1 | 179.1 | 151.1 | **100.0** | 183.9 |
-| M0 | accuracy | 809 | 852 | 828 | 809 | **856** | 841 |
+| M0 | accuracy | 809 | 852 | 828 | 809 | **855** | 841 |
 | M1 | Brier | 183.1 | 187.3 | 189.2 | **162.5** | 271.3 | 188.9 |
 | M1 | accuracy | 765 | **841** | 757 | 765 | 687 | 753 |
 | M2 | Brier | 223.3 | 242.3 | 204.3 | 220.1 | **48.4** | 217.6 |
 | M2 | accuracy | 651 | 565 | 733 | 651 | **930** | 739 |
 | M3 | Brier | 194.9 | 207.8 | 198.1 | 178.6 | **141.9** | 199.6 |
-| M3 | accuracy | 745 | 788 | 756 | 745 | **791** | 775 |
+| M3 | accuracy | 745 | 787 | 756 | 745 | **791** | 775 |
 | M4 | Brier | 217.6 | 219.3 | 222.9 | **210.2** | 326.3 | 225.3 |
 | M4 | accuracy | 663 | **691** | 661 | 663 | 649 | 671 |
 
-M4 accuracy on the 20% of target facts is near zero for every method:
+M4 accuracy on the 20% of target facts is at most 7.5% for every method,
+and 0 for Dawid–Skene:
 
 | flat | graded | mo | majority | dawid_skene | truthfinder |
 |---|---|---|---|---|---|
-| 75 | 48 | 25 | 75 | 0 | 29 |
+| 75 | 47 | 25 | 75 | 0 | 29 |
 
-On those facts three colluders outvote about one honest claim.
+On a target fact, three false colluder claims face about two other claims,
+of which about 1.5 are true.
 
 ## Predictions
 
@@ -114,8 +121,8 @@ Dawid–Skene rates that block as highly reliable. It becomes confidently wrong
 ### H4 and H5: majority and TruthFinder. No direction was predicted.
 
 - Majority beats mo in M0, M1, M3 and M4, and loses to it in M2.
-- mo beats TruthFinder in M0, M2, M3 and M4 by small margins. In M1 there is
-  no difference.
+- mo beats TruthFinder in M0, M2, M3 and M4 by small margins. In M1 the
+  difference is not significant (+0.3, Holm p = 0.28).
 
 ## What this means
 

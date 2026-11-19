@@ -14,8 +14,9 @@ This is the run `run-20261119` of the pre-registered study
 
 ## Summary
 
-- **The moment cache is the only mechanism that changes correctness at full
-  strength.** Turning it off fixes 23 items and breaks none. It hides the
+- **The moment cache is the only mechanism whose removal significantly
+  changes correctness against the full arm.** Turning it off fixes 23 items
+  and breaks none. It hides the
   effect of operator confidence (BETA): with the cache off, removing BETA
   costs 17 items.
 - **Substrate, predictive coding and Forward-Forward change no reply.** That
@@ -54,7 +55,8 @@ The table is `stats.tsv`.
 
 abl_cache is significantly better than full. It gained 23 items and lost
 none. The gains are the predicted ones:
-- cluster collisions: R04a–R11b, P21, H03, H04, H06;
+- cluster collisions: R04a, R04b, R05a, R06b, R07b, R08a, R09a, R10b, R11b,
+  P21, H03, H04, H06;
 - a colliding nonce word: U04;
 - flip re-asks: F02q, F07q, F09q;
 - hedge follow-ups that the cache answers with the pre-feedback reply: B06q,
@@ -88,7 +90,9 @@ off fixes those three items.
 ### H4: everything off. Not significant (no direction was predicted).
 
 abl_all lost 12 items and gained 18.
-- The gains are the cache items.
+- The gains are 14 of the 23 cache items, the 3 IA items (B16q, H25, H40),
+  and H07.
+- The cache's hedge and flip gains do not appear, because BETA is off too.
 - The losses are BETA's hedge items, plus H08 and H38.
 
 ### H5: the B3 Hebbian step. Null predictions hold, and the decision rule is not met.
@@ -103,15 +107,21 @@ do not:
 - Condition 1 fails: hebb_nocache vs abl_cache is not significant.
 - Condition 2 holds: hebb vs full shows no significant loss.
 - Condition 3 fails: P-block pooled correctness drops in hebb (920) compared
-  with full (966).
+  with full (966). It also drops in hebb_nocache compared with abl_cache, in
+  the R block (965 vs 975), the P block (953 vs 1000) and the B block
+  (925 vs 937).
 
 `CE_HEBB` therefore stays off by default. It does change behaviour: the
-reply text differs on 30 items. On net it changes the chain chosen at the
-fever fork, gaining 4 items and losing 2.
+reply text differs on 30 items.
+- Most of the correctness changes come from changing which chain is chosen
+  at the fever fork: gains H07, H37 and R22, losses H08 and P20.
+- The H40 gain is a change of intent: `treat` no longer gets a debatable
+  reply.
 
 ## Pooled correctness per block
 
-The table is `blocks.tsv`. Values are per mille over items × permutations.
+The table is `blocks.tsv`. Values are per mille over items × permutations,
+truncated rather than rounded.
 
 | Arm | R | P | C | U | B | F | H |
 |---|---|---|---|---|---|---|---|
@@ -131,8 +141,9 @@ abl_substrate, abl_ff and abl_pc are identical to full and are omitted.
 
 **Note on the F block.** Even without the cache, at most 62% of flip
 re-asks change their reply *and* stay on topic after `/bad`. Under abl_beta,
-F is 0. With confidence updates off, `/bad` changes nothing, so the reply
-never changes.
+F is 0. With BETA off, the cache replays the probe's reply on every re-ask.
+Without the cache (nocache_beta), 355 per mille of F still passes, because
+`/bad` also moves the router-table weights.
 
 ## What this means
 
@@ -147,8 +158,10 @@ never changes.
    learning that affects answers.
 3. **Operator confidence (BETA) is the mechanism that makes feedback
    visible.** It is responsible for the hedge, and the cache is what hides it.
-4. **The F-03 Hebbian fix makes the router table learn, but that learning
-   does not improve these replies.** `CE_HEBB` stays opt-in.
+4. **The F-03 Hebbian step does not significantly improve these replies.**
+   With the cache on it is net +2 items; with the cache off it is net +5.
+   Neither is significant, and the P block drops. `CE_HEBB` stays opt-in.
+   E1 does not measure the router-table weights themselves.
 
 ## Files
 

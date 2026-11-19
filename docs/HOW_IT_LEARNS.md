@@ -33,7 +33,7 @@
 > - Substrate ticks, predictive coding and Forward-Forward change no reply at
 >   all.
 > - Operator confidence (BETA) is what makes feedback visible: with the cache
->   off, removing it breaks 17 items.
+>   off, removing it breaks 17 items and fixes 2.
 > - Intent-adaptive prototypes break 3 items.
 > - Router-table weights and the opt-in `CE_HEBB` step have no significant
 >   effect, so `CE_HEBB` stays off by default.
