@@ -760,9 +760,9 @@ import them, so nothing in this document's v3n-sa description changes.
 | Module | What it provides |
 |---|---|
 | `src/safety/gf256.nova` | GF(2^8) with the AES polynomial 0x11B. Multiply is 8 fixed rounds of shift-and-xor with masks; inverse is a^254 by a fixed chain. No tables, no branches on values. |
-| `src/safety/shamir.nova` | Byte-wise t-of-n Shamir sharing (n ≤ 255, x = 1..n). `shamir_split` draws coefficients from an `rng.nova` context and wipes them afterwards. `shamir_combine` interpolates at 0 and refuses an empty set, an x outside 1..255, or a repeated x. |
+| `src/safety/shamir.nova` | Byte-wise t-of-n Shamir sharing (n ≤ 255, x = 1..n). A share is [x, buf, len]. `shamir_split` draws coefficients from an `rng.nova` context and wipes its copy afterwards. `shamir_combine` interpolates at 0 and refuses an empty set, an x outside 1..255, a repeated x, or a share whose length is not the expected one. It cannot tell when it has fewer than t shares: the caller enforces the threshold. |
 | `src/safety/saprg.nova` | The mask generator: ChaCha20 keyed by a 32-byte seed, zero nonce, counter from 0; word i is little-endian keystream word i. Includes mod-2^32 vector add and subtract. |
-| `src/learning/sa_crypto.nova` | X25519 key pairs from an RNG context (an OS context or none: no fallback). KA = HKDF-SHA256 over the X25519 output, refusing an all-zero result. Pairwise mask seeds are symmetric; share-encryption keys are per direction. Shares are sealed with ChaCha20-Poly1305 and sent as ciphertext‖tag. |
+| `src/learning/sa_crypto.nova` | X25519 key pairs from an `rng.nova` context. `sac_os_rng` returns an OS-entropy context or 0, with no fallback; the deterministic test context is for tests only. KA = HKDF-SHA256 over the X25519 output, refusing an all-zero result. Pairwise mask seeds are symmetric; share-encryption keys are per direction. Shares are sealed with ChaCha20-Poly1305 and sent as ciphertext‖tag. |
 | `ed25519_pk_from_seed` in `src/safety/ed25519.nova` | Public key from a 32-byte seed, for checking identity keys against a pinned roster (A2.1). |
 
 **Domain separation.**
@@ -775,9 +775,14 @@ import them, so nothing in this document's v3n-sa description changes.
 because each directional key, fresh per round, encrypts exactly one
 message. The A2.2 state machine must keep that true.
 
-**Constant time is best effort,** as for `field25519`/`ed25519`. Secret data
-passes only through branch-free `int_*` builtins, but NOVA gives no
-constant-time guarantee.
+**Constant time is best effort.**
+- In `gf256`, `shamir`, `saprg` and the wrappers, secret bytes pass only
+  through branch-free `int_*` builtins. NOVA itself gives no constant-time
+  guarantee.
+- `ed25519_pk_from_seed` uses the existing Ed25519 scalar multiply, which
+  is not constant time (see the R14F appendix).
+- Wiping is limited to the copies these modules make. The RNG pool, the
+  ChaCha20 state and the HKDF intermediates are not wiped.
 
 **Tests.**
 - Unit tests: `test_gf256`, `test_shamir`, `test_saprg`, `test_sa_crypto`.
