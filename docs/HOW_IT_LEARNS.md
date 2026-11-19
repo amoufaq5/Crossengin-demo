@@ -25,6 +25,19 @@
 > replies. Read the rest of this page as a description of the wiring, not as
 > a demonstration of learning.
 
+> **E1 results (2026-11-19, pre-registered ablation study).** See
+> `experiments/e1/results/run-20261119/REPORT.md`. On a scored 200-item
+> replay:
+> - Turning off the moment cache fixes 23 items and breaks none. It answers
+>   one input with another input's reply, and keeps a reply after `/bad`.
+> - Substrate ticks, predictive coding and Forward-Forward change no reply at
+>   all.
+> - Operator confidence (BETA) is what makes feedback visible: with the cache
+>   off, removing it breaks 17 items and fixes 2.
+> - Intent-adaptive prototypes break 3 items.
+> - Router-table weights and the opt-in `CE_HEBB` step have no significant
+>   effect, so `CE_HEBB` stays off by default.
+
 > **B3 update (audit F-03 fix, opt-in).** `CE_HEBB=1` turns on a Hebbian
 > step on the cognitive router's own table (`cr_hebb_step` in
 > `src/agent/cognitive_router.nova`). After every routed reply, cache hit or

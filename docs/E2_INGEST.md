@@ -7,6 +7,15 @@ behaviour is opt-in: with no flags set, ingestion and the meta-observer behave
 as before. The exception is the labelled attribution in "Bug fixes" below,
 which is a correctness fix.
 
+**E2 results (2026-11-19).** See
+`experiments/e2/results/run-20261119/REPORT.md`.
+- Tier weighting is worse calibrated than counting every claim equally.
+- The meta-observer's learned weights help only against a systematic liar.
+- One-coin Dawid–Skene is far better calibrated unless sources copy each
+  other or collude.
+- The limit is the belief model (the declaration prior, and weights in [0, 1]
+  that can only dilute evidence), not the trust estimate.
+
 ## `pip_ingest_ex(reg, record, mo, capreg, flags, sa)`
 
 This is `pip_ingest_with_capreg` with option flags (`src/ingest/pipeline.nova`).
