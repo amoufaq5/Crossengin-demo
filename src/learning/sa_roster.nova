@@ -1,0 +1,627 @@
+// CrossEngin learning: the SecAgg v4 roster and soul identity keys (A2.1).
+//
+// Purpose
+//   SecAgg v4 (Bonawitz et al. 2017 double masking, plan item A2) needs a
+//   fixed, authenticated set of souls. v3n-sa learns its peer set from the
+//   souls themselves, and the coordinator relays their keys, so a
+//   coordinator can add or impersonate souls. In v4 every party (each soul
+//   and the coordinator) loads the same roster: the souls' numeric ids,
+//   names and long-term Ed25519 public keys, pinned by the operator. Each
+//   soul also holds its own Ed25519 seed. Round messages are signed with
+//   those keys (A2.2 onwards); this module only loads and checks them.
+//   Nothing imports it yet.
+//
+// Roster file (CE_SECAGG_ROSTER)
+//   ASCII text, at most 64 KiB, lines at most 1024 bytes. Blank lines and
+//   lines starting with '#' are ignored. The first other line must be
+//       crossengin-secagg-roster v1
+//   and every following line is one soul:
+//       <id> <name> <public key>
+//   - id: decimal u32 (0 .. 4294967295), no sign, no leading zeros.
+//     Ids are strictly ascending through the file. They are fixed numbers,
+//     never derived from names, so adding a soul renumbers nobody.
+//   - name: 1-64 characters of [A-Za-z0-9_-], unique. For logs and config.
+//   - public key: 64 lowercase hex characters (RFC 8032 encoding), unique,
+//     a valid curve point of large order (ed25519_pk_check).
+//   Fields are separated by one or more spaces. 2 <= N <= 255 souls (255
+//   is the Shamir share limit). The file must be a regular file (not a
+//   symlink, FIFO or device), owned by the current user or root, and not
+//   writable by group or others.
+//
+// Derived values
+//   - Shamir x coordinate of a soul = its rank in id order + 1 (1 .. N),
+//     over the whole roster, so it does not depend on who joins a round.
+//   - Threshold t = max(floor(2N/3) + 1, floor(N/2) + 1). The second term
+//     never binds for 1 <= N <= 255; it is kept as the documented lower
+//     bound. N = 3 tolerates no dropout, N = 4 one, N = 10 three.
+//   - Fingerprint = SHA-256 of the canonical text: the header line, then
+//     one "<id> <name> <hex>" line per soul, each ending in "\n". Comments
+//     and spacing do not change it. Operators compare it out of band, and
+//     A2.2 binds it into every signed message so parties holding different
+//     rosters refuse each other.
+//
+// Identity key (CE_SECAGG_ID_KEY)
+//   The path of the soul's 32-byte Ed25519 seed in snapshot-key format: the
+//   raw seed, nothing else (scripts/secagg_keygen.sh writes <base>.priv).
+//   It must be a regular file (opened with O_NOFOLLOW), owned by the
+//   current user, with no group or other permission bits, and exactly 32
+//   bytes long. Its public key must equal exactly one roster entry, and
+//   that entry is this soul: there is no separate "who am I" setting.
+//
+// Public API
+//   sroster_parse(text)            -> roster record (check sroster_ok)
+//   sroster_read_file(path)        -> [ok, err, text]
+//   sroster_load_file(path)        -> roster record
+//   sroster_load_from_env()        -> roster record (CE_SECAGG_ROSTER)
+//   sroster_read_seed(path)        -> [ok, err, seed list of 32 ints]
+//   sroster_identity(roster, seed) -> [ok, err, entry]
+//   sroster_identity_from_env(roster) -> [ok, err, entry, seed]
+//   sroster_ok / sroster_err / sroster_n / sroster_t / sroster_fingerprint /
+//   sroster_entries / sroster_canonical
+//   sroster_entry_by_id / _by_name / _by_pk_hex -> entry or 0
+//   sroster_x(roster, id)          -> Shamir x (1 .. N), or 0 if not listed
+//   sroster_peers(roster, self_id) -> entries except self, in id order
+//   sroster_threshold(n)           -> t for n souls (0 if n outside 1..255)
+//   sroster_fp_short(fp_hex)       -> first 16 hex digits in groups of 4
+//   Entry: [id, name, pk list, pk hex, x]; see the SROSTER_E_* slots.
+//
+// Failure is always explicit: a record with ok = 0 and an error string,
+// never a partial roster.
+//
+// Test parity: tests/unit/test_sa_roster.nova and
+// tests/integration/scenario_sroster.sh.
+//
+// NOVA dependencies: std/syscall (sys_open, sys_fstat, sys_close).
+// CrossEngin dependencies: src/safety/ed25519.nova, src/safety/sha256.nova,
+//   src/util/run_dir.nova, src/util/sys_tagged.nova, src/util/str_safe.nova.
+
+import "std/syscall"
+import "../safety/ed25519.nova"
+import "../safety/sha256.nova"
+import "../util/run_dir.nova"
+import "../util/sys_tagged.nova"
+import "../util/str_safe.nova"
+
+let SROSTER_HEADER = "crossengin-secagg-roster v1"
+let SROSTER_MAX_BYTES = 65536
+let SROSTER_MAX_LINE = 1024
+let SROSTER_MAX_N = 255
+let SROSTER_MIN_N = 2
+let SROSTER_MAX_NAME = 64
+let SROSTER_MAX_ID = 4294967295
+let SROSTER_O_NOFOLLOW = 133120        // O_RDONLY | O_NOFOLLOW | O_NONBLOCK
+
+// Record slots.
+let SROSTER_R_OK = 0
+let SROSTER_R_ERR = 1
+let SROSTER_R_ENTRIES = 2
+let SROSTER_R_N = 3
+let SROSTER_R_T = 4
+let SROSTER_R_FP = 5
+let SROSTER_R_CANON = 6
+
+// Entry slots.
+let SROSTER_E_ID = 0
+let SROSTER_E_NAME = 1
+let SROSTER_E_PK = 2
+let SROSTER_E_PKHEX = 3
+let SROSTER_E_X = 4
+
+// ---- record accessors ---------------------------------------------------
+
+fn sroster_ok(r) { return r[0] }
+fn sroster_err(r) { return r[1] }
+fn sroster_entries(r) { return r[2] }
+fn sroster_n(r) { return r[3] }
+fn sroster_t(r) { return r[4] }
+fn sroster_fingerprint(r) { return r[5] }
+fn sroster_canonical(r) { return r[6] }
+
+fn _sroster_fail(msg) {
+    let r = list_new()
+    push(r, 0)
+    push(r, "roster: " + msg)
+    push(r, list_new())
+    push(r, 0)
+    push(r, 0)
+    push(r, "")
+    push(r, "")
+    return r
+}
+
+fn _sroster_res(ok, err, v) {
+    let r = list_new()
+    push(r, ok)
+    push(r, err)
+    push(r, v)
+    return r
+}
+
+// ---- small helpers --------------------------------------------------------
+
+fn sroster_threshold(n) {
+    if n < 1 { return 0 }
+    if n > 255 { return 0 }
+    let a = (2 * n) / 3 + 1
+    let b = n / 2 + 1
+    if b > a { return b }
+    return a
+}
+
+fn _sroster_hexdigit(v) {
+    if v < 10 { return chr(v + 48) }
+    return chr(v + 87)
+}
+
+fn _sroster_hex_buf(buf, n) {
+    let s = ""
+    let i = 0
+    while i < n {
+        let b = load8(buf + i)
+        s = s + _sroster_hexdigit(int_shr(b, 4)) + _sroster_hexdigit(int_and(b, 15))
+        i = i + 1
+    }
+    return s
+}
+
+fn sroster_fp_short(fp_hex) {
+    if len(fp_hex) < 16 { return fp_hex }
+    return substr(fp_hex, 0, 4) + " " + substr(fp_hex, 4, 4) + " "
+        + substr(fp_hex, 8, 4) + " " + substr(fp_hex, 12, 4)
+}
+
+// Decimal u32 with no sign and no leading zeros, or -1.
+fn _sroster_parse_id(s) {
+    let n = len(s)
+    if n < 1 { return 0 - 1 }
+    if n > 10 { return 0 - 1 }
+    if n > 1 {
+        if char_at(s, 0) == 48 { return 0 - 1 }
+    }
+    let v = 0
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c < 48 { return 0 - 1 }
+        if c > 57 { return 0 - 1 }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    if v > 4294967295 { return 0 - 1 }
+    return v
+}
+
+fn _sroster_name_ok(s) {
+    let n = len(s)
+    if n < 1 { return 0 }
+    if n > 64 { return 0 }
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        let ok = 0
+        if c >= 48 { if c <= 57 { ok = 1 } }
+        if c >= 65 { if c <= 90 { ok = 1 } }
+        if c >= 97 { if c <= 122 { ok = 1 } }
+        if c == 95 { ok = 1 }
+        if c == 45 { ok = 1 }
+        if ok == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// 64 lowercase hex characters -> list of 32 ints, or 0.
+fn _sroster_parse_pk(s) {
+    if len(s) != 64 { return 0 }
+    let out = list_new()
+    let i = 0
+    while i < 64 {
+        let hi = _sroster_nib(char_at(s, i))
+        let lo = _sroster_nib(char_at(s, i + 1))
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        push(out, int_or(int_shl(hi, 4), lo))
+        i = i + 2
+    }
+    return out
+}
+
+fn _sroster_nib(c) {
+    if c >= 48 { if c <= 57 { return c - 48 } }
+    if c >= 97 { if c <= 102 { return c - 87 } }
+    return 0 - 1
+}
+
+fn _sroster_bytes_hex(lst) {
+    let s = ""
+    let i = 0
+    while i < len(lst) {
+        let b = lst[i]
+        s = s + _sroster_hexdigit(int_shr(b, 4)) + _sroster_hexdigit(int_and(b, 15))
+        i = i + 1
+    }
+    return s
+}
+
+// Split a line on runs of spaces; empty fields are dropped.
+fn _sroster_fields(line) {
+    let out = list_new()
+    let n = len(line)
+    let start = 0 - 1
+    let i = 0
+    while i < n {
+        if char_at(line, i) == 32 {
+            if start >= 0 {
+                push(out, substr(line, start, i - start))
+                start = 0 - 1
+            }
+        } else {
+            if start < 0 { start = i }
+        }
+        i = i + 1
+    }
+    if start >= 0 { push(out, substr(line, start, n - start)) }
+    return out
+}
+
+// Strip one trailing CR and surrounding spaces.
+fn _sroster_clean(line) {
+    let n = len(line)
+    if n > 0 {
+        if char_at(line, n - 1) == 13 { n = n - 1 }
+    }
+    let a = 0
+    let go = 1
+    while go == 1 {
+        go = 0
+        if a < n {
+            if char_at(line, a) == 32 {
+                a = a + 1
+                go = 1
+            }
+        }
+    }
+    let b = n
+    go = 1
+    while go == 1 {
+        go = 0
+        if b > a {
+            if char_at(line, b - 1) == 32 {
+                b = b - 1
+                go = 1
+            }
+        }
+    }
+    return substr(line, a, b - a)
+}
+
+// Only printable ASCII plus newline, and carriage return only as part of
+// a CRLF line ending (a bare CR could make a comment display as a line).
+fn _sroster_text_ok(text) {
+    let n = len(text)
+    let i = 0
+    while i < n {
+        let c = char_at(text, i)
+        let ok = 0
+        if c >= 32 { if c <= 126 { ok = 1 } }
+        if c == 10 { ok = 1 }
+        if c == 13 {
+            if i + 1 < n {
+                if char_at(text, i + 1) == 10 { ok = 1 }
+            }
+        }
+        if ok == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- parsing ----------------------------------------------------------------
+
+fn sroster_parse(text) {
+    if text == 0 { return _sroster_fail("no text") }
+    if len(text) > 65536 { return _sroster_fail("file larger than 64 KiB") }
+    if _sroster_text_ok(text) == 0 { return _sroster_fail("non-printable character") }
+    let lines = split_char(text, 10)
+    let entries = list_new()
+    let seen_header = 0
+    let prev_id = 0 - 1
+    let li = 0
+    while li < len(lines) {
+        let raw = lines[li]
+        let lpos = "line " + int_to_str(li + 1) + ": "
+        if len(raw) > 1024 { return _sroster_fail(lpos + "longer than 1024 bytes") }
+        let line = _sroster_clean(raw)
+        let skip = 0
+        if len(line) == 0 { skip = 1 }
+        if skip == 0 {
+            if char_at(line, 0) == 35 { skip = 1 }      // '#'
+        }
+        if skip == 0 {
+            if seen_header == 0 {
+                if str_eq_bytes(line, SROSTER_HEADER) == 0 {
+                    return _sroster_fail(lpos + "expected header '" + SROSTER_HEADER + "'")
+                }
+                seen_header = 1
+            } else {
+                let f = _sroster_fields(line)
+                if len(f) != 3 { return _sroster_fail(lpos + "expected '<id> <name> <public key>'") }
+                let id = _sroster_parse_id(f[0])
+                if id < 0 { return _sroster_fail(lpos + "bad id (decimal 0..4294967295, no leading zeros)") }
+                if id <= prev_id { return _sroster_fail(lpos + "ids must be strictly ascending") }
+                if _sroster_name_ok(f[1]) == 0 { return _sroster_fail(lpos + "bad name (1-64 of A-Z a-z 0-9 _ -)") }
+                let pk = _sroster_parse_pk(f[2])
+                if pk == 0 { return _sroster_fail(lpos + "bad public key (64 lowercase hex)") }
+                if len(entries) >= 255 { return _sroster_fail(lpos + "more than 255 souls") }
+                let j = 0
+                while j < len(entries) {
+                    if str_eq_bytes(entries[j][1], f[1]) == 1 { return _sroster_fail(lpos + "duplicate name " + f[1]) }
+                    if str_eq_bytes(entries[j][3], f[2]) == 1 { return _sroster_fail(lpos + "duplicate public key") }
+                    j = j + 1
+                }
+                if ed25519_pk_check(pk) == 0 { return _sroster_fail(lpos + "public key is not a valid Ed25519 key") }
+                let e = list_new()
+                push(e, id)
+                push(e, f[1])
+                push(e, pk)
+                push(e, f[2])
+                push(e, len(entries) + 1)
+                push(entries, e)
+                prev_id = id
+            }
+        }
+        li = li + 1
+    }
+    if seen_header == 0 { return _sroster_fail("missing header '" + SROSTER_HEADER + "'") }
+    let n = len(entries)
+    if n < 2 { return _sroster_fail("needs at least 2 souls, found " + int_to_str(n)) }
+    let canon = SROSTER_HEADER + "\n"
+    let k = 0
+    while k < n {
+        canon = canon + int_to_str(entries[k][0]) + " " + entries[k][1] + " " + entries[k][3] + "\n"
+        k = k + 1
+    }
+    let r = list_new()
+    push(r, 1)
+    push(r, "")
+    push(r, entries)
+    push(r, n)
+    push(r, sroster_threshold(n))
+    push(r, _sroster_hex_buf(sha256_oneshot_str(canon), 32))
+    push(r, canon)
+    return r
+}
+
+// ---- lookups ------------------------------------------------------------------
+
+fn sroster_entry_by_id(r, id) {
+    let es = r[2]
+    let i = 0
+    while i < len(es) {
+        if es[i][0] == id { return es[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn sroster_entry_by_name(r, name) {
+    let es = r[2]
+    let i = 0
+    while i < len(es) {
+        if str_eq_bytes(es[i][1], name) == 1 { return es[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn sroster_entry_by_pk_hex(r, hex) {
+    let es = r[2]
+    let i = 0
+    while i < len(es) {
+        if str_eq_bytes(es[i][3], hex) == 1 { return es[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn sroster_x(r, id) {
+    let e = sroster_entry_by_id(r, id)
+    if e == 0 { return 0 }
+    return e[4]
+}
+
+fn sroster_peers(r, self_id) {
+    let out = list_new()
+    let es = r[2]
+    let i = 0
+    while i < len(es) {
+        if es[i][0] != self_id { push(out, es[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- files ----------------------------------------------------------------------
+
+// errno of a failed sys_open (a raw -errno), negated and tagged.
+fn _sroster_errno(raw_neg) {
+    asm {
+        "mov rax, [rbp-8]"
+        "neg rax"
+        "lea rax, [rax + rax + 1]"
+    }
+}
+
+// Open `path` with O_NOFOLLOW | O_NONBLOCK (so a FIFO cannot block the
+// open; it is then refused as not a regular file) and check it is a
+// regular file. private = 1
+// additionally requires owner == euid and no group/other bits; private = 0
+// requires owner == euid or root and no group/other write bit.
+// Returns [ok, fd, err]. The fd is the raw value sys_open returned, so it is
+// only passed back to syscalls, never compared.
+fn _sroster_open_checked(path, private) {
+    let fd = sys_open(path, SROSTER_O_NOFOLLOW, 0)
+    if _ce_open_failed(fd) == 1 {
+        let e = _sroster_errno(fd)
+        if e == 40 { return [0, 0, path + ": is a symlink (refused)"] }
+        if e == 2 { return [0, 0, path + ": not found"] }
+        return [0, 0, path + ": cannot open (errno " + int_to_str(e) + ")"]
+    }
+    let mu = _ce_fd_mode_uid(fd)
+    if mu == 0 {
+        sys_close(fd)
+        return [0, 0, path + ": cannot stat"]
+    }
+    let mode = mu[0]
+    if int_and(mode, 61440) != 32768 {
+        sys_close(fd)
+        return [0, 0, path + ": not a regular file"]
+    }
+    let me = _ce_geteuid()
+    if private == 1 {
+        if mu[1] != me {
+            sys_close(fd)
+            return [0, 0, path + ": not owned by the current user"]
+        }
+        if int_and(mode, 63) != 0 {
+            sys_close(fd)
+            return [0, 0, path + ": readable or writable by group/others (chmod 600)"]
+        }
+    } else {
+        let owner_ok = 0
+        if mu[1] == me { owner_ok = 1 }
+        if mu[1] == 0 { owner_ok = 1 }
+        if owner_ok == 0 {
+            sys_close(fd)
+            return [0, 0, path + ": not owned by the current user or root"]
+        }
+        if int_and(mode, 18) != 0 {
+            sys_close(fd)
+            return [0, 0, path + ": writable by group/others"]
+        }
+    }
+    return [1, fd, ""]
+}
+
+// Read up to cap bytes; n = cap + 1 means "too long", -1 a read error.
+fn _sroster_read_fd(fd, buf, cap) {
+    let got = 0
+    let done = 0
+    while done == 0 {
+        let m = _sys_read_tagged(fd, buf + got, cap + 1 - got)
+        if m < 0 { return 0 - 1 }
+        if m == 0 {
+            done = 1
+        } else {
+            got = got + m
+            if got > cap { done = 1 }
+        }
+    }
+    return got
+}
+
+fn sroster_read_file(path) {
+    if path == 0 { return _sroster_res(0, "roster: CE_SECAGG_ROSTER is not set", "") }
+    if len(path) == 0 { return _sroster_res(0, "roster: CE_SECAGG_ROSTER is not set", "") }
+    let o = _sroster_open_checked(path, 0)
+    if o[0] == 0 { return _sroster_res(0, "roster: " + o[2], "") }
+    let buf = alloc(65538)
+    let n = _sroster_read_fd(o[1], buf, 65536)
+    sys_close(o[1])
+    if n < 0 { return _sroster_res(0, "roster: " + path + ": read error", "") }
+    if n > 65536 { return _sroster_res(0, "roster: " + path + ": larger than 64 KiB", "") }
+    let txt = ""
+    let piece = ""
+    let i = 0
+    while i < n {
+        let c = load8(buf + i)
+        if c == 0 { return _sroster_res(0, "roster: " + path + ": contains a NUL byte", "") }
+        piece = piece + chr(c)
+        if len(piece) >= 4096 {
+            txt = txt + piece
+            piece = ""
+        }
+        i = i + 1
+    }
+    txt = txt + piece
+    return _sroster_res(1, "", txt)
+}
+
+fn sroster_load_file(path) {
+    let rd = sroster_read_file(path)
+    if rd[0] == 0 {
+        let r = _sroster_fail("")
+        list_set(r, 1, rd[1])
+        return r
+    }
+    return sroster_parse(rd[2])
+}
+
+fn sroster_load_from_env() {
+    return sroster_load_file(getenv("CE_SECAGG_ROSTER"))
+}
+
+fn sroster_read_seed(path) {
+    if path == 0 { return _sroster_res(0, "identity: CE_SECAGG_ID_KEY is not set", list_new()) }
+    if len(path) == 0 { return _sroster_res(0, "identity: CE_SECAGG_ID_KEY is not set", list_new()) }
+    let o = _sroster_open_checked(path, 1)
+    if o[0] == 0 { return _sroster_res(0, "identity: " + o[2], list_new()) }
+    let buf = alloc(40)
+    let n = _sroster_read_fd(o[1], buf, 32)
+    sys_close(o[1])
+    if n < 0 { return _sroster_res(0, "identity: " + path + ": read error", list_new()) }
+    if n != 32 {
+        let k = 0
+        while k < 34 {
+            store8(buf + k, 0)
+            k = k + 1
+        }
+        return _sroster_res(0, "identity: " + path + ": must be exactly 32 bytes (a raw Ed25519 seed)", list_new())
+    }
+    let seed = list_new()
+    let i = 0
+    while i < 32 {
+        push(seed, load8(buf + i))
+        store8(buf + i, 0)
+        i = i + 1
+    }
+    return _sroster_res(1, "", seed)
+}
+
+// The roster entry whose public key belongs to `seed`. Costs one
+// ed25519_pk_from_seed (~0.5 s).
+fn sroster_identity(r, seed) {
+    if r[0] != 1 { return _sroster_res(0, "identity: roster not loaded", 0) }
+    if len(seed) != 32 { return _sroster_res(0, "identity: seed must be 32 bytes", 0) }
+    let pk = ed25519_pk_from_seed(seed)
+    if len(pk) != 32 { return _sroster_res(0, "identity: cannot derive public key", 0) }
+    let e = sroster_entry_by_pk_hex(r, _sroster_bytes_hex(pk))
+    if e == 0 {
+        return _sroster_res(0, "identity: this key (public key " + _sroster_bytes_hex(pk) + ") is not in the roster", 0)
+    }
+    return _sroster_res(1, "", e)
+}
+
+fn sroster_identity_from_env(r) {
+    let sd = sroster_read_seed(getenv("CE_SECAGG_ID_KEY"))
+    if sd[0] == 0 {
+        let out = _sroster_res(0, sd[1], 0)
+        push(out, list_new())
+        return out
+    }
+    let id = sroster_identity(r, sd[2])
+    if id[0] == 0 {
+        let seed = sd[2]
+        let i = 0
+        while i < 32 {
+            list_set(seed, i, 0)
+            i = i + 1
+        }
+        let out2 = _sroster_res(0, id[1], 0)
+        push(out2, list_new())
+        return out2
+    }
+    let out3 = _sroster_res(1, "", id[2])
+    push(out3, sd[2])
+    return out3
+}
