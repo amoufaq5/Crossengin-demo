@@ -799,6 +799,67 @@ message. The A2.2 state machine must keep that true.
 | 10,000 mask words | about 8 ms |
 | Ed25519 public key from a seed | about 0.5 s |
 
+## SecAgg v4 roster and identity keys (A2.1, not wired in yet)
+
+In v3n-sa the coordinator learns the peer set from the souls and relays
+their keys. A coordinator can therefore add a soul, or stand in for one.
+v4 replaces that trust-on-first-use with a roster that the operator pins.
+Every party loads the same roster: each soul and the coordinator. A2.1
+adds the roster loader and the key tooling. A2.2 onward will sign round
+messages with these keys.
+
+**Making keys.** `scripts/secagg_keygen.sh <basepath> <id> <name>` writes:
+- `<basepath>.priv`: the raw 32-byte Ed25519 seed, mode 0600. This is
+  `CE_SECAGG_ID_KEY`.
+- `<basepath>.pub`: the raw public key, mode 0644.
+
+It prints the soul's roster line and the SHA-256 of the public key. It
+runs with `umask 077`. It refuses to overwrite an existing file or to
+follow a symlink at either path, and it checks the DER layout that openssl
+produced.
+
+**Roster file.** This is `CE_SECAGG_ROSTER`, parsed by
+`src/learning/sa_roster.nova`.
+- The first line other than blanks and `#` comments is the header
+  `crossengin-secagg-roster v1`.
+- Every other line is `<id> <name> <public key hex>`, one per soul.
+
+The loader refuses the roster unless all of these hold:
+
+| Item | Rule |
+|---|---|
+| Ids | Decimal u32, strictly ascending. Never derived from names. |
+| Names | `[A-Za-z0-9_-]{1,64}`, unique. |
+| Public keys | Unique, decode as a curve point, and not of small order. |
+| Soul count | 2 ≤ N ≤ 255. |
+| Size | Lines at most 1024 bytes; file at most 64 KiB; printable ASCII. |
+| File | A regular file (opened `O_NOFOLLOW`), owned by the user or root, not writable by group or others. |
+
+**Derived values.**
+- Each soul's Shamir x is its rank in id order.
+- The threshold is t = max(⌊2N/3⌋+1, ⌊N/2⌋+1).
+- The fingerprint is the SHA-256 of the canonical roster text. Comments and
+  spacing do not change it. Operators compare it out of band, and A2.2 binds
+  it into every signed message.
+
+**Identity key.** `CE_SECAGG_ID_KEY` must be a regular file, not a symlink.
+It must be owned by the user, with no group or other permission bits, and
+be exactly 32 bytes long. Its public key must equal exactly one roster
+entry, and that entry is the soul's identity. The loaders for snapshot keys
+(`merkle_signing_keypair_load`) do not make these checks, so this is a
+separate key with a separate loader.
+
+**Checking a setup.** Run `examples/secagg_roster_check.nova`. It prints N,
+t, the fingerprint and each soul's id, name and x, and it prints which
+entry the identity key belongs to.
+
+**Tests.**
+- `tests/unit/test_sa_roster.nova`: 129 checks, including N = 255 and 256
+  and file mode, symlink and length refusals.
+- `tests/integration/scenario_sroster.sh`, run in CI. It covers the keygen
+  script, the roster checker, the fingerprint against Python, and
+  agreement with openssl.
+
 ## Full SecAgg upgrade path
 
 The reference Google SecAgg (~4-6 weeks per the published prototype)
