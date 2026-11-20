@@ -13,8 +13,10 @@
 # (src/learning/sa_roster.nova).
 #
 # Safety: umask 077; refuses to overwrite or follow an existing file or
-# symlink at either path; writes with noclobber; checks the DER layout that
-# openssl produced before extracting the raw bytes.
+# symlink at either path; builds both files in a private directory next to
+# the target and publishes them with link(2), which never follows or
+# replaces anything; checks the DER layout that openssl produced before
+# extracting the raw bytes.
 #
 # Exit: 0 ok, 1 failure, 2 bad usage.
 set -uo pipefail
@@ -36,8 +38,13 @@ for f in "$BASE.priv" "$BASE.pub"; do
 done
 
 command -v openssl >/dev/null 2>&1 || { echo "error: openssl is not on PATH" >&2; exit 1; }
-TMP="$(mktemp -d)" || { echo "error: mktemp failed" >&2; exit 1; }
-trap 'rm -rf "$TMP"' EXIT
+# Work in a private directory next to the target, so the final step can be
+# link(2): it never follows a symlink or overwrites anything at the
+# destination, unlike '>' (which writes through a symlink planted after the
+# check above, even under noclobber when it points at a FIFO or device).
+DIR="$(dirname -- "$BASE")"
+TMP="$(mktemp -d -- "$DIR/.secagg_keygen.XXXXXX")" || { echo "error: cannot create a work directory in $DIR" >&2; exit 1; }
+trap 'rm -rf -- "$TMP"' EXIT
 
 openssl genpkey -algorithm ed25519 -outform DER -out "$TMP/k.der" 2>/dev/null \
   || { echo "error: openssl cannot generate Ed25519 keys" >&2; exit 1; }
@@ -54,18 +61,19 @@ if [ "${#PH}" -ne 88 ] || [ "${PH:0:24}" != "302a300506032b6570032100" ]; then
   echo "error: unexpected public key encoding from openssl" >&2; exit 1
 fi
 
-set -C   # noclobber: '>' fails if the file (or a symlink) appeared meanwhile
-if ! tail -c 32 "$TMP/k.der" > "$BASE.priv"; then
-  echo "error: cannot create $BASE.priv" >&2; exit 1
+tail -c 32 "$TMP/k.der" > "$TMP/priv" && chmod 600 "$TMP/priv" \
+  || { echo "error: cannot write the seed" >&2; exit 1; }
+tail -c 32 "$TMP/p.der" > "$TMP/pub" && chmod 644 "$TMP/pub" \
+  || { echo "error: cannot write the public key" >&2; exit 1; }
+if ! ln -T -- "$TMP/priv" "$BASE.priv" 2>/dev/null; then
+  echo "error: cannot create $BASE.priv (it appeared meanwhile, or the directory is not writable)" >&2; exit 1
 fi
-if ! tail -c 32 "$TMP/p.der" > "$BASE.pub"; then
-  echo "error: cannot create $BASE.pub" >&2; rm -f "$BASE.priv"; exit 1
+if ! ln -T -- "$TMP/pub" "$BASE.pub" 2>/dev/null; then
+  echo "error: cannot create $BASE.pub" >&2; rm -f -- "$BASE.priv"; exit 1
 fi
-chmod 600 "$BASE.priv"
-chmod 644 "$BASE.pub"
 
 PK="${PH:24}"
-FP="$(sha256sum "$BASE.pub" | cut -c1-64)"
+FP="$(sha256sum -- "$BASE.pub" | cut -c1-64)" || { echo "error: sha256sum failed" >&2; exit 1; }
 echo "private key: $BASE.priv  (export CE_SECAGG_ID_KEY=$BASE.priv)"
 echo "public key:  $BASE.pub"
 echo "roster line: $ID $NAME $PK"

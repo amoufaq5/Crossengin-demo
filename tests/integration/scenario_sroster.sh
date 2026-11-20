@@ -7,8 +7,10 @@
 #      lines: N, t, x and a fingerprint that an independent Python hash of
 #      the canonical text reproduces.
 #   3. Each soul's seed maps to its own roster entry; a 0644 seed, a
-#      symlinked seed, a seed not in the roster, a group-writable roster and
-#      a tampered roster line are refused.
+#      symlinked seed, a seed not in the roster, a group-writable roster, a
+#      corrupt roster line, out-of-order ids and a FIFO in place of either
+#      file are refused (promptly: a FIFO must not block the open). An
+#      edited roster loads with a different fingerprint.
 #   4. openssl agrees: the public key in the roster is the one openssl
 #      derives from the seed.
 
@@ -55,6 +57,7 @@ bash "$KG" "$WORK/s8" 4294967296 big >/dev/null 2>&1
 assert_eq "$?" "2" "keygen refuses id 2^32"
 bash "$KG" "$WORK/s8" 8 'bad name' >/dev/null 2>&1
 assert_eq "$?" "2" "keygen refuses a bad name"
+assert_eq "$(ls -A "$WORK" | grep -c '^\.secagg_keygen\.')" "0" "keygen leaves no work directory behind"
 
 # openssl derives the same public key from the seed
 SEEDHEX=$(od -An -vtx1 "$WORK/s2.priv" | tr -d ' \n')
@@ -110,6 +113,17 @@ assert_eq "$([ -n "$FP2" ] && [ "$FP2" != "$FP" ] && echo differs)" "differs" "e
 { echo "crossengin-secagg-roster v1"; echo "$L2"; echo "$L1"; } > "$WORK/roster.o"; chmod 644 "$WORK/roster.o"
 OUT=$(CE_SECAGG_ROSTER="$WORK/roster.o" "$WORK/check" 2>&1); RC=$?
 assert_eq "$RC" "1" "out-of-order ids refused"
+sed 's/^17 beta \(.\)/17 beta X\1/' "$R" > "$WORK/roster.c"; chmod 644 "$WORK/roster.c"
+OUT=$(CE_SECAGG_ROSTER="$WORK/roster.c" "$WORK/check" 2>&1); RC=$?
+assert_eq "$RC" "1" "corrupt roster line refused"
+assert_match "$OUT" 'line 4' "corrupt line: line number printed"
+mkfifo -m 600 "$WORK/fifo.priv"
+OUT=$(CE_SECAGG_ROSTER="$R" CE_SECAGG_ID_KEY="$WORK/fifo.priv" timeout 30 "$WORK/check" 2>&1); RC=$?
+assert_eq "$RC" "1" "FIFO seed refused without blocking"
+assert_match "$OUT" 'not a regular file' "FIFO seed: reason printed"
+mkfifo -m 644 "$WORK/fifo.roster"
+OUT=$(CE_SECAGG_ROSTER="$WORK/fifo.roster" timeout 30 "$WORK/check" 2>&1); RC=$?
+assert_eq "$RC" "1" "FIFO roster refused without blocking"
 OUT=$(env -u CE_SECAGG_ROSTER "$WORK/check" 2>&1); RC=$?
 assert_eq "$RC" "1" "missing CE_SECAGG_ROSTER refused"
 

@@ -833,10 +833,11 @@ The loader refuses the roster unless all of these hold:
 | Public keys | Unique, decode as a curve point, and not of small order. |
 | Soul count | 2 ≤ N ≤ 255. |
 | Size | Lines at most 1024 bytes; file at most 64 KiB; printable ASCII. |
-| File | A regular file (opened `O_NOFOLLOW`), owned by the user or root, not writable by group or others. |
+| File | A regular file (opened `O_NOFOLLOW` and `O_NONBLOCK`, so a symlink or FIFO is refused), owned by the user or root, not writable by group or others. |
 
 **Derived values.**
-- Each soul's Shamir x is its rank in id order.
+- Each soul's Shamir x is its position in id order, counting from 1
+  (1..N; x = 0 is where the secret sits).
 - The threshold is t = max(⌊2N/3⌋+1, ⌊N/2⌋+1).
 - The fingerprint is the SHA-256 of the canonical roster text. Comments and
   spacing do not change it. Operators compare it out of band, and A2.2 binds
@@ -854,8 +855,8 @@ t, the fingerprint and each soul's id, name and x, and it prints which
 entry the identity key belongs to.
 
 **Tests.**
-- `tests/unit/test_sa_roster.nova`: 129 checks, including N = 255 and 256
-  and file mode, symlink and length refusals.
+- `tests/unit/test_sa_roster.nova`: 147 checks, including N = 255 and 256, all eight small-order keys,
+  and file mode, owner, symlink and length refusals.
 - `tests/integration/scenario_sroster.sh`, run in CI. It covers the keygen
   script, the roster checker, the fingerprint against Python, and
   agreement with openssl.
