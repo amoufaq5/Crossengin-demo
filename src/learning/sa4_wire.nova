@@ -1,0 +1,657 @@
+// CrossEngin learning: SecAgg v4 wire format and signed transcripts (A2.2a).
+//
+// Purpose
+//   The line protocol and the exact signed byte strings of SecAgg v4
+//   (double masking after Bonawitz et al. CCS 2017, with signatures: the
+//   actively secure variant). The soul state machine (sa4_soul.nova) and the
+//   coordinator (A2.2b) both use this module, and the stdlib Python
+//   reference soul (A2.3) must match it byte for byte.
+//
+// Lines
+//   Every line is at most SA4W_MAX_LINE (1000) bytes, without its newline.
+//   Fields are separated by exactly one space, with no leading or trailing
+//   space. Decimals are canonical (no sign, no leading zeros): a round is
+//   0 .. 2^62-1, an id 0 .. 2^32-1. Hex is lowercase and of exact length.
+//   A line that breaks any rule parses as 0; callers refuse it.
+//
+//   SA4_ROUND <r> <fp64> <L> <layout64>           coordinator -> soul
+//   SA4_ADV <r> <id> <cpk64> <spk64> <sig128>     soul -> coord -> souls
+//   SA4_SET <r> <k> <bitmap64>                    k = 1..4: U1..U4; closes
+//                                                 the batch before it
+//   SA4_SHARE <r> <from> <to> <ct196>             encrypted share message
+//   SA4_Y <r> <from> <i> <n> <hex words>          chunk i of n (0-based) of
+//                                                 the masked vector, 100
+//                                                 words per chunk (the last
+//                                                 one may be shorter)
+//   SA4_SIG3 <r> <id> <sig128>                    consistency signature
+//   SA4_REVEAL <r> <from> <about> <b|s> <share64> unmasking response
+//   SA4_END <r> <phase> <id> <count>              end of a soul's batch;
+//                                                 phase 1 shares, 2 y,
+//                                                 3 reveals
+//   SA4_ABORT <r> <id> <code>                     code [a-z0-9_]{1,32}
+//
+//   fp is the roster fingerprint (sa_roster.nova), layout the SHA-256 of
+//   the public vector layout, L the vector length in u32 words (1 .. 2^24).
+//   A bitmap is 32 bytes over roster x coordinates: soul x is bit (x-1)&7
+//   (least significant first) of byte (x-1)>>3; bits above N must be 0.
+//   Words are 8 hex digits, most significant first.
+//
+// Signed transcripts (byte strings; never the line text)
+//   SIGPFX(tag) = "crossengin/v4-sa/v1/sig" || u8(len tag) || tag
+//                 || fp[32] || u64be(round)
+//   ADV  = SIGPFX("adv") || u32be(id) || u32be(L) || layout[32]
+//          || c_pk[32] || s_pk[32]                                 (171 B)
+//   H1   = SHA-256("crossengin/v4-sa/v1/advset" || bitmap(U1)
+//          || c_pk || s_pk of every v in U1, ascending x)
+//   T3   = SIGPFX("u3") || H1 || bitmap(U2) || bitmap(U3)          (162 B)
+//   ADV binds the key pair to the roster, the round, L and the layout; T3
+//   binds U3 together with the key set every soul saw and U2, so a
+//   coordinator that shows different souls different sets gets no valid
+//   set of t signatures.
+//
+// Share plaintext (82 bytes; one message per (round, sender, receiver),
+// sealed with sac_share_seal under the directional key sac_enc_key):
+//   u8 1 || u32be from || u32be to || u64be round || u8 x_to
+//   || s-share[32] || b-share[32]
+//
+// Byte strings are NOVA lists of ints 0..255 throughout.
+//
+// CrossEngin dependencies: src/safety/sha256.nova,
+//   src/learning/sa_crypto.nova (sac_list_to_buf, sac_buf_to_list).
+
+import "./sa_crypto.nova"
+import "../safety/sha256.nova"
+import "../util/str_safe.nova"
+
+let SA4W_MAX_LINE = 1000
+let SA4W_CHUNK = 100
+let SA4W_MAX_WORDS = 16777216
+let SA4W_SIG_DOMAIN = "crossengin/v4-sa/v1/sig"
+let SA4W_ADVSET_DOMAIN = "crossengin/v4-sa/v1/advset"
+
+// Event ids of parsed records (disjoint from KGSYNC/FED/SECAGG ids).
+let SA4W_EV_ROUND = 40
+let SA4W_EV_ADV = 41
+let SA4W_EV_SET = 42
+let SA4W_EV_SHARE = 43
+let SA4W_EV_Y = 44
+let SA4W_EV_SIG3 = 45
+let SA4W_EV_REVEAL = 46
+let SA4W_EV_END = 47
+let SA4W_EV_ABORT = 48
+
+let SA4W_PHASE_SHARES = 1
+let SA4W_PHASE_Y = 2
+let SA4W_PHASE_REVEAL = 3
+
+let SA4W_SHARE_PT_LEN = 82
+let SA4W_SHARE_WIRE_LEN = 98
+
+// ---- byte helpers ------------------------------------------------------
+
+fn _sa4w_hexdig(v) {
+    if v < 10 { return chr(v + 48) }
+    return chr(v + 87)
+}
+
+fn sa4w_hex(lst) {
+    let s = ""
+    let i = 0
+    while i < len(lst) {
+        let b = lst[i]
+        s = s + _sa4w_hexdig(int_shr(b, 4)) + _sa4w_hexdig(int_and(b, 15))
+        i = i + 1
+    }
+    return s
+}
+
+fn _sa4w_nib(c) {
+    if c >= 48 { if c <= 57 { return c - 48 } }
+    if c >= 97 { if c <= 102 { return c - 87 } }
+    return 0 - 1
+}
+
+// Lowercase hex of exactly nbytes bytes -> list, or 0.
+fn sa4w_unhex(s, nbytes) {
+    if len(s) != nbytes * 2 { return 0 }
+    let out = list_new()
+    let i = 0
+    while i < len(s) {
+        let hi = _sa4w_nib(char_at(s, i))
+        let lo = _sa4w_nib(char_at(s, i + 1))
+        if hi < 0 { return 0 }
+        if lo < 0 { return 0 }
+        push(out, int_or(int_shl(hi, 4), lo))
+        i = i + 2
+    }
+    return out
+}
+
+fn _sa4w_put_be(out, v, nbytes) {
+    let i = 0
+    while i < nbytes {
+        let shift = int_shl(nbytes - 1 - i, 3)
+        push(out, int_and(int_shr(v, shift), 255))
+        i = i + 1
+    }
+    return out
+}
+
+fn _sa4w_get_be(lst, off, nbytes) {
+    let v = 0
+    let i = 0
+    while i < nbytes {
+        v = int_or(int_shl(v, 8), lst[off + i])
+        i = i + 1
+    }
+    return v
+}
+
+fn _sa4w_append(out, lst) {
+    let i = 0
+    while i < len(lst) {
+        push(out, lst[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _sa4w_append_str(out, s) {
+    let i = 0
+    while i < len(s) {
+        push(out, char_at(s, i))
+        i = i + 1
+    }
+    return out
+}
+
+fn sa4w_sha256(lst) {
+    let buf = sac_list_to_buf(lst)
+    let d = sha256_oneshot(buf, len(lst))
+    return sac_buf_to_list(d, 32)
+}
+
+// ---- canonical decimals --------------------------------------------------
+
+fn _sa4w_digits_ok(s, maxlen) {
+    let n = len(s)
+    if n < 1 { return 0 }
+    if n > maxlen { return 0 }
+    if n > 1 {
+        if char_at(s, 0) == 48 { return 0 }
+    }
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        if c < 48 { return 0 }
+        if c > 57 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _sa4w_digits_val(s) {
+    let v = 0
+    let i = 0
+    while i < len(s) {
+        v = int_add(int_mul(v, 10), char_at(s, i) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+// u32 decimal, or -1.
+fn sa4w_dec_u32(s) {
+    if _sa4w_digits_ok(s, 10) == 0 { return 0 - 1 }
+    let v = _sa4w_digits_val(s)
+    if v > 4294967295 { return 0 - 1 }
+    return v
+}
+
+// Round decimal 0 .. 2^62-1 (4611686018427387903), or -1. Nineteen-digit
+// values are compared as strings before conversion, because larger ones
+// would wrap in NOVA's 63-bit ints.
+fn sa4w_dec_round(s) {
+    if _sa4w_digits_ok(s, 19) == 0 { return 0 - 1 }
+    if len(s) == 19 {
+        let lim = "4611686018427387903"
+        let i = 0
+        let decided = 0
+        while i < 19 {
+            if decided == 0 {
+                let a = char_at(s, i)
+                let b = char_at(lim, i)
+                if a > b { return 0 - 1 }
+                if a < b { decided = 1 }
+            }
+            i = i + 1
+        }
+    }
+    return _sa4w_digits_val(s)
+}
+
+// ---- tokenizer -----------------------------------------------------------
+
+// Exactly-one-space separated tokens of a line of printable ASCII, or 0.
+fn _sa4w_tokens(line) {
+    let n = len(line)
+    if n < 1 { return 0 }
+    if n > 1000 { return 0 }
+    let out = list_new()
+    let start = 0
+    let i = 0
+    while i < n {
+        let c = char_at(line, i)
+        if c == 32 {
+            if i == start { return 0 }          // empty token
+            push(out, substr(line, start, i - start))
+            start = i + 1
+        } else {
+            if c < 33 { return 0 }
+            if c > 126 { return 0 }
+        }
+        i = i + 1
+    }
+    if start >= n { return 0 }                  // trailing space
+    push(out, substr(line, start, n - start))
+    return out
+}
+
+fn _sa4w_is(tok, s) {
+    return str_eq_bytes(tok, s)
+}
+
+fn _sa4w_code_ok(s) {
+    let n = len(s)
+    if n < 1 { return 0 }
+    if n > 32 { return 0 }
+    let i = 0
+    while i < n {
+        let c = char_at(s, i)
+        let ok = 0
+        if c >= 97 { if c <= 122 { ok = 1 } }
+        if c >= 48 { if c <= 57 { ok = 1 } }
+        if c == 95 { ok = 1 }
+        if ok == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- parsing -----------------------------------------------------------------
+
+fn _sa4w_rec(ev, r) {
+    let out = list_new()
+    push(out, ev)
+    push(out, r)
+    return out
+}
+
+fn sa4w_parse(line) {
+    let t = _sa4w_tokens(line)
+    if t == 0 { return 0 }
+    let n = len(t)
+    if n < 2 { return 0 }
+    let r = sa4w_dec_round(t[1])
+    if r < 0 { return 0 }
+    let k = t[0]
+    if _sa4w_is(k, "SA4_ROUND") == 1 {
+        if n != 5 { return 0 }
+        let fp = sa4w_unhex(t[2], 32)
+        let lw = sa4w_dec_u32(t[3])
+        let lay = sa4w_unhex(t[4], 32)
+        if fp == 0 { return 0 }
+        if lay == 0 { return 0 }
+        if lw < 1 { return 0 }
+        if lw > 16777216 { return 0 }
+        let rec = _sa4w_rec(40, r)
+        push(rec, fp)
+        push(rec, lw)
+        push(rec, lay)
+        return rec
+    }
+    if _sa4w_is(k, "SA4_ADV") == 1 {
+        if n != 6 { return 0 }
+        let id = sa4w_dec_u32(t[2])
+        let cpk = sa4w_unhex(t[3], 32)
+        let spk = sa4w_unhex(t[4], 32)
+        let sig = sa4w_unhex(t[5], 64)
+        if id < 0 { return 0 }
+        if cpk == 0 { return 0 }
+        if spk == 0 { return 0 }
+        if sig == 0 { return 0 }
+        let rec = _sa4w_rec(41, r)
+        push(rec, id)
+        push(rec, cpk)
+        push(rec, spk)
+        push(rec, sig)
+        return rec
+    }
+    if _sa4w_is(k, "SA4_SET") == 1 {
+        if n != 4 { return 0 }
+        let which = sa4w_dec_u32(t[2])
+        let bm = sa4w_unhex(t[3], 32)
+        if which < 1 { return 0 }
+        if which > 4 { return 0 }
+        if bm == 0 { return 0 }
+        let rec = _sa4w_rec(42, r)
+        push(rec, which)
+        push(rec, bm)
+        return rec
+    }
+    if _sa4w_is(k, "SA4_SHARE") == 1 {
+        if n != 5 { return 0 }
+        let frm = sa4w_dec_u32(t[2])
+        let to = sa4w_dec_u32(t[3])
+        let ct = sa4w_unhex(t[4], 98)
+        if frm < 0 { return 0 }
+        if to < 0 { return 0 }
+        if ct == 0 { return 0 }
+        let rec = _sa4w_rec(43, r)
+        push(rec, frm)
+        push(rec, to)
+        push(rec, ct)
+        return rec
+    }
+    if _sa4w_is(k, "SA4_Y") == 1 {
+        if n != 6 { return 0 }
+        let frm = sa4w_dec_u32(t[2])
+        let ci = sa4w_dec_u32(t[3])
+        let cn = sa4w_dec_u32(t[4])
+        if frm < 0 { return 0 }
+        if ci < 0 { return 0 }
+        if cn < 1 { return 0 }
+        if ci >= cn { return 0 }
+        let hx = t[5]
+        let hl = len(hx)
+        if hl < 8 { return 0 }
+        if hl > 800 { return 0 }
+        if int_and(hl, 7) != 0 { return 0 }
+        let bys = sa4w_unhex(hx, int_shr(hl, 1))
+        if bys == 0 { return 0 }
+        let words = list_new()
+        let j = 0
+        while j < len(bys) {
+            push(words, _sa4w_get_be(bys, j, 4))
+            j = j + 4
+        }
+        let rec = _sa4w_rec(44, r)
+        push(rec, frm)
+        push(rec, ci)
+        push(rec, cn)
+        push(rec, words)
+        return rec
+    }
+    if _sa4w_is(k, "SA4_SIG3") == 1 {
+        if n != 4 { return 0 }
+        let id = sa4w_dec_u32(t[2])
+        let sig = sa4w_unhex(t[3], 64)
+        if id < 0 { return 0 }
+        if sig == 0 { return 0 }
+        let rec = _sa4w_rec(45, r)
+        push(rec, id)
+        push(rec, sig)
+        return rec
+    }
+    if _sa4w_is(k, "SA4_REVEAL") == 1 {
+        if n != 6 { return 0 }
+        let frm = sa4w_dec_u32(t[2])
+        let about = sa4w_dec_u32(t[3])
+        let kind = 0 - 1
+        if _sa4w_is(t[4], "b") == 1 { kind = 0 }
+        if _sa4w_is(t[4], "s") == 1 { kind = 1 }
+        let sh = sa4w_unhex(t[5], 32)
+        if frm < 0 { return 0 }
+        if about < 0 { return 0 }
+        if kind < 0 { return 0 }
+        if sh == 0 { return 0 }
+        let rec = _sa4w_rec(46, r)
+        push(rec, frm)
+        push(rec, about)
+        push(rec, kind)
+        push(rec, sh)
+        return rec
+    }
+    if _sa4w_is(k, "SA4_END") == 1 {
+        if n != 5 { return 0 }
+        let ph = sa4w_dec_u32(t[2])
+        let id = sa4w_dec_u32(t[3])
+        let cnt = sa4w_dec_u32(t[4])
+        if ph < 1 { return 0 }
+        if ph > 3 { return 0 }
+        if id < 0 { return 0 }
+        if cnt < 0 { return 0 }
+        let rec = _sa4w_rec(47, r)
+        push(rec, ph)
+        push(rec, id)
+        push(rec, cnt)
+        return rec
+    }
+    if _sa4w_is(k, "SA4_ABORT") == 1 {
+        if n != 4 { return 0 }
+        let id = sa4w_dec_u32(t[2])
+        if id < 0 { return 0 }
+        if _sa4w_code_ok(t[3]) == 0 { return 0 }
+        let rec = _sa4w_rec(48, r)
+        push(rec, id)
+        push(rec, t[3])
+        return rec
+    }
+    return 0
+}
+
+// ---- formatting ------------------------------------------------------------
+
+fn sa4w_fmt_round(r, fp, lw, layout) {
+    return "SA4_ROUND " + int_to_str(r) + " " + sa4w_hex(fp) + " " + int_to_str(lw) + " " + sa4w_hex(layout)
+}
+
+fn sa4w_fmt_adv(r, id, cpk, spk, sig) {
+    return "SA4_ADV " + int_to_str(r) + " " + int_to_str(id) + " " + sa4w_hex(cpk) + " " + sa4w_hex(spk) + " " + sa4w_hex(sig)
+}
+
+fn sa4w_fmt_set(r, k, bm) {
+    return "SA4_SET " + int_to_str(r) + " " + int_to_str(k) + " " + sa4w_hex(bm)
+}
+
+fn sa4w_fmt_share(r, frm, to, ct) {
+    return "SA4_SHARE " + int_to_str(r) + " " + int_to_str(frm) + " " + int_to_str(to) + " " + sa4w_hex(ct)
+}
+
+fn sa4w_fmt_sig3(r, id, sig) {
+    return "SA4_SIG3 " + int_to_str(r) + " " + int_to_str(id) + " " + sa4w_hex(sig)
+}
+
+fn sa4w_fmt_reveal(r, frm, about, kind, sh) {
+    let ks = "b"
+    if kind == 1 { ks = "s" }
+    return "SA4_REVEAL " + int_to_str(r) + " " + int_to_str(frm) + " " + int_to_str(about) + " " + ks + " " + sa4w_hex(sh)
+}
+
+fn sa4w_fmt_end(r, phase, id, count) {
+    return "SA4_END " + int_to_str(r) + " " + int_to_str(phase) + " " + int_to_str(id) + " " + int_to_str(count)
+}
+
+fn sa4w_fmt_abort(r, id, code) {
+    return "SA4_ABORT " + int_to_str(r) + " " + int_to_str(id) + " " + code
+}
+
+fn _sa4w_word_hex(w) {
+    let s = ""
+    let k = 28
+    while k >= 0 {
+        s = s + _sa4w_hexdig(int_and(int_shr(w, k), 15))
+        k = k - 4
+    }
+    return s
+}
+
+// The SA4_Y lines for a vector of u32 words, 100 words per line.
+fn sa4w_fmt_y_lines(r, frm, words) {
+    let out = list_new()
+    let lw = len(words)
+    let cn = (lw + 99) / 100
+    let ci = 0
+    while ci < cn {
+        let hx = ""
+        let j = ci * 100
+        let stop = j + 100
+        if stop > lw { stop = lw }
+        while j < stop {
+            hx = hx + _sa4w_word_hex(words[j])
+            j = j + 1
+        }
+        push(out, "SA4_Y " + int_to_str(r) + " " + int_to_str(frm) + " " + int_to_str(ci) + " " + int_to_str(cn) + " " + hx)
+        ci = ci + 1
+    }
+    return out
+}
+
+// Reassemble parsed SA4_Y records (all from one soul, one round) into a
+// vector of exactly lw words, or 0: every chunk index exactly once, the
+// same n everywhere, n = ceil(lw/100), full chunks except the last.
+fn sa4w_y_assemble(recs, lw) {
+    if lw < 1 { return 0 }
+    let cn = (lw + 99) / 100
+    if len(recs) != cn { return 0 }
+    let slots = list_new()
+    let i = 0
+    while i < cn {
+        push(slots, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < len(recs) {
+        let rc = recs[i]
+        if rc[4] != cn { return 0 }
+        let ci = rc[3]
+        if slots[ci] != 0 { return 0 }
+        let want = 100
+        if ci == cn - 1 { want = lw - (cn - 1) * 100 }
+        if len(rc[5]) != want { return 0 }
+        list_set(slots, ci, rc[5])
+        i = i + 1
+    }
+    let out = list_new()
+    i = 0
+    while i < cn {
+        _sa4w_append(out, slots[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ---- bitmaps -------------------------------------------------------------------
+
+fn sa4w_bitmap(xs) {
+    let bm = list_new()
+    let i = 0
+    while i < 32 {
+        push(bm, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < len(xs) {
+        let x = xs[i]
+        let bi = int_shr(x - 1, 3)
+        list_set(bm, bi, int_or(bm[bi], int_shl(1, int_and(x - 1, 7))))
+        i = i + 1
+    }
+    return bm
+}
+
+// Ascending x values set in bm, or 0 if a bit above n is set.
+fn sa4w_bitmap_xs(bm, n) {
+    if len(bm) != 32 { return 0 }
+    let out = list_new()
+    let x = 1
+    while x <= 256 {
+        let bit = int_and(int_shr(bm[int_shr(x - 1, 3)], int_and(x - 1, 7)), 1)
+        if bit == 1 {
+            if x > n { return 0 }
+            push(out, x)
+        }
+        x = x + 1
+    }
+    return out
+}
+
+// ---- transcripts -------------------------------------------------------------------
+
+fn sa4w_sig_prefix(tag, fp, r) {
+    let out = list_new()
+    _sa4w_append_str(out, SA4W_SIG_DOMAIN)
+    push(out, len(tag))
+    _sa4w_append_str(out, tag)
+    _sa4w_append(out, fp)
+    _sa4w_put_be(out, r, 8)
+    return out
+}
+
+fn sa4w_adv_transcript(fp, r, id, lw, layout, cpk, spk) {
+    let out = sa4w_sig_prefix("adv", fp, r)
+    _sa4w_put_be(out, id, 4)
+    _sa4w_put_be(out, lw, 4)
+    _sa4w_append(out, layout)
+    _sa4w_append(out, cpk)
+    _sa4w_append(out, spk)
+    return out
+}
+
+// keys: list of [c_pk, s_pk] for the souls in U1, in ascending x.
+fn sa4w_advset_hash(bm_u1, keys) {
+    let out = list_new()
+    _sa4w_append_str(out, SA4W_ADVSET_DOMAIN)
+    _sa4w_append(out, bm_u1)
+    let i = 0
+    while i < len(keys) {
+        _sa4w_append(out, keys[i][0])
+        _sa4w_append(out, keys[i][1])
+        i = i + 1
+    }
+    return sa4w_sha256(out)
+}
+
+fn sa4w_t3_transcript(fp, r, h1, bm_u2, bm_u3) {
+    let out = sa4w_sig_prefix("u3", fp, r)
+    _sa4w_append(out, h1)
+    _sa4w_append(out, bm_u2)
+    _sa4w_append(out, bm_u3)
+    return out
+}
+
+// ---- share plaintext -------------------------------------------------------------------
+
+fn sa4w_share_pt(frm, to, r, x_to, s_share, b_share) {
+    let out = list_new()
+    push(out, 1)
+    _sa4w_put_be(out, frm, 4)
+    _sa4w_put_be(out, to, 4)
+    _sa4w_put_be(out, r, 8)
+    push(out, x_to)
+    _sa4w_append(out, s_share)
+    _sa4w_append(out, b_share)
+    return out
+}
+
+// [from, to, round, x_to, s_share, b_share], or 0.
+fn sa4w_share_pt_parse(pt) {
+    if len(pt) != 82 { return 0 }
+    if pt[0] != 1 { return 0 }
+    let out = list_new()
+    push(out, _sa4w_get_be(pt, 1, 4))
+    push(out, _sa4w_get_be(pt, 5, 4))
+    push(out, _sa4w_get_be(pt, 9, 8))
+    push(out, pt[17])
+    let s = list_new()
+    let b = list_new()
+    let i = 0
+    while i < 32 {
+        push(s, pt[18 + i])
+        push(b, pt[50 + i])
+        i = i + 1
+    }
+    push(out, s)
+    push(out, b)
+    return out
+}

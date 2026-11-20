@@ -1,0 +1,742 @@
+// CrossEngin learning: the SecAgg v4 soul state machine (A2.2a).
+//
+// Purpose
+//   One soul's side of one SecAgg v4 round: double masking after Bonawitz
+//   et al. (CCS 2017), the actively secure variant with signatures, over the
+//   wire format in sa4_wire.nova. Transport-free: the caller feeds incoming
+//   lines to sa4s_handle and sends the lines it returns. Nothing in the chat
+//   or the coordinator uses it yet (A2.2b adds the coordinator, A2.3 the
+//   integration).
+//
+// Round, as seen by soul u (all sums mod 2^32)
+//   R0  SA4_ROUND r fp L layout  ->  fresh X25519 pairs c_u, s_u, self-mask
+//       seed b_u; sign ADV(fp, r, u, L, layout, c_u^PK, s_u^PK); send SA4_ADV.
+//   R1  every SA4_ADV, then SA4_SET r 1 U1  ->  check the batch, verify every
+//       other soul's ADV signature against the roster, then split s_u^SK and
+//       b_u t-of-N (Shamir x = roster x) and send each v in U1 one sealed
+//       share message (sac_enc_key(c_u, c_v, r, u, v)); SA4_END r 1.
+//   R2  the SA4_SHARE lines addressed to u, then SA4_SET r 2 U2  ->  open
+//       and check each, then send y_u = x_u + PRG(b_u)
+//       + sum_{v in U2, v > u} PRG(s_uv) - sum_{v in U2, v < u} PRG(s_uv)
+//       as SA4_Y chunks; SA4_END r 2. b_u, s_u^SK and c_u^SK are wiped.
+//   R3  SA4_SET r 3 U3  ->  sign T3 = (fp, r, H1(U1 keys), U2, U3); SA4_SIG3.
+//   R4  the SA4_SIG3 lines, then SA4_SET r 4 U4  ->  verify signatures in
+//       ascending x until t valid ones over u's own T3 (any invalid one is
+//       a refusal), then for every v in U2 reveal the b-share of v if v is
+//       in the U3 that u signed, else the s-share; never both. SA4_END r 3.
+//   Order of every check: format, round, fingerprint, membership, counts,
+//   duplicates and keys first; signatures (~0.9 s each) last.
+//
+// Refusal
+//   Any check that does not hold ends the round for this soul: the state
+//   becomes ABORTED, every round secret it holds is wiped, it returns one
+//   SA4_ABORT line, and it answers nothing more. sa4s_handle returns
+//   [0, "refused: <reason>", [abort line]].
+//
+// What the caller must do
+//   - Pass an rng context (rng_os_new in production; sa_crypto's
+//     sac_os_rng returns 0 if there is none: then do not run a round).
+//     Draw order is fixed: c key, s key, b_u (32 bytes), Shamir
+//     coefficients for b_u, then for s_u^SK.
+//   - Persist sa4s_done_round after a round and pass it back as last_round
+//     next time, so a coordinator cannot replay an old round id (A2.3).
+//   - Supply the input as u32 words in the public layout, and keep every
+//     word's sum over all souls below 2^32 (fixed-point scaling is the
+//     caller's job).
+//
+// API
+//   sa4s_new(roster, entry, seed, rng, vcache, last_round) -> soul
+//     entry: the soul's roster entry; seed: its 32-byte Ed25519 seed list
+//     (sroster_identity_from_env gives both). vcache: 0, or a list shared
+//     by souls in one process to cache signature checks and signatures
+//     (both are pure functions of public data); tests use it.
+//   sa4s_set_input(soul, words, layout) -> [ok, err]
+//   sa4s_handle(soul, line) -> [ok, err, out_lines]
+//   sa4s_state(soul), sa4s_round(soul), sa4s_done_round(soul)
+//
+// Side channels and hygiene: best effort, as for the primitives
+// (SECAGG_AUDIT.md). ed25519_sign re-derives its scalar from the seed and
+// does not wipe it.
+//
+// CrossEngin dependencies: sa4_wire, sa_crypto, sa_roster, shamir, saprg,
+//   ed25519, rng.
+
+import "./sa4_wire.nova"
+import "./sa_crypto.nova"
+import "./sa_roster.nova"
+import "../safety/shamir.nova"
+import "../safety/saprg.nova"
+import "../safety/ed25519.nova"
+import "../safety/rng.nova"
+
+let SA4S_OBJ_TAG = 7510
+
+let SA4S_ST_IDLE = 0
+let SA4S_ST_ADV = 1
+let SA4S_ST_SHARED = 2
+let SA4S_ST_MASKED = 3
+let SA4S_ST_SIGNED = 4
+let SA4S_ST_DONE = 5
+let SA4S_ST_ABORTED = 6
+
+// Slots.
+let SA4S_TAG = 0
+let SA4S_ROSTER = 1
+let SA4S_SELF = 2
+let SA4S_SEED = 3
+let SA4S_RNG = 4
+let SA4S_VCACHE = 5
+let SA4S_LAST = 6
+let SA4S_STATE = 7
+let SA4S_RND = 8
+let SA4S_X = 9
+let SA4S_LAYOUT = 10
+let SA4S_FP = 11
+let SA4S_CSK = 12
+let SA4S_CPK = 13
+let SA4S_SSK = 14
+let SA4S_SPK = 15
+let SA4S_B = 16
+let SA4S_KEYS = 17        // per roster x: [c_pk, s_pk] or 0 (U1)
+let SA4S_BATCH = 18
+let SA4S_HELD = 19        // per roster x: [s_share, b_share] held about x
+let SA4S_U1 = 20
+let SA4S_U2 = 21
+let SA4S_U3 = 22
+let SA4S_H1 = 23
+let SA4S_T3 = 24
+let SA4S_MYSIG3 = 25
+let SA4S_DONE_R = 26
+let SA4S_SEEDS = 27       // per roster x: pairwise mask seed buffer or 0
+let SA4S_INPUT_OK = 28
+let SA4S_NSLOTS = 29
+
+// ---- small helpers -----------------------------------------------------
+
+fn _sa4s_list(n, v) {
+    let out = list_new()
+    let i = 0
+    while i < n {
+        push(out, v)
+        i = i + 1
+    }
+    return out
+}
+
+fn _sa4s_res(ok, err, outs) {
+    let r = list_new()
+    push(r, ok)
+    push(r, err)
+    push(r, outs)
+    return r
+}
+
+fn _sa4s_eq_list(a, b) {
+    if len(a) != len(b) { return 0 }
+    let acc = 0
+    let i = 0
+    while i < len(a) {
+        acc = int_or(acc, int_xor(a[i], b[i]))
+        i = i + 1
+    }
+    if acc == 0 { return 1 }
+    return 0
+}
+
+fn _sa4s_zero_list(l) {
+    if l == 0 { return 0 }
+    let i = 0
+    while i < len(l) {
+        list_set(l, i, 0)
+        i = i + 1
+    }
+    return 0
+}
+
+fn _sa4s_zero_buf(b) {
+    if b == 0 { return 0 }
+    sac_zero_buf(b, 32)
+    return 0
+}
+
+fn _sa4s_contains(xs, x) {
+    let i = 0
+    while i < len(xs) {
+        if xs[i] == x { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _sa4s_subset(a, b) {
+    let i = 0
+    while i < len(a) {
+        if _sa4s_contains(b, a[i]) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _sa4s_n(st) { return sroster_n(st[1]) }
+fn _sa4s_t(st) { return sroster_t(st[1]) }
+fn _sa4s_my_id(st) { return st[2][0] }
+fn _sa4s_my_x(st) { return st[2][4] }
+
+fn _sa4s_entry_at_x(st, x) {
+    let es = sroster_entries(st[1])
+    return es[x - 1]
+}
+
+// Roster x of id, or 0 if the id is not in the roster.
+fn _sa4s_x_of(st, id) {
+    return sroster_x(st[1], id)
+}
+
+// ---- signature cache --------------------------------------------------------
+
+fn _sa4s_cache_get(st, key) {
+    let vc = st[5]
+    if vc == 0 { return 0 }
+    let i = 0
+    while i < len(vc) {
+        if str_eq_bytes(vc[i][0], key) == 1 { return vc[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _sa4s_cache_put(st, key, val) {
+    let vc = st[5]
+    if vc == 0 { return 0 }
+    let e = list_new()
+    push(e, key)
+    push(e, val)
+    push(vc, e)
+    return 0
+}
+
+fn _sa4s_sign(st, msg) {
+    let pk = st[2][2]
+    let key = "s" + sa4w_hex(pk) + sa4w_hex(sa4w_sha256(msg))
+    let hit = _sa4s_cache_get(st, key)
+    if hit != 0 { return hit[1] }
+    let sig = ed25519_sign(msg, st[3], pk)
+    _sa4s_cache_put(st, key, sig)
+    return sig
+}
+
+fn _sa4s_verify(st, msg, sig, pk) {
+    let key = "v" + sa4w_hex(pk) + sa4w_hex(sig) + sa4w_hex(sa4w_sha256(msg))
+    if _sa4s_cache_get(st, key) != 0 { return 1 }
+    let ok = ed25519_verify(msg, sig, pk)
+    if ok == 1 { _sa4s_cache_put(st, key, 1) }
+    return ok
+}
+
+// ---- construction --------------------------------------------------------------
+
+fn sa4s_new(roster, entry, seed, rng, vcache, last_round) {
+    let st = _sa4s_list(29, 0)
+    list_set(st, 0, 7510)
+    list_set(st, 1, roster)
+    list_set(st, 2, entry)
+    list_set(st, 3, seed)
+    list_set(st, 4, rng)
+    list_set(st, 5, vcache)
+    list_set(st, 6, last_round)
+    list_set(st, 7, 0)
+    list_set(st, 8, 0 - 1)
+    list_set(st, 26, 0 - 1)
+    list_set(st, 11, sa4w_unhex(sroster_fingerprint(roster), 32))
+    return st
+}
+
+fn sa4s_state(st) { return st[7] }
+fn sa4s_round(st) { return st[8] }
+fn sa4s_done_round(st) { return st[26] }
+
+fn sa4s_set_input(st, words, layout) {
+    if st[7] != 0 { return [0, "refused: input can only be set before a round"] }
+    if words == 0 { return [0, "refused: no input"] }
+    let n = len(words)
+    if n < 1 { return [0, "refused: empty input"] }
+    if n > 16777216 { return [0, "refused: input longer than 2^24 words"] }
+    if len(layout) != 32 { return [0, "refused: layout hash must be 32 bytes"] }
+    let i = 0
+    while i < n {
+        let w = words[i]
+        if w < 0 { return [0, "refused: input word out of range"] }
+        if w > 4294967295 { return [0, "refused: input word out of range"] }
+        i = i + 1
+    }
+    list_set(st, 9, words)
+    list_set(st, 10, layout)
+    list_set(st, 28, 1)
+    return [1, ""]
+}
+
+// ---- refusal ----------------------------------------------------------------------
+
+fn _sa4s_wipe(st) {
+    _sa4s_zero_buf(st[12])
+    _sa4s_zero_buf(st[14])
+    _sa4s_zero_buf(st[16])
+    list_set(st, 12, 0)
+    list_set(st, 14, 0)
+    list_set(st, 16, 0)
+    let held = st[19]
+    if held != 0 {
+        let i = 0
+        while i < len(held) {
+            if held[i] != 0 {
+                _sa4s_zero_list(held[i][0])
+                _sa4s_zero_list(held[i][1])
+            }
+            i = i + 1
+        }
+    }
+    list_set(st, 19, 0)
+    let seeds = st[27]
+    if seeds != 0 {
+        let j = 0
+        while j < len(seeds) {
+            _sa4s_zero_buf(seeds[j])
+            j = j + 1
+        }
+    }
+    list_set(st, 27, 0)
+    list_set(st, 18, 0)
+    return 0
+}
+
+fn _sa4s_refuse(st, code, why) {
+    _sa4s_wipe(st)
+    list_set(st, 7, 6)
+    let outs = list_new()
+    let r = st[8]
+    if r < 0 { r = 0 }
+    push(outs, sa4w_fmt_abort(r, _sa4s_my_id(st), code))
+    return _sa4s_res(0, "refused: " + why, outs)
+}
+
+// ---- R0: SA4_ROUND --------------------------------------------------------------
+
+fn _sa4s_on_round(st, rec) {
+    let r = rec[1]
+    list_set(st, 8, r)
+    if st[28] != 1 { return _sa4s_refuse(st, "no_input", "no input set for the round") }
+    if _sa4s_eq_list(rec[2], st[11]) == 0 { return _sa4s_refuse(st, "bad_fp", "roster fingerprint differs") }
+    if r <= st[6] { return _sa4s_refuse(st, "stale_round", "round " + int_to_str(r) + " is not after the last round") }
+    if rec[3] != len(st[9]) { return _sa4s_refuse(st, "bad_len", "vector length differs from the input") }
+    if _sa4s_eq_list(rec[4], st[10]) == 0 { return _sa4s_refuse(st, "bad_layout", "vector layout differs") }
+    let csk = alloc(33)
+    let cpk = alloc(33)
+    let ssk = alloc(33)
+    let spk = alloc(33)
+    let b = alloc(33)
+    let k1 = sac_x25519_keygen(st[4], csk, cpk)
+    if k1 != 1 { return _sa4s_refuse(st, "rng", "key generation refused") }
+    list_set(st, 12, csk)
+    let k2 = sac_x25519_keygen(st[4], ssk, spk)
+    if k2 != 1 { return _sa4s_refuse(st, "rng", "key generation refused") }
+    list_set(st, 14, ssk)
+    let kb = rng_read(st[4], b, 32)
+    if kb != 1 { return _sa4s_refuse(st, "rng", "rng refused") }
+    list_set(st, 16, b)
+    let cpl = sac_buf_to_list(cpk, 32)
+    let spl = sac_buf_to_list(spk, 32)
+    if _sa4s_eq_list(cpl, spl) == 1 { return _sa4s_refuse(st, "rng", "identical key pairs") }
+    list_set(st, 13, cpl)
+    list_set(st, 15, spl)
+    let msg = sa4w_adv_transcript(st[11], r, _sa4s_my_id(st), len(st[9]), st[10], cpl, spl)
+    let sig = _sa4s_sign(st, msg)
+    list_set(st, 7, 1)
+    list_set(st, 18, list_new())
+    let outs = list_new()
+    push(outs, sa4w_fmt_adv(r, _sa4s_my_id(st), cpl, spl, sig))
+    return _sa4s_res(1, "", outs)
+}
+
+// ---- R1: ADV batch + SET 1 --------------------------------------------------------
+
+fn _sa4s_on_u1(st, bm) {
+    let n = _sa4s_n(st)
+    let t = _sa4s_t(st)
+    let r = st[8]
+    let me = _sa4s_my_id(st)
+    let u1 = sa4w_bitmap_xs(bm, n)
+    if u1 == 0 { return _sa4s_refuse(st, "bad_set", "U1 bitmap has bits above N") }
+    if len(u1) < t { return _sa4s_refuse(st, "u1_small", "|U1| below the threshold") }
+    if _sa4s_contains(u1, _sa4s_my_x(st)) == 0 { return _sa4s_refuse(st, "not_in_u1", "this soul is not in U1") }
+    let batch = st[18]
+    if len(batch) != len(u1) { return _sa4s_refuse(st, "bad_set", "ADV lines do not match U1") }
+    let keys = _sa4s_list(n, 0)
+    let i = 0
+    while i < len(batch) {
+        let rec = batch[i]
+        let x = _sa4s_x_of(st, rec[2])
+        if x == 0 { return _sa4s_refuse(st, "bad_adv", "ADV from an id not in the roster") }
+        if _sa4s_contains(u1, x) == 0 { return _sa4s_refuse(st, "bad_set", "ADV from a soul outside U1") }
+        if keys[x - 1] != 0 { return _sa4s_refuse(st, "bad_adv", "two ADV lines from one soul") }
+        if _sa4s_eq_list(rec[3], rec[4]) == 1 { return _sa4s_refuse(st, "dup_key", "a soul advertised c_pk == s_pk") }
+        let kp = list_new()
+        push(kp, rec[3])
+        push(kp, rec[4])
+        list_set(keys, x - 1, kp)
+        i = i + 1
+    }
+    // Own ADV must come back unchanged.
+    let mine = keys[_sa4s_my_x(st) - 1]
+    if _sa4s_eq_list(mine[0], st[13]) == 0 { return _sa4s_refuse(st, "bad_adv", "own ADV altered") }
+    if _sa4s_eq_list(mine[1], st[15]) == 0 { return _sa4s_refuse(st, "bad_adv", "own ADV altered") }
+    // All 2|U1| public keys pairwise distinct.
+    let all = list_new()
+    i = 0
+    while i < len(u1) {
+        let kq = keys[u1[i] - 1]
+        push(all, kq[0])
+        push(all, kq[1])
+        i = i + 1
+    }
+    i = 0
+    while i < len(all) {
+        let j = i + 1
+        while j < len(all) {
+            if _sa4s_eq_list(all[i], all[j]) == 1 { return _sa4s_refuse(st, "dup_key", "two advertised keys are equal") }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Key agreement with every peer (refuses low-order keys) before any
+    // signature work; keep the pairwise mask seeds.
+    let seeds = _sa4s_list(n, 0)
+    list_set(st, 27, seeds)
+    i = 0
+    while i < len(u1) {
+        let vx = u1[i]
+        if vx != _sa4s_my_x(st) {
+            let v = _sa4s_entry_at_x(st, vx)[0]
+            let kv = keys[vx - 1]
+            let ek = sac_enc_key(st[12], sac_list_to_buf(kv[0]), r, me, v)
+            if ek[1] != 1 { return _sa4s_refuse(st, "bad_key", "key agreement with soul " + int_to_str(v) + " refused") }
+            let ms = sac_mask_seed(st[14], sac_list_to_buf(kv[1]), r, me, v)
+            if ms[1] != 1 { return _sa4s_refuse(st, "bad_key", "mask key agreement with soul " + int_to_str(v) + " refused") }
+            list_set(seeds, vx - 1, ms[0])
+        }
+        i = i + 1
+    }
+    // Signatures, last.
+    i = 0
+    while i < len(batch) {
+        let rec2 = batch[i]
+        if rec2[2] != me {
+            let x2 = _sa4s_x_of(st, rec2[2])
+            let pk = _sa4s_entry_at_x(st, x2)[2]
+            let msg = sa4w_adv_transcript(st[11], r, rec2[2], len(st[9]), st[10], rec2[3], rec2[4])
+            if _sa4s_verify(st, msg, rec2[5], pk) != 1 {
+                return _sa4s_refuse(st, "bad_sig", "ADV signature of soul " + int_to_str(rec2[2]) + " does not verify")
+            }
+        }
+        i = i + 1
+    }
+    list_set(st, 17, keys)
+    list_set(st, 20, u1)
+    // H1 over the U1 keys, ascending x.
+    let kl = list_new()
+    i = 0
+    while i < len(u1) {
+        push(kl, keys[u1[i] - 1])
+        i = i + 1
+    }
+    list_set(st, 23, sa4w_advset_hash(bm, kl))
+    // Shares: coefficients for b_u first, then s_u^SK.
+    let bsh = shamir_split(st[4], st[16], 32, t, n)
+    if bsh == 0 { return _sa4s_refuse(st, "rng", "share split refused") }
+    let ssh = shamir_split(st[4], st[14], 32, t, n)
+    if ssh == 0 { return _sa4s_refuse(st, "rng", "share split refused") }
+    let held = _sa4s_list(n, 0)
+    list_set(st, 19, held)
+    let outs = list_new()
+    let sent = 0
+    i = 0
+    while i < n {
+        let x3 = i + 1
+        let sbuf = shamir_share_buf(ssh[i])
+        let bbuf = shamir_share_buf(bsh[i])
+        if _sa4s_contains(u1, x3) == 1 {
+            let sl = sac_buf_to_list(sbuf, 32)
+            let bl = sac_buf_to_list(bbuf, 32)
+            if x3 == _sa4s_my_x(st) {
+                let own = list_new()
+                push(own, sl)
+                push(own, bl)
+                list_set(held, i, own)
+            } else {
+                let v3 = _sa4s_entry_at_x(st, x3)[0]
+                let pt = sa4w_share_pt(me, v3, r, x3, sl, bl)
+                let ek3 = sac_enc_key(st[12], sac_list_to_buf(keys[i][0]), r, me, v3)
+                let ptb = sac_list_to_buf(pt)
+                let w = sac_share_seal(ek3[0], r, me, v3, ptb, 82)
+                sac_zero_buf(ptb, 82)
+                _sa4s_zero_list(pt)
+                _sa4s_zero_list(sl)
+                _sa4s_zero_list(bl)
+                sac_zero_buf(ek3[0], 32)
+                push(outs, sa4w_fmt_share(r, me, v3, sac_buf_to_list(w[0], w[1])))
+                sent = sent + 1
+            }
+        }
+        sac_zero_buf(sbuf, 32)
+        sac_zero_buf(bbuf, 32)
+        i = i + 1
+    }
+    push(outs, sa4w_fmt_end(r, 1, me, sent))
+    list_set(st, 18, list_new())
+    list_set(st, 7, 2)
+    return _sa4s_res(1, "", outs)
+}
+
+// ---- R2: SHARE batch + SET 2 --------------------------------------------------------
+
+fn _sa4s_on_u2(st, bm) {
+    let n = _sa4s_n(st)
+    let t = _sa4s_t(st)
+    let r = st[8]
+    let me = _sa4s_my_id(st)
+    let mx = _sa4s_my_x(st)
+    let u2 = sa4w_bitmap_xs(bm, n)
+    if u2 == 0 { return _sa4s_refuse(st, "bad_set", "U2 bitmap has bits above N") }
+    if _sa4s_subset(u2, st[20]) == 0 { return _sa4s_refuse(st, "bad_set", "U2 is not a subset of U1") }
+    if len(u2) < t { return _sa4s_refuse(st, "u2_small", "|U2| below the threshold") }
+    if _sa4s_contains(u2, mx) == 0 { return _sa4s_refuse(st, "not_in_u2", "this soul is not in U2") }
+    let batch = st[18]
+    if len(batch) != len(u2) - 1 { return _sa4s_refuse(st, "bad_share", "share lines do not match U2") }
+    let got = _sa4s_list(n, 0)
+    let held = st[19]
+    let i = 0
+    while i < len(batch) {
+        let rec = batch[i]
+        let v = rec[2]
+        let vx = _sa4s_x_of(st, v)
+        if vx == 0 { return _sa4s_refuse(st, "bad_share", "share from an id not in the roster") }
+        if rec[3] != me { return _sa4s_refuse(st, "bad_share", "share addressed to another soul") }
+        if _sa4s_contains(u2, vx) == 0 { return _sa4s_refuse(st, "bad_share", "share from a soul outside U2") }
+        if vx == mx { return _sa4s_refuse(st, "bad_share", "share from this soul to itself") }
+        if got[vx - 1] != 0 { return _sa4s_refuse(st, "bad_share", "two shares from one soul") }
+        list_set(got, vx - 1, 1)
+        let ek = sac_enc_key(st[12], sac_list_to_buf(st[17][vx - 1][0]), r, v, me)
+        if ek[1] != 1 { return _sa4s_refuse(st, "bad_key", "key agreement refused") }
+        let wb = sac_list_to_buf(rec[4])
+        let op = sac_share_open(ek[0], r, v, me, wb, 98)
+        sac_zero_buf(ek[0], 32)
+        if op[2] != 1 { return _sa4s_refuse(st, "bad_share", "share from soul " + int_to_str(v) + " does not open") }
+        if op[1] != 82 { return _sa4s_refuse(st, "bad_share", "share plaintext has the wrong length") }
+        let ptl = sac_buf_to_list(op[0], 82)
+        sac_zero_buf(op[0], 82)
+        let p = sa4w_share_pt_parse(ptl)
+        _sa4s_zero_list(ptl)
+        if p == 0 { return _sa4s_refuse(st, "bad_share", "share plaintext malformed") }
+        let fields_ok = 1
+        if p[0] != v { fields_ok = 0 }
+        if p[1] != me { fields_ok = 0 }
+        if p[2] != r { fields_ok = 0 }
+        if p[3] != mx { fields_ok = 0 }
+        if fields_ok == 0 {
+            _sa4s_zero_list(p[4])
+            _sa4s_zero_list(p[5])
+            return _sa4s_refuse(st, "bad_share", "share plaintext ids, round or x differ")
+        }
+        let hv = list_new()
+        push(hv, p[4])
+        push(hv, p[5])
+        list_set(held, vx - 1, hv)
+        i = i + 1
+    }
+    // Masked input.
+    let y = saprg_mask(st[9], st[16], 1)
+    if y == 0 { return _sa4s_refuse(st, "mask", "mask expansion refused") }
+    i = 0
+    while i < len(u2) {
+        let ox = u2[i]
+        if ox != mx {
+            let ov = _sa4s_entry_at_x(st, ox)[0]
+            let sg = 1
+            if ov < me { sg = 0 - 1 }
+            let y2 = saprg_mask(y, st[27][ox - 1], sg)
+            if y2 == 0 { return _sa4s_refuse(st, "mask", "mask expansion refused") }
+            y = y2
+        }
+        i = i + 1
+    }
+    list_set(st, 21, u2)
+    // b_u, s_u^SK, c_u^SK and the mask seeds are no longer needed.
+    _sa4s_zero_buf(st[12])
+    _sa4s_zero_buf(st[14])
+    _sa4s_zero_buf(st[16])
+    list_set(st, 12, 0)
+    list_set(st, 14, 0)
+    list_set(st, 16, 0)
+    let seeds = st[27]
+    let j = 0
+    while j < len(seeds) {
+        _sa4s_zero_buf(seeds[j])
+        j = j + 1
+    }
+    list_set(st, 27, 0)
+    let outs = sa4w_fmt_y_lines(r, me, y)
+    let cnt = len(outs)
+    push(outs, sa4w_fmt_end(r, 2, me, cnt))
+    list_set(st, 18, list_new())
+    list_set(st, 7, 3)
+    return _sa4s_res(1, "", outs)
+}
+
+// ---- R3: SET 3 ----------------------------------------------------------------------
+
+fn _sa4s_on_u3(st, bm) {
+    let n = _sa4s_n(st)
+    let t = _sa4s_t(st)
+    let r = st[8]
+    let u3 = sa4w_bitmap_xs(bm, n)
+    if u3 == 0 { return _sa4s_refuse(st, "bad_set", "U3 bitmap has bits above N") }
+    if _sa4s_subset(u3, st[21]) == 0 { return _sa4s_refuse(st, "bad_set", "U3 is not a subset of U2") }
+    if len(u3) < t { return _sa4s_refuse(st, "u3_small", "|U3| below the threshold") }
+    if _sa4s_contains(u3, _sa4s_my_x(st)) == 0 { return _sa4s_refuse(st, "not_in_u3", "this soul is not in U3") }
+    let t3 = sa4w_t3_transcript(st[11], r, st[23], sa4w_bitmap(st[21]), bm)
+    let sig = _sa4s_sign(st, t3)
+    list_set(st, 22, u3)
+    list_set(st, 24, t3)
+    list_set(st, 25, sig)
+    list_set(st, 7, 4)
+    list_set(st, 18, list_new())
+    let outs = list_new()
+    push(outs, sa4w_fmt_sig3(r, _sa4s_my_id(st), sig))
+    return _sa4s_res(1, "", outs)
+}
+
+// ---- R4: SIG3 batch + SET 4 --------------------------------------------------------
+
+fn _sa4s_on_u4(st, bm) {
+    let n = _sa4s_n(st)
+    let t = _sa4s_t(st)
+    let r = st[8]
+    let me = _sa4s_my_id(st)
+    let mx = _sa4s_my_x(st)
+    let u3 = st[22]
+    let u4 = sa4w_bitmap_xs(bm, n)
+    if u4 == 0 { return _sa4s_refuse(st, "bad_set", "U4 bitmap has bits above N") }
+    if _sa4s_subset(u4, u3) == 0 { return _sa4s_refuse(st, "bad_set", "U4 is not a subset of U3") }
+    if len(u4) < t { return _sa4s_refuse(st, "u4_small", "fewer than t consistency signatures") }
+    if _sa4s_contains(u4, mx) == 0 { return _sa4s_refuse(st, "not_in_u4", "this soul is not in U4") }
+    let batch = st[18]
+    if len(batch) != len(u4) { return _sa4s_refuse(st, "bad_sig3", "signature lines do not match U4") }
+    let sigs = _sa4s_list(n, 0)
+    let i = 0
+    while i < len(batch) {
+        let rec = batch[i]
+        let x = _sa4s_x_of(st, rec[2])
+        if x == 0 { return _sa4s_refuse(st, "bad_sig3", "signature from an id not in the roster") }
+        if _sa4s_contains(u4, x) == 0 { return _sa4s_refuse(st, "bad_sig3", "signature from a soul outside U4") }
+        if sigs[x - 1] != 0 { return _sa4s_refuse(st, "bad_sig3", "two signatures from one soul") }
+        list_set(sigs, x - 1, rec[3])
+        i = i + 1
+    }
+    if _sa4s_eq_list(sigs[mx - 1], st[25]) == 0 { return _sa4s_refuse(st, "bad_sig3", "own signature altered") }
+    // Verify in ascending x until t valid (own signature counts).
+    let valid = 1
+    i = 0
+    while i < len(u4) {
+        let vx = u4[i]
+        if valid < t {
+            if vx != mx {
+                let pk = _sa4s_entry_at_x(st, vx)[2]
+                if _sa4s_verify(st, st[24], sigs[vx - 1], pk) != 1 {
+                    return _sa4s_refuse(st, "bad_sig3", "consistency signature of soul " + int_to_str(_sa4s_entry_at_x(st, vx)[0]) + " does not verify")
+                }
+                valid = valid + 1
+            }
+        }
+        i = i + 1
+    }
+    if valid < t { return _sa4s_refuse(st, "bad_sig3", "fewer than t valid consistency signatures") }
+    // Reveal: b-share for v in U3, s-share for v in U2 \ U3; decided by the
+    // U3 this soul signed.
+    let held = st[19]
+    let u2 = st[21]
+    let outs = list_new()
+    i = 0
+    while i < len(u2) {
+        let ox = u2[i]
+        let hv = held[ox - 1]
+        if hv == 0 { return _sa4s_refuse(st, "internal", "missing held share") }
+        let about = _sa4s_entry_at_x(st, ox)[0]
+        if _sa4s_contains(u3, ox) == 1 {
+            push(outs, sa4w_fmt_reveal(r, me, about, 0, hv[1]))
+        } else {
+            push(outs, sa4w_fmt_reveal(r, me, about, 1, hv[0]))
+        }
+        i = i + 1
+    }
+    let cnt = len(outs)
+    push(outs, sa4w_fmt_end(r, 3, me, cnt))
+    _sa4s_wipe(st)
+    list_set(st, 26, r)
+    list_set(st, 7, 5)
+    return _sa4s_res(1, "", outs)
+}
+
+// ---- dispatch -------------------------------------------------------------------------
+
+fn sa4s_handle(st, line) {
+    let state = st[7]
+    if state == 6 { return _sa4s_res(0, "refused: round already aborted", list_new()) }
+    if state == 5 { return _sa4s_refuse(st, "unexpected", "line after the round finished") }
+    let rec = sa4w_parse(line)
+    if rec == 0 { return _sa4s_refuse(st, "bad_line", "malformed line") }
+    let ev = rec[0]
+    if state == 0 {
+        if ev != 40 { return _sa4s_refuse(st, "unexpected", "expected SA4_ROUND") }
+        return _sa4s_on_round(st, rec)
+    }
+    if rec[1] != st[8] { return _sa4s_refuse(st, "bad_round", "line for another round") }
+    if state == 1 {
+        if ev == 41 {
+            push(st[18], rec)
+            if len(st[18]) > _sa4s_n(st) { return _sa4s_refuse(st, "bad_adv", "more ADV lines than souls") }
+            return _sa4s_res(1, "", list_new())
+        }
+        if ev == 42 {
+            if rec[2] == 1 { return _sa4s_on_u1(st, rec[3]) }
+        }
+        return _sa4s_refuse(st, "unexpected", "unexpected line while collecting ADV")
+    }
+    if state == 2 {
+        if ev == 43 {
+            push(st[18], rec)
+            if len(st[18]) > _sa4s_n(st) { return _sa4s_refuse(st, "bad_share", "more share lines than souls") }
+            return _sa4s_res(1, "", list_new())
+        }
+        if ev == 42 {
+            if rec[2] == 2 { return _sa4s_on_u2(st, rec[3]) }
+        }
+        return _sa4s_refuse(st, "unexpected", "unexpected line while collecting shares")
+    }
+    if state == 3 {
+        if ev == 42 {
+            if rec[2] == 3 { return _sa4s_on_u3(st, rec[3]) }
+        }
+        return _sa4s_refuse(st, "unexpected", "expected SA4_SET 3")
+    }
+    if state == 4 {
+        if ev == 45 {
+            push(st[18], rec)
+            if len(st[18]) > _sa4s_n(st) { return _sa4s_refuse(st, "bad_sig3", "more signatures than souls") }
+            return _sa4s_res(1, "", list_new())
+        }
+        if ev == 42 {
+            if rec[2] == 4 { return _sa4s_on_u4(st, rec[3]) }
+        }
+        return _sa4s_refuse(st, "unexpected", "unexpected line while collecting signatures")
+    }
+    return _sa4s_refuse(st, "internal", "unknown state")
+}
