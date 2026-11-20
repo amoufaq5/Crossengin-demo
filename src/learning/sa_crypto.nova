@@ -1,0 +1,331 @@
+// CrossEngin learning: key agreement, key derivation and share encryption
+// for SecAgg v4 (Bonawitz et al. 2017 double masking, plan item A2).
+//
+// Purpose
+//   The small set of crypto calls the v4 soul and coordinator need, built on
+//   the audited primitives in src/safety. Nothing here is wired into the
+//   chat, the coordinator or v3n-sa (src/learning/secure_aggregation.nova)
+//   yet; A2.2 onwards use it.
+//
+//   - Key pairs: every round each soul makes two fresh X25519 key pairs,
+//     (c_u^SK, c_u^PK) for encrypting shares and (s_u^SK, s_u^PK) for masks.
+//   - Agreement: KA(sk_u, pk_v) = HKDF-SHA256(salt = empty, IKM =
+//     X25519(sk_u, pk_v), info, 32 bytes). An all-zero X25519 output
+//     (low-order peer key) is refused.
+//   - info = "crossengin/v4-sa/v1" || u8(len(purpose)) || purpose
+//            || u64be(round) || u32be(id_a) || u32be(id_b)
+//     The purpose is length-prefixed and every later field is fixed width,
+//     so no two (purpose, round, ids) tuples share an info string.
+//   - Mask seeds (purpose "mask") are symmetric: both souls of a pair must
+//     derive the same s_uv, so sac_mask_seed orders the ids (min, max).
+//   - Share keys (purpose "enc") are directional: sac_enc_key binds
+//     (sender, receiver). u -> v and v -> u therefore use different keys,
+//     although they come from the same X25519 secret. This is what makes
+//     the fixed nonce below safe; with one shared key, the two ciphertexts
+//     of a pair would reuse the ChaCha20 keystream and the Poly1305 key.
+//   - Share encryption: ChaCha20-Poly1305 (RFC 8439) with a zero nonce and
+//     AAD = "crossengin/v4-sa/v1/share" || u64be(round) || u32be(sender)
+//     || u32be(receiver). Wire format = ciphertext || 16-byte tag.
+//     NONCE RULE: an enc key encrypts exactly ONE message. That holds as
+//     long as c_u is fresh every round, the round is in the info, and a soul
+//     seals one share message per (round, receiver). The A2.2 state machine
+//     must keep it that way.
+//
+// Byte conventions: (buf, len) pairs as in src/safety; keys are 32-byte
+// buffers. Results that can fail are lists whose last element is ok (1/0).
+// Ids are 0 .. 2^32-1; rounds are 0 .. 2^62-1 (NOVA's positive int range).
+//
+// Public API
+//   sac_x25519_keygen(rng_ctx, priv_out, pub_out) -> 1 / 0
+//   sac_os_rng()                                  -> rng ctx, or 0 (refuse)
+//   sac_x25519_pub(pub_out, priv)                 -> 1 / 0 (pub from a key)
+//   sac_kdf_info(purpose, round, id_a, id_b)      -> [buf, len] or 0
+//   sac_agree(priv, peer_pub, purpose, round, id_a, id_b) -> [key32, ok]
+//   sac_mask_seed(s_priv, peer_s_pub, round, my_id, peer_id) -> [key32, ok]
+//   sac_enc_key(c_priv, peer_c_pub, round, sender, receiver) -> [key32, ok]
+//   sac_share_aad(round, sender, receiver)        -> [buf, len] or 0
+//   sac_share_seal(key, round, sender, receiver, pt, pt_len) -> [wire, len]
+//                                                    or 0
+//   sac_share_open(key, round, sender, receiver, wire, wire_len)
+//                                                 -> [pt, pt_len, ok]
+//   sac_buf_to_list(buf, n), sac_list_to_buf(lst), sac_ct_eq(a, b, n),
+//   sac_zero_buf(buf, n), sac_hex(buf, n)
+//
+// Side channels: X25519 (Montgomery ladder with fe_cswap), HKDF and the
+// AEAD are the existing src/safety implementations, with their documented
+// best-effort constant-time properties. Secrets are wiped where this module
+// creates them (the raw X25519 output).
+//
+// Test parity: tests/unit/test_sa_crypto.nova, against RFC 7748 / 5869 /
+// 8439 and an independent Python reference for the info/AAD formats.
+//
+// NOVA dependencies: builtins.
+// CrossEngin dependencies: src/safety/{x25519,hkdf_sha256,
+//   chacha20_poly1305,rng}.nova.
+
+import "../safety/x25519.nova"
+import "../safety/hkdf_sha256.nova"
+import "../safety/chacha20_poly1305.nova"
+import "../safety/rng.nova"
+
+let SAC_KEY_LEN = 32
+let SAC_TAG_LEN = 16
+let SAC_DOMAIN = "crossengin/v4-sa/v1"
+let SAC_SHARE_AAD_DOMAIN = "crossengin/v4-sa/v1/share"
+let SAC_PURPOSE_MASK = "mask"
+let SAC_PURPOSE_ENC = "enc"
+let SAC_MAX_ID = 4294967295            // 2^32 - 1
+
+// ---- byte helpers -------------------------------------------------------
+
+fn sac_zero_buf(buf, n) {
+    let i = 0
+    while i < n {
+        store8(buf + i, 0)
+        i = i + 1
+    }
+    return 1
+}
+
+fn sac_buf_to_list(buf, n) {
+    let out = list_new()
+    let i = 0
+    while i < n {
+        push(out, load8(buf + i))
+        i = i + 1
+    }
+    return out
+}
+
+fn sac_list_to_buf(lst) {
+    let n = len(lst)
+    let buf = alloc(n + 1)
+    let i = 0
+    while i < n {
+        store8(buf + i, int_and(lst[i], 255))
+        i = i + 1
+    }
+    store8(buf + n, 0)
+    return buf
+}
+
+// Constant-time equality over n bytes (n is public). 1 if equal.
+fn sac_ct_eq(a, b, n) {
+    let acc = 0
+    let i = 0
+    while i < n {
+        acc = int_or(acc, int_xor(load8(a + i), load8(b + i)))
+        i = i + 1
+    }
+    if acc == 0 { return 1 }
+    return 0
+}
+
+fn sac_hex(buf, n) {
+    return cc_hex_encode_buf(buf, n)
+}
+
+fn _sac_put_str(buf, off, s) {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        store8(buf + off + i, char_at(s, i))
+        i = i + 1
+    }
+    return off + n
+}
+
+fn _sac_put_be(buf, off, v, nbytes) {
+    let i = 0
+    while i < nbytes {
+        let shift = int_shl(nbytes - 1 - i, 3)
+        store8(buf + off + i, int_and(int_shr(v, shift), 255))
+        i = i + 1
+    }
+    return off + nbytes
+}
+
+fn _sac_id_ok(x) {
+    if x < 0 { return 0 }
+    if x > 4294967295 { return 0 }
+    return 1
+}
+
+fn _sac_pair(a, b) {
+    let out = list_new()
+    push(out, a)
+    push(out, b)
+    return out
+}
+
+// ---- key pairs ------------------------------------------------------------
+
+fn _sac_all_zero(buf, n) {
+    let acc = 0
+    let i = 0
+    while i < n {
+        acc = int_or(acc, load8(buf + i))
+        i = i + 1
+    }
+    if acc == 0 { return 1 }
+    return 0
+}
+
+// pub = X25519(priv, 9). Refuses an all-zero result.
+fn sac_x25519_pub(pub_out, priv) {
+    if x25519_base(pub_out, priv) != 1 { return 0 }
+    if _sac_all_zero(pub_out, 32) == 1 { return 0 }
+    return 1
+}
+
+// Fresh key pair from rng_ctx. The private key is stored unclamped; X25519
+// clamps it on every use. Returns 0 (and wipes both outputs) on failure.
+fn sac_x25519_keygen(rng_ctx, priv_out, pub_out) {
+    if rng_read(rng_ctx, priv_out, 32) != 1 {
+        sac_zero_buf(priv_out, 32)
+        sac_zero_buf(pub_out, 32)
+        return 0
+    }
+    if sac_x25519_pub(pub_out, priv_out) != 1 {
+        sac_zero_buf(priv_out, 32)
+        sac_zero_buf(pub_out, 32)
+        return 0
+    }
+    return 1
+}
+
+// An OS-entropy RNG context, or 0 when the OS RNG is unavailable. Callers
+// must refuse to run a round on 0 (fail closed); there is no fallback.
+fn sac_os_rng() {
+    let ctx = list_new()
+    if rng_os_new(ctx) != 1 { return 0 }
+    return ctx
+}
+
+// ---- key derivation ---------------------------------------------------------
+
+fn sac_kdf_info(purpose, round, id_a, id_b) {
+    let plen = len(purpose)
+    if plen < 1 { return 0 }
+    if plen > 255 { return 0 }
+    if round < 0 { return 0 }
+    if _sac_id_ok(id_a) == 0 { return 0 }
+    if _sac_id_ok(id_b) == 0 { return 0 }
+    let n = len(SAC_DOMAIN) + 1 + plen + 8 + 4 + 4
+    let buf = alloc(n + 1)
+    let off = _sac_put_str(buf, 0, SAC_DOMAIN)
+    store8(buf + off, plen)
+    off = off + 1
+    off = _sac_put_str(buf, off, purpose)
+    off = _sac_put_be(buf, off, round, 8)
+    off = _sac_put_be(buf, off, id_a, 4)
+    off = _sac_put_be(buf, off, id_b, 4)
+    store8(buf + n, 0)
+    return _sac_pair(buf, n)
+}
+
+fn sac_agree(priv, peer_pub, purpose, round, id_a, id_b) {
+    let info = sac_kdf_info(purpose, round, id_a, id_b)
+    if info == 0 { return _sac_pair(0, 0) }
+    let shared = alloc(33)
+    let ok = x25519(shared, priv, peer_pub)
+    if ok != 1 {
+        sac_zero_buf(shared, 32)
+        return _sac_pair(0, 0)
+    }
+    let okm = hkdf_sha256(0, 0, shared, 32, info[0], info[1], 32)
+    sac_zero_buf(shared, 32)
+    if okm[1] != 32 { return _sac_pair(0, 0) }
+    return _sac_pair(okm[0], 1)
+}
+
+// Symmetric pairwise mask seed s_uv: both souls get the same 32 bytes.
+fn sac_mask_seed(s_priv, peer_s_pub, round, my_id, peer_id) {
+    if my_id == peer_id { return _sac_pair(0, 0) }
+    let lo = my_id
+    let hi = peer_id
+    if peer_id < my_id {
+        lo = peer_id
+        hi = my_id
+    }
+    return sac_agree(s_priv, peer_s_pub, SAC_PURPOSE_MASK, round, lo, hi)
+}
+
+// Directional share-encryption key for sender -> receiver.
+fn sac_enc_key(c_priv, peer_c_pub, round, sender, receiver) {
+    if sender == receiver { return _sac_pair(0, 0) }
+    return sac_agree(c_priv, peer_c_pub, SAC_PURPOSE_ENC, round, sender, receiver)
+}
+
+// ---- share encryption -------------------------------------------------------
+
+fn sac_share_aad(round, sender, receiver) {
+    if round < 0 { return 0 }
+    if _sac_id_ok(sender) == 0 { return 0 }
+    if _sac_id_ok(receiver) == 0 { return 0 }
+    let n = len(SAC_SHARE_AAD_DOMAIN) + 8 + 4 + 4
+    let buf = alloc(n + 1)
+    let off = _sac_put_str(buf, 0, SAC_SHARE_AAD_DOMAIN)
+    off = _sac_put_be(buf, off, round, 8)
+    off = _sac_put_be(buf, off, sender, 4)
+    off = _sac_put_be(buf, off, receiver, 4)
+    store8(buf + n, 0)
+    return _sac_pair(buf, n)
+}
+
+fn _sac_zero_nonce() {
+    let nonce = alloc(13)
+    sac_zero_buf(nonce, 13)
+    return nonce
+}
+
+fn sac_share_seal(key, round, sender, receiver, pt, pt_len) {
+    if key == 0 { return 0 }
+    if pt_len < 0 { return 0 }
+    let aad = sac_share_aad(round, sender, receiver)
+    if aad == 0 { return 0 }
+    let r = caead_seal_buf(key, _sac_zero_nonce(), aad[0], aad[1], pt, pt_len)
+    let ct = r[0]
+    let tag = r[2]
+    let wlen = pt_len + 16
+    let wire = alloc(wlen + 1)
+    let i = 0
+    while i < pt_len {
+        store8(wire + i, load8(ct + i))
+        i = i + 1
+    }
+    i = 0
+    while i < 16 {
+        store8(wire + pt_len + i, load8(tag + i))
+        i = i + 1
+    }
+    store8(wire + wlen, 0)
+    return _sac_pair(wire, wlen)
+}
+
+fn _sac_open_refused() {
+    let empty = alloc(1)
+    store8(empty, 0)
+    let out = list_new()
+    push(out, empty)
+    push(out, 0)
+    push(out, 0)
+    return out
+}
+
+fn sac_share_open(key, round, sender, receiver, wire, wire_len) {
+    if key == 0 { return _sac_open_refused() }
+    if wire == 0 { return _sac_open_refused() }
+    if wire_len < 16 { return _sac_open_refused() }
+    let aad = sac_share_aad(round, sender, receiver)
+    if aad == 0 { return _sac_open_refused() }
+    let ct_len = wire_len - 16
+    let tag = alloc(17)
+    let i = 0
+    while i < 16 {
+        store8(tag + i, load8(wire + ct_len + i))
+        i = i + 1
+    }
+    store8(tag + 16, 0)
+    return caead_open_buf(key, _sac_zero_nonce(), aad[0], aad[1], wire, ct_len, tag)
+}
