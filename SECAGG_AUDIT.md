@@ -927,7 +927,10 @@ duplicates and keys, then signatures. The soul refuses all of these:
   - |U4| < t;
   - a missing or duplicate signature;
   - its own signature coming back altered;
-  - any invalid signature, including one over a different transcript.
+  - an invalid signature among those checked, including one over a
+    different transcript. The soul checks in ascending x and stops at t
+    valid ones (its own counts); later signatures are not checked, because
+    t valid signatures over one T3 are what the protocol needs.
 - **Any batch:** lines for another round, or a line that does not fit the
   current state.
 
@@ -941,24 +944,36 @@ duplicates and keys, then signatures. The soul refuses all of these:
 
 | Test | Checks | What it covers |
 |---|---|---|
-| `test_sa4_wire` | 92 | Parsing, formatting, chunking and bitmaps. Transcript digests are checked against Python. |
-| `test_sa4_soul` | 14 | An honest round at N = 3. |
-| `test_sa4_soul_dropout` | 7 | A dropout after shares at N = 5. |
+| `test_sa4_wire` | 96 | Parsing, formatting, chunking and bitmaps. Transcript digests are checked against Python. |
+| `test_sa4_soul` | 15 | An honest round at N = 3. |
+| `test_sa4_soul_dropout` | 8 | A dropout after shares at N = 5. |
 | `test_sa4_soul_dropout2` | 3 | A dropout after ADV at N = 5. |
-| `test_sa4_soul_refuse` | 153 | One scenario per refusal above. |
+| `test_sa4_soul_u4` | 11 | A soul in U3 that sends no signature (U4 smaller than U3): its b-share is revealed. A SIG3 verifies over a T3 recomputed from the public lines. |
+| `test_sa4_soul_refuse` | 227 | The refusals reachable at N = 3, with the abort code. |
+| `test_sa4_soul_refuse5` | 86 | The subset, membership, share-field, batch-cap and equivocation refusals that need N > t, with code and reason; secret bytes zeroed. |
 
 The round tests use an in-memory coordinator (`tests/sa4_harness.nova`).
 It rebuilds the aggregate from the reveals and compares it with the sum of
-the inputs. A mask-sign or reveal-policy mutant makes the dropout tests
-fail.
+the inputs. In a mutation check, each of 15 weakened checks made at least
+one of these tests fail. The weakenings covered the subset and membership
+checks, the share-field check, the T3 and H1 contents, the reveal policy,
+the batch caps, the R2 wipe and two wire rules. A mask-sign mutant is
+caught only by the dropout tests: with nobody dropping, the masks cancel
+under either convention.
 
 **Cost.**
 - Each soul makes 2 signatures per round.
 - Each soul makes (|U1| − 1) + (t − 1) signature checks per round. At about
   0.9 s each, that is roughly 15 s at N = 10 and roughly 6 minutes at N = 255.
 - In NOVA every Ed25519 operation allocates 23–46 MB that is never freed.
-  A long-running soul process therefore needs one process per round, or an
-  Ed25519 fix, before A2.3.
+  One soul's round therefore takes about 2 × 23 MB + ((|U1| − 1) + (t − 1)) ×
+  46 MB:
+  - about 0.75 GB at N = 10;
+  - about 19 GB at N = 255.
+
+  Running one process per round bounds the leak across rounds, but not
+  within a round. Fixing Ed25519's allocation is a prerequisite for A2.3
+  at more than a handful of souls.
 
 ## Full SecAgg upgrade path
 
