@@ -779,10 +779,11 @@ message. The A2.2 state machine must keep that true.
 - In `gf256`, `shamir`, `saprg` and the wrappers, secret bytes pass only
   through branch-free `int_*` builtins. NOVA itself gives no constant-time
   guarantee.
-- `ed25519_pk_from_seed` uses the Ed25519 scalar multiply. Since A2.3a
-  that is a swap-based ladder on field25519 with no branch on key bits;
-  the remaining caveat is the scalar reduction mod L (see the R14F
-  appendix).
+- `ed25519_pk_from_seed` is SHA-512, clamping and the Ed25519 scalar
+  multiply. Since A2.3a that is a swap-based ladder on field25519 with no
+  branch on key bits, and no bn256 step is involved; the bn256 mod-L
+  caveat applies to signing only (see the R14F appendix). As everywhere,
+  NOVA gives no guarantee about the machine code.
 - Wiping is limited to the copies these modules make. The RNG pool, the
   ChaCha20 state and the HKDF intermediates are not wiped.
 
@@ -1576,8 +1577,9 @@ A self-contained 1100-line module that ships:
   * SHA-512 of a 32-byte input: ~0.1 ms (single compression block).
 
   A2.3a update: sign ~4 ms / ~45 KB of heap, verify ~8 ms / ~30 KB,
-  SHA-512 of one block ~35 µs / ~4 KB (it was ~490 KB per block: a
-  two-element list per 64-bit operation). Outputs are unchanged:
+  SHA-512 ~20-30 µs per block, ~3 KB per call (the padded tail and the
+  output) and nothing per block (it was ~490 KB per block: a two-element
+  list per 64-bit operation). Outputs are unchanged:
   `tests/unit/test_ed25519_equiv.nova` checks SHA-512, keys, signatures,
   verify results and decode / `pk_check` decisions on vectors from an
   independent Python implementation that the old code also matched.
