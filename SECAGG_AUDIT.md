@@ -998,9 +998,9 @@ under either convention.
 A set below t cancels the round. In that case nothing is unmasked, and
 `sa4c_unmask` and `sa4c_close` refuse.
 
-**One bad soul does not cancel the round.** If a soul breaks a rule, the
-coordinator leaves it out of every later set and records the reason
-(`sa4c_why`). The rules:
+**Leaving souls out.** If a soul breaks a rule the coordinator can check,
+the coordinator leaves it out of every later set and records the reason
+(`sa4c_why`). The round continues for the others. The rules:
 - every line parses;
 - the line speaks only for the soul's own id;
 - the line fits the current phase.
@@ -1009,7 +1009,9 @@ It also checks, by phase:
 - **ADV:** a bad signature, c = s, or a low-order key.
 - **Shares:** exactly one share per receiver in U1, with an END count that
   matches.
-- **y:** the chunks must assemble to exactly L words.
+- **y:** each chunk must match this round's L in count, index and length,
+  so what one soul can make the coordinator store is bounded by L. The
+  chunks must assemble to exactly L words.
 - **SIG3:** it must verify over the T3 the coordinator computes itself.
 - **Reveals:** exactly one per soul in U2, of the right kind (b for U3, s
   for U2∖U3).
@@ -1017,6 +1019,19 @@ It also checks, by phase:
 The coordinator also leaves out both souls of any pair that advertised the
 same key. Without these exclusions, one bad ADV would make every honest
 soul refuse the round.
+
+**What the coordinator cannot check: share contents.** Only a share's
+receiver can open it. A malicious soul can send an honest receiver a share
+that does not open, or that holds the wrong fields. The receiver then
+refuses the round and sends `SA4_ABORT`, and the coordinator leaves the
+receiver out, not the sender.
+- With enough such shares, |U3| falls below t and the round is cancelled.
+  `test_sa4_coord5` pins both outcomes.
+- The coordinator records these souls separately (`sa4c_aborted`), and
+  their reason says "possibly a victim". An abort is not evidence of
+  misbehaviour and must not be used to penalise a soul.
+- Verifiable blame needs a complaint round. That is an open design item
+  for A2.4.
 
 **Unmasking** (`sa4c_unmask`, at most once):
 - Start from the sum of y over U3.
@@ -1054,7 +1069,9 @@ a different U3.
 | `test_sa4_coord2` | 7 | A soul stops after ADV; a soul in U3 sends no SIG3. |
 | `test_sa4_coord3` | 8 | A bad ADV signature leaves a soul out of U1; a bad SIG3 leaves a soul out of U4. |
 | `test_sa4_coord4` | 4 | A wrong reveal kind: that soul's reveals are ignored. |
-| `test_sa4_coord_refuse` | 73 | Every recv rule, with its reason. |
+| `test_sa4_coord5` | 11 | One corrupted share: its receiver is left out as an abort and the round completes. Every share corrupted: the round is cancelled. |
+| `test_sa4_coord_refuse` | 75 | Recv rules in the ADV, share, SIG3 and reveal phases, each with its reason. |
+| `test_sa4_coord_refuse2` | 39 | With a soul outside U2: lines from outside the current set, a reveal about a soul outside U2, END rules in every phase, y-chunk bounds, and cancels at U3, U4 and the revealers. |
 | `test_sa4_attack` | 14 | The false-dropout attack. |
 
 In a mutation check, each of 10 weakened coordinator checks made at least
