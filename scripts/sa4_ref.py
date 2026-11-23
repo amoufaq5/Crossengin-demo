@@ -89,7 +89,7 @@ def lagrange0(xs):
 
 def shamir_combine(shares, slen):
     xs = [x for x, _ in shares]
-    if not shares or len(shares) > 255 or len(set(xs)) != len(xs):
+    if slen < 1 or not shares or len(shares) > 255 or len(set(xs)) != len(xs):
         return None
     if any(x < 1 or x > 255 or len(y) != slen for x, y in shares):
         return None
@@ -1060,6 +1060,55 @@ def harness_compare(which, dump):
 
 
 # ============================================================ selftest
+def _selftest_files():
+    import tempfile
+    d = tempfile.mkdtemp()
+    try:
+        ro = os.path.join(d, "roster")
+        with open(ro, "w") as fh:
+            fh.write(h_roster(3).canon)
+        for mode, ok in [(0o644, True), (0o600, True), (0o664, False), (0o646, False)]:
+            os.chmod(ro, mode)
+            try:
+                roster_load(ro)
+                got = True
+            except (ValueError, OSError):
+                got = False
+            assert got == ok, "roster mode %o" % mode
+        sd = os.path.join(d, "seed")
+        with open(sd, "wb") as fh:
+            fh.write(bytes.fromhex(H_SEEDS[0]))
+        for mode, ok in [(0o600, True), (0o400, True), (0o640, False), (0o604, False)]:
+            os.chmod(sd, mode)
+            try:
+                seed_load(sd)
+                got = True
+            except (ValueError, OSError):
+                got = False
+            assert got == ok, "seed mode %o" % mode
+        os.chmod(sd, 0o600)
+        with open(sd, "ab") as fh:
+            fh.write(b"x")
+        for path in [sd, os.path.join(d, "missing")]:
+            try:
+                seed_load(path)
+                assert False, path
+            except (ValueError, OSError):
+                pass
+        os.symlink(ro, os.path.join(d, "link"))
+        os.mkfifo(os.path.join(d, "fifo"), 0o600)
+        for name in ["link", "fifo"]:
+            try:
+                roster_load(os.path.join(d, name))
+                assert False, name
+            except (ValueError, OSError):
+                pass
+    finally:
+        for name in os.listdir(d):
+            os.unlink(os.path.join(d, name))
+        os.rmdir(d)
+
+
 def selftest():
     H = lambda b: b.hex()
     # GF(256) FIPS-197
@@ -1092,6 +1141,13 @@ def selftest():
     bsk = bytes.fromhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
     apk, bpk = x25519_base(ask), x25519_base(bsk)
     assert H(x25519(ask, bpk)) == "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+    # RFC 7748 5.2 #2: u has bit 255 set (must be masked), and the
+    # iterated vector after one step (clamping of a scalar used as-is).
+    assert H(x25519(bytes.fromhex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
+                    bytes.fromhex("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493"))) == \
+        "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957"
+    nine = (9).to_bytes(32, "little")
+    assert H(x25519(nine, nine)) == "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079"
     # sa_crypto KATs (tests/unit/test_sa_crypto.nova)
     assert H(kdf_info(b"mask", 7, 1, 2)) == "63726f7373656e67696e2f76342d73612f7631046d61736b00000000000000070000000100000002"
     assert H(agree(ask, bpk, b"mask", 7, 1, 2)) == "1c40444cfd660fb3f068a66b47f45f10bc961766cb01deb3b56c6c9e635ede31"
@@ -1125,6 +1181,24 @@ def selftest():
     assert not ed25519_pk_check(bytes.fromhex("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"))
     assert not ed25519_pk_check(bytes.fromhex("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"))  # y = p
     assert all(ed25519_pk_check(bytes.fromhex(p)) for p in H_PKS)
+    # Strict decoding (as src/safety/ed25519.nova): a non-canonical y that
+    # is on the curve and not small order (y = p + 3), and signatures that
+    # verify only if R = "-0" (01 00..00 80) or R with y = p + 1 were read
+    # as the identity: s = k a with R = identity satisfies [s]B = R + [k]A.
+    assert not ed25519_pk_check((P + 3).to_bytes(32, "little"))
+    assert _pt_dec((3).to_bytes(32, "little")) is not None
+    sd0 = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    pk0 = ed25519_pk_from_seed(sd0)
+    h0 = bytearray(hashlib.sha512(sd0).digest()[:32]); h0[0] &= 248; h0[31] &= 127; h0[31] |= 64
+    a0 = int.from_bytes(h0, "little")
+    for r_enc in [(1 | (1 << 255)).to_bytes(32, "little"), (P + 1).to_bytes(32, "little")]:
+        k0 = int.from_bytes(hashlib.sha512(r_enc + pk0 + b"m").digest(), "little") % ED_L
+        assert not ed25519_verify(b"m", r_enc + (k0 * a0 % ED_L).to_bytes(32, "little"), pk0)
+    k1 = int.from_bytes(hashlib.sha512(_IDENT_ENC + pk0 + b"m").digest(), "little") % ED_L
+    assert ed25519_verify(b"m", _IDENT_ENC + (k1 * a0 % ED_L).to_bytes(32, "little"), pk0)  # control
+    # File checks (as sa_roster.nova): roster not group/other-writable,
+    # seed owned by us with no group/other bits, regular files only.
+    _selftest_files()
     # wire round trips
     assert parse("SA4_END 5 1 7 2") == (EV_END, 5, 1, 7, 2)
     for bad in ["SA4_END 05 1 7 2", "SA4_END 5 1 7  2", "SA4_END 5 1 7 2 ", "SA4_END 4611686018427387904 1 7 2",

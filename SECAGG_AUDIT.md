@@ -1120,13 +1120,32 @@ wipe secret bytes, and its PRG is slow for long vectors.
   | D | N = 5, one soul in U3 but not U4 | 74 |
   | E | 11 refusals (abort line and code) | 11 |
 
-  Every line carries signatures, ciphertexts or masked words. Matching
-  lines therefore pin the KDF info strings, the AEAD framing, the Shamir
-  share layout, the PRG, the mask signs, the signed transcripts and the
-  reveal policy on both sides.
+  Every ADV, SHARE, Y, SIG3 and REVEAL line carries a signature, a
+  ciphertext, masked words or a share. Matching lines therefore pin the KDF
+  info strings, the AEAD framing, the Shamir share layout, the PRG, the
+  mask signs, the signed transcripts and the reveal policy on both sides.
+  Scenario E compares abort lines.
+- A differential run checks that the two souls refuse the same things.
+  `tests/tools/sa4_cases.py gen` builds 753 cases from honest rounds,
+  perturbed in every phase:
+  - every abort code;
+  - forged shares (sealed with the sender's real key) and signatures;
+  - low-order and out-of-range keys;
+  - `set_input` validation;
+  - seeded random mutations, moves, duplications and deletions of every
+    line of four rounds.
+
+  `tests/tools/sa4_script.nova` runs them through the NOVA soul and
+  `sa4_cases.py run` through the Python soul. At every step the two must
+  agree on ok, state, round and output lines. Only the human-readable
+  reason text may differ.
+- The self-test also pins strict Ed25519 decoding (a non-canonical key that
+  is not small order; signatures that verify only if "-0" or a y >= p were
+  read as the identity), RFC 7748 vectors with bit 255 of u set, and the
+  file checks (roster and seed modes, symlink, FIFO, seed length).
 - `tests/integration/scenario_sa4_pyref.sh` (in CI) runs the self-test, all
-  five comparisons, and a negative control: one changed hex digit in a
-  masked word must be reported. It needs no sockets.
+  five comparisons, the differential run, and a negative control: one
+  changed hex digit in a masked word must be reported. It needs no sockets.
 
 The live mixed round, in which a Python soul talks to the NOVA coordinator
 over the network, comes with the transport in A2.3c.

@@ -11,10 +11,18 @@
 #     C  N = 4, one soul drops after its ADV
 #     D  N = 5, one soul in U3 but not U4      (no SIG3 from it)
 #     E  11 refusals (abort line and code)
-#   Every line carries signatures, ciphertexts and masked words, so a match
-#   pins the KDFs, AEAD framing, Shamir layout, PRG, mask signs, transcripts
-#   and reveal policy on both sides. A tampered transcript must be reported
-#   as a difference (negative control). Needs no sockets.
+#   Every ADV/SHARE/Y/SIG3/REVEAL line carries a signature, ciphertext,
+#   masked words or a share, so a match pins the KDFs, AEAD framing, Shamir
+#   layout, PRG, mask signs, transcripts and reveal policy on both sides; E
+#   compares abort lines. A tampered transcript must be reported as a
+#   difference (negative control).
+#   Then a differential run: tests/tools/sa4_cases.py builds 753 cases
+#   (honest rounds perturbed in every phase: every abort code, forged shares
+#   and signatures, low-order keys, set_input validation, and seeded random
+#   mutations / moves / duplications / deletions of every line of four
+#   rounds); the NOVA soul (tests/tools/sa4_script.nova) and the Python soul
+#   must give the same ok / state / round / output lines at every step.
+#   Needs no sockets.
 
 . "$(dirname "$0")/_lib.sh"
 
@@ -64,6 +72,26 @@ for X in A B C D E; do
         *) assert_eq "$(grep -c -E '^(ADV|OUT) ' "$WORK/py_$X.txt")" "$N" "scenario $X: same number of lines" ;;
     esac
 done
+
+# Differential run over perturbed rounds (only the reason text may differ).
+python3 -I "$REPO_ROOT/tests/tools/sa4_cases.py" gen > "$WORK/cases.txt" 2>&1
+assert_eq "$?" "0" "differential: case script generated"
+NC=$(grep -c '^CASE ' "$WORK/cases.txt")
+assert_match "$NC" '^[1-9][0-9]{2,}$' "differential: $NC cases"
+"$NOVA" build "$REPO_ROOT/tests/tools/sa4_script.nova" -o "$WORK/script" >"$WORK/build2.log" 2>&1
+assert_eq "$?" "0" "differential: NOVA driver builds"
+SA4SCRIPT="$WORK/cases.txt" "$WORK/script" > "$WORK/cases_nova.txt" 2>&1
+assert_eq "$?" "0" "differential: NOVA soul runs every case"
+python3 -I "$REPO_ROOT/tests/tools/sa4_cases.py" run "$WORK/cases.txt" > "$WORK/cases_py.txt" 2>&1
+assert_eq "$?" "0" "differential: Python soul runs every case"
+grep -v '^E ' "$WORK/cases_nova.txt" > "$WORK/cn.txt"
+grep -v '^E ' "$WORK/cases_py.txt" > "$WORK/cp.txt"
+assert_eq "$(grep -c '^C ' "$WORK/cn.txt")" "$NC" "differential: NOVA reported every case"
+assert_eq "$(grep -c '^S .* ok=0 ' "$WORK/cn.txt")" "$(grep -c '^S .* ok=0 ' "$WORK/cp.txt")" "differential: same number of refused steps"
+DIFF=$(diff "$WORK/cn.txt" "$WORK/cp.txt" | head -5)
+assert_eq "$DIFF" "" "differential: every step identical (ok, state, round, output lines)"
+CODES=$(grep -o 'SA4_ABORT [0-9]* [0-9]* [a-z0-9_]*' "$WORK/cn.txt" | awk '{print $4}' | sort -u | wc -l)
+assert_match "$CODES" '^(2[0-9]|[3-9][0-9])$' "differential: $CODES distinct abort codes exercised"
 
 # Negative control: change one hex digit of one masked Y word.
 awk 'BEGIN{d=0} /^OUT SA4_Y / && d==0 { n=split($0,f," "); w=f[n]; c=substr(w,1,1); r=(c=="0")?"1":"0"; f[n]=r substr(w,2); s=f[1]; for(i=2;i<=n;i++) s=s" "f[i]; print s; d=1; next } {print}' \
