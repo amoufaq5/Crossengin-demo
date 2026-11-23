@@ -1086,6 +1086,51 @@ one of these tests fail. The checks were:
 - the t check on U2;
 - share routing.
 
+## SecAgg v4 independent reference soul (A2.3b)
+
+`scripts/sa4_ref.py` is a second implementation of the v4 soul. It is
+written in Python with only the standard library, and uses its own
+primitives:
+- Ed25519 (RFC 8032, strict decode, cofactorless verify, the same `pk_check`);
+- X25519 (RFC 7748);
+- HKDF-SHA256 (RFC 5869);
+- ChaCha20-Poly1305 (RFC 8439);
+- the ChaCha20 PRG;
+- GF(256) Shamir;
+- the test RNG stream.
+
+It parses and formats every `SA4_*` line, builds the same transcripts and
+runs the same soul state machine, including the abort codes. Its purpose is
+to cross-check the NOVA code. It is not a production soul: Python cannot
+wipe secret bytes, and its PRG is slow for long vectors.
+
+**How it is checked.**
+- `python3 -I scripts/sa4_ref.py --selftest` runs RFC 7748, 8032, 8439 and
+  5869 vectors, FIPS-197 GF(256) values and the repo's `test_sa_crypto` KATs.
+- `tests/tools/sa4_dump.nova` prints the full transcript of five
+  deterministic harness rounds (same roster, seeds and test RNG as
+  `tests/sa4_harness.nova`). `sa4_ref.py --harness X` replays each round
+  in Python and compares line by line:
+
+  | Scenario | Setup | Lines |
+  |---|---|---|
+  | A | N = 3, honest (roster fingerprint too) | 36 |
+  | B | N = 5, one soul in U2 but not U3 | 73 |
+  | C | N = 4, one soul drops after its ADV | 44 |
+  | D | N = 5, one soul in U3 but not U4 | 74 |
+  | E | 11 refusals (abort line and code) | 11 |
+
+  Every line carries signatures, ciphertexts or masked words. Matching
+  lines therefore pin the KDF info strings, the AEAD framing, the Shamir
+  share layout, the PRG, the mask signs, the signed transcripts and the
+  reveal policy on both sides.
+- `tests/integration/scenario_sa4_pyref.sh` (in CI) runs the self-test, all
+  five comparisons, and a negative control: one changed hex digit in a
+  masked word must be reported. It needs no sockets.
+
+The live mixed round, in which a Python soul talks to the NOVA coordinator
+over the network, comes with the transport in A2.3c.
+
 ## Full SecAgg upgrade path
 
 The reference Google SecAgg (~4-6 weeks per the published prototype)
