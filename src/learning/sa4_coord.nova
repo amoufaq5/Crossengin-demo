@@ -1,0 +1,670 @@
+// CrossEngin learning: the SecAgg v4 coordinator (A2.2b).
+//
+// Purpose
+//   The coordinator's side of one SecAgg v4 round (Bonawitz et al. 2017
+//   double masking, actively secure variant), over the wire format in
+//   sa4_wire.nova and against souls running sa4_soul.nova. Transport-free:
+//   the caller passes every line it receives together with the roster id of
+//   the connection it came from, closes each phase (normally on a deadline),
+//   and sends the [to_id, line] messages it gets back. Nothing in the chat
+//   or the fed coordinator uses it yet (A2.3).
+//
+// Phases
+//   0  collect SA4_ADV            close -> U1; to every u in U1: every ADV
+//                                 of U1 (ascending x) + SA4_SET 1
+//   1  collect SA4_SHARE + END 1  close -> U2; to every v in U2: the shares
+//                                 addressed to v from U2 + SA4_SET 2
+//   2  collect SA4_Y + END 2      close -> U3; SA4_SET 3 to every u in U3
+//   3  collect SA4_SIG3           close -> U4; to every u in U4: every SIG3
+//                                 of U4 + SA4_SET 4
+//   4  collect SA4_REVEAL + END 3 close -> revealers R
+//   5  ready: sa4c_unmask once -> sum over U3 of the inputs, mod 2^32
+//   A phase whose set falls below t cancels the round (state CANCELLED):
+//   nothing is unmasked and the caller closes the connections.
+//
+// One bad soul cannot cancel the round for the others
+//   A line that does not parse, speaks for another id, arrives in the wrong
+//   phase or breaks a rule below marks that soul bad: it is left out of
+//   every later set, and its lines are ignored. Checks:
+//   - ADV: signature over the ADV transcript verified against the roster
+//     key (souls would refuse a round containing a bad one); c_pk != s_pk;
+//     no key shared with another soul (both left out); no low-order key.
+//   - shares: one per receiver in U1 \ {sender}; the END count matches.
+//   - y: the chunks assemble to exactly L words; the END count matches.
+//   - SIG3: verifies over the T3 the coordinator computes from its own U1
+//     keys, U2 and U3. A soul that signed another T3 is left out of U4.
+//   - reveals: exactly one per soul in U2, a b-share for every soul in U3
+//     and an s-share for every soul in U2 \ U3; the END count matches.
+//
+// Unmasking (sa4c_unmask, at most once)
+//   total = sum_{u in U3} y_u - sum_{u in U3} PRG(b_u)
+//           + correction for every d in U2 \ U3: for each v in U3, y_v
+//             carried +PRG(s_vd) if d > v, else -PRG(s_vd); undo it.
+//   b_u and s_d^SK are rebuilt from t shares (revealers in ascending x).
+//   A rebuilt s_d^SK must give the s_pk that d advertised, else the round
+//   is refused (a revealer sent a wrong share). b_u has no public
+//   commitment, so a wrong b-share gives a wrong sum: that is the
+//   protocol's (semi-honest) limit, documented in SECAGG_AUDIT.md.
+//   Rebuilt secrets are wiped after use. A second sa4c_unmask is refused.
+//
+// API
+//   sa4c_new(roster, round, L, layout, vcache) -> coordinator
+//   sa4c_round_line(c)                -> the SA4_ROUND line for every soul
+//   sa4c_recv(c, from_id, line)       -> [ok, err]
+//   sa4c_close(c)                     -> [ok, err, msgs]; msgs = [to, line]
+//   sa4c_unmask(c)                    -> [ok, err, words]
+//   sa4c_state(c), sa4c_set(c, k) (k = 1..4 ids; 5 = revealers)
+//   vcache: 0, or the verify/sign cache shared with souls in one process
+//   (tests only; see sa4_soul.nova).
+//
+// The caller chooses the round id and must keep it increasing (souls
+// refuse a round that is not after their last); persisting it is A2.3's
+// job, like v3n-sa's crossengin_fed_secagg_round.
+//
+// CrossEngin dependencies: sa4_wire, sa_crypto, sa_roster, shamir, saprg,
+//   ed25519, x25519.
+
+import "./sa4_wire.nova"
+import "./sa_crypto.nova"
+import "./sa_roster.nova"
+import "../safety/shamir.nova"
+import "../safety/saprg.nova"
+import "../safety/ed25519.nova"
+
+let SA4C_OBJ_TAG = 7511
+
+let SA4C_ST_ADV = 0
+let SA4C_ST_SHARES = 1
+let SA4C_ST_Y = 2
+let SA4C_ST_SIG3 = 3
+let SA4C_ST_REVEAL = 4
+let SA4C_ST_READY = 5
+let SA4C_ST_DONE = 6
+let SA4C_ST_CANCELLED = 7
+
+// Per-soul record slots (index x-1).
+let SA4C_P_ADV = 0       // parsed ADV record or 0
+let SA4C_P_BAD = 1       // 1 if left out
+let SA4C_P_SHARES = 2    // list of parsed SHARE records
+let SA4C_P_SEND = 3      // END 1 count, or -1
+let SA4C_P_Y = 4         // list of parsed Y records
+let SA4C_P_YEND = 5      // END 2 count, or -1
+let SA4C_P_YV = 6        // assembled words or 0
+let SA4C_P_SIG = 7       // SIG3 line or 0
+let SA4C_P_REV = 8       // list of parsed REVEAL records
+let SA4C_P_REND = 9      // END 3 count, or -1
+let SA4C_P_SHARE_LINES = 10
+let SA4C_P_WHY = 11      // reason it was left out
+
+fn _sa4c_list(n, v) {
+    let out = list_new()
+    let i = 0
+    while i < n {
+        push(out, v)
+        i = i + 1
+    }
+    return out
+}
+
+fn _sa4c_res(ok, err, v) {
+    let r = list_new()
+    push(r, ok)
+    push(r, err)
+    push(r, v)
+    return r
+}
+
+fn _sa4c_peer() {
+    let p = list_new()
+    push(p, 0)
+    push(p, 0)
+    push(p, list_new())
+    push(p, 0 - 1)
+    push(p, list_new())
+    push(p, 0 - 1)
+    push(p, 0)
+    push(p, 0)
+    push(p, list_new())
+    push(p, 0 - 1)
+    push(p, list_new())
+    push(p, "")
+    return p
+}
+
+// Slots: 0 tag, 1 roster, 2 round, 3 L, 4 layout, 5 vcache, 6 state,
+// 7 peers, 8 U1 xs, 9 U2 xs, 10 U3 xs, 11 U4 xs, 12 R xs, 13 fp, 14 T3,
+// 15 cancel reason.
+fn sa4c_new(roster, r, lw, layout, vcache) {
+    let c = list_new()
+    push(c, 7511)
+    push(c, roster)
+    push(c, r)
+    push(c, lw)
+    push(c, layout)
+    push(c, vcache)
+    push(c, 0)
+    let peers = list_new()
+    let i = 0
+    while i < sroster_n(roster) {
+        push(peers, _sa4c_peer())
+        i = i + 1
+    }
+    push(c, peers)
+    push(c, list_new())
+    push(c, list_new())
+    push(c, list_new())
+    push(c, list_new())
+    push(c, list_new())
+    push(c, sa4w_unhex(sroster_fingerprint(roster), 32))
+    push(c, 0)
+    push(c, "")
+    return c
+}
+
+fn sa4c_state(c) { return c[6] }
+
+fn sa4c_set(c, k) {
+    let xs = c[7 + k]
+    let out = list_new()
+    let i = 0
+    while i < len(xs) {
+        push(out, sroster_entries(c[1])[xs[i] - 1][0])
+        i = i + 1
+    }
+    return out
+}
+
+fn sa4c_why(c, id) {
+    let x = sroster_x(c[1], id)
+    if x == 0 { return "" }
+    return c[7][x - 1][11]
+}
+
+fn sa4c_round_line(c) {
+    return sa4w_fmt_round(c[2], c[13], c[3], c[4])
+}
+
+fn _sa4c_id_at(c, x) { return sroster_entries(c[1])[x - 1][0] }
+
+fn _sa4c_contains(xs, x) {
+    let i = 0
+    while i < len(xs) {
+        if xs[i] == x { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _sa4c_eq(a, b) {
+    if len(a) != len(b) { return 0 }
+    let acc = 0
+    let i = 0
+    while i < len(a) {
+        acc = int_or(acc, int_xor(a[i], b[i]))
+        i = i + 1
+    }
+    if acc == 0 { return 1 }
+    return 0
+}
+
+fn _sa4c_bad(c, x, why) {
+    let p = c[7][x - 1]
+    list_set(p, 1, 1)
+    if len(p[11]) == 0 { list_set(p, 11, why) }
+    return _sa4c_res(0, "left out soul " + int_to_str(_sa4c_id_at(c, x)) + ": " + why, 0)
+}
+
+fn _sa4c_ok() { return _sa4c_res(1, "", 0) }
+
+// Signature check through the shared cache (see sa4_soul.nova).
+fn _sa4c_verify(c, msg, sig, pk) {
+    let key = "v" + sa4w_hex(pk) + sa4w_hex(sig) + sa4w_hex(sa4w_sha256(msg))
+    let vc = c[5]
+    if vc != 0 {
+        let i = 0
+        while i < len(vc) {
+            if str_eq_bytes(vc[i][0], key) == 1 { return 1 }
+            i = i + 1
+        }
+    }
+    let ok = ed25519_verify(msg, sig, pk)
+    if ok == 1 {
+        if vc != 0 {
+            let e = list_new()
+            push(e, key)
+            push(e, 1)
+            push(vc, e)
+        }
+    }
+    return ok
+}
+
+// 1 if X25519 with a fixed scalar gives an all-zero result (low order).
+fn _sa4c_low_order(pk) {
+    let sk = alloc(33)
+    let i = 0
+    while i < 32 {
+        store8(sk + i, 7)
+        i = i + 1
+    }
+    let out = alloc(33)
+    let ok = x25519(out, sk, sac_list_to_buf(pk))
+    if ok == 1 { return 0 }
+    return 1
+}
+
+// ---- receiving -----------------------------------------------------------
+
+fn sa4c_recv(c, from_id, line) {
+    let st = c[6]
+    if st > 4 { return _sa4c_res(0, "round no longer accepts lines", 0) }
+    let x = sroster_x(c[1], from_id)
+    if x == 0 { return _sa4c_res(0, "connection id not in the roster", 0) }
+    let p = c[7][x - 1]
+    if p[1] == 1 { return _sa4c_res(0, "soul already left out", 0) }
+    let rec = sa4w_parse(line)
+    if rec == 0 { return _sa4c_bad(c, x, "malformed line") }
+    if rec[1] != c[2] { return _sa4c_bad(c, x, "line for another round") }
+    let ev = rec[0]
+    if ev == 48 { return _sa4c_bad(c, x, "soul aborted (" + rec[3] + ")") }
+    if st == 0 {
+        if ev != 41 { return _sa4c_bad(c, x, "expected SA4_ADV") }
+        if rec[2] != from_id { return _sa4c_bad(c, x, "ADV for another id") }
+        if p[0] != 0 { return _sa4c_bad(c, x, "second ADV") }
+        if _sa4c_eq(rec[3], rec[4]) == 1 { return _sa4c_bad(c, x, "c_pk == s_pk") }
+        if _sa4c_low_order(rec[3]) == 1 { return _sa4c_bad(c, x, "low-order c_pk") }
+        if _sa4c_low_order(rec[4]) == 1 { return _sa4c_bad(c, x, "low-order s_pk") }
+        let msg = sa4w_adv_transcript(c[13], c[2], from_id, c[3], c[4], rec[3], rec[4])
+        let pk = sroster_entries(c[1])[x - 1][2]
+        if _sa4c_verify(c, msg, rec[5], pk) != 1 { return _sa4c_bad(c, x, "ADV signature does not verify") }
+        list_set(p, 0, rec)
+        return _sa4c_ok()
+    }
+    if _sa4c_contains(c[7 + st], x) == 0 {
+        if st != 4 { return _sa4c_bad(c, x, "soul not in the current set") }
+    }
+    if st == 1 {
+        if p[3] >= 0 { return _sa4c_bad(c, x, "line after END") }
+        if ev == 43 {
+            if rec[2] != from_id { return _sa4c_bad(c, x, "share for another sender") }
+            let tx = sroster_x(c[1], rec[3])
+            if tx == 0 { return _sa4c_bad(c, x, "share to an id not in the roster") }
+            if tx == x { return _sa4c_bad(c, x, "share to itself") }
+            if _sa4c_contains(c[8], tx) == 0 { return _sa4c_bad(c, x, "share to a soul outside U1") }
+            let i = 0
+            while i < len(p[2]) {
+                if p[2][i][3] == rec[3] { return _sa4c_bad(c, x, "two shares to one soul") }
+                i = i + 1
+            }
+            push(p[2], rec)
+            push(p[10], line)
+            return _sa4c_ok()
+        }
+        if ev == 47 {
+            if rec[2] != 1 { return _sa4c_bad(c, x, "wrong END phase") }
+            if rec[3] != from_id { return _sa4c_bad(c, x, "END for another id") }
+            if rec[4] != len(p[2]) { return _sa4c_bad(c, x, "END count differs") }
+            if rec[4] != len(c[8]) - 1 { return _sa4c_bad(c, x, "not one share per soul in U1") }
+            list_set(p, 3, rec[4])
+            return _sa4c_ok()
+        }
+        return _sa4c_bad(c, x, "unexpected line while collecting shares")
+    }
+    if st == 2 {
+        if p[5] >= 0 { return _sa4c_bad(c, x, "line after END") }
+        if ev == 44 {
+            if rec[2] != from_id { return _sa4c_bad(c, x, "Y for another id") }
+            if len(p[4]) >= 167773 { return _sa4c_bad(c, x, "too many Y chunks") }
+            push(p[4], rec)
+            return _sa4c_ok()
+        }
+        if ev == 47 {
+            if rec[2] != 2 { return _sa4c_bad(c, x, "wrong END phase") }
+            if rec[3] != from_id { return _sa4c_bad(c, x, "END for another id") }
+            if rec[4] != len(p[4]) { return _sa4c_bad(c, x, "END count differs") }
+            let yv = sa4w_y_assemble(p[4], c[3])
+            if yv == 0 { return _sa4c_bad(c, x, "Y chunks do not assemble to L words") }
+            list_set(p, 6, yv)
+            list_set(p, 5, rec[4])
+            return _sa4c_ok()
+        }
+        return _sa4c_bad(c, x, "unexpected line while collecting y")
+    }
+    if st == 3 {
+        if ev != 45 { return _sa4c_bad(c, x, "expected SA4_SIG3") }
+        if rec[2] != from_id { return _sa4c_bad(c, x, "SIG3 for another id") }
+        if p[7] != 0 { return _sa4c_bad(c, x, "second SIG3") }
+        let pk3 = sroster_entries(c[1])[x - 1][2]
+        if _sa4c_verify(c, c[14], rec[3], pk3) != 1 { return _sa4c_bad(c, x, "SIG3 does not verify over this round's T3") }
+        list_set(p, 7, line)
+        return _sa4c_ok()
+    }
+    // st == 4: reveals from U4 only.
+    if _sa4c_contains(c[11], x) == 0 { return _sa4c_bad(c, x, "soul not in U4") }
+    if p[9] >= 0 { return _sa4c_bad(c, x, "line after END") }
+    if ev == 46 {
+        if rec[2] != from_id { return _sa4c_bad(c, x, "reveal for another id") }
+        let ax = sroster_x(c[1], rec[3])
+        if ax == 0 { return _sa4c_bad(c, x, "reveal about an id not in the roster") }
+        if _sa4c_contains(c[9], ax) == 0 { return _sa4c_bad(c, x, "reveal about a soul outside U2") }
+        let want = 1
+        if _sa4c_contains(c[10], ax) == 1 { want = 0 }
+        if rec[4] != want { return _sa4c_bad(c, x, "wrong share kind for that soul") }
+        let j = 0
+        while j < len(p[8]) {
+            if p[8][j][3] == rec[3] { return _sa4c_bad(c, x, "two reveals about one soul") }
+            j = j + 1
+        }
+        push(p[8], rec)
+        return _sa4c_ok()
+    }
+    if ev == 47 {
+        if rec[2] != 3 { return _sa4c_bad(c, x, "wrong END phase") }
+        if rec[3] != from_id { return _sa4c_bad(c, x, "END for another id") }
+        if rec[4] != len(p[8]) { return _sa4c_bad(c, x, "END count differs") }
+        if rec[4] != len(c[9]) { return _sa4c_bad(c, x, "not one reveal per soul in U2") }
+        list_set(p, 9, rec[4])
+        return _sa4c_ok()
+    }
+    return _sa4c_bad(c, x, "unexpected line while collecting reveals")
+}
+
+// ---- closing phases -----------------------------------------------------------
+
+fn _sa4c_cancel(c, why) {
+    list_set(c, 6, 7)
+    list_set(c, 15, why)
+    return _sa4c_res(0, "cancelled: " + why, list_new())
+}
+
+fn _sa4c_msg(out, to, line) {
+    let m = list_new()
+    push(m, to)
+    push(m, line)
+    push(out, m)
+    return 0
+}
+
+fn _sa4c_close_adv(c) {
+    let n = sroster_n(c[1])
+    let peers = c[7]
+    // Keys shared between souls: leave every such soul out.
+    let i = 0
+    while i < n {
+        let a = peers[i]
+        if a[0] != 0 {
+            if a[1] == 0 {
+                let j = 0
+                while j < n {
+                    if j != i {
+                        let b = peers[j]
+                        if b[0] != 0 {
+                            let clash = 0
+                            if _sa4c_eq(a[0][3], b[0][3]) == 1 { clash = 1 }
+                            if _sa4c_eq(a[0][3], b[0][4]) == 1 { clash = 1 }
+                            if _sa4c_eq(a[0][4], b[0][3]) == 1 { clash = 1 }
+                            if _sa4c_eq(a[0][4], b[0][4]) == 1 { clash = 1 }
+                            if clash == 1 {
+                                _sa4c_bad(c, i + 1, "advertised a key another soul also advertised")
+                            }
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    let u1 = list_new()
+    i = 0
+    while i < n {
+        if peers[i][0] != 0 {
+            if peers[i][1] == 0 { push(u1, i + 1) }
+        }
+        i = i + 1
+    }
+    list_set(c, 8, u1)
+    if len(u1) < sroster_t(c[1]) { return _sa4c_cancel(c, "|U1| " + int_to_str(len(u1)) + " below t") }
+    let advs = list_new()
+    i = 0
+    while i < len(u1) {
+        let rec = peers[u1[i] - 1][0]
+        push(advs, sa4w_fmt_adv(c[2], rec[2], rec[3], rec[4], rec[5]))
+        i = i + 1
+    }
+    let set1 = sa4w_fmt_set(c[2], 1, sa4w_bitmap(u1))
+    let out = list_new()
+    i = 0
+    while i < len(u1) {
+        let to = _sa4c_id_at(c, u1[i])
+        let k = 0
+        while k < len(advs) {
+            _sa4c_msg(out, to, advs[k])
+            k = k + 1
+        }
+        _sa4c_msg(out, to, set1)
+        i = i + 1
+    }
+    list_set(c, 6, 1)
+    return _sa4c_res(1, "", out)
+}
+
+fn _sa4c_close_shares(c) {
+    let u1 = c[8]
+    let u2 = list_new()
+    let i = 0
+    while i < len(u1) {
+        let p = c[7][u1[i] - 1]
+        if p[1] == 0 {
+            if p[3] >= 0 { push(u2, u1[i]) }
+        }
+        i = i + 1
+    }
+    list_set(c, 9, u2)
+    if len(u2) < sroster_t(c[1]) { return _sa4c_cancel(c, "|U2| " + int_to_str(len(u2)) + " below t") }
+    let set2 = sa4w_fmt_set(c[2], 2, sa4w_bitmap(u2))
+    let out = list_new()
+    i = 0
+    while i < len(u2) {
+        let to = _sa4c_id_at(c, u2[i])
+        let j = 0
+        while j < len(u2) {
+            if j != i {
+                let sp = c[7][u2[j] - 1]
+                let k = 0
+                while k < len(sp[2]) {
+                    if sp[2][k][3] == to { _sa4c_msg(out, to, sp[10][k]) }
+                    k = k + 1
+                }
+            }
+            j = j + 1
+        }
+        _sa4c_msg(out, to, set2)
+        i = i + 1
+    }
+    list_set(c, 6, 2)
+    return _sa4c_res(1, "", out)
+}
+
+fn _sa4c_close_y(c) {
+    let u2 = c[9]
+    let u3 = list_new()
+    let i = 0
+    while i < len(u2) {
+        let p = c[7][u2[i] - 1]
+        if p[1] == 0 {
+            if p[5] >= 0 { push(u3, u2[i]) }
+        }
+        i = i + 1
+    }
+    list_set(c, 10, u3)
+    if len(u3) < sroster_t(c[1]) { return _sa4c_cancel(c, "|U3| " + int_to_str(len(u3)) + " below t") }
+    // T3 the souls in U3 are expected to sign.
+    let keys = list_new()
+    i = 0
+    while i < len(c[8]) {
+        let a = c[7][c[8][i] - 1][0]
+        let kp = list_new()
+        push(kp, a[3])
+        push(kp, a[4])
+        push(keys, kp)
+        i = i + 1
+    }
+    let h1 = sa4w_advset_hash(sa4w_bitmap(c[8]), keys)
+    list_set(c, 14, sa4w_t3_transcript(c[13], c[2], h1, sa4w_bitmap(u2), sa4w_bitmap(u3)))
+    let set3 = sa4w_fmt_set(c[2], 3, sa4w_bitmap(u3))
+    let out = list_new()
+    i = 0
+    while i < len(u3) {
+        _sa4c_msg(out, _sa4c_id_at(c, u3[i]), set3)
+        i = i + 1
+    }
+    list_set(c, 6, 3)
+    return _sa4c_res(1, "", out)
+}
+
+fn _sa4c_close_sig3(c) {
+    let u3 = c[10]
+    let u4 = list_new()
+    let i = 0
+    while i < len(u3) {
+        let p = c[7][u3[i] - 1]
+        if p[1] == 0 {
+            if p[7] != 0 { push(u4, u3[i]) }
+        }
+        i = i + 1
+    }
+    list_set(c, 11, u4)
+    if len(u4) < sroster_t(c[1]) { return _sa4c_cancel(c, "|U4| " + int_to_str(len(u4)) + " below t") }
+    let set4 = sa4w_fmt_set(c[2], 4, sa4w_bitmap(u4))
+    let out = list_new()
+    i = 0
+    while i < len(u4) {
+        let to = _sa4c_id_at(c, u4[i])
+        let j = 0
+        while j < len(u4) {
+            _sa4c_msg(out, to, c[7][u4[j] - 1][7])
+            j = j + 1
+        }
+        _sa4c_msg(out, to, set4)
+        i = i + 1
+    }
+    list_set(c, 6, 4)
+    return _sa4c_res(1, "", out)
+}
+
+fn _sa4c_close_reveal(c) {
+    let u4 = c[11]
+    let rv = list_new()
+    let i = 0
+    while i < len(u4) {
+        let p = c[7][u4[i] - 1]
+        if p[1] == 0 {
+            if p[9] >= 0 { push(rv, u4[i]) }
+        }
+        i = i + 1
+    }
+    list_set(c, 12, rv)
+    if len(rv) < sroster_t(c[1]) { return _sa4c_cancel(c, int_to_str(len(rv)) + " complete reveal batches, below t") }
+    list_set(c, 6, 5)
+    return _sa4c_res(1, "", list_new())
+}
+
+fn sa4c_close(c) {
+    let st = c[6]
+    if st == 0 { return _sa4c_close_adv(c) }
+    if st == 1 { return _sa4c_close_shares(c) }
+    if st == 2 { return _sa4c_close_y(c) }
+    if st == 3 { return _sa4c_close_sig3(c) }
+    if st == 4 { return _sa4c_close_reveal(c) }
+    return _sa4c_res(0, "refused: no phase to close", list_new())
+}
+
+// ---- unmasking -------------------------------------------------------------------
+
+// Rebuild the secret about soul `ax` from t revealers (ascending x), or 0.
+fn _sa4c_rebuild(c, ax) {
+    let about = _sa4c_id_at(c, ax)
+    let t = sroster_t(c[1])
+    let rv = c[12]
+    let shares = list_new()
+    let i = 0
+    while i < len(rv) {
+        if len(shares) < t {
+            let p = c[7][rv[i] - 1]
+            let j = 0
+            while j < len(p[8]) {
+                if p[8][j][3] == about {
+                    push(shares, shamir_share(rv[i], sac_list_to_buf(p[8][j][5]), 32))
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    if len(shares) < t { return 0 }
+    let sec = shamir_combine(shares, 32)
+    i = 0
+    while i < len(shares) {
+        sac_zero_buf(shares[i][1], 32)
+        i = i + 1
+    }
+    return sec
+}
+
+fn sa4c_unmask(c) {
+    if c[6] == 6 { return _sa4c_res(0, "refused: this round was already unmasked", 0) }
+    if c[6] != 5 { return _sa4c_res(0, "refused: the round is not ready to unmask", 0) }
+    list_set(c, 6, 6)
+    let r = c[2]
+    let u2 = c[9]
+    let u3 = c[10]
+    let total = _sa4c_list(c[3], 0)
+    let i = 0
+    while i < len(u3) {
+        total = saprg_vec_add(total, c[7][u3[i] - 1][6])
+        i = i + 1
+    }
+    i = 0
+    while i < len(u2) {
+        let ax = u2[i]
+        let sec = _sa4c_rebuild(c, ax)
+        if sec == 0 { return _sa4c_res(0, "refused: fewer than t shares about soul " + int_to_str(_sa4c_id_at(c, ax)), 0) }
+        if _sa4c_contains(u3, ax) == 1 {
+            total = saprg_mask(total, sec, 0 - 1)
+        } else {
+            let d = _sa4c_id_at(c, ax)
+            let adv = c[7][ax - 1][0]
+            let chk = alloc(33)
+            let okp = sac_x25519_pub(chk, sec)
+            if okp != 1 {
+                sac_zero_buf(sec, 32)
+                return _sa4c_res(0, "refused: rebuilt s key of soul " + int_to_str(d) + " is invalid", 0)
+            }
+            if _sa4c_eq(sac_buf_to_list(chk, 32), adv[4]) == 0 {
+                sac_zero_buf(sec, 32)
+                return _sa4c_res(0, "refused: rebuilt s key of soul " + int_to_str(d) + " does not match its advertised s_pk", 0)
+            }
+            let k = 0
+            while k < len(u3) {
+                let vx = u3[k]
+                let v = _sa4c_id_at(c, vx)
+                let ms = sac_mask_seed(sec, sac_list_to_buf(c[7][vx - 1][0][4]), r, d, v)
+                if ms[1] != 1 {
+                    sac_zero_buf(sec, 32)
+                    return _sa4c_res(0, "refused: mask key agreement refused", 0)
+                }
+                if d > v {
+                    total = saprg_mask(total, ms[0], 0 - 1)
+                } else {
+                    total = saprg_mask(total, ms[0], 1)
+                }
+                sac_zero_buf(ms[0], 32)
+                k = k + 1
+            }
+        }
+        sac_zero_buf(sec, 32)
+        i = i + 1
+    }
+    return _sa4c_res(1, "", total)
+}
