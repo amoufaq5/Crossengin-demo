@@ -24,7 +24,7 @@ bytes, and its PRG is slow for long vectors.
                                        Faults (tests): stop-after-adv,
                                        stop-after-shares, stop-after-y,
                                        stop-after-sig3, bad-adv-sig, bad-sig3,
-                                       bad-share, swap-reveal.
+                                       bad-share, swap-reveal, silent, drip.
 
 Scenarios: A N=3 honest; B N=5, one soul in U2 but not U3; C N=4, one soul
 drops after its ADV; D N=5, one soul in U3 but not U4; E 11 refusals.
@@ -1325,7 +1325,13 @@ def connect_main(argv):
     rf = sock.makefile("rb")
 
     def send(line):
-        sock.sendall((line + "\n").encode("latin-1"))
+        data = (line + "\n").encode("latin-1")
+        if fault == "drip":                    # one byte at a time, slowly
+            for k in range(len(data)):
+                sock.sendall(data[k:k + 1])
+                time.sleep(0.2)
+            return
+        sock.sendall(data)
 
     def recv():
         b = rf.readline(1002)
@@ -1335,12 +1341,18 @@ def connect_main(argv):
             raise ValueError("line too long or not terminated")
         return b[:-1].decode("latin-1")
 
-    send(FED_HELLO)
+    sock.sendall((FED_HELLO + "\n").encode("latin-1"))
     if recv() != FED_OK:
         print("sa4_ref: handshake refused")
         return 3
-    send("FED_JOIN %d 1000" % soul.me)
+    sock.sendall(("FED_JOIN %d 1000\n" % soul.me).encode("latin-1"))
     print("sa4_ref: joined as id=%d x=%d" % (soul.me, soul.mx), flush=True)
+    if fault == "silent":                     # joins, then never answers
+        sock.settimeout(None)
+        while recv() is not None:
+            pass
+        print("sa4_ref: fault silent: coordinator closed")
+        return 0
     sums = 0
     while True:
         line = recv()

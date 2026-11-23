@@ -749,7 +749,7 @@ borrow-chain wraparound — see the inline comment in `bn2048_mod`).
 This is the only algorithmic difference between the two modules
 beyond limb-count scaling.
 
-## SecAgg v4 primitives (A2.0, not wired in yet)
+## SecAgg v4 primitives (A2.0)
 
 SecAgg v4 is double masking after Bonawitz et al. (CCS 2017). It is being
 built in steps A2.0 to A2.5. A2.0 adds only the building blocks, as leaf
@@ -802,7 +802,7 @@ message. The A2.2 state machine must keep that true.
 | 10,000 mask words | about 8 ms |
 | Ed25519 public key from a seed | about 4 ms (about 0.5 s before A2.3a) |
 
-## SecAgg v4 roster and identity keys (A2.1, not wired in yet)
+## SecAgg v4 roster and identity keys (A2.1)
 
 In v3n-sa the coordinator learns the peer set from the souls and relays
 their keys. A coordinator can therefore add a soul, or stand in for one.
@@ -864,7 +864,7 @@ entry the identity key belongs to.
   script, the roster checker, the fingerprint against Python, and
   agreement with openssl.
 
-## SecAgg v4 wire format and soul state machine (A2.2a, not wired in yet)
+## SecAgg v4 wire format and soul state machine (A2.2a)
 
 A2.2a adds two modules:
 - `src/learning/sa4_wire.nova`: the `SA4_*` line protocol and the exact
@@ -873,8 +873,8 @@ A2.2a adds two modules:
   transport-free state machine. The caller feeds it lines with
   `sa4s_handle` and sends whatever it returns.
 
-The coordinator logic is A2.2b, and the chat and coordinator integration is
-A2.3.
+The coordinator logic is A2.2b; the chat and fed-coordinator integration
+is A2.3c (see "SecAgg v4 over the network").
 
 **The round, as seen by soul u** (Bonawitz et al. 2017, actively secure
 variant; all sums mod 2^32):
@@ -940,7 +940,8 @@ duplicates and keys, then signatures. The soul refuses all of these:
 **The caller's duties.**
 - Pass an RNG context. Without OS entropy, do not run a round.
 - Persist `sa4s_done_round` and pass it back next time, so an old round id
-  cannot be replayed. This is A2.3's job.
+  cannot be replayed. The chat does this since A2.3c (a last-round file
+  per roster and id, saved before the round is handled).
 - Keep every word's sum over all souls below 2^32.
 
 **Tests.**
@@ -976,7 +977,7 @@ under either convention.
   0.9 s and 46 MB per check: about 0.75 GB at N = 10 and about 19 GB at
   N = 255.
 
-## SecAgg v4 coordinator (A2.2b, not wired in yet)
+## SecAgg v4 coordinator (A2.2b)
 
 `src/learning/sa4_coord.nova` implements the coordinator's side of a round.
 - **Transport-free:** the caller passes each line it receives together
@@ -984,7 +985,8 @@ under either convention.
   (normally on a deadline) and sends the `[to, line]` messages it gets
   back.
 - **Rounds:** the caller chooses the round id and must keep it
-  increasing. Persisting it is A2.3's job.
+  increasing. The fed coordinator persists it since A2.3c (one counter per
+  roster fingerprint, saved before SA4_ROUND is sent).
 
 **Phases.**
 
@@ -1149,6 +1151,123 @@ wipe secret bytes, and its PRG is slow for long vectors.
 
 The live mixed round, in which a Python soul talks to the NOVA coordinator
 over the network, comes with the transport in A2.3c.
+
+## SecAgg v4 over the network (A2.3c)
+
+`CE_SECAGG_ENABLED=1` together with `CE_SECAGG_MODE=v4` runs one v4 round
+between the fed coordinator (`examples/crossengin_fed_coordinator.nova`) and
+chat souls (`/fed_join`). Unset, or `v3n-sa`, keeps the v3n-sa path
+unchanged. Any other value is refused on both sides. The shared glue is
+`src/learning/sa4_fed.nova`.
+
+**Setup.**
+1. Each soul's operator runs `scripts/secagg_keygen.sh <base> <id> <name>`.
+   The private seed stays on the soul's machine; the printed roster line
+   is shared.
+2. Everyone installs the same roster file (`CE_SECAGG_ROSTER`) and compares
+   its fingerprint out of band. Each soul also sets `CE_SECAGG_ID_KEY` to its
+   seed.
+3. Everyone sets the same tag set, `CE_SECAGG_V4_TAGS=tag1,tag2,...`.
+
+**The tag set is pinned by each operator, not announced by the
+coordinator.**
+- Each tag gives three words: promotion rate, atrophy rate (milli) and
+  present (1 when the soul has samples for it).
+- The layout hash is SHA-256 of `crossengin-fed-layout v1\n` plus one
+  `<tag> promo atr present\n` line per sorted tag.
+- `SA4_ROUND` and every signed ADV carry L and this hash. A soul with
+  another tag set therefore refuses the round (`bad_len` / `bad_layout`)
+  instead of mixing vectors.
+- If the coordinator chose the tags, it could ask for a tag only one soul
+  has and read that soul's value from the sum.
+
+**Flow.**
+- **Join.** `SECAGG_HELLO ce-fed v4-sa`, answered exactly by
+  `OK ce-fed v4-sa protocol accepted`, then `FED_JOIN <roster id> 1000`.
+  - v3n-sa and v4 refuse each other's hello.
+  - Unknown ids and duplicate connections are rejected.
+  - The coordinator waits for `CE_FED_SOULS` souls (default: the roster
+    size; at least t) for up to `CE_SECAGG_V4_JOIN_MS`.
+- **Round id.**
+  - The coordinator keeps a counter per roster fingerprint in its run dir
+    (`crossengin_fed_sa4_round_<fp16>`, 0600, flock) and saves the new id
+    before it sends `SA4_ROUND`.
+  - Each soul keeps the last round it took part in
+    (`crossengin_sa4_last_round_<fp16>_<id>`: header, fingerprint, id, round;
+    0600, owner-only, flock) and saves a new id before it handles the
+    round. A crash can therefore never let it reuse a round id.
+  - A coordinator that restarts at round 1 is refused (`stale_round`).
+  - A damaged file is refused, never treated as missing.
+  - Deleting a soul's run dir re-arms old round ids for that soul.
+- **Phases.**
+  - The coordinator reads each live soul's lines for the phase up to its
+    terminator: one ADV or SIG3 line, or up to `SA4_END` or `SA4_ABORT`
+    with at most N + 1 (or ⌈L/100⌉ + 1) lines. All reads share one deadline,
+    `CE_SECAGG_V4_PHASE_MS` (default 30 s).
+  - The receive timeout is re-armed before every byte, so a soul that
+    trickles bytes cannot stretch the phase.
+  - A soul read after the deadline still gets a 250 ms grace window for
+    lines it has already sent.
+  - A soul that times out, closes, sends a line over 1000 bytes, a NUL byte
+    or too many lines is disconnected.
+  - All lines go to `sa4c_recv` only after collection, so signature checks
+    never use up the read deadline.
+  - Then the coordinator closes the phase, routes the messages, and
+    disconnects souls outside the next set.
+- **Result.**
+  - After the reveals, the coordinator unmasks the sum over U3 and sends
+    `FED_AGGREGATE_SUM <r> <tag> <sum promo> <sum atr> <present>` for each
+    tag, then `BYE`.
+  - A tag is published only when `present` is at least
+    max(2, `CE_SECAGG_V4_MIN_PRESENT`, default t).
+  - The chat accepts a result only for its round, for a pinned tag, and
+    with 1 ≤ n ≤ |U3|. It applies it like a v3n-sa sum (the source-tier
+    nudge).
+  - One round per coordinator process.
+
+**What this does and does not protect.**
+- **What the coordinator sees.** It sees the sum per word over U3 (masks
+  cancel only there), the sets, and who joined. With the minimum-present
+  rule, a sum is published to the souls only when it covers at least
+  min-present souls (default t).
+- **The present flag is not private.** Each tag's `present` word is part
+  of the sum, so the coordinator learns how many souls have samples for
+  that tag. Withholding a tag hides its sum from the souls, not from the
+  coordinator, which unmasks every word. Pinned tags limit what can be
+  asked for; they do not hide counts.
+- **Unauthenticated lines.**
+  - `FED_JOIN` is not authenticated, but a squatter cannot sign the ADV,
+    so it is left out: denial of service only.
+  - `FED_AGGREGATE_SUM` is unsigned, the same trust as in v3n-sa: a
+    malicious coordinator can publish a wrong sum.
+  - Wrong b-shares give a wrong sum. This is the semi-honest limit
+    described in the coordinator section.
+  - A soul that sends an unopenable share makes its receiver abort. The
+    receiver is recorded as "possibly a victim". Verifiable blame needs
+    the complaint round (A2.4).
+- **Scaling.** The coordinator reads souls one after another (no `poll`),
+  so a phase takes about as long as its slowest soul or the deadline.
+
+**Tests.**
+- `tests/unit/test_sa4_fed.nova` (69 checks): tag parsing, the layout text
+  and hash (checked against Python hashlib), input words and sums, the
+  `FED_JOIN` parser, and the last-round file (missing, durable save, exact
+  content, 0600, the refusals).
+- `tests/integration/scenario_u4_secagg.sh` (in CI, 72 checks):
+  - a mixed round: two chat souls and one Python soul, all printing the same
+    sums, which equal the inputs each soul printed locally; the Python soul's
+    plain input words never appear on the wire;
+  - replay refused after a coordinator restart;
+  - a dropout after the shares (s-shares revealed);
+  - a silent soul and a byte-trickling soul (both cut off at the deadline,
+    the others complete);
+  - a corrupted share (receiver aborts, recorded as a possible victim);
+  - a swapped reveal kind;
+  - a different tag set;
+  - an unknown id, a duplicate id, too few souls;
+  - configuration refusals, and v3n-sa / v4 hello cross-refusal.
+- `scripts/sa4_ref.py --connect` is the Python soul used there. Its
+  `--fault` options drive the failure cases.
 
 ## Full SecAgg upgrade path
 
