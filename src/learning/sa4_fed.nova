@@ -1,0 +1,529 @@
+// CrossEngin learning: SecAgg v4 federation glue (A2.3c).
+//
+// Shared by the chat soul (examples/crossengin_chat.nova, /fed_join) and
+// the fed coordinator (examples/crossengin_fed_coordinator.nova) when
+// CE_SECAGG_ENABLED=1 and CE_SECAGG_MODE=v4. The protocol itself lives in
+// sa4_wire / sa4_soul / sa4_coord (transport-free); this module adds what a
+// networked round needs around it:
+//
+//   Mode        sa4f_mode(): CE_SECAGG_MODE unset, empty or "v3n-sa" -> 0
+//               (the v3n-sa path, unchanged); "v4" or "v4-sa" -> 1; any
+//               other value -> -1 (callers refuse).
+//   Handshake   "SECAGG_HELLO ce-fed v4-sa", answered exactly by
+//               "OK ce-fed v4-sa protocol accepted"; then
+//               "FED_JOIN <roster id> 1000". A v3n-sa peer refuses the v4
+//               hello and a v4 coordinator refuses the v3n-sa hello.
+//   Layout      The tags are pinned by each operator in CE_SECAGG_V4_TAGS
+//               (comma-separated, [0-9A-Za-z_:-]{1,64}, 1..256 tags), sorted
+//               and de-duplicated. Each tag gives three words: promo rate,
+//               atrophy rate (milli, 0..1000) and present (1 if the soul has
+//               a sample for the tag). L = 3 * ntags; the layout hash is
+//               SHA-256("crossengin-fed-layout v1\n" + "<tag> promo atr
+//               present\n" per tag). SA4_ROUND and every signed ADV carry L
+//               and the hash, so souls with different tag sets refuse the
+//               round instead of mixing vectors. The coordinator does not
+//               choose the tags: if it did, it could ask for a tag only one
+//               soul has and learn that soul's value from the sum.
+//   Sockets     sa4f_set_timeouts (SO_RCVTIMEO / SO_SNDTIMEO with untagged
+//               arguments), sa4f_recv_line (status: line, EOF, timeout or
+//               error, too long, NUL byte) and sa4f_send_line.
+//   Last round  The soul keeps the last round id it took part in, per
+//               roster fingerprint and roster id, in its run dir:
+//               crossengin_sa4_last_round_<fp 16 hex>_<id>, content
+//               "crossengin-sa4-last-round v1 <fp 64 hex> <id> <round>\n",
+//               mode 0600, owner euid, written durably (temp file with
+//               O_EXCL|O_NOFOLLOW, fsync, rename, directory fsync) under an
+//               flock on "<path>.lock" held for the life of the process.
+//               The chat saves a round id BEFORE handling its SA4_ROUND
+//               (write-ahead), so a crash can never let it take part in the
+//               same round id twice. Removing the run dir re-arms old ids.
+//
+// Prefix: sa4f_ / SA4F_ / _sa4f_.
+
+import "std/syscall"
+import "std/string"
+import "./sa4_wire.nova"
+import "./sa_roster.nova"
+import "./federated_aggregator.nova"
+import "../util/run_dir.nova"
+import "../util/sys_tagged.nova"
+
+let SA4F_HELLO = "SECAGG_HELLO ce-fed v4-sa"
+let SA4F_OK = "OK ce-fed v4-sa protocol accepted"
+let SA4F_LAYOUT_HEADER = "crossengin-fed-layout v1"
+let SA4F_LR_HEADER = "crossengin-sa4-last-round"
+let SA4F_MAX_TAGS = 256
+let SA4F_MAX_TAG_LEN = 64
+let SA4F_MAX_WORD = 4294967295
+
+// sa4f_recv_line statuses.
+let SA4F_RL_LINE = 0
+let SA4F_RL_EOF = 1
+let SA4F_RL_TIMEOUT = 2
+let SA4F_RL_LONG = 3
+let SA4F_RL_BAD = 4
+
+fn sa4f_mode() {
+    let m = getenv("CE_SECAGG_MODE")
+    if m == 0 { return 0 }
+    if len(m) == 0 { return 0 }
+    if str_eq_bytes(m, "v3n-sa") == 1 { return 0 }
+    if str_eq_bytes(m, "v4") == 1 { return 1 }
+    if str_eq_bytes(m, "v4-sa") == 1 { return 1 }
+    return 0 - 1
+}
+
+// ---- tags and layout --------------------------------------------------------
+
+fn _sa4f_tag_char(c) {
+    if c >= 48 { if c <= 57 { return 1 } }
+    if c >= 65 { if c <= 90 { return 1 } }
+    if c >= 97 { if c <= 122 { return 1 } }
+    if c == 95 { return 1 }
+    if c == 45 { return 1 }
+    if c == 58 { return 1 }
+    return 0
+}
+
+// Byte-wise comparison: -1, 0 or 1.
+fn _sa4f_cmp(a, b) {
+    let na = len(a)
+    let nb = len(b)
+    let i = 0
+    while i < na {
+        if i >= nb { return 1 }
+        let ca = char_at(a, i)
+        let cb = char_at(b, i)
+        if ca < cb { return 0 - 1 }
+        if ca > cb { return 1 }
+        i = i + 1
+    }
+    if na < nb { return 0 - 1 }
+    return 0
+}
+
+// "t1,t2,..." -> [ok, err, sorted unique tags].
+fn sa4f_tags_parse(s) {
+    let out = list_new()
+    if s == 0 { return [0, "CE_SECAGG_V4_TAGS is not set (the tag set must be pinned by the operator)", out] }
+    if len(s) == 0 { return [0, "CE_SECAGG_V4_TAGS is empty", out] }
+    let raw = list_new()
+    let cur = ""
+    let i = 0
+    let n = len(s)
+    while i <= n {
+        let c = 44
+        if i < n { c = char_at(s, i) }
+        if c == 44 {
+            if len(cur) == 0 { return [0, "CE_SECAGG_V4_TAGS has an empty tag", out] }
+            push(raw, cur)
+            cur = ""
+        } else {
+            if _sa4f_tag_char(c) == 0 { return [0, "CE_SECAGG_V4_TAGS: bad character in a tag (allowed: 0-9 A-Z a-z _ : -)", out] }
+            cur = cur + chr(c)
+            if len(cur) > SA4F_MAX_TAG_LEN { return [0, "CE_SECAGG_V4_TAGS: a tag is longer than 64 characters", out] }
+        }
+        i = i + 1
+    }
+    // Insertion sort, dropping duplicates.
+    let k = 0
+    while k < len(raw) {
+        let tg = raw[k]
+        let pos = 0
+        let dup = 0
+        let j = 0
+        while j < len(out) {
+            let cr = _sa4f_cmp(out[j], tg)
+            if cr == 0 { dup = 1 }
+            if cr < 0 { pos = j + 1 }
+            j = j + 1
+        }
+        if dup == 0 {
+            push(out, "")
+            let m = len(out) - 1
+            while m > pos {
+                list_set(out, m, out[m - 1])
+                m = m - 1
+            }
+            list_set(out, pos, tg)
+        }
+        k = k + 1
+    }
+    if len(out) > SA4F_MAX_TAGS { return [0, "CE_SECAGG_V4_TAGS: more than 256 tags", list_new()] }
+    return [1, "", out]
+}
+
+fn sa4f_tags_from_env() {
+    return sa4f_tags_parse(getenv("CE_SECAGG_V4_TAGS"))
+}
+
+// The canonical layout text for sorted tags.
+fn sa4f_layout_text(tags) {
+    let t = SA4F_LAYOUT_HEADER + "\n"
+    let i = 0
+    while i < len(tags) {
+        t = t + tags[i] + " promo atr present\n"
+        i = i + 1
+    }
+    return t
+}
+
+// SHA-256 of the layout text, as a list of 32 bytes.
+fn sa4f_layout(tags) {
+    let t = sa4f_layout_text(tags)
+    let b = list_new()
+    let i = 0
+    while i < len(t) {
+        push(b, char_at(t, i))
+        i = i + 1
+    }
+    return sa4w_sha256(b)
+}
+
+fn sa4f_lw(tags) { return int_mul(3, len(tags)) }
+
+// mo_report rows [tag, promo_milli, atrophy_milli, sample, ...] -> the
+// input vector for the pinned tags: [ok, err, words, rows_outside_layout].
+// A tag without a row, or with sample 0, gives 0, 0, 0.
+fn sa4f_words(tags, report) {
+    let words = list_new()
+    let i = 0
+    while i < len(tags) {
+        let wp = 0
+        let wa = 0
+        let wq = 0
+        let j = 0
+        while j < len(report) {
+            let row = report[j]
+            if str_eq_bytes(row[0], tags[i]) == 1 {
+                if row[3] >= 1 {
+                    wp = row[1]
+                    wa = row[2]
+                    wq = 1
+                }
+            }
+            j = j + 1
+        }
+        if wp < 0 { return [0, "input value below 0 for tag " + tags[i], list_new(), 0] }
+        if wa < 0 { return [0, "input value below 0 for tag " + tags[i], list_new(), 0] }
+        if wp > SA4F_MAX_WORD { return [0, "input value above 2^32-1 for tag " + tags[i], list_new(), 0] }
+        if wa > SA4F_MAX_WORD { return [0, "input value above 2^32-1 for tag " + tags[i], list_new(), 0] }
+        push(words, wp)
+        push(words, wa)
+        push(words, wq)
+        i = i + 1
+    }
+    let outside = 0
+    let r = 0
+    while r < len(report) {
+        let found = 0
+        let k = 0
+        while k < len(tags) {
+            if str_eq_bytes(report[r][0], tags[k]) == 1 { found = 1 }
+            k = k + 1
+        }
+        if found == 0 { outside = outside + 1 }
+        r = r + 1
+    }
+    return [1, "", words, outside]
+}
+
+// Unmasked words -> per tag [tag, sum_promo, sum_atr, present].
+fn sa4f_sums(tags, words) {
+    let out = list_new()
+    if len(words) != sa4f_lw(tags) { return out }
+    let i = 0
+    while i < len(tags) {
+        push(out, [tags[i], words[int_mul(3, i)], words[int_mul(3, i) + 1], words[int_mul(3, i) + 2]])
+        i = i + 1
+    }
+    return out
+}
+
+// ---- sockets ----------------------------------------------------------------
+
+// setsockopt(fd, level, optname, optval, optlen): fd / level / optname /
+// optlen are tagged ints and are untagged here; optval is a buffer
+// pointer (untagged if tagged). Returns the tagged result (0 = ok).
+fn _sa4f_setsockopt(fd, level, optname, optval, optlen) {
+    asm {
+        "mov rax, 54"
+        "mov rdi, [rbp-8]"
+        "sar rdi, 1"
+        "mov rsi, [rbp-16]"
+        "sar rsi, 1"
+        "mov rdx, [rbp-24]"
+        "sar rdx, 1"
+        "mov r10, [rbp-32]"
+        "test r10, 1"
+        "jz .sa4f_so_u"
+        "sar r10, 1"
+        ".sa4f_so_u:"
+        "mov r8, [rbp-40]"
+        "sar r8, 1"
+        "syscall"
+        "test rax, rax"
+        "js .sa4f_so_ret"
+        "lea rax, [rax + rax + 1]"
+        ".sa4f_so_ret:"
+    }
+}
+
+// struct timeval {sec, usec} for ms milliseconds (little-endian).
+fn _sa4f_timeval(ms) {
+    let tv = alloc(16)
+    let sec = ms / 1000
+    let usec = int_mul(ms - int_mul(sec, 1000), 1000)
+    let k = 0
+    while k < 8 {
+        store8(tv + k, int_and(sec, 255))
+        store8(tv + 8 + k, int_and(usec, 255))
+        sec = int_shr(sec, 8)
+        usec = int_shr(usec, 8)
+        k = k + 1
+    }
+    return tv
+}
+
+// SO_RCVTIMEO and SO_SNDTIMEO on fd (ms >= 1). 1 on success.
+fn sa4f_set_timeouts(fd, ms) {
+    let v = ms
+    if v < 1 { v = 1 }
+    let tv = _sa4f_timeval(v)
+    let a = _sa4f_setsockopt(fd, 1, 20, tv, 16)
+    let b = _sa4f_setsockopt(fd, 1, 21, tv, 16)
+    if a != 0 { return 0 }
+    if b != 0 { return 0 }
+    return 1
+}
+
+// Only SO_RCVTIMEO (accept() on a listening socket honours it).
+fn sa4f_set_recv_timeout(fd, ms) {
+    let v = ms
+    if v < 1 { v = 1 }
+    if _sa4f_setsockopt(fd, 1, 20, _sa4f_timeval(v), 16) != 0 { return 0 }
+    return 1
+}
+
+// Read one line (up to "\n", which is dropped). Returns [status, line]:
+// SA4F_RL_LINE with the line; SA4F_RL_EOF when the peer closed before a
+// newline; SA4F_RL_TIMEOUT on a timeout or error (also mid-line);
+// SA4F_RL_LONG past 1000 bytes without a newline; SA4F_RL_BAD on a NUL
+// byte. Anything but a full line leaves the stream position unknown, so
+// the caller should drop the connection.
+fn sa4f_recv_line(fd) {
+    let cap = SA4W_MAX_LINE + 2
+    let buf = alloc(cap + 1)
+    let n = 0
+    let st = 0 - 1
+    while st < 0 {
+        let b = recv_data(fd, buf + n, 1)
+        if b == 0 {
+            st = SA4F_RL_EOF
+        } else {
+            if b < 0 {
+                st = SA4F_RL_TIMEOUT
+            } else {
+                let c = load8(buf + n)
+                if c == 10 {
+                    store8(buf + n, 0)
+                    st = SA4F_RL_LINE
+                } else {
+                    if c == 0 {
+                        st = SA4F_RL_BAD
+                    } else {
+                        n = n + 1
+                        if n > SA4W_MAX_LINE { st = SA4F_RL_LONG }
+                    }
+                }
+            }
+        }
+    }
+    if st != SA4F_RL_LINE { return [st, ""] }
+    return [SA4F_RL_LINE, buf]
+}
+
+// Send s (callers include the newline). 1 when every byte was sent.
+fn sa4f_send_line(fd, s) {
+    let total = len(s)
+    let sent = 0
+    while sent < total {
+        let chunk = substr(s, sent, total - sent)
+        let m = send_data(fd, chunk, total - sent)
+        if m <= 0 { return 0 }
+        sent = sent + m
+    }
+    return 1
+}
+
+// Connect, send the v4 hello and require the exact OK line. Timeouts of
+// ms on the socket. Returns the fd, or -1.
+fn sa4f_dial(host, port, ms) {
+    let ip = _fed_ip_str_to_int(host)
+    if ip < 0 { return 0 - 1 }
+    let sock = socket(2, 1, 0)
+    if sock < 0 { return 0 - 1 }
+    sa4f_set_timeouts(sock, ms)
+    if connect_socket(sock, make_sockaddr_in(port, ip), 16) < 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    if sa4f_send_line(sock, SA4F_HELLO + "\n") == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    let rl = sa4f_recv_line(sock)
+    if rl[0] != SA4F_RL_LINE {
+        close_fd(sock)
+        return 0 - 1
+    }
+    if str_eq_bytes(rl[1], SA4F_OK) == 0 {
+        close_fd(sock)
+        return 0 - 1
+    }
+    return sock
+}
+
+// "FED_JOIN <id> 1000" -> the canonical u32 id, or -1.
+fn sa4f_parse_join(line) {
+    let p = "FED_JOIN "
+    if len(line) < len(p) + 6 { return 0 - 1 }
+    if str_eq_bytes(substr(line, 0, len(p)), p) == 0 { return 0 - 1 }
+    let tail = " 1000"
+    let nl = len(line)
+    if str_eq_bytes(substr(line, nl - len(tail), len(tail)), tail) == 0 { return 0 - 1 }
+    return sa4w_dec_u32(substr(line, len(p), nl - len(p) - len(tail)))
+}
+
+// ---- last round (soul side) -------------------------------------------------
+
+fn sa4f_last_round_path(fp_hex, id) {
+    return ce_run_path("crossengin_sa4_last_round_" + substr(fp_hex, 0, 16) + "_" + int_to_str(id))
+}
+
+fn _sa4f_flock_ex_nb(fd) {
+    asm {
+        "mov rax, 73"
+        "mov rdi, [rbp-8]"
+        "mov rsi, 6"
+        "syscall"
+        "test rax, rax"
+        "js .sa4f_fl_ret"
+        "lea rax, [rax + rax + 1]"
+        ".sa4f_fl_ret:"
+    }
+}
+
+// Paths this process holds the lock for (the fds stay open).
+let _SA4F_LOCKED = list_new()
+
+// Take (once per process) the lock for a last-round file. [ok, err].
+fn sa4f_last_round_lock(path) {
+    let i = 0
+    while i < len(_SA4F_LOCKED) {
+        if str_eq_bytes(_SA4F_LOCKED[i], path) == 1 { return [1, ""] }
+        i = i + 1
+    }
+    let lp = path + ".lock"
+    let fd = sys_open(lp, 2 + 64 + 131072, 384)              // O_RDWR|O_CREAT|O_NOFOLLOW, 0600
+    if _ce_open_failed(fd) == 1 {
+        return [0, "cannot open " + lp + " (errno " + int_to_str(_sroster_errno(fd)) + ")"]
+    }
+    if _sa4f_flock_ex_nb(fd) != 0 {
+        sys_close(fd)
+        return [0, lp + " is locked: another process uses this identity and run dir"]
+    }
+    push(_SA4F_LOCKED, path)
+    return [1, ""]
+}
+
+// [ok, err, last_round]: 0 when there is no file yet. Any other problem
+// (symlink, wrong owner or mode, corrupt content, another roster or id)
+// refuses, so a damaged file can never reset the replay guard silently.
+fn sa4f_last_round_load(fp_hex, id) {
+    return sa4f_last_round_load_at(sa4f_last_round_path(fp_hex, id), fp_hex, id)
+}
+
+fn sa4f_last_round_load_at(path, fp_hex, id) {
+    let probe = sys_open(path, SROSTER_O_NOFOLLOW, 0)
+    if _ce_open_failed(probe) == 1 {
+        let e = _sroster_errno(probe)
+        if e == 2 { return [1, "", 0] }
+        return [0, "last round: " + path + ": cannot open (errno " + int_to_str(e) + ")", 0]
+    }
+    sys_close(probe)
+    let o = _sroster_open_checked(path, 1)
+    if o[0] == 0 { return [0, "last round: " + o[2], 0] }
+    let buf = alloc(140)
+    let n = _sroster_read_fd(o[1], buf, 128)
+    sys_close(o[1])
+    if n < 0 { return [0, "last round: " + path + ": read error", 0] }
+    if n > 128 { return [0, "last round: " + path + ": too long", 0] }
+    if n < 2 { return [0, "last round: " + path + ": corrupt", 0] }
+    if load8(buf + n - 1) != 10 { return [0, "last round: " + path + ": corrupt", 0] }
+    let txt = ""
+    let i = 0
+    while i < n - 1 {
+        let c = load8(buf + i)
+        if c < 32 { return [0, "last round: " + path + ": corrupt", 0] }
+        if c > 126 { return [0, "last round: " + path + ": corrupt", 0] }
+        txt = txt + chr(c)
+        i = i + 1
+    }
+    let f = list_new()
+    let cur = ""
+    let k = 0
+    while k <= len(txt) {
+        let c2 = 32
+        if k < len(txt) { c2 = char_at(txt, k) }
+        if c2 == 32 {
+            push(f, cur)
+            cur = ""
+        } else {
+            cur = cur + chr(c2)
+        }
+        k = k + 1
+    }
+    if len(f) != 5 { return [0, "last round: " + path + ": corrupt", 0] }
+    if str_eq_bytes(f[0], SA4F_LR_HEADER) == 0 { return [0, "last round: " + path + ": corrupt", 0] }
+    if str_eq_bytes(f[1], "v1") == 0 { return [0, "last round: " + path + ": corrupt", 0] }
+    if str_eq_bytes(f[2], fp_hex) == 0 { return [0, "last round: " + path + ": written for another roster", 0] }
+    if sa4w_dec_u32(f[3]) != id { return [0, "last round: " + path + ": written for another id", 0] }
+    let rv = sa4w_dec_round(f[4])
+    if rv < 0 { return [0, "last round: " + path + ": corrupt round id", 0] }
+    return [1, "", rv]
+}
+
+// Durably record round r. [ok, err].
+fn sa4f_last_round_save(fp_hex, id, r) {
+    return sa4f_last_round_save_at(sa4f_last_round_path(fp_hex, id), ce_run_dir(), fp_hex, id, r)
+}
+
+// dir: the directory holding path (fsynced after the rename).
+fn sa4f_last_round_save_at(path, dir, fp_hex, id, r) {
+    let lk = sa4f_last_round_lock(path)
+    if lk[0] == 0 { return [0, "last round: " + lk[1]] }
+    let tmp = path + ".tmp." + int_to_str(getpid())
+    sys_unlink(tmp)
+    let fd = sys_open(tmp, O_WRONLY + O_CREAT + 131200, 384)  // + O_EXCL|O_NOFOLLOW, 0600
+    if _ce_open_failed(fd) == 1 { return [0, "last round: cannot create " + tmp] }
+    let text = SA4F_LR_HEADER + " v1 " + fp_hex + " " + int_to_str(id) + " " + int_to_str(r) + "\n"
+    let w = _sys_write_tagged(fd, text, len(text))
+    if w != len(text) {
+        sys_close(fd)
+        sys_unlink(tmp)
+        return [0, "last round: cannot write " + tmp]
+    }
+    sys_fsync(fd)
+    sys_close(fd)
+    if sys_rename(tmp, path) != 0 {
+        sys_unlink(tmp)
+        return [0, "last round: cannot rename onto " + path]
+    }
+    let dfd = sys_open(dir, O_RDONLY, 0)
+    if _ce_open_failed(dfd) == 0 {
+        sys_fsync(dfd)
+        sys_close(dfd)
+    }
+    return [1, ""]
+}
