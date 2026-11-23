@@ -16,6 +16,15 @@ bytes, and its PRG is slow for long vectors.
                                        of a tests/sa4_harness.nova scenario
     sa4_ref.py --harness X DUMPFILE    compare it with the NOVA transcript
                                        (tests/tools/sa4_dump.nova output)
+    sa4_ref.py --connect HOST:PORT --tags T1,T2 [--x TAG=PROMO:ATR,...]
+               [--state FILE] [--fault F] [--timeout SEC]
+                                       live soul against a v4 fed coordinator
+                                       (A2.3c). Roster and identity seed from
+                                       CE_SECAGG_ROSTER / CE_SECAGG_ID_KEY.
+                                       Faults (tests): stop-after-adv,
+                                       stop-after-shares, stop-after-y,
+                                       stop-after-sig3, bad-adv-sig, bad-sig3,
+                                       bad-share, swap-reveal.
 
 Scenarios: A N=3 honest; B N=5, one soul in U2 but not U3; C N=4, one soul
 drops after its ADV; D N=5, one soul in U3 but not U4; E 11 refusals.
@@ -1231,7 +1240,172 @@ def dump(which):
     return 0
 
 
+# ============================================================ live soul (A2.3c)
+FED_HELLO = "SECAGG_HELLO ce-fed v4-sa"
+FED_OK = "OK ce-fed v4-sa protocol accepted"
+LAYOUT_HEADER = "crossengin-fed-layout v1"
+TAG_CHARS = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_:-")
+
+
+def fed_tags(s):
+    """sa4f_tags_parse: comma-separated, sorted, de-duplicated."""
+    tags = s.split(",")
+    for t in tags:
+        if not (1 <= len(t) <= 64) or any(c not in TAG_CHARS for c in t):
+            raise ValueError("bad tag %r" % t)
+    out = sorted(set(tags), key=lambda t: t.encode("ascii"))
+    if len(out) > 256:
+        raise ValueError("more than 256 tags")
+    return out
+
+
+def fed_layout(tags):
+    text = LAYOUT_HEADER + "\n" + "".join("%s promo atr present\n" % t for t in tags)
+    return sha256(text.encode("ascii"))
+
+
+def fed_words(tags, x):
+    """x: {tag: (promo, atr)} -> [promo, atr, present] per tag."""
+    w = []
+    for t in tags:
+        if t in x:
+            w += [x[t][0], x[t][1], 1]
+        else:
+            w += [0, 0, 0]
+    return w
+
+
+def _corrupt_hex_token(line, idx, pos=0):
+    t = line.split(" ")
+    h = list(t[idx])
+    h[pos] = "1" if h[pos] == "0" else "0"
+    t[idx] = "".join(h)
+    return " ".join(t)
+
+
+def connect_main(argv):
+    import socket
+    opt = {"--x": "", "--state": None, "--fault": None, "--timeout": "60", "--tags": None, "--connect": None}
+    i = 0
+    while i < len(argv):
+        if argv[i] not in opt or i + 1 >= len(argv):
+            print("sa4_ref: bad argument %r" % argv[i])
+            return 2
+        opt[argv[i]] = argv[i + 1]
+        i += 2
+    host, _, port = opt["--connect"].rpartition(":")
+    tags = fed_tags(opt["--tags"])
+    x = {}
+    if opt["--x"]:
+        for item in opt["--x"].split(","):
+            tag, _, v = item.partition("=")
+            pv, _, av = v.partition(":")
+            x[tag] = (int(pv), int(av))
+    ro = roster_load(os.environ.get("CE_SECAGG_ROSTER", ""))
+    seed = seed_load(os.environ.get("CE_SECAGG_ID_KEY", ""))
+    last = 0
+    if opt["--state"] and os.path.exists(opt["--state"]):
+        last = int(open(opt["--state"]).read().strip())
+    soul = Soul(ro, seed, OsRng(), last)
+    if not soul.set_input(fed_words(tags, x), fed_layout(tags)):
+        print("sa4_ref: input refused")
+        return 2
+    fault = opt["--fault"]
+    sock = None
+    import time
+    for _ in range(50):                      # the coordinator may still be starting
+        try:
+            sock = socket.create_connection((host, int(port)), timeout=float(opt["--timeout"]))
+            break
+        except ConnectionRefusedError:
+            time.sleep(0.2)
+    if sock is None:
+        print("sa4_ref: cannot connect to %s:%s" % (host, port))
+        return 3
+    rf = sock.makefile("rb")
+
+    def send(line):
+        sock.sendall((line + "\n").encode("latin-1"))
+
+    def recv():
+        b = rf.readline(1002)
+        if not b:
+            return None
+        if not b.endswith(b"\n") or len(b) > 1001:
+            raise ValueError("line too long or not terminated")
+        return b[:-1].decode("latin-1")
+
+    send(FED_HELLO)
+    if recv() != FED_OK:
+        print("sa4_ref: handshake refused")
+        return 3
+    send("FED_JOIN %d 1000" % soul.me)
+    print("sa4_ref: joined as id=%d x=%d" % (soul.me, soul.mx), flush=True)
+    sums = 0
+    while True:
+        line = recv()
+        if line is None:
+            print("sa4_ref: coordinator closed (state %d)" % soul.state)
+            return 0 if soul.state == ST_DONE else 4
+        if soul.state == ST_DONE:
+            if line == "BYE":
+                print("sa4_ref: BYE after %d aggregate(s)" % sums)
+                return 0
+            f = line.split(" ")
+            if len(f) == 6 and f[0] == "FED_AGGREGATE_SUM" and int(f[1]) == soul.done_round:
+                print("sa4_ref: AGGREGATE_SUM round=%s tag=%s sum_promo=%s sum_atr=%s n_part=%s" % tuple(f[1:]),
+                      flush=True)
+                sums += 1
+            continue
+        if line.startswith("SA4_ROUND ") and opt["--state"]:
+            rec = parse(line)
+            if rec is not None and rec[1] > soul.last:
+                with open(opt["--state"] + ".tmp", "w") as fh:          # write-ahead
+                    fh.write("%d\n" % rec[1])
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(opt["--state"] + ".tmp", opt["--state"])
+        ok, err, outs = soul.handle(line)
+        if fault == "bad-adv-sig":
+            outs = [_corrupt_hex_token(o, 5) if o.startswith("SA4_ADV ") else o for o in outs]
+        if fault == "bad-sig3":
+            outs = [_corrupt_hex_token(o, 3) if o.startswith("SA4_SIG3 ") else o for o in outs]
+        if fault == "bad-share":
+            done1 = False
+            new = []
+            for o in outs:
+                if o.startswith("SA4_SHARE ") and not done1:
+                    o = _corrupt_hex_token(o, 4, 10)
+                    done1 = True
+                new.append(o)
+            outs = new
+        if fault == "swap-reveal":
+            new = []
+            for o in outs:
+                if o.startswith("SA4_REVEAL "):
+                    t = o.split(" ")
+                    t[4] = "s" if t[4] == "b" else "b"
+                    o = " ".join(t)
+                new.append(o)
+            outs = new
+        for o in outs:
+            send(o)
+        if not ok:
+            print("sa4_ref: " + err)
+            return 3
+        stop = {"stop-after-adv": ST_ADV, "stop-after-shares": ST_SHARED, "stop-after-y": ST_MASKED,
+                "stop-after-sig3": ST_SIGNED}.get(fault)
+        if stop is not None and soul.state == stop and outs:
+            print("sa4_ref: fault %s: leaving" % fault)
+            sock.close()
+            return 0
+        if soul.state == ST_DONE:
+            print("sa4_ref: round %d done" % soul.done_round, flush=True)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--connect":
+        sys.exit(connect_main(sys.argv[1:]))
     if len(sys.argv) == 2 and sys.argv[1] == "--selftest":
         sys.exit(selftest())
     if len(sys.argv) == 3 and sys.argv[1] == "--dump" and sys.argv[2] in "ABCDE":
