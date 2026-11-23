@@ -861,6 +861,120 @@ entry the identity key belongs to.
   script, the roster checker, the fingerprint against Python, and
   agreement with openssl.
 
+## SecAgg v4 wire format and soul state machine (A2.2a, not wired in yet)
+
+A2.2a adds two modules:
+- `src/learning/sa4_wire.nova`: the `SA4_*` line protocol and the exact
+  byte strings that get signed.
+- `src/learning/sa4_soul.nova`: one soul's side of a round, as a
+  transport-free state machine. The caller feeds it lines with
+  `sa4s_handle` and sends whatever it returns.
+
+The coordinator logic is A2.2b, and the chat and coordinator integration is
+A2.3.
+
+**The round, as seen by soul u** (Bonawitz et al. 2017, actively secure
+variant; all sums mod 2^32):
+
+| Round | Soul u receives | Soul u does, then sends |
+|---|---|---|
+| R0 | `SA4_ROUND` | Makes fresh X25519 pairs c_u and s_u and a self-mask seed b_u. Sends the signed `SA4_ADV`. |
+| R1 | Every `SA4_ADV`, then `SA4_SET 1` (U1) | Checks the batch and verifies every other ADV signature against the roster. Splits b_u and s_u^SK t-of-N, with each soul's roster x as its Shamir x. Seals one share message per peer. |
+| R2 | The shares addressed to u, then `SA4_SET 2` (U2) | Opens and checks each share. Sends the masked vector in 100-word `SA4_Y` chunks, then wipes b_u, s_u^SK and c_u^SK. The vector is y_u = x_u + PRG(b_u) + Σ_{v∈U2, v>u} PRG(s_uv) − Σ_{v∈U2, v<u} PRG(s_uv). |
+| R3 | `SA4_SET 3` (U3) | Signs T3. |
+| R4 | The `SA4_SIG3` lines, then `SA4_SET 4` | Verifies the signatures in ascending x until it has t valid ones over its own T3. For every v in U2, reveals v's b-share if v is in the U3 it signed, otherwise v's s-share. Never both. |
+
+**What is signed.** Every signed message carries a prefix of
+`crossengin/v4-sa/v1/sig`, the message tag, the roster fingerprint and the
+round.
+- **ADV** also covers the soul id, the vector length, the hash of the
+  public vector layout and both public keys.
+- **T3** covers:
+  - H1, a hash over the U1 bitmap and every advertised key pair;
+  - the U2 bitmap;
+  - the U3 bitmap.
+
+  So a coordinator that shows different souls different sets cannot
+  collect t valid signatures.
+
+**Share messages.** Each sender sends each peer one share message,
+sealed under the directional per-round key from A2.0. It carries:
+- both ids and the round;
+- the receiver's x;
+- the receiver's s-share and b-share.
+
+**Refusal.** Any failed check ends the round for that soul. The state
+becomes ABORTED, the soul wipes every round secret, sends one `SA4_ABORT`
+line with a code, and answers nothing more.
+
+Checks run cheapest first: format, round, fingerprint, membership, counts,
+duplicates and keys, then signatures. The soul refuses all of these:
+- **R0 (`SA4_ROUND`):** a wrong fingerprint, a round not after the last
+  one, or a wrong vector length or layout.
+- **ADV batch:**
+  - |U1| < t;
+  - a batch that does not match U1;
+  - unknown or duplicate souls;
+  - its own ADV coming back altered;
+  - c = s for a peer, any two equal keys, or a low-order key;
+  - a bad ADV signature.
+- **Share batch:**
+  - |U2| < t, or U2 not a subset of U1;
+  - a missing, duplicate or misaddressed share;
+  - a share that does not open, or whose fields do not match.
+- **R3 (`SA4_SET 3`):** |U3| < t, or U3 not a subset of U2.
+- **SIG3 batch:**
+  - |U4| < t;
+  - a missing or duplicate signature;
+  - its own signature coming back altered;
+  - an invalid signature among those checked, including one over a
+    different transcript. The soul checks in ascending x and stops at t
+    valid ones (its own counts); later signatures are not checked, because
+    t valid signatures over one T3 are what the protocol needs.
+- **Any batch:** lines for another round, or a line that does not fit the
+  current state.
+
+**The caller's duties.**
+- Pass an RNG context. Without OS entropy, do not run a round.
+- Persist `sa4s_done_round` and pass it back next time, so an old round id
+  cannot be replayed. This is A2.3's job.
+- Keep every word's sum over all souls below 2^32.
+
+**Tests.**
+
+| Test | Checks | What it covers |
+|---|---|---|
+| `test_sa4_wire` | 96 | Parsing, formatting, chunking and bitmaps. Transcript digests are checked against Python. |
+| `test_sa4_soul` | 15 | An honest round at N = 3. |
+| `test_sa4_soul_dropout` | 8 | A dropout after shares at N = 5. |
+| `test_sa4_soul_dropout2` | 3 | A dropout after ADV at N = 5. |
+| `test_sa4_soul_u4` | 11 | A soul in U3 that sends no signature (U4 smaller than U3): its b-share is revealed. A SIG3 verifies over a T3 recomputed from the public lines. |
+| `test_sa4_soul_refuse` | 227 | The refusals reachable at N = 3, with the abort code. |
+| `test_sa4_soul_refuse5` | 86 | The subset, membership, share-field, batch-cap and equivocation refusals that need N > t, with code and reason; secret bytes zeroed. |
+
+The round tests use an in-memory coordinator (`tests/sa4_harness.nova`).
+It rebuilds the aggregate from the reveals and compares it with the sum of
+the inputs. In a mutation check, each of 15 weakened checks made at least
+one of these tests fail. The weakenings covered the subset and membership
+checks, the share-field check, the T3 and H1 contents, the reveal policy,
+the batch caps, the R2 wipe and two wire rules. A mask-sign mutant is
+caught only by the dropout tests: with nobody dropping, the masks cancel
+under either convention.
+
+**Cost.**
+- Each soul makes 2 signatures per round.
+- Each soul makes (|U1| − 1) + (t − 1) signature checks per round. At about
+  0.9 s each, that is roughly 15 s at N = 10 and roughly 6 minutes at N = 255.
+- In NOVA every Ed25519 operation allocates 23–46 MB that is never freed.
+  One soul's round therefore takes about 2 × 23 MB + ((|U1| − 1) + (t − 1)) ×
+  46 MB:
+  - about 0.75 GB at N = 10;
+  - about 19 GB at N = 255.
+
+  Running one process per round bounds the leak across rounds, but not
+  within a round. Fixing Ed25519's allocation is a prerequisite for A2.3
+  at more than a handful of souls.
+
 ## Full SecAgg upgrade path
 
 The reference Google SecAgg (~4-6 weeks per the published prototype)
