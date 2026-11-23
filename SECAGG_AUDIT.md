@@ -779,8 +779,10 @@ message. The A2.2 state machine must keep that true.
 - In `gf256`, `shamir`, `saprg` and the wrappers, secret bytes pass only
   through branch-free `int_*` builtins. NOVA itself gives no constant-time
   guarantee.
-- `ed25519_pk_from_seed` uses the existing Ed25519 scalar multiply, which
-  is not constant time (see the R14F appendix).
+- `ed25519_pk_from_seed` uses the Ed25519 scalar multiply. Since A2.3a
+  that is a swap-based ladder on field25519 with no branch on key bits;
+  the remaining caveat is the scalar reduction mod L (see the R14F
+  appendix).
 - Wiping is limited to the copies these modules make. The RNG pool, the
   ChaCha20 state and the HKDF intermediates are not wiped.
 
@@ -797,7 +799,7 @@ message. The A2.2 state machine must keep that true.
 | Seal or open of a share | about 0.05 ms |
 | Shamir split, 32 bytes, t = 67, n = 100 | about 23 ms |
 | 10,000 mask words | about 8 ms |
-| Ed25519 public key from a seed | about 0.5 s |
+| Ed25519 public key from a seed | about 4 ms (about 0.5 s before A2.3a) |
 
 ## SecAgg v4 roster and identity keys (A2.1, not wired in yet)
 
@@ -963,17 +965,15 @@ under either convention.
 
 **Cost.**
 - Each soul makes 2 signatures per round.
-- Each soul makes (|U1| − 1) + (t − 1) signature checks per round. At about
-  0.9 s each, that is roughly 15 s at N = 10 and roughly 6 minutes at N = 255.
-- In NOVA every Ed25519 operation allocates 23–46 MB that is never freed.
-  One soul's round therefore takes about 2 × 23 MB + ((|U1| − 1) + (t − 1)) ×
-  46 MB:
-  - about 0.75 GB at N = 10;
-  - about 19 GB at N = 255.
-
-  Running one process per round bounds the leak across rounds, but not
-  within a round. Fixing Ed25519's allocation is a prerequisite for A2.3
-  at more than a handful of souls.
+- Each soul makes (|U1| − 1) + (t − 1) signature checks per round.
+- NOVA's allocator never frees, so heap per operation matters as much as
+  time. Since A2.3a an Ed25519 signature takes about 4 ms and 45 KB, and a
+  check about 8 ms and 30 KB (`test_ed25519_equiv` bounds both at 512 KB).
+  One soul's round at N = 255 (t = 171) then needs 424 checks: about
+  3.5 s and about 13 MB of Ed25519 work.
+- Before A2.3a the figures were about 0.5 s and 23 MB per signature and
+  0.9 s and 46 MB per check: about 0.75 GB at N = 10 and about 19 GB at
+  N = 255.
 
 ## SecAgg v4 coordinator (A2.2b, not wired in yet)
 
@@ -1541,17 +1541,18 @@ A self-contained 1100-line module that ships:
      (104-byte ASCII string) and a dual-block-padding KAT (114
      bytes, forces `rem >= 112` so the second compression block
      fires).
-  2. **Field arithmetic over p_25519** — `_fe_add`, `_fe_sub`,
-     `_fe_mul`, `_fe_neg`, `_fe_inv` (Fermat-style via
-     `bn256_modpow_ct(a, p-2, p)`), all routed through a CACHED
-     Montgomery context (`_ED_P_CTX_CACHE`, singleton). Per-fe_mul
-     cost ~0.1-0.5 ms.
+  2. **Field arithmetic over p_25519** — originally bn256 wrappers
+     (`_fe_mul` via `bn256_modmul`, a bit-serial reduction, ~90 µs and
+     ~4 KB per multiply). Since A2.3a: `src/safety/field25519.nova`
+     (ten limbs, in place, no allocation, ~0.6 µs per multiply), the
+     same field code x25519 uses.
   3. **Edwards point arithmetic** — extended projective form
      (X:Y:Z:T) per RFC 8032 5.1.4 + Hisil et al. 2008 formulas for
-     twisted Edwards a = -1. `_ed_point_add` (9 mults), `_ed_point_double`
-     (4 squarings + 4 mults), `_ed_scalar_mult` (constant-time
-     Montgomery ladder, 256 iterations). Single `_fe_inv` at the END
-     of scalar_mult to convert back to affine for encoding.
+     twisted Edwards a = -1. Since A2.3a `_ed_pt_add_into` and
+     `_ed_pt_dbl` work in place on module scratch, and `_ed_scalar_mult`
+     is a Montgomery ladder with a conditional swap (256 iterations, no
+     branch on key bits). One inversion per encoding; point equality
+     cross-multiplies instead of inverting.
   4. **Scalar arithmetic mod L** — `_l_mod_512` (reduce a 512-bit
      SHA-512 output mod L) and `_l_addmul` (compute `(r + k*a) mod
      L`). Uses a precomputed `2^256 mod L` constant to fold the
@@ -1574,6 +1575,13 @@ A self-contained 1100-line module that ships:
   * `ed25519_verify` on the canonical triple: ~750-800 ms.
   * SHA-512 of a 32-byte input: ~0.1 ms (single compression block).
 
+  A2.3a update: sign ~4 ms / ~45 KB of heap, verify ~8 ms / ~30 KB,
+  SHA-512 of one block ~35 µs / ~4 KB (it was ~490 KB per block: a
+  two-element list per 64-bit operation). Outputs are unchanged:
+  `tests/unit/test_ed25519_equiv.nova` checks SHA-512, keys, signatures,
+  verify results and decode / `pk_check` decisions on vectors from an
+  independent Python implementation that the old code also matched.
+
 The dominant cost is the Edwards `_ed_scalar_mult` (1 in sign, 2 in
 verify); each scalar_mult does 256 doublings + ~128 adds (Mont ladder
 loop body is bit-INDEPENDENT). Per-scalar_mult ~= 1920 modular mults.
@@ -1590,11 +1598,12 @@ public API.
 ### Constant-time / side-channel disclaimer
 
   * `_ed_scalar_mult` uses the Montgomery ladder (one add + one
-    double per bit; loop body is bit-independent control flow).
-  * The internal `_fe_mul` / `_fe_inv` route through `bn256_*`
-    which has the same "OUTER loop is exponent-independent but
-    inner `bn256_cmp` / `bn256_sub` still branches on operand bits"
-    caveat documented in `bignum_256.nova`. We inherit that.
+    double per bit). Since A2.3a the ladder swaps with `fe_cswap`
+    masks instead of branching on the key bit.
+  * Since A2.3a the field operations are field25519's branch-free
+    limb code (before: `bn256_*`, whose inner compare / subtract
+    branches on operand bits). Scalars mod L still use `bn256_*`, so
+    that caveat remains for `_l_mod_512` / `_l_addmul` in signing.
   * The hash-then-reduce path inside sign uses SHA-512 (data-
     dependent inner control flow over the message; this is fine —
     the message is public input to the signer) and `_l_mod_512`
