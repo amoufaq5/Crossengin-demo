@@ -1117,6 +1117,11 @@ def selftest():
     # Shamir S0 round trip
     s0 = shamir_split_coeffs(b"\x42", 3, 5, b"\x13\x37")
     assert all(shamir_combine([s0[i] for i in c], 1) == b"\x42" for c in [(0, 1, 2), (1, 3, 4), (4, 2, 0)])
+    # Refusals as shamir.nova: empty secret, x = 0, duplicate x, length mismatch.
+    assert shamir_combine([(1, b""), (2, b"")], 0) is None
+    assert shamir_combine([(0, b"\x01"), (2, b"\x02")], 1) is None
+    assert shamir_combine([(1, b"\x01"), (1, b"\x02")], 1) is None
+    assert shamir_combine([(1, b"\x01"), (2, b"\x02\x03")], 1) is None
     # ChaCha20 RFC 8439 2.3.2, A.1 #1 (== saprg P1)
     assert H(chacha_block(bytes(range(32)), 1, bytes.fromhex("000000090000004a00000000"))).startswith("10f1e7e4d13b5915500fdd1fa32071c4")
     assert b"".join(w.to_bytes(4, "little") for w in saprg_expand(bytes(32), 16)) == bytes.fromhex(
