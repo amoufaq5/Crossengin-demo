@@ -975,6 +975,116 @@ under either convention.
   within a round. Fixing Ed25519's allocation is a prerequisite for A2.3
   at more than a handful of souls.
 
+## SecAgg v4 coordinator (A2.2b, not wired in yet)
+
+`src/learning/sa4_coord.nova` implements the coordinator's side of a round.
+- **Transport-free:** the caller passes each line it receives together
+  with the roster id of the connection it came from. It closes each phase
+  (normally on a deadline) and sends the `[to, line]` messages it gets
+  back.
+- **Rounds:** the caller chooses the round id and must keep it
+  increasing. Persisting it is A2.3's job.
+
+**Phases.**
+
+| Phase | Collects | On close |
+|---|---|---|
+| 0 | ADV | Builds U1 and sends every U1 soul all the ADVs plus `SET 1`. |
+| 1 | Shares + `END` | Builds U2 and routes each share to its receiver, plus `SET 2`. |
+| 2 | y chunks + `END` | Builds U3 and sends `SET 3`. |
+| 3 | SIG3 | Builds U4 and sends every U4 soul all the SIG3s plus `SET 4`. |
+| 4 | Reveals + `END` | Builds the set of revealers. |
+
+A set below t cancels the round. In that case nothing is unmasked, and
+`sa4c_unmask` and `sa4c_close` refuse.
+
+**Leaving souls out.** If a soul breaks a rule the coordinator can check,
+the coordinator leaves it out of every later set and records the reason
+(`sa4c_why`). The round continues for the others. The rules:
+- every line parses;
+- the line speaks only for the soul's own id;
+- the line fits the current phase.
+
+It also checks, by phase:
+- **ADV:** a bad signature, c = s, or a low-order key.
+- **Shares:** exactly one share per receiver in U1, with an END count that
+  matches.
+- **y:** each chunk must match this round's L in count, index and length,
+  so what one soul can make the coordinator store is bounded by L. The
+  chunks must assemble to exactly L words.
+- **SIG3:** it must verify over the T3 the coordinator computes itself.
+- **Reveals:** exactly one per soul in U2, of the right kind (b for U3, s
+  for U2∖U3).
+
+The coordinator also leaves out both souls of any pair that advertised the
+same key. Without these exclusions, one bad ADV would make every honest
+soul refuse the round.
+
+**What the coordinator cannot check: share contents.** Only a share's
+receiver can open it. A malicious soul can send an honest receiver a share
+that does not open, or that holds the wrong fields. The receiver then
+refuses the round and sends `SA4_ABORT`, and the coordinator leaves the
+receiver out, not the sender.
+- With enough such shares, |U3| falls below t and the round is cancelled.
+  `test_sa4_coord5` pins both outcomes.
+- The coordinator records these souls separately (`sa4c_aborted`), and
+  their reason says "possibly a victim". An abort is not evidence of
+  misbehaviour and must not be used to penalise a soul.
+- Verifiable blame needs a complaint round. That is an open design item
+  for A2.4.
+
+**Unmasking** (`sa4c_unmask`, at most once):
+- Start from the sum of y over U3.
+- Subtract PRG(b_u) for each u in U3.
+- Undo each dropped soul's pairwise masks.
+
+b_u and s_d^SK are rebuilt from t reveals, taking revealers in ascending x.
+A rebuilt s_d^SK must produce the s_pk that d advertised; otherwise the
+coordinator refuses to unmask. Rebuilt secrets are wiped after use.
+
+**Limit.** b_u has no public commitment. A soul that sends a wrong b-share
+in R4 produces a wrong sum, not a refusal. This is the semi-honest limit of
+the reveal step in Bonawitz et al. It does not affect privacy.
+
+**False-dropout attack** (`test_sa4_attack`). A malicious coordinator tells
+four of five souls that soul E dropped, although E sent its y, and shows E
+a different U3.
+- The four souls reveal E's s-share. The coordinator can therefore rebuild
+  E's s key.
+- No b-share about E is revealed. Only souls that signed a U3 containing E
+  would reveal one.
+- E refuses to reveal anything, because the other signatures are over a
+  different T3.
+- Stripping the pairwise masks from y_E therefore leaves x_E + PRG(b_E),
+  which matches x_E in no word.
+- As a control, the same reveals give the exact aggregate over the other
+  four souls.
+
+**Tests.**
+
+| Test | Checks | Covers |
+|---|---|---|
+| `test_sa4_coord_n3` | 7 | Honest N = 3 round; a second unmask and late lines are refused. |
+| `test_sa4_coord` | 12 | Dropout with exactly t reveals; an altered s-share is refused via s_pk; a cancel at \|U2\| < t. |
+| `test_sa4_coord2` | 7 | A soul stops after ADV; a soul in U3 sends no SIG3. |
+| `test_sa4_coord3` | 8 | A bad ADV signature leaves a soul out of U1; a bad SIG3 leaves a soul out of U4. |
+| `test_sa4_coord4` | 4 | A wrong reveal kind: that soul's reveals are ignored. |
+| `test_sa4_coord5` | 11 | One corrupted share: its receiver is left out as an abort and the round completes. Every share corrupted: the round is cancelled. |
+| `test_sa4_coord_refuse` | 75 | Recv rules in the ADV, share, SIG3 and reveal phases, each with its reason. |
+| `test_sa4_coord_refuse2` | 39 | With a soul outside U2: lines from outside the current set, a reveal about a soul outside U2, END rules in every phase, y-chunk bounds, and cancels at U3, U4 and the revealers. |
+| `test_sa4_attack` | 14 | The false-dropout attack. |
+
+In a mutation check, each of 10 weakened coordinator checks made at least
+one of these tests fail. The checks were:
+- ADV and SIG3 verification;
+- the duplicate-key and low-order rules;
+- the reveal-kind rule;
+- the s_pk check;
+- the single unmask;
+- the correction sign;
+- the t check on U2;
+- share routing.
+
 ## Full SecAgg upgrade path
 
 The reference Google SecAgg (~4-6 weeks per the published prototype)
