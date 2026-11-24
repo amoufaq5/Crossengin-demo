@@ -29,8 +29,10 @@
 #                (bad_sig3), no b-reveal about it, its s key is rebuilt but
 #                its y without pairwise masks equals its input in no word;
 #                the control aggregate over the others is exact.
-#                Checker negative controls on that log: a REVEAL after the
-#                abort, and a soul short of t valid SIG3s, are reported.
+#                Checker negative controls on copies of that log: a REVEAL
+#                after the abort, a soul short of t valid SIG3s, an altered
+#                SIG3, and a REVEAL of the wrong kind / before SET 4 / sent
+#                twice are each reported.
 #   E.split E.sig3bad E.ownsig3 E.u4notsub E.u4small   bad_sig3 / bad_set /
 #                u4_small, no reveal from a refusing soul.
 #   E.oop E.early E.long E.nul   unexpected / bad_line / transport.
@@ -71,9 +73,11 @@ SECONDS=0
 sa4_keys 10
 sa4_roster "$T/R5" 1 2 3 4 5
 sa4_roster "$T/R10" 1 2 3 4 5 6 7 8 9 10
-assert_match "$(cat "$T/R10")" '^crossengin-secagg-roster v1' "rosters written"
+assert_eq "$(grep -c '^[0-9]* [A-Za-z0-9_-]* [0-9a-f]\{64\}$' "$T/R5") $(grep -c '^[0-9]* [A-Za-z0-9_-]* [0-9a-f]\{64\}$' "$T/R10")" "5 10" \
+    "rosters written (5 and 10 entries)"
 
-PORT=$(( 41000 + (RANDOM % 900) * 8 ))
+# Below the Linux ephemeral range (32768+), apart from the U4 scenario.
+PORT=$(( 20000 + (RANDOM % 900) * 8 ))
 next_port() { PORT=$((PORT + 1)); }
 py_x() { echo "seed=${1}1:${1}2,user-teach=${1}3:${1}4"; }
 T2="seed,user-teach"
@@ -279,15 +283,16 @@ if stage notinu1 "$T/R5" "1 2" "3 4 5" --round 7 --attack not-in-u1; then
     refusal not-in-u1 "$(all5 not_in_u1)" "refused: this soul is not in U1 \\(abort code not_in_u1\\)" \
         "refused: this soul is not in U1 \\(abort code not_in_u1\\)"
 fi
-# U1 equivocation: the victim's U1 lacks one soul; H1 differs.
+# U1 equivocation: the victim's U1 lacks one soul; every soul gets the same
+# U2 (without that soul), so only H1 differs between the transcripts.
 if stage equivu1a "$T/R5" "1 2" "3 4 5" --round 7 --attack equiv-u1 --victim 10 --hide 40; then
-    refusal equiv-u1/chat "10=bad_sig3 20=bad_sig3 30=bad_sig3 40=bad_share 50=bad_sig3" \
+    refusal equiv-u1/chat "10=bad_sig3 20=bad_sig3 30=bad_sig3 40=not_in_u2 50=bad_sig3" \
         "refused: consistency signature of soul [0-9]+ does not verify \\(abort code bad_sig3\\)" \
         "refused: consistency signature does not verify \\(abort code bad_sig3\\)"
 fi
 if stage equivu1b "$T/R5" "1 2" "3 4 5" --round 7 --attack equiv-u1 --victim 50 --hide 20; then
-    assert_eq "$(codes "$CK")" "10=bad_sig3 20=bad_share 30=bad_sig3 40=bad_sig3 50=bad_sig3" "equiv-u1/py: abort codes on the wire"
-    assert_match "$(cat "$D/soul2.out")" "refused: share lines do not match U2 \\(abort code bad_share\\)" "equiv-u1/py: chat soul 20 (hidden from 50) refused"
+    assert_eq "$(codes "$CK")" "10=bad_sig3 20=not_in_u2 30=bad_sig3 40=bad_sig3 50=bad_sig3" "equiv-u1/py: abort codes on the wire"
+    assert_match "$(cat "$D/soul2.out")" "refused: this soul is not in U2 \\(abort code not_in_u2\\)" "equiv-u1/py: chat soul 20 (hidden from 50, left out of every U2) refused"
     assert_match "$(cat "$D/py5.out")" "refused: consistency signature does not verify \\(abort code bad_sig3\\)" "equiv-u1/py: Python victim 50 refused"
     nothing_learned equiv-u1/py
 fi
@@ -335,21 +340,48 @@ if stage fd50 "$T/R5" "1 2" "3 4 5" --round 7 --attack false-dropout --victim 50
         "false-dropout/py: the Python victim says why"
     assert_match "$(cat "$D/soul1.out")" "fed: \\[SA4\\] AGGREGATE_SUM round=7 tag=seed .* n_part=4$" "false-dropout/py: chat soul 10 got the sum over 4"
 fi
-# Negative controls for the checker itself (no sockets): a REVEAL written
-# into the log after the victim's abort, and two SIG3 lines taken out of
-# what soul 40 was sent, must both be reported.
-if [ -s "$T/fd50/wire.log" ]; then
+# Negative controls for the checker itself (no sockets), on copies of the
+# fd50 log (only when soul 40 revealed there): a REVEAL written after the
+# victim's abort; two SIG3 lines taken out of what soul 40 was sent; one of
+# those SIG3s with an altered signature; one of 40's REVEALs with the other
+# kind, moved before SET 4, or sent twice. Each must be reported.
+if [ -s "$T/fd50/wire.log" ] && grep -q '^40>S SA4_REVEAL ' "$T/fd50/wire.log"; then
     { cat "$T/fd50/wire.log"
       grep -m1 '^40>S SA4_REVEAL ' "$T/fd50/wire.log" | sed 's/^40>S SA4_REVEAL \([0-9]*\) 40 /50>S SA4_REVEAL \1 50 /'
     } > "$T/fd50/forged.log"
     awk '/^S>40 SA4_SIG3 / && n < 2 { n++; next } { print }' "$T/fd50/wire.log" > "$T/fd50/nosig.log"
-    for f in forged nosig; do
+    python3 -I - "$T/fd50" <<'PYEOF'
+import sys
+d = sys.argv[1]
+L = open(d + "/wire.log", encoding="latin-1").read().split("\n")
+rv = next(k for k, ln in enumerate(L) if ln.startswith("40>S SA4_REVEAL "))
+sg = next(k for k, ln in enumerate(L) if ln.startswith("S>40 SA4_SIG3 "))
+s4 = next(k for k, ln in enumerate(L) if ln.startswith("S>40 SA4_SET ") and ln.split(" ")[3] == "4")
+def out(name, lines):
+    open(d + "/" + name + ".log", "w", encoding="latin-1").write("\n".join(lines))
+a = list(L); f = a[sg].split(" "); f[-1] = ("0" if f[-1][0] != "0" else "1") + f[-1][1:]; a[sg] = " ".join(f)
+out("badsig", a)
+a = list(L); f = a[rv].split(" "); f[5] = "s" if f[5] == "b" else "b"; a[rv] = " ".join(f)
+out("swapkind", a)
+a = list(L); ln = a.pop(rv); a.insert(s4, ln)
+out("early", a)
+a = list(L); a.insert(rv, a[rv])
+out("dup", a)
+PYEOF
+    for f in forged nosig badsig swapkind early dup; do
         CE_SECAGG_ROSTER="$T/R5" CE_SECAGG_V4_TAGS="$T2" python3 -I "$EVIL" --check "$T/fd50/$f.log" > "$T/fd50/$f.json" 2>&1
     done
     assert_eq "$(jget "$T/fd50/forged.json" after_abort)" "[50]" "checker: a line after an abort is reported"
     assert_eq "$(jget "$T/fd50/forged.json" bad_revealers)" "[50]" "checker: a reveal without t valid SIG3s over the soul's T3 is reported"
     assert_eq "$(jget "$T/fd50/nosig.json" souls.40.sig3_valid) $(jget "$T/fd50/nosig.json" bad_revealers)" "2 [40]" \
         "checker: a soul that revealed after only 2 valid SIG3s is reported"
+    assert_eq "$(jget "$T/fd50/badsig.json" souls.40.sig3_valid) $(jget "$T/fd50/badsig.json" bad_revealers)" "3 [40]" \
+        "checker: a soul that revealed although one SIG3 does not verify is reported"
+    assert_eq "$(jget "$T/fd50/swapkind.json" bad_revealers)" "[40]" "checker: a REVEAL of the wrong kind (b for s) is reported"
+    assert_eq "$(jget "$T/fd50/early.json" bad_revealers)" "[40]" "checker: a REVEAL before SET 4 is reported"
+    assert_eq "$(jget "$T/fd50/dup.json" bad_revealers)" "[40]" "checker: a REVEAL sent twice is reported"
+else
+    assert_eq "no REVEAL from soul 40 in the fd50 log" "a REVEAL from soul 40" "checker negative controls ran"
 fi
 if stage fd10 "$T/R5" "1 2" "3 4 5" --round 7 --attack false-dropout --victim 10; then
     fd_checks false-dropout/chat 10 "[20, 30, 40, 50]"

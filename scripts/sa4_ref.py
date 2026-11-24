@@ -1408,24 +1408,32 @@ def connect_main(argv):
                 return None
             pending.extend(chunk)
 
-    sock.sendall((FED_HELLO + "\n").encode("latin-1"))
-    if recv() != FED_OK:
-        print("sa4_ref: handshake refused")
+    try:
+        sock.sendall((FED_HELLO + "\n").encode("latin-1"))
+        reply = recv()
+        if reply != FED_OK:
+            print("sa4_ref: handshake refused")
+            return 3
+        sock.sendall(("FED_JOIN %d 1000\n" % soul.me).encode("latin-1"))
+    except (ValueError, OSError) as e:          # nothing secret exists yet
+        print("sa4_ref: handshake failed: %s" % e)
         return 3
-    sock.sendall(("FED_JOIN %d 1000\n" % soul.me).encode("latin-1"))
     print("sa4_ref: joined as id=%d x=%d" % (soul.me, soul.mx), flush=True)
     if fault == "silent":                     # joins, then never answers
         try:
             while recv() is not None:
                 pass
             print("sa4_ref: fault silent: coordinator closed")
-        except (socket.timeout, OSError):
-            print("sa4_ref: fault silent: timed out")
+        except (ValueError, OSError):
+            print("sa4_ref: fault silent: timed out or bad line")
         return 0
     try:
         return _connect_loop(soul, tags, opt, fault, sock, send, recv)
     except (ValueError, OSError) as e:          # socket.timeout is an OSError
-        if soul.state not in (ST_DONE, ST_ABORTED):
+        if soul.state == ST_ABORTED:            # refused, then the abort line could not be sent
+            print("sa4_ref: refused; the abort line was not delivered: %s" % e)
+            return 3
+        if soul.state != ST_DONE:
             soul._wipe()
             soul.state = ST_ABORTED
             try:
@@ -1446,8 +1454,10 @@ def _connect_loop(soul, tags, opt, fault, sock, send, recv):
     while True:
         line = recv()
         if line is None:
+            if soul.state != ST_DONE:            # mid-round EOF: the caller wipes and aborts
+                raise ConnectionError("coordinator closed the connection")
             print("sa4_ref: coordinator closed (state %d)" % soul.state)
-            return 0 if soul.state == ST_DONE else 4
+            return 0
         if soul.state == ST_DONE:
             if line == "BYE":
                 print("sa4_ref: BYE after %d aggregate(s)" % sums)
@@ -1500,8 +1510,12 @@ def _connect_loop(soul, tags, opt, fault, sock, send, recv):
                     o = " ".join(t)
                 new.append(o)
             outs = new
-        for o in outs:
-            send(o)
+        try:
+            for o in outs:
+                send(o)
+        except OSError:
+            if ok:
+                raise
         if not ok:
             code = outs[-1].split(" ")[-1] if outs else "-"
             print("sa4_ref: %s (abort code %s)" % (err, code))

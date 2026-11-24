@@ -36,7 +36,8 @@ Attacks (stage names of tests/integration/scenario_u4_evil.sh):
                older round): as signed for the souls in --victim, with the
                round field rewritten to this round for the others.
   u1-small     U1 of t-1 souls.        not-in-u1   U1 without the receiver.
-  equiv-u1     --victim is shown U1 without --hide, the others the full U1.
+  equiv-u1     --victim is shown U1 without --hide, the others the full U1;
+               every U2 leaves --hide out, so only U1 / H1 differ.
   tamper-ct    one share ciphertext to every soul has a flipped byte.
   u2-small     U2 of t-1 souls.        not-in-u2   U2 without the receiver.
   u2-notsub    U1 without --hide for everyone, then U2 with it.
@@ -438,6 +439,10 @@ class Evil:
             return [x for x in d if x != mx]
         if a == "u2-notsub":
             return sorted(set(d) | {self.X(self.hide)})
+        if a == "equiv-u1":
+            # Every soul (the hidden one too) gets the same U2 without
+            # --hide, so the transcripts differ only in U1 / H1.
+            return [x for x in d if x != self.X(self.hide)]
         return d
 
     def shares_for(self, i, u2):

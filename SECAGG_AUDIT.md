@@ -1314,8 +1314,8 @@ C ≤ 2t − N − 1 (and C < t − 1):
   after the round.
 
 **Tests.**
-- `tests/unit/test_sa4_soul_api.nova` (20 checks): `sa4s_round_ok` codes
-  and `sa4s_abort`.
+- `tests/unit/test_sa4_soul_api.nova` (24 checks): `sa4s_round_ok` codes
+  and `sa4s_abort` (mid-round, idle, repeated, and after DONE).
 - `tests/unit/test_sa4_fed.nova` (101 checks): tag parsing, the layout text
   and hash (checked against Python hashlib), input words and sums, the
   `FED_JOIN` parser, the strict result parser and the soul's result
@@ -1342,6 +1342,28 @@ C ≤ 2t − N − 1 (and C < t − 1):
   - configuration refusals, and v3n-sa / v4 hello cross-refusal.
 - `scripts/sa4_ref.py --connect` is the Python soul used there. Its
   `--fault` options drive the failure cases.
+- `tests/integration/scenario_u4_evil.sh` (in CI, about 70 s):
+  `scripts/secagg_evil_coord.py` plays a malicious coordinator against
+  real chat and Python souls, one lie per stage:
+  - round ids: replay, a burnt id, bad fingerprint / length / layout;
+  - R1: own ADV altered, a forged or old ADV, U1 too small or without the
+    receiver, U1 equivocation (only H1 differs);
+  - R2-R4: an altered share, U2 / U4 too small or not a subset, U2
+    without the receiver, U3 split between groups, bad or altered SIG3s;
+  - false dropout of a chat and of a Python victim (its y is used, its
+    s-key is never revealed);
+  - transport: lines out of phase, an early line, a long line, NUL, a
+    hang and a byte trickle (with timing bounds);
+  - forged results after an honest round (only the first valid line per
+    tag is applied, then the soul closes past the cap);
+  - collusion at N = 10, t = 7: C = 3 colluders learn nothing; C = 4 do
+    (so the bound is tight).
+  Its `--check` mode rebuilds what each soul was sent and sent from the
+  log: abort codes, no line after an abort, every revealer had t valid
+  SIG3s over its own T3 and followed the reveal rule, and no soul's input
+  can be rebuilt. Negative controls on altered copies of a log (a line
+  after an abort, missing or altered SIG3s, a REVEAL of the wrong kind,
+  before SET 4, or twice) show the checker reports each one.
 
 ## Full SecAgg upgrade path
 

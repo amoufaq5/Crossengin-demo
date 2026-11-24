@@ -66,7 +66,11 @@ wait_all() {
         [ "$alive" -eq 0 ] && break
         sleep 1; elapsed=$((elapsed + 1))
     done
-    if [ "$elapsed" -ge "$deadline" ]; then
+    # Recheck after the loop: a process that exited during the last sleep
+    # is not a hang.
+    alive=0
+    for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    if [ "$alive" -ne 0 ]; then
         FAIL=$((FAIL+1))
         printf "  ${C_RED}FAIL${C_RST}  process(es) hung past %ss, force-killed\n" "$deadline"
         # Chats run inside a subshell: kill its children (the binary) too.
