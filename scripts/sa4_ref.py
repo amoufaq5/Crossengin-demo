@@ -1275,6 +1275,56 @@ def fed_words(tags, x):
     return w
 
 
+def fed_parse_result(line):
+    """sa4f_parse_result: strict FED_AGGREGATE_SUM -> (r, tag, sp, sa, n) or None."""
+    t = _tokens(line)
+    if t is None or len(t) != 6 or t[0] != "FED_AGGREGATE_SUM":
+        return None
+    r = _round(t[1])
+    if r < 0 or not (1 <= len(t[2]) <= 64) or any(c not in TAG_CHARS for c in t[2]):
+        return None
+    sp, sa, n = _u32(t[3]), _u32(t[4]), _u32(t[5])
+    if sp < 0 or sa < 0 or n < 0:
+        return None
+    return (r, t[2], sp, sa, n)
+
+
+def fed_result_why(rec, r, tags, u3n, applied):
+    """sa4f_result_why."""
+    if rec is None:
+        return "not a FED_AGGREGATE_SUM line"
+    if rec[0] != r:
+        return "for another round"
+    if rec[1] not in tags:
+        return "tag not in CE_SECAGG_V4_TAGS"
+    if rec[1] in applied:
+        return "second result for this tag"
+    if rec[4] < 1:
+        return "n_part below 1"
+    if rec[4] > u3n:
+        return "n_part above |U3|"
+    return ""
+
+
+def round_ok(soul, rec):
+    """sa4s_round_ok: '' when the soul would accept this SA4_ROUND record."""
+    if rec is None:
+        return "bad_line"
+    if rec[0] != EV_ROUND:
+        return "unexpected"
+    if soul.x is None:
+        return "no_input"
+    if rec[2] != soul.ro.fp:
+        return "bad_fp"
+    if rec[1] <= soul.last:
+        return "stale_round"
+    if rec[3] != len(soul.x):
+        return "bad_len"
+    if rec[4] != soul.layout:
+        return "bad_layout"
+    return ""
+
+
 def _corrupt_hex_token(line, idx, pos=0):
     t = line.split(" ")
     h = list(t[idx])
@@ -1285,7 +1335,8 @@ def _corrupt_hex_token(line, idx, pos=0):
 
 def connect_main(argv):
     import socket
-    opt = {"--x": "", "--state": None, "--fault": None, "--timeout": "60", "--tags": None, "--connect": None}
+    opt = {"--x": "", "--state": None, "--fault": None, "--timeout": "60", "--tags": None, "--connect": None,
+           "--deadline": "300"}
     i = 0
     while i < len(argv):
         if argv[i] not in opt or i + 1 >= len(argv):
@@ -1322,7 +1373,7 @@ def connect_main(argv):
     if sock is None:
         print("sa4_ref: cannot connect to %s:%s" % (host, port))
         return 3
-    rf = sock.makefile("rb")
+    deadline = time.monotonic() + float(opt["--deadline"])   # bounds the whole session
 
     def send(line):
         data = (line + "\n").encode("latin-1")
@@ -1333,52 +1384,109 @@ def connect_main(argv):
             return
         sock.sendall(data)
 
-    def recv():
-        b = rf.readline(1002)
-        if not b:
-            return None
-        if not b.endswith(b"\n") or len(b) > 1001:
-            raise ValueError("line too long or not terminated")
-        return b[:-1].decode("latin-1")
+    pending = bytearray()
 
-    sock.sendall((FED_HELLO + "\n").encode("latin-1"))
-    if recv() != FED_OK:
-        print("sa4_ref: handshake refused")
+    def recv():
+        # The deadline is checked before every socket read, so a peer that
+        # trickles bytes cannot stretch the session past --deadline.
+        while True:
+            nl = pending.find(b"\n")
+            if nl >= 0:
+                if nl > 1000:
+                    raise ValueError("line over 1000 bytes")
+                line = bytes(pending[:nl])
+                del pending[:nl + 1]
+                return line.decode("latin-1")
+            if len(pending) > 1000:
+                raise ValueError("line over 1000 bytes")
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("session deadline (--deadline) passed")
+            sock.settimeout(min(left, float(opt["--timeout"])))
+            chunk = sock.recv(1024)
+            if not chunk:
+                return None
+            pending.extend(chunk)
+
+    try:
+        sock.sendall((FED_HELLO + "\n").encode("latin-1"))
+        reply = recv()
+        if reply != FED_OK:
+            print("sa4_ref: handshake refused")
+            return 3
+        sock.sendall(("FED_JOIN %d 1000\n" % soul.me).encode("latin-1"))
+    except (ValueError, OSError) as e:          # nothing secret exists yet
+        print("sa4_ref: handshake failed: %s" % e)
         return 3
-    sock.sendall(("FED_JOIN %d 1000\n" % soul.me).encode("latin-1"))
     print("sa4_ref: joined as id=%d x=%d" % (soul.me, soul.mx), flush=True)
     if fault == "silent":                     # joins, then never answers
         try:
             while recv() is not None:
                 pass
             print("sa4_ref: fault silent: coordinator closed")
-        except (socket.timeout, OSError):
-            print("sa4_ref: fault silent: timed out")
+        except (ValueError, OSError):
+            print("sa4_ref: fault silent: timed out or bad line")
         return 0
+    try:
+        return _connect_loop(soul, tags, opt, fault, sock, send, recv)
+    except (ValueError, OSError) as e:          # socket.timeout is an OSError
+        if soul.state == ST_ABORTED:            # refused, then the abort line could not be sent
+            print("sa4_ref: refused; the abort line was not delivered: %s" % e)
+            return 3
+        if soul.state != ST_DONE:
+            soul._wipe()
+            soul.state = ST_ABORTED
+            try:
+                sock.sendall((fmt_abort(max(soul.r, 0), soul.me, "transport") + "\n").encode("latin-1"))
+            except OSError:
+                pass
+            print("sa4_ref: refused: transport: %s (abort code transport)" % e)
+            return 3
+        print("sa4_ref: transport after the round: %s" % e)
+        return 0
+
+
+def _connect_loop(soul, tags, opt, fault, sock, send, recv):
     sums = 0
+    applied = []
+    after_done = 0
+    u3n = 0
     while True:
         line = recv()
         if line is None:
+            if soul.state != ST_DONE:            # mid-round EOF: the caller wipes and aborts
+                raise ConnectionError("coordinator closed the connection")
             print("sa4_ref: coordinator closed (state %d)" % soul.state)
-            return 0 if soul.state == ST_DONE else 4
+            return 0
         if soul.state == ST_DONE:
             if line == "BYE":
                 print("sa4_ref: BYE after %d aggregate(s)" % sums)
                 return 0
-            f = line.split(" ")
-            if len(f) == 6 and f[0] == "FED_AGGREGATE_SUM" and int(f[1]) == soul.done_round:
-                print("sa4_ref: AGGREGATE_SUM round=%s tag=%s sum_promo=%s sum_atr=%s n_part=%s" % tuple(f[1:]),
-                      flush=True)
+            after_done += 1
+            if after_done > len(tags):           # an honest coordinator sends at most one per tag
+                print("sa4_ref: too many lines after the round; closing")
+                return 0
+            rec = fed_parse_result(line)
+            why = fed_result_why(rec, soul.done_round, tags, u3n, applied)
+            if why == "":
+                applied.append(rec[1])
+                print("sa4_ref: AGGREGATE_SUM round=%d tag=%s sum_promo=%d sum_atr=%d n_part=%d" % rec, flush=True)
                 sums += 1
+            else:
+                print("sa4_ref: ignored a result line (%s)" % why, flush=True)
             continue
-        if line.startswith("SA4_ROUND ") and opt["--state"]:
-            rec = parse(line)
-            if rec is not None and rec[1] > soul.last:
-                with open(opt["--state"] + ".tmp", "w") as fh:          # write-ahead
+        rec = parse(line)
+        if soul.state == ST_IDLE and opt["--state"] and rec is not None and rec[0] == EV_ROUND:
+            if round_ok(soul, rec) == "":              # write-ahead, only for a round we accept
+                with open(opt["--state"] + ".tmp", "w") as fh:
                     fh.write("%d\n" % rec[1])
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(opt["--state"] + ".tmp", opt["--state"])
+        if rec is not None and rec[0] == EV_SET and rec[2] == 3:
+            xs = bitmap_xs(rec[3], soul.ro.n)
+            if xs is not None:
+                u3n = len(xs)
         ok, err, outs = soul.handle(line)
         if fault == "bad-adv-sig":
             outs = [_corrupt_hex_token(o, 5) if o.startswith("SA4_ADV ") else o for o in outs]
@@ -1402,10 +1510,15 @@ def connect_main(argv):
                     o = " ".join(t)
                 new.append(o)
             outs = new
-        for o in outs:
-            send(o)
+        try:
+            for o in outs:
+                send(o)
+        except OSError:
+            if ok:
+                raise
         if not ok:
-            print("sa4_ref: " + err)
+            code = outs[-1].split(" ")[-1] if outs else "-"
+            print("sa4_ref: %s (abort code %s)" % (err, code))
             return 3
         stop = {"stop-after-adv": ST_ADV, "stop-after-shares": ST_SHARED, "stop-after-y": ST_MASKED,
                 "stop-after-sig3": ST_SIGNED}.get(fault)
