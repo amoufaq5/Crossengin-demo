@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Malicious SecAgg v4 coordinator for tests (A2.4a). Stdlib only.
+"""Malicious SecAgg v4 coordinator for tests (A2.4a; wire v4-sa2 since A2.4b). Stdlib only.
 
-It speaks the real v4 wire (src/learning/sa4_wire.nova) to real souls: NOVA
-chat souls (/fed_join with CE_SECAGG_MODE=v4) and Python souls
-(scripts/sa4_ref.py --connect). It accepts the v4 hello and FED_JOIN, then
+It speaks the real v4-sa2 wire (src/learning/sa4_wire.nova: 8-token ADV with
+B_u and M_u, share plaintext v2 with the Merkle path, 7-token REVEAL with a
+proof) to real souls: NOVA chat souls (/fed_join with CE_SECAGG_MODE=v4)
+and Python souls (scripts/sa4_ref.py --connect). It accepts the v4-sa2 hello and FED_JOIN, then
 drives one round in which it lies in a chosen way (--attack), and logs every
 line both ways. A second mode (--check) judges, from that log alone, what
 the honest souls revealed: it does not trust the attack code.
@@ -32,6 +33,8 @@ Attacks (stage names of tests/integration/scenario_u4_evil.sh):
                honest line for round N); stops after the ADVs.
   own-adv      each soul is sent its own ADV with c_pk altered.
   adv-sig      each soul is sent another soul's ADV with a forged signature.
+  alter-m      each soul is sent another soul's ADV with its Merkle root
+               (mroot token) altered, signature kept: refused (bad_sig).
   adv-old      each soul is sent another soul's ADV from --prev-log (an
                older round): as signed for the souls in --victim, with the
                round field rewritten to this round for the others.
@@ -418,7 +421,10 @@ class Evil:
             lines[k] = flip_hex(lines[k], 3, 0)
         if a == "adv-sig" and nxt:
             k = u1.index(nxt[0])
-            lines[k] = flip_hex(lines[k], 5, 10)
+            lines[k] = flip_hex(lines[k], 7, 10)
+        if a == "alter-m" and nxt:
+            k = u1.index(nxt[0])
+            lines[k] = flip_hex(lines[k], 6, 10)
         if a == "adv-old" and nxt:
             k = u1.index(nxt[0])
             old = self.old_adv.get(self.I(nxt[0]))
@@ -485,8 +491,8 @@ class Evil:
         for ln in self.sent_adv[i]:
             p = R.parse(ln)
             if p and p[0] == R.EV_ADV:
-                keys[self.X(p[2])] = (p[3], p[4])
-        h1 = R.advset_hash(R.bitmap(v[1]), [keys.get(x, (b"", b"")) for x in v[1]])
+                keys[self.X(p[2])] = (p[3], p[4], p[6], p[7])
+        h1 = R.advset_hash(R.bitmap(v[1]), [keys.get(x, (b"",) * 4) for x in v[1]])
         return R.t3_transcript(self.fp, self.r, h1, R.bitmap(v[2]), R.bitmap(v[3]))
 
     def sig3_for(self, i, u4):
@@ -860,7 +866,7 @@ def check_main(o):
             c = p[3]
             ek = R.enc_key(cols_csk[c], cpk[u], p[1], u, c)
             pt = R.share_open(ek, p[1], u, c, p[4]) if ek else None
-            q = R.share_pt_parse(pt) if pt else None
+            q = R.share_pt_parse(pt, R.depth(n)) if pt else None
             if q and q[:4] == (u, c, r, X(c)):
                 ssh.setdefault(u, {})[X(c)] = q[4]
                 bsh.setdefault(u, {})[X(c)] = q[5]
@@ -899,8 +905,8 @@ def check_main(o):
             for s, ln in tl:
                 p = P(ln)
                 if s < sets[1][0] and p and p[0] == R.EV_ADV and p[1] == r:
-                    keys.setdefault(X(p[2]), (p[3], p[4]))
-            h1 = R.advset_hash(sets[1][1], [keys.get(x, (b"", b"")) for x in u[1]])
+                    keys.setdefault(X(p[2]), (p[3], p[4], p[6], p[7]))
+            h1 = R.advset_hash(sets[1][1], [keys.get(x, (b"",) * 4) for x in u[1]])
             t3 = R.t3_transcript(rnd[2], r, h1, R.bitmap(u[2]), sets[3][1])
             _, _, ps = first(fl, lambda p: p[0] == R.EV_SIG3 and p[2] == v)
             d["own_sig3_over_t3"] = bool(ps) and R.ed25519_verify(t3, ps[3], ro.by_id[v][2])

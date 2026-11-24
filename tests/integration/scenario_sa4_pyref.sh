@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Scenario sa4_pyref -- SecAgg v4: NOVA soul vs an independent Python soul
-# (A2.3b).
+# Scenario sa4_pyref -- SecAgg v4 (v4-sa2): NOVA soul vs an independent
+# Python soul (A2.3b; verifiable shares A2.4b).
 #   scripts/sa4_ref.py is a second implementation of the v4 soul with its
 #   own primitives (stdlib only). Driven with the same seeds, roster and
 #   deterministic RNG as tests/sa4_harness.nova, it must produce exactly the
@@ -10,15 +10,19 @@
 #     B  N = 5, one soul in U2 but not U3      (s-shares revealed)
 #     C  N = 4, one soul drops after its ADV
 #     D  N = 5, one soul in U3 but not U4      (no SIG3 from it)
-#     E  11 refusals (abort line and code)
+#     E  15 refusals (abort line and code; v4-sa2: own ADV with B or M
+#        altered, a peer ADV with M altered, a v1 6-token ADV)
 #   Every ADV/SHARE/Y/SIG3/REVEAL line carries a signature, ciphertext,
 #   masked words or a share, so a match pins the KDFs, AEAD framing, Shamir
-#   layout, PRG, mask signs, transcripts and reveal policy on both sides; E
+#   layout, PRG, mask signs, transcripts, share commitments (B_u, Merkle
+#   root, authentication paths, reveal proofs) and reveal policy; E
 #   compares abort lines. A tampered transcript must be reported as a
 #   difference (negative control).
-#   Then a differential run: tests/tools/sa4_cases.py builds 753 cases
+#   Then a differential run: tests/tools/sa4_cases.py builds 793 cases
 #   (honest rounds perturbed in every phase: every abort code, forged shares
-#   and signatures, low-order keys, set_input validation, and seeded random
+#   and signatures, shares or paths that do not match the dealer's
+#   commitment (bad_commit), B/M altered or re-signed in an ADV, wrong share
+#   ciphertext lengths, low-order keys, set_input validation, and seeded random
 #   mutations / moves / duplications / deletions of every line of four
 #   rounds); the NOVA soul (tests/tools/sa4_script.nova) and the Python soul
 #   must give the same ok / state / round / output lines at every step.
@@ -68,7 +72,11 @@ for X in A B C D E; do
     fi
     python3 -I "$REF" --dump $X > "$WORK/py_$X.txt" 2>&1
     case $X in
-        E) assert_eq "$(grep -c '^CASE ' "$WORK/py_$X.txt")" "$N" "scenario E: same number of refusals" ;;
+        E) assert_eq "$(grep -c '^CASE ' "$WORK/py_$X.txt")" "$N" "scenario E: same number of refusals"
+           assert_eq "$N" "15" "scenario E: 15 refusal cases"
+           assert_eq "$(grep -c '^CASE 1[12] ok=0 last=SA4_ABORT 5 7 bad_adv' "$WORK/nova_E.txt")" "2" "scenario E: own ADV with B or M altered refused (bad_adv)"
+           assert_match "$(grep '^CASE 13 ' "$WORK/nova_E.txt")" 'ok=0 last=SA4_ABORT 5 7 bad_sig' "scenario E: peer ADV with M altered refused (bad_sig)"
+           assert_match "$(grep '^CASE 14 ' "$WORK/nova_E.txt")" 'ok=0 last=SA4_ABORT 5 7 bad_line' "scenario E: v1 (6-token) ADV refused (bad_line)" ;;
         *) assert_eq "$(grep -c -E '^(ADV|OUT) ' "$WORK/py_$X.txt")" "$N" "scenario $X: same number of lines" ;;
     esac
 done
@@ -92,6 +100,12 @@ DIFF=$(diff "$WORK/cn.txt" "$WORK/cp.txt" | head -5)
 assert_eq "$DIFF" "" "differential: every step identical (ok, state, round, output lines)"
 CODES=$(grep -o 'SA4_ABORT [0-9]* [0-9]* [a-z0-9_]*' "$WORK/cn.txt" | awk '{print $4}' | sort -u | wc -l)
 assert_match "$CODES" '^(2[0-9]|[3-9][0-9])$' "differential: $CODES distinct abort codes exercised"
+NBC=$(grep -c 'SA4_ABORT [0-9]* [0-9]* bad_commit' "$WORK/cn.txt")
+assert_match "$NBC" '^[1-9][0-9]*$' "differential: $NBC bad_commit refusals (share or path does not match the dealer's commitment)"
+assert_eq "$NBC" "$(grep -c 'SA4_ABORT [0-9]* [0-9]* bad_commit' "$WORK/cp.txt")" "differential: same bad_commit refusals on both sides"
+python3 -I "$REPO_ROOT/tests/tools/sa4_cases.py" check > "$WORK/check.txt" 2>&1
+assert_eq "$?" "0" "differential: named v4-sa2 case outcomes (sa4_cases.py check)"
+assert_match "$(tail -1 "$WORK/check.txt")" 'check: OK' "differential: case check reports OK"
 
 # Negative control: change one hex digit of one masked Y word.
 awk 'BEGIN{d=0} /^OUT SA4_Y / && d==0 { n=split($0,f," "); w=f[n]; c=substr(w,1,1); r=(c=="0")?"1":"0"; f[n]=r substr(w,2); s=f[1]; for(i=2;i<=n;i++) s=s" "f[i]; print s; d=1; next } {print}' \

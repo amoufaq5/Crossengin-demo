@@ -876,6 +876,13 @@ A2.2a adds two modules:
 The coordinator logic is A2.2b; the chat and fed-coordinator integration
 is A2.3c (see "SecAgg v4 over the network").
 
+Since A2.4b (protocol v4-sa2) both Shamir splits happen in R0, the signed
+ADV also commits to every share (B_u and a Merkle root M_u), each share
+message carries its receiver's authentication path, R2 checks it against
+the commitment, and every reveal carries a proof. The table below is the
+A2.2a round; the v4-sa2 changes are in "SecAgg v4-sa2: verifiable shares
+(A2.4b)".
+
 **The round, as seen by soul u** (Bonawitz et al. 2017, actively secure
 variant; all sums mod 2^32):
 
@@ -888,8 +895,8 @@ variant; all sums mod 2^32):
 | R4 | The `SA4_SIG3` lines, then `SA4_SET 4` | Verifies the signatures in ascending x until it has t valid ones over its own T3. For every v in U2, reveals v's b-share if v is in the U3 it signed, otherwise v's s-share. Never both. |
 
 **What is signed.** Every signed message carries a prefix of
-`crossengin/v4-sa/v1/sig`, the message tag, the roster fingerprint and the
-round.
+`crossengin/v4-sa/v1/sig` (`crossengin/v4-sa/v2/sig` since A2.4b), the
+message tag, the roster fingerprint and the round.
 - **ADV** also covers the soul id, the vector length, the hash of the
   public vector layout and both public keys.
 - **T3** covers:
@@ -948,13 +955,13 @@ duplicates and keys, then signatures. The soul refuses all of these:
 
 | Test | Checks | What it covers |
 |---|---|---|
-| `test_sa4_wire` | 96 | Parsing, formatting, chunking and bitmaps. Transcript digests are checked against Python. |
+| `test_sa4_wire` | 153 | Parsing, formatting, chunking and bitmaps. Transcript digests are checked against Python (v4-sa2: 8-token ADV, ciphertext and proof length bounds). |
 | `test_sa4_soul` | 15 | An honest round at N = 3. |
 | `test_sa4_soul_dropout` | 8 | A dropout after shares at N = 5. |
 | `test_sa4_soul_dropout2` | 3 | A dropout after ADV at N = 5. |
 | `test_sa4_soul_u4` | 11 | A soul in U3 that sends no signature (U4 smaller than U3): its b-share is revealed. A SIG3 verifies over a T3 recomputed from the public lines. |
-| `test_sa4_soul_refuse` | 227 | The refusals reachable at N = 3, with the abort code. |
-| `test_sa4_soul_refuse5` | 86 | The subset, membership, share-field, batch-cap and equivocation refusals that need N > t, with code and reason; secret bytes zeroed. |
+| `test_sa4_soul_refuse` | 251 | The refusals reachable at N = 3, with the abort code (v4-sa2: own ADV with B or M altered, a peer's B or M altered in transit). |
+| `test_sa4_soul_refuse5` | 138 | The subset, membership, share-field, batch-cap and equivocation refusals that need N > t, with code and reason; secret bytes zeroed (v4-sa2: `bad_commit` for an altered s-share, b-share, path node or another receiver's share and path; two ADVs differing only in B). |
 
 The round tests use an in-memory coordinator (`tests/sa4_harness.nova`).
 It rebuilds the aggregate from the reveals and compares it with the sum of
@@ -1033,8 +1040,11 @@ receiver out, not the sender.
 - The coordinator records these souls separately (`sa4c_aborted`), and
   their reason says "possibly a victim". An abort is not evidence of
   misbehaviour and must not be used to penalise a soul.
+- Since A2.4b a share that opens but does not match the sender's signed
+  commitment is refused the same way (`bad_commit`), with the same
+  "possibly a victim" record.
 - Verifiable blame needs a complaint round. That is an open design item
-  for A2.4.
+  (A2.4c).
 
 **Unmasking** (`sa4c_unmask`, at most once):
 - Start from the sum of y over U3.
@@ -1042,12 +1052,17 @@ receiver out, not the sender.
 - Undo each dropped soul's pairwise masks.
 
 b_u and s_d^SK are rebuilt from t reveals, taking revealers in ascending x.
-A rebuilt s_d^SK must produce the s_pk that d advertised; otherwise the
-coordinator refuses to unmask. Rebuilt secrets are wiped after use.
+Rebuilt secrets are wiped after use.
 
-**Limit.** b_u has no public commitment. A soul that sends a wrong b-share
-in R4 produces a wrong sum, not a refusal. This is the semi-honest limit of
-the reveal step in Bonawitz et al. It does not affect privacy.
+**Before A2.4b (protocol v4-sa)** the rebuild was not robust: b_u had no
+public commitment, so a soul that sent a wrong b-share in R4 produced a
+silently wrong sum, and a wrong s-share (caught by the s_pk check) made the
+coordinator refuse the whole round. **Since A2.4b (v4-sa2)** each rebuilt
+b_u is checked against the dealer's signed B_u and each s_d^SK against
+s_pk_d; on a mismatch the coordinator verifies the revealers' proofs,
+excludes the ones that do not match the dealer's commitment, and still
+unmasks the correct sum while t good shares remain. See "SecAgg v4-sa2:
+verifiable shares (A2.4b)".
 
 **False-dropout attack** (`test_sa4_attack`). A malicious coordinator tells
 four of five souls that soul E dropped, although E sent its y, and shows E
@@ -1068,12 +1083,12 @@ a different U3.
 | Test | Checks | Covers |
 |---|---|---|
 | `test_sa4_coord_n3` | 7 | Honest N = 3 round; a second unmask and late lines are refused. |
-| `test_sa4_coord` | 12 | Dropout with exactly t reveals; an altered s-share is refused via s_pk; a cancel at \|U2\| < t. |
+| `test_sa4_coord` | 15 | Dropout with exactly t reveals; an altered s-share with \|R\| = t: the liar is excluded (v4-sa2) and the round is refused, fewer than t good shares remain (with \|R\| > t it is a correct sum: `test_sa4_coord6`); a cancel at \|U2\| < t. |
 | `test_sa4_coord2` | 7 | A soul stops after ADV; a soul in U3 sends no SIG3. |
 | `test_sa4_coord3` | 8 | A bad ADV signature leaves a soul out of U1; a bad SIG3 leaves a soul out of U4. |
 | `test_sa4_coord4` | 4 | A wrong reveal kind: that soul's reveals are ignored. |
 | `test_sa4_coord5` | 11 | One corrupted share: its receiver is left out as an abort and the round completes. Every share corrupted: the round is cancelled. |
-| `test_sa4_coord_refuse` | 75 | Recv rules in the ADV, share, SIG3 and reveal phases, each with its reason. |
+| `test_sa4_coord_refuse` | 85 | Recv rules in the ADV, share, SIG3 and reveal phases, each with its reason (v4-sa2: share ciphertext and reveal proof lengths against D(N)). |
 | `test_sa4_coord_refuse2` | 39 | With a soul outside U2: lines from outside the current set, a reveal about a soul outside U2, END rules in every phase, y-chunk bounds, and cancels at U3, U4 and the revealers. |
 | `test_sa4_attack` | 14 | The false-dropout attack. |
 
@@ -1082,7 +1097,7 @@ one of these tests fail. The checks were:
 - ADV and SIG3 verification;
 - the duplicate-key and low-order rules;
 - the reveal-kind rule;
-- the s_pk check;
+- the s_pk check (since A2.4b part of the robust rebuild);
 - the single unmask;
 - the correction sign;
 - the t check on U2;
@@ -1120,18 +1135,23 @@ wipe secret bytes, and its PRG is slow for long vectors.
   | B | N = 5, one soul in U2 but not U3 | 73 |
   | C | N = 4, one soul drops after its ADV | 44 |
   | D | N = 5, one soul in U3 but not U4 | 74 |
-  | E | 11 refusals (abort line and code) | 11 |
+  | E | 15 refusals (abort line and code; v4-sa2: own ADV with B or M altered, a peer ADV with M altered, a v1 6-token ADV) | 15 |
 
   Every ADV, SHARE, Y, SIG3 and REVEAL line carries a signature, a
   ciphertext, masked words or a share. Matching lines therefore pin the KDF
   info strings, the AEAD framing, the Shamir share layout, the PRG, the
-  mask signs, the signed transcripts and the reveal policy on both sides.
-  Scenario E compares abort lines.
+  mask signs, the signed transcripts, the share commitments (B_u, Merkle
+  roots, authentication paths, reveal proofs; v4-sa2) and the reveal policy
+  on both sides. Scenario E compares abort lines.
 - A differential run checks that the two souls refuse the same things.
-  `tests/tools/sa4_cases.py gen` builds 753 cases from honest rounds,
+  `tests/tools/sa4_cases.py gen` builds 793 cases from honest rounds,
   perturbed in every phase:
   - every abort code;
   - forged shares (sealed with the sender's real key) and signatures;
+  - v4-sa2: shares or paths that do not match the dealer's commitment
+    (`bad_commit`; every share and path byte class, another x's share and
+    path, s and b swapped), B or M altered or re-signed in an ADV, wrong
+    share ciphertext lengths;
   - low-order and out-of-range keys;
   - `set_input` validation;
   - seeded random mutations, moves, duplications and deletions of every
@@ -1146,8 +1166,10 @@ wipe secret bytes, and its PRG is slow for long vectors.
   read as the identity), RFC 7748 vectors with bit 255 of u set, and the
   file checks (roster and seed modes, symlink, FIFO, seed length).
 - `tests/integration/scenario_sa4_pyref.sh` (in CI) runs the self-test, all
-  five comparisons, the differential run, and a negative control: one
-  changed hex digit in a masked word must be reported. It needs no sockets.
+  five comparisons, the differential run (including `sa4_cases.py check`,
+  which asserts the outcome of 62 named v4-sa2 cases), and a negative
+  control: one changed hex digit in a masked word must be reported. It
+  needs no sockets.
 
 The live mixed round, in which a Python soul talks to the NOVA coordinator
 over the network next to chat souls, is in `scenario_u4_secagg.sh` (see
@@ -1185,9 +1207,14 @@ coordinator.**
   has and read that soul's value from the sum.
 
 **Flow.**
-- **Join.** `SECAGG_HELLO ce-fed v4-sa`, answered exactly by
-  `OK ce-fed v4-sa protocol accepted`, then `FED_JOIN <roster id> 1000`.
-  - v3n-sa and v4 refuse each other's hello.
+- **Join.** `SECAGG_HELLO ce-fed v4-sa2`, answered exactly by
+  `OK ce-fed v4-sa2 protocol accepted`, then `FED_JOIN <roster id> 1000`
+  (the hello was `v4-sa` before A2.4b).
+  - v3n-sa and v4 refuse each other's hello. A v4-sa2 soul or coordinator
+    also refuses the v4-sa (v1) hello: no fallback, so the versions part
+    at the hello instead of at a mid-round `bad_sig`.
+    `CE_SECAGG_MODE=v4` (or `v4-sa`) selects the v4 path, which speaks
+    v4-sa2.
   - Unknown ids and duplicate connections are rejected.
   - The coordinator waits for `CE_FED_SOULS` souls (default: the roster
     size; at least t) for up to `CE_SECAGG_V4_JOIN_MS` (default 60 s).
@@ -1279,11 +1306,16 @@ C ≤ 2t − N − 1 (and C < t − 1):
     so it is left out: denial of service only.
   - `FED_AGGREGATE_SUM` is unsigned, the same trust as in v3n-sa: a
     malicious coordinator can publish a wrong sum.
-  - Wrong b-shares give a wrong sum. This is the semi-honest limit
-    described in the coordinator section.
-  - A soul that sends an unopenable share makes its receiver abort. The
-    receiver is recorded as "possibly a victim". Verifiable blame needs
-    the complaint round (A2.4).
+  - Reveals are attributed by connection only (FED_JOIN is
+    unauthenticated and reveals are not signed). Since A2.4b a wrong
+    b-share or s-share in a reveal no longer gives a wrong sum or kills the
+    round: the coordinator excludes that revealer and still publishes the
+    correct sum while t good shares remain (see "SecAgg v4-sa2: verifiable
+    shares (A2.4b)").
+  - A soul that sends an unopenable share, or one that does not match its
+    signed commitment, makes its receiver abort (`bad_share` /
+    `bad_commit`). The receiver is recorded as "possibly a victim".
+    Verifiable blame needs the complaint round (A2.4c).
 - **Scaling and denial of service.** The coordinator reads souls one
   after another (no `poll`), so a phase takes about as long as its
   slowest soul or the deadline. Joins are handled one at a time too: a
@@ -1316,7 +1348,7 @@ C ≤ 2t − N − 1 (and C < t − 1):
 **Tests.**
 - `tests/unit/test_sa4_soul_api.nova` (24 checks): `sa4s_round_ok` codes
   and `sa4s_abort` (mid-round, idle, repeated, and after DONE).
-- `tests/unit/test_sa4_fed.nova` (101 checks): tag parsing, the layout text
+- `tests/unit/test_sa4_fed.nova` (105 checks): tag parsing, the layout text
   and hash (checked against Python hashlib), input words and sums, the
   `FED_JOIN` parser, the strict result parser and the soul's result
   checks, and the last-round file (missing, durable save, exact content,
@@ -1337,17 +1369,25 @@ C ≤ 2t − N − 1 (and C < t − 1):
     cancelled;
   - a corrupted share (receiver aborts, recorded as a possible victim);
   - a swapped reveal kind;
+  - v4-sa2 verifiable shares: a bad b reveal at N = 4 (sums equal the
+    inputs, excluded revealer logged), a bad s reveal with a dropout at
+    N = 7 (sums correct), a share that does not match its commitment
+    (receiver aborts `bad_commit`, possible victim), an inconsistent dealer
+    (round refused, that dealer blamed);
   - a different tag set;
   - an unknown id, a duplicate id, too few souls;
-  - configuration refusals, and v3n-sa / v4 hello cross-refusal.
+  - configuration refusals, v3n-sa / v4 hello cross-refusal, and the v4-sa
+    (v1) hello refused by a v4-sa2 coordinator and a v1 OK refused by v4-sa2
+    souls (chat and Python).
 - `scripts/sa4_ref.py --connect` is the Python soul used there. Its
   `--fault` options drive the failure cases.
 - `tests/integration/scenario_u4_evil.sh` (in CI, about 70 s):
   `scripts/secagg_evil_coord.py` plays a malicious coordinator against
   real chat and Python souls, one lie per stage:
   - round ids: replay, a burnt id, bad fingerprint / length / layout;
-  - R1: own ADV altered, a forged or old ADV, U1 too small or without the
-    receiver, U1 equivocation (only H1 differs);
+  - R1: own ADV altered, a forged or old ADV, another soul's ADV with its
+    Merkle root altered (v4-sa2: `bad_sig`, the signature covers B and M),
+    U1 too small or without the receiver, U1 equivocation (only H1 differs);
   - R2-R4: an altered share, U2 / U4 too small or not a subset, U2
     without the receiver, U3 split between groups, bad or altered SIG3s;
   - false dropout of a chat and of a Python victim (its y is used, its
@@ -1364,6 +1404,201 @@ C ≤ 2t − N − 1 (and C < t − 1):
   can be rebuilt. Negative controls on altered copies of a log (a line
   after an abort, missing or altered SIG3s, a REVEAL of the wrong kind,
   before SET 4, or twice) show the checker reports each one.
+
+## SecAgg v4-sa2: verifiable shares (A2.4b)
+
+Protocol v4-sa2 makes every Shamir share in a v4 round verifiable. Before
+it (v4-sa), a soul that revealed a wrong b-share in R4 gave a silently
+wrong sum, and one that revealed a wrong s-share made the coordinator
+refuse the whole round. Now every share is committed in the dealer's
+signed ADV, every receiver checks its shares against that commitment in
+R2, and the coordinator rebuilds b_u and s_u robustly.
+
+**Commitments.** Dealer u makes them in R0, for roster fingerprint fp and
+round r. H is SHA-256 and the domains are ASCII with no length prefix.
+- B_u = H("crossengin/v4-sa/v2/bcommit" ‖ fp ‖ u64be r ‖ u32be u ‖ b_u).
+- For every roster x = 1..N, the dealer's own x included:
+  - hb_x = H("…/v2/bshare" ‖ fp ‖ r ‖ u ‖ u8 x ‖ b-share_x);
+  - hs_x = H("…/v2/sshare" ‖ fp ‖ r ‖ u ‖ u8 x ‖ s-share_x);
+  - leaf_x = H(0x00 ‖ hs_x ‖ hb_x), at index x − 1.
+- The tree has depth D(N) = max(1, ⌈log2 N⌉). Padding leaves are 32 zero
+  bytes. A node is H(0x01 ‖ left ‖ right). M_u is the root.
+- An authentication path lists the siblings from the leaf level up.
+- The fold sets h to H(0x01 ‖ path[k] ‖ h) when index bit k is 1, and to
+  H(0x01 ‖ h ‖ path[k]) otherwise.
+
+B_u reveals nothing useful about b_u: b_u is 256 fresh uniform bits each
+round, hashed in a context-bound domain. No B_u-style commitment is needed
+for s: s_pk already plays that role for s_u^SK.
+
+**Wire changes.** Every line stays at or below 1000 bytes.
+
+| Item | v4-sa | v4-sa2 |
+|---|---|---|
+| Hello | `SECAGG_HELLO ce-fed v4-sa` | `SECAGG_HELLO ce-fed v4-sa2`, reply `OK ce-fed v4-sa2 protocol accepted`. Each version refuses the other's hello; there is no fallback. |
+| Signature domain | `crossengin/v4-sa/v1/sig` and `/advset` | `crossengin/v4-sa/v2/sig` and `/advset`. The sa_crypto KDF info and the share AAD stay `v1`. |
+| ADV | 6 tokens | `SA4_ADV r id cpk spk bcm mroot sig`: 8 tokens, at most 427 bytes. The 235-byte transcript ends with B_u ‖ M_u, so the signature covers both. |
+| H1 | c_pk ‖ s_pk per soul | c_pk ‖ s_pk ‖ B ‖ M per soul in U1. A dealer that signs two ADVs therefore cannot show different souls different roots. |
+| Share plaintext | 82 bytes, version 1 | 82 + 32D bytes, version 2: … ‖ s-share ‖ b-share ‖ path[D]. The receiver's path is sealed with its share. |
+| SHARE line | ciphertext of 98 bytes | ciphertext of 98 + 32k bytes. The parser accepts k = 1..8; the soul and the coordinator require k = D(N). |
+| REVEAL | 6 tokens | 7 tokens, ending with a proof of (D + 1) × 32 bytes. The proof is the other share's hash ‖ the path; it never carries the other share. |
+
+Line sizes at N = 3, 10 and 255 (D = 2, 4 and 8):
+- SHARE, at most: 376, 504 and 760 bytes;
+- REVEAL, at most: 312, 440 and 696 bytes.
+
+**The soul.**
+- **R0.** Draws c, s and b, then does both splits (b, then s). The RNG draw
+  order is unchanged, so harness rounds A–D produce byte-identical Y lines
+  to v4-sa. It hashes every share, builds the tree, and signs ADV v2.
+- **R1.** Checks that its own ADV comes back with B and M unchanged
+  (`bad_adv`), then seals each receiver's shares together with its path.
+  The dealt shares and the tree are wiped after sealing, or on any
+  refusal.
+- **R2.** For each share, in batch order:
+  1. the ciphertext length and the AEAD open, the plaintext length, the
+     version and the fields; any failure is `bad_share`;
+  2. hs, hb and the leaf at its own x, folded with the path against the
+     dealer's signed M; a mismatch is the new abort code `bad_commit`.
+
+  This R2 check is what makes an honest revealer unframeable. A share
+  that passed it always verifies later.
+- **R4.** Each reveal carries share ‖ proof: the hash of the other kind's
+  held share, then the held path.
+
+**The coordinator's robust rebuild.** The coordinator keeps B_u and M_u
+from each verified ADV and checks the SHARE and proof lengths against D(N)
+on receipt. A soul whose line has a wrong length is left out with a reason
+(it is not an exclusion). Then, lazily, for each b_u (u in U3) and each
+s_d^SK (d in U2∖U3):
+1. **Candidates.** The revealers of that share, in ascending x, minus every
+   revealer already excluded for any dealer (exclusion is global). With
+   fewer than t candidates, the round is refused.
+2. **Fast path.** Combine the first t candidates and check the result:
+   H(bcommit … b) = B_u, or X25519_base(s) = s_pk_d. If it holds, use it.
+   An honest round does no proof work.
+3. **Proof check.** Otherwise, verify the candidates' proofs in ascending
+   x until t verify. Each (revealer, dealer, kind) proof is verified at
+   most once. A failing revealer is excluded: `sa4c_why` reads "reveal
+   about soul u does not match its commitment", and it is not counted as
+   an abort.
+4. With fewer than t verified, the round is refused.
+5. **Recombine.** Combine the t verified shares. If the check still fails,
+   dealer u dealt shares that do not lie on one polynomial. That is
+   provable from u's signed ADV plus t shares and their paths. The round
+   is refused and u is blamed ("soul u dealt shares that do not match its
+   commitment").
+
+`sa4c_bad_revealers(c)` lists the excluded revealers. After a successful
+unmask the fed coordinator logs `fed-coord: [SA4] excluded revealer(s):
+<id>,<id>` and still publishes.
+
+**What it gives.**
+- **Privacy is unchanged.** Every revealer is in U3 and could already
+  garble the sum. B_u leaks nothing, and a proof carries only a hash of the
+  other share. The collusion bound above still holds.
+- **Robustness to |R| − t bad revealers.** While t revealers per secret
+  are honest, the published sum is exactly Σ_{U3} x_u, a well-defined
+  result: b_u is the secret behind u's signed B_u. A wrong s-share in a
+  round with a dropout no longer kills the round.
+- **Honest revealers cannot be framed.** Their proofs always verify,
+  because their soul checked the share in R2. Blame for an inconsistent
+  dealer is sound.
+- **Clamped bits.** An s-share error confined to the bits X25519 clamps
+  gives the same s_pk and the same DH. It is harmless and is accepted with
+  no exclusion.
+- **Liars outside the first t** are not looked for. They did not affect
+  the result.
+
+**What it does not give.**
+- **Reveals are still attributed by connection only.** FED_JOIN is
+  unauthenticated and reveals are unsigned, so an exclusion names a
+  connection, not a provable signer. A signed reveal batch was optional
+  in the design and is not shipped.
+- **`FED_AGGREGATE_SUM` is still unsigned.** A malicious coordinator can
+  still publish a wrong sum to the souls.
+- **The complaint round is still open (A2.4c).** A dealer that seals a
+  receiver a share that does not match its commitment makes that receiver
+  abort with `bad_commit`. The receiver is recorded as "possibly a victim",
+  and the dealer is not blamed. Making that claim checkable needs the
+  receiver to reveal its c key: ChaCha20-Poly1305 is not key-committing,
+  so a revealed directional key proves nothing on its own.
+
+**Costs.** These are the design report's measurements: a SHA-256 of about
+100 bytes in NOVA takes about 46 µs and about 2.6 KB of heap.
+- **Dealer, per soul at N = 255:** about 1020 hashes, about 47 ms and
+  2.7 MB.
+- **Receiver, per soul at N = 255:** 254 × 11 hashes, about 130 ms and
+  7.3 MB.
+- For comparison, the Ed25519 work is about 3.5 s and 13 MB per soul.
+- **Coordinator, honest path:** |U3| B hashes, about 12 ms.
+- **Coordinator, one dispute:** up to |R| proofs of D + 3 hashes each,
+  about 130 ms.
+- **Coordinator, worst case:** at N = 255 with 84 coordinated liars, about
+  21.7k proofs, about 11 s and about 600 MB. Checking every proof eagerly
+  would take about 33 s and 1.9 GB, so the rebuild is lazy.
+- **Bandwidth at N = 255:**
+  - share phase: about 49 MB (from about 16 MB);
+  - reveal phase: about 45 MB (from about 7 MB).
+
+  At N = 10, both phases are about 45 KB.
+
+**Tests.**
+- `test_sa4_wire` (153 checks): v2 ADV, SHARE and REVEAL parsing and
+  formatting, the length bounds, and the transcript, H1, T3, share
+  plaintext and commitment digests, pinned from Python hashlib.
+- `test_sa4_commit` (157 checks), new:
+  - D(N) and tree KATs at N = 2, 3, 5 and 255;
+  - every leaf position folds to the root, padding included;
+  - a b proof used as an s proof fails, and so does leaf/node prefix
+    confusion; the index bit matters;
+  - the `scripts/sa4_ref.py --pins` vector: roots, full paths, reveal
+    proofs, the ADV transcript, H1, T3 and the share plaintext.
+- `test_sa4_soul_refuse` (251) and `test_sa4_soul_refuse5` (138):
+  - `bad_commit` for an altered s-share, b-share or path node, or for
+    another receiver's share and path;
+  - own ADV with B or M altered (`bad_adv`);
+  - a peer's B or M altered in transit (`bad_sig`);
+  - two ADVs differing only in B (H1 differs, `bad_sig3`);
+  - the dealt shares zeroed on a refusal.
+- `test_sa4_coord6` (43 checks), new:
+  - a wrong b-share with |R| = t + 1: correct sum, liar listed;
+  - a wrong s-share with a dropout at N = 7: correct sum;
+  - |R| − t + 1 liars: refused;
+  - two liars about two dealers: refused (global exclusion);
+  - an inconsistent dealer: refused, that dealer blamed;
+  - a clamped-bit s error: correct sum, no exclusion;
+  - a proof of the wrong length: left out on receipt;
+  - one liar about every dealer: excluded once.
+- Updated tests:
+  - `test_sa4_coord` (15): an altered s-share at |R| = t is still refused,
+    now as "fewer than t good shares", with the liar excluded;
+  - `test_sa4_coord_refuse` (85) and `test_sa4_coord_refuse2` (39);
+  - `test_sa4_fed` (105): the v4-sa2 hello; the v1 strings differ.
+  - `test_sa4_attack` (14) passes unchanged, and harness rounds A–D are
+    byte-identical to v4-sa.
+- **Mutation check.** Each of 12 weakened checks made at least one test
+  fail:
+  - the R2 path check, the B_u check and the proof check;
+  - the index bit in the fold;
+  - B and M left out of H1;
+  - the global exclusion;
+  - the 0x00 and 0x01 prefixes;
+  - the soul's own-ADV B and M checks;
+  - the coordinator's proof and ciphertext length checks.
+- `scenario_sa4_pyref.sh`:
+  - NOVA and Python are byte-identical on rounds A–D;
+  - 15 refusal cases, including own B/M, peer M and a v1 ADV;
+  - a 793-case differential, including 15 `bad_commit` refusals;
+  - `sa4_cases.py check`, 62 named outcomes.
+- `scenario_u4_secagg.sh`, with new `sa4_ref.py --fault` modes:
+  - `bad-b-reveal` at N = 4;
+  - `bad-s-reveal` with a dropout at N = 7;
+  - `bad-commit-share`;
+  - `inconsistent-deal`;
+  - the v1 and v2 hello cross-refusal.
+- `scenario_u4_evil.sh`: `alter-m`, another soul's M altered by the
+  coordinator, gives `bad_sig` at every soul.
 
 ## Full SecAgg upgrade path
 
@@ -1388,7 +1623,7 @@ adds:
    pinned Ed25519 roster, signed ADV and SIG3 transcripts, and shares
    encrypted per pair with ChaCha20-Poly1305. Still open: signed
    results (`FED_AGGREGATE_SUM` is unsigned), the complaint round for
-   verifiable blame (A2.4), and TLS on the coordinator connection.
+   verifiable blame (A2.4c), and TLS on the coordinator connection.
 
 The MVP's pairwise-additive-masking module is the foundation; each
 of the four layers above sits on top of it without invalidating the

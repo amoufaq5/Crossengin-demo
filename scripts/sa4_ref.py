@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent reference soul for SecAgg v4 (stdlib only).
+"""Independent reference soul for SecAgg v4, protocol v4-sa2 (stdlib only).
 
 A second implementation of the v4 soul, written from the wire and protocol
 definitions, used to cross-check the NOVA code byte for byte. It mirrors
@@ -24,10 +24,28 @@ bytes, and its PRG is slow for long vectors.
                                        Faults (tests): stop-after-adv,
                                        stop-after-shares, stop-after-y,
                                        stop-after-sig3, bad-adv-sig, bad-sig3,
-                                       bad-share, swap-reveal, silent, drip.
+                                       bad-share, swap-reveal, silent, drip,
+                                       bad-b-reveal / bad-s-reveal (the first
+                                       b / s REVEAL's share altered, proof
+                                       kept), bad-commit-share (the lowest
+                                       other x in U1 is sealed a b-share that
+                                       does not match M_u), inconsistent-deal
+                                       (the b-share of the lowest other x is
+                                       altered before the tree is built: its
+                                       proof verifies, the rebuild of b_u
+                                       does not match B_u -> dealer blamed).
+    sa4_ref.py --pins [FILE]           print (and write) the v4-sa2 known
+                                       answers: tree KATs N = 2, 3, 5, 255,
+                                       ADV transcript, H1, T3, share pt v2.
+
+v4-sa2 (verifiable shares): each dealer signs B_u = H(b_u) and the Merkle
+root M_u over per-x leaves H(0 || hs_x || hb_x) in its ADV; each share
+carries its authentication path and is checked in R2 (bad_commit); each
+REVEAL carries other-hash || path. coord_rebuild() is a Python oracle of
+the coordinator's lazy robust rebuild (excluded revealers, blamed dealer).
 
 Scenarios: A N=3 honest; B N=5, one soul in U2 but not U3; C N=4, one soul
-drops after its ADV; D N=5, one soul in U3 but not U4; E 11 refusals.
+drops after its ADV; D N=5, one soul in U3 but not U4; E 15 refusals.
 """
 import hashlib
 import hmac
@@ -551,18 +569,21 @@ def parse(line):
         if fp is None or lay is None or not (1 <= lw <= 16777216):
             return None
         return (EV_ROUND, r, fp, lw, lay)
-    if k == "SA4_ADV" and n == 6:
-        i, c, s, g = _u32(t[2]), _unhex(t[3], 32), _unhex(t[4], 32), _unhex(t[5], 64)
-        if i < 0 or None in (c, s, g):
+    if k == "SA4_ADV" and n == 8:
+        i, c, s = _u32(t[2]), _unhex(t[3], 32), _unhex(t[4], 32)
+        bc, mr, g = _unhex(t[5], 32), _unhex(t[6], 32), _unhex(t[7], 64)
+        if i < 0 or None in (c, s, bc, mr, g):
             return None
-        return (EV_ADV, r, i, c, s, g)
+        return (EV_ADV, r, i, c, s, g, bc, mr)
     if k == "SA4_SET" and n == 4:
         w, bm = _u32(t[2]), _unhex(t[3], 32)
         if not (1 <= w <= 4) or bm is None:
             return None
         return (EV_SET, r, w, bm)
     if k == "SA4_SHARE" and n == 5:
-        f, to, ct = _u32(t[2]), _u32(t[3]), _unhex(t[4], 98)
+        hl = len(t[4])
+        ct = _unhex(t[4], hl // 2) if hl % 64 == 4 and 1 <= (hl // 2 - 98) // 32 <= 8 else None
+        f, to = _u32(t[2]), _u32(t[3])
         if f < 0 or to < 0 or ct is None:
             return None
         return (EV_SHARE, r, f, to, ct)
@@ -579,13 +600,15 @@ def parse(line):
         if i < 0 or g is None:
             return None
         return (EV_SIG3, r, i, g)
-    if k == "SA4_REVEAL" and n == 6:
+    if k == "SA4_REVEAL" and n == 7:
         f, a = _u32(t[2]), _u32(t[3])
         kind = {"b": 0, "s": 1}.get(t[4], -1)
         sh = _unhex(t[5], 32)
-        if f < 0 or a < 0 or kind < 0 or sh is None:
+        pl = len(t[6])
+        pf = _unhex(t[6], pl // 2) if pl % 64 == 0 and 2 <= pl // 64 <= 9 else None
+        if f < 0 or a < 0 or kind < 0 or sh is None or pf is None:
             return None
-        return (EV_REVEAL, r, f, a, kind, sh)
+        return (EV_REVEAL, r, f, a, kind, sh, pf)
     if k == "SA4_END" and n == 5:
         ph, i, c = _u32(t[2]), _u32(t[3]), _u32(t[4])
         if not (1 <= ph <= 3) or i < 0 or c < 0:
@@ -601,11 +624,11 @@ def parse(line):
 
 
 def fmt_round(r, fp, lw, lay): return "SA4_ROUND %d %s %d %s" % (r, fp.hex(), lw, lay.hex())
-def fmt_adv(r, i, c, s, g): return "SA4_ADV %d %d %s %s %s" % (r, i, c.hex(), s.hex(), g.hex())
+def fmt_adv(r, i, c, s, g, bc, mr): return "SA4_ADV %d %d %s %s %s %s %s" % (r, i, c.hex(), s.hex(), bc.hex(), mr.hex(), g.hex())
 def fmt_set(r, k, bm): return "SA4_SET %d %d %s" % (r, k, bm.hex())
 def fmt_share(r, f, to, ct): return "SA4_SHARE %d %d %d %s" % (r, f, to, ct.hex())
 def fmt_sig3(r, i, g): return "SA4_SIG3 %d %d %s" % (r, i, g.hex())
-def fmt_reveal(r, f, a, kind, sh): return "SA4_REVEAL %d %d %d %s %s" % (r, f, a, "s" if kind == 1 else "b", sh.hex())
+def fmt_reveal(r, f, a, kind, sh, pf): return "SA4_REVEAL %d %d %d %s %s %s" % (r, f, a, "s" if kind == 1 else "b", sh.hex(), pf.hex())
 def fmt_end(r, ph, i, c): return "SA4_END %d %d %d %d" % (r, ph, i, c)
 def fmt_abort(r, i, code): return "SA4_ABORT %d %d %s" % (r, i, code)
 
@@ -633,35 +656,119 @@ def bitmap_xs(bm, n):
     return out
 
 
-SIG_DOMAIN = b"crossengin/v4-sa/v1/sig"
-ADVSET_DOMAIN = b"crossengin/v4-sa/v1/advset"
+SIG_DOMAIN = b"crossengin/v4-sa/v2/sig"
+ADVSET_DOMAIN = b"crossengin/v4-sa/v2/advset"
+BCOMMIT_DOMAIN = b"crossengin/v4-sa/v2/bcommit"
+BSHARE_DOMAIN = b"crossengin/v4-sa/v2/bshare"
+SSHARE_DOMAIN = b"crossengin/v4-sa/v2/sshare"
+SHARE_PT_VERSION = 2
 
 
 def sig_prefix(tag, fp, r):
     return SIG_DOMAIN + bytes([len(tag)]) + tag + fp + be(r, 8)
 
 
-def adv_transcript(fp, r, i, lw, lay, c, s):
-    return sig_prefix(b"adv", fp, r) + be(i, 4) + be(lw, 4) + lay + c + s
+def adv_transcript(fp, r, i, lw, lay, c, s, bc, mr):
+    """SIGPFX("adv") || id || L || layout || c_pk || s_pk || B || M (235 bytes)."""
+    return sig_prefix(b"adv", fp, r) + be(i, 4) + be(lw, 4) + lay + c + s + bc + mr
 
 
 def advset_hash(bm_u1, keys):
-    return sha256(ADVSET_DOMAIN + bm_u1 + b"".join(c + s for c, s in keys))
+    """H1; keys: (c_pk, s_pk, B, M) per soul of U1, ascending x."""
+    return sha256(ADVSET_DOMAIN + bm_u1 + b"".join(b"".join(k) for k in keys))
 
 
 def t3_transcript(fp, r, h1, bm2, bm3):
     return sig_prefix(b"u3", fp, r) + h1 + bm2 + bm3
 
 
-def share_pt(f, to, r, x_to, s_sh, b_sh):
-    return b"\x01" + be(f, 4) + be(to, 4) + be(r, 8) + bytes([x_to]) + s_sh + b_sh
+# ---- commitments (v4-sa2): B_u, per-x share hashes, Merkle tree M_u
+def depth(n):
+    """D(N) = max(1, ceil(log2 N))."""
+    return max(1, (n - 1).bit_length())
 
 
-def share_pt_parse(pt):
-    if len(pt) != 82 or pt[0] != 1:
+def b_commit(fp, r, u, b):
+    return sha256(BCOMMIT_DOMAIN + fp + be(r, 8) + be(u, 4) + b)
+
+
+def h_bshare(fp, r, u, x, sh):
+    return sha256(BSHARE_DOMAIN + fp + be(r, 8) + be(u, 4) + bytes([x]) + sh)
+
+
+def h_sshare(fp, r, u, x, sh):
+    return sha256(SSHARE_DOMAIN + fp + be(r, 8) + be(u, 4) + bytes([x]) + sh)
+
+
+def leaf_hash(hs, hb):
+    return sha256(b"\x00" + hs + hb)
+
+
+def node_hash(left, right):
+    return sha256(b"\x01" + left + right)
+
+
+def tree_levels(leaves, d):
+    """levels[0] = the 2^d leaves (padding = 32 zero bytes, not hashed),
+    levels[d] = [root]."""
+    lv = [list(leaves) + [bytes(32)] * ((1 << d) - len(leaves))]
+    for _ in range(d):
+        p = lv[-1]
+        lv.append([node_hash(p[2 * j], p[2 * j + 1]) for j in range(len(p) // 2)])
+    return lv
+
+
+def tree_path(levels, i):
+    """Authentication path of leaf index i: path[0] = sibling at the leaf level."""
+    return [levels[k][(i >> k) ^ 1] for k in range(len(levels) - 1)]
+
+
+def path_fold(leaf, i, path):
+    h = leaf
+    for node in path:
+        h = node_hash(node, h) if i & 1 else node_hash(h, node)
+        i >>= 1
+    return h
+
+
+def deal_tree(fp, r, u, ssh, bsh, d):
+    """ssh / bsh: [(x, share)] for x = 1..N -> tree levels (root = M_u)."""
+    leaves = [leaf_hash(h_sshare(fp, r, u, x, s), h_bshare(fp, r, u, x, b)) for (x, s), (_, b) in zip(ssh, bsh)]
+    return tree_levels(leaves, d)
+
+
+def share_leaf(fp, r, u, x, s, b):
+    return leaf_hash(h_sshare(fp, r, u, x, s), h_bshare(fp, r, u, x, b))
+
+
+def reveal_proof(fp, r, u, x, kind, s, b, path):
+    """The proof a receiver at x sends with its kind-b (0) or kind-s (1) reveal."""
+    other = h_sshare(fp, r, u, x, s) if kind == 0 else h_bshare(fp, r, u, x, b)
+    return other + b"".join(path)
+
+
+def reveal_proof_ok(fp, r, u, x, kind, share, proof, mroot, d):
+    if len(proof) != 32 * (d + 1) or len(share) != 32 or not (1 <= x <= 255):
+        return False
+    other, path = proof[:32], [proof[32 * (k + 1):32 * (k + 2)] for k in range(d)]
+    if kind == 0:
+        leaf = leaf_hash(other, h_bshare(fp, r, u, x, share))
+    else:
+        leaf = leaf_hash(h_sshare(fp, r, u, x, share), other)
+    return path_fold(leaf, x - 1, path) == mroot
+
+
+def share_pt(f, to, r, x_to, s_sh, b_sh, path):
+    return bytes([SHARE_PT_VERSION]) + be(f, 4) + be(to, 4) + be(r, 8) + bytes([x_to]) + s_sh + b_sh + b"".join(path)
+
+
+def share_pt_parse(pt, d):
+    """-> (from, to, r, x_to, s-share, b-share, [path]) or None (v2 only, 82 + 32 d bytes)."""
+    if len(pt) != 82 + 32 * d or pt[0] != SHARE_PT_VERSION:
         return None
     return (int.from_bytes(pt[1:5], "big"), int.from_bytes(pt[5:9], "big"),
-            int.from_bytes(pt[9:17], "big"), pt[17], pt[18:50], pt[50:82])
+            int.from_bytes(pt[9:17], "big"), pt[17], pt[18:50], pt[50:82],
+            [pt[82 + 32 * k:114 + 32 * k] for k in range(d)])
 
 
 # ============================================================ soul
@@ -695,6 +802,8 @@ class Soul:
         self.x = None
         self.layout = None
         self.batch = []
+        self.d = depth(roster.n)
+        self.fault = None          # test faults: "bad-commit-share", "inconsistent-deal"
 
     def set_input(self, words, layout):
         if self.state != ST_IDLE:
@@ -705,7 +814,7 @@ class Soul:
         return True
 
     def _wipe(self):
-        for k in ("csk", "ssk", "b", "held", "seeds"):
+        for k in ("csk", "ssk", "b", "held", "seeds", "bsh", "ssh", "tree"):
             setattr(self, k, None)
         self.batch = []
 
@@ -762,11 +871,23 @@ class Soul:
         self.b = self.rng.read(32)
         if self.cpk == bytes(32) or self.spk == bytes(32) or self.cpk == self.spk:
             raise Refuse("rng", "key generation refused")
-        sig = ed25519_sign(adv_transcript(self.ro.fp, r, self.me, len(self.x), self.layout, self.cpk, self.spk),
-                           self.seed, self.pk)
+        # Shares for every roster x, dealt here (v4-sa2) in the same rng
+        # order as before: b_u coefficients first, then s_u^SK.
+        n, t = self.ro.n, self.ro.t
+        self.bsh = shamir_split(self.rng, self.b, t, n)
+        self.ssh = shamir_split(self.rng, self.ssk, t, n)
+        if self.fault == "inconsistent-deal":      # commit to an off-polynomial b-share
+            lx = 1 if self.mx != 1 else 2
+            x0, y0 = self.bsh[lx - 1]
+            self.bsh[lx - 1] = (x0, bytes([y0[0] ^ 1]) + y0[1:])
+        self.tree = deal_tree(self.ro.fp, r, self.me, self.ssh, self.bsh, self.d)
+        self.bcm = b_commit(self.ro.fp, r, self.me, self.b)
+        self.mroot = self.tree[-1][0]
+        sig = ed25519_sign(adv_transcript(self.ro.fp, r, self.me, len(self.x), self.layout, self.cpk, self.spk,
+                                          self.bcm, self.mroot), self.seed, self.pk)
         self.state = ST_ADV
         self.batch = []
-        return (True, "", [fmt_adv(r, self.me, self.cpk, self.spk, sig)])
+        return (True, "", [fmt_adv(r, self.me, self.cpk, self.spk, sig, self.bcm, self.mroot)])
 
     def _on_u1(self, bm):
         n, t, r, me = self.ro.n, self.ro.t, self.r, self.me
@@ -782,9 +903,10 @@ class Soul:
             if x not in u1: raise Refuse("bad_set", "ADV from a soul outside U1")
             if keys[x - 1] is not None: raise Refuse("bad_adv", "two ADV lines from one soul")
             if rec[3] == rec[4]: raise Refuse("dup_key", "a soul advertised c_pk == s_pk")
-            keys[x - 1] = (rec[3], rec[4])
-        if keys[self.mx - 1] != (self.cpk, self.spk): raise Refuse("bad_adv", "own ADV altered")
-        allk = [k for x in u1 for k in keys[x - 1]]
+            keys[x - 1] = (rec[3], rec[4], rec[6], rec[7])
+        if keys[self.mx - 1] != (self.cpk, self.spk, self.bcm, self.mroot):
+            raise Refuse("bad_adv", "own ADV altered")
+        allk = [k for x in u1 for k in keys[x - 1][:2]]
         if len(set(allk)) != len(allk): raise Refuse("dup_key", "two advertised keys are equal")
         self.seeds = [None] * n
         for vx in u1:
@@ -798,14 +920,14 @@ class Soul:
         for rec in self.batch:
             if rec[2] != me:
                 pk = self.ro.by_id[rec[2]][2]
-                msg = adv_transcript(self.ro.fp, r, rec[2], len(self.x), self.layout, rec[3], rec[4])
+                msg = adv_transcript(self.ro.fp, r, rec[2], len(self.x), self.layout, rec[3], rec[4], rec[6], rec[7])
                 if not ed25519_verify(msg, rec[5], pk):
                     raise Refuse("bad_sig", "ADV signature does not verify")
         self.keys, self.u1 = keys, u1
         self.h1 = advset_hash(bm, [keys[x - 1] for x in u1])
-        # Coefficients: b_u first, then s_u^SK.
-        bsh = shamir_split(self.rng, self.b, t, n)
-        ssh = shamir_split(self.rng, self.ssk, t, n)
+        # The shares were dealt in R0; each carries its authentication path.
+        bsh, ssh = self.bsh, self.ssh
+        lowx = next((x for x in u1 if x != self.mx), 0) if self.fault == "bad-commit-share" else 0
         self.held = [None] * n
         outs = []
         for i in range(n):
@@ -813,13 +935,17 @@ class Soul:
             if x3 not in u1:
                 continue
             sl, bl = ssh[i][1], bsh[i][1]
+            path = tree_path(self.tree, i)
             if x3 == self.mx:
-                self.held[i] = (sl, bl)
+                self.held[i] = (sl, bl, path)
                 continue
+            if x3 == lowx:                       # after the tree: does not match M_u
+                bl = bytes([bl[0] ^ 1]) + bl[1:]
             v3 = self._eid(x3)
             ek = enc_key(self.csk, keys[i][0], r, me, v3)
-            outs.append(fmt_share(r, me, v3, share_seal(ek, r, me, v3, share_pt(me, v3, r, x3, sl, bl))))
+            outs.append(fmt_share(r, me, v3, share_seal(ek, r, me, v3, share_pt(me, v3, r, x3, sl, bl, path))))
         outs.append(fmt_end(r, 1, me, len(outs)))
+        self.bsh = self.ssh = self.tree = None
         self.batch = []
         self.state = ST_SHARED
         return (True, "", outs)
@@ -846,12 +972,15 @@ class Soul:
             if ek is None: raise Refuse("bad_key", "key agreement refused")
             pt = share_open(ek, r, v, me, rec[4])
             if pt is None: raise Refuse("bad_share", "share does not open")
-            if len(pt) != 82: raise Refuse("bad_share", "share plaintext has the wrong length")
-            p = share_pt_parse(pt)
+            if len(pt) != 82 + 32 * self.d: raise Refuse("bad_share", "share plaintext has the wrong length")
+            p = share_pt_parse(pt, self.d)
             if p is None: raise Refuse("bad_share", "share plaintext malformed")
             if (p[0], p[1], p[2], p[3]) != (v, me, r, mx):
                 raise Refuse("bad_share", "share plaintext ids, round or x differ")
-            self.held[vx - 1] = (p[4], p[5])
+            leaf = share_leaf(self.ro.fp, r, v, mx, p[4], p[5])
+            if path_fold(leaf, mx - 1, p[6]) != self.keys[vx - 1][3]:
+                raise Refuse("bad_commit", "share does not match its commitment")
+            self.held[vx - 1] = (p[4], p[5], p[6])
         y = saprg_mask(self.x, self.b, 1)
         for ox in u2:
             if ox != mx:
@@ -905,15 +1034,240 @@ class Soul:
         for ox in self.u2:
             hv = self.held[ox - 1]
             if hv is None: raise Refuse("internal", "missing held share")
-            if ox in self.u3:
-                outs.append(fmt_reveal(r, me, self._eid(ox), 0, hv[1]))
-            else:
-                outs.append(fmt_reveal(r, me, self._eid(ox), 1, hv[0]))
+            u = self._eid(ox)
+            kind = 0 if ox in self.u3 else 1
+            pf = reveal_proof(self.ro.fp, r, u, mx, kind, hv[0], hv[1], hv[2])
+            outs.append(fmt_reveal(r, me, u, kind, hv[1] if kind == 0 else hv[0], pf))
         outs.append(fmt_end(r, 3, me, len(outs)))
         self._wipe()
         self.done_round = r
         self.state = ST_DONE
         return (True, "", outs)
+
+
+# ============================================================ coordinator oracle (A2.4b)
+def coord_rebuild(ro, r, lw, advs, ys, reveals, u2, u3):
+    """Python oracle of the coordinator's lazy robust rebuild (SPEC.md,
+    coordinator steps 1-5) and unmask (sa4c_unmask order: U2 ascending x).
+
+    advs: {id: ADV record}; ys: {id: masked words}; reveals: {revealer id:
+    [REVEAL records]}; u2, u3: ascending x lists.
+    -> (sum words or None, excluded revealer ids sorted, blamed dealer id or
+    None, why). A revealer with a proof of the wrong length (not D+1 units)
+    is left out entirely (structural, not 'excluded'); the first reveal per
+    (revealer, dealer, kind) is used."""
+    n, t, d, fp = ro.n, ro.t, depth(ro.n), ro.fp
+    I = lambda x: ro.entries[x - 1][0]
+    rv = {}
+    for w, recs in reveals.items():
+        if ro.x(w) == 0 or any(len(p[6]) != 32 * (d + 1) for p in recs):
+            continue
+        m = {}
+        for p in recs:
+            m.setdefault((p[3], p[4]), (p[5], p[6]))
+        rv[ro.x(w)] = m
+    rxs = sorted(rv)
+    bad, checked = set(), {}
+
+    def out(total, blamed, why):
+        return total, sorted(I(x) for x in bad), blamed, why
+    total = [0] * lw
+    for x in u3:
+        total = [(a + b) & M32 for a, b in zip(total, ys[I(x)])]
+    for ax in u2:
+        u = I(ax)
+        kind = 0 if ax in u3 else 1
+        adv = advs[u]
+
+        def good(sec):
+            if sec is None:
+                return False
+            return b_commit(fp, r, u, sec) == adv[6] if kind == 0 else x25519_base(sec) == adv[4]
+        cand = [x for x in rxs if x not in bad and (u, kind) in rv[x]]
+        if len(cand) < t:
+            return out(None, None, "fewer than t good shares about soul %d" % u)
+        sec = shamir_combine([(x, rv[x][(u, kind)][0]) for x in cand[:t]], 32)
+        if not good(sec):
+            ver = []
+            for x in cand:
+                if len(ver) >= t:
+                    break
+                key = (x, u, kind)
+                if key not in checked:
+                    sh, pf = rv[x][(u, kind)]
+                    checked[key] = reveal_proof_ok(fp, r, u, x, kind, sh, pf, adv[7], d)
+                if checked[key]:
+                    ver.append(x)
+                else:
+                    bad.add(x)          # "reveal about soul u does not match its commitment"
+            if len(ver) < t:
+                return out(None, None, "fewer than t good shares about soul %d" % u)
+            sec = shamir_combine([(x, rv[x][(u, kind)][0]) for x in ver], 32)
+            if not good(sec):
+                return out(None, u, "soul %d dealt shares that do not match its commitment" % u)
+        if kind == 0:
+            total = saprg_mask(total, sec, -1)
+            continue
+        for vx in u3:
+            v = I(vx)
+            ms = mask_seed(sec, advs[v][4], r, u, v)
+            if ms is None:
+                return out(None, None, "mask key agreement refused")
+            total = saprg_mask(total, ms, -1 if u > v else 1)
+    return out(total, None, "")
+
+
+def o_roster(n):
+    """Oracle roster: ids 10, 20, ..; seeds SHA-256("sa4-oracle-seed" || i)."""
+    seeds = [sha256(b"sa4-oracle-seed" + bytes([i])) for i in range(n)]
+    text = ROSTER_HEADER + "\n" + "".join("%d o%d %s\n" % (10 * (i + 1), i + 1, ed25519_pk_from_seed(sd).hex())
+                                          for i, sd in enumerate(seeds))
+    return roster_parse(text), seeds
+
+
+def o_round(ro, seeds, r, lw, drop_after=(), faults=None, harness=False):
+    """Run Python souls (all of U1 = roster) through one round.
+    drop_after: x's that leave after their Y (in U2, not U3).
+    -> dict(advs, ys, reveals, u2, u3, inputs, refused)."""
+    faults = faults or {}
+    lay = h_layout()
+    souls = {}
+    for e in ro.entries:
+        x = e[4]
+        rng = h_rng(e[0], r) if harness else TestRng(b"sa4-oracle" + be(e[0], 4) + be(r, 8))
+        s = Soul(ro, seeds[x - 1], rng, 0, e)
+        s.fault = faults.get(x)
+        s.set_input(h_input(x - 1, lw), lay)
+        souls[x] = s
+    refused = {}
+
+    def feed(x, lines):
+        outs = []
+        for ln in lines:
+            ok, err, o = souls[x].handle(ln)
+            outs += o
+            if not ok:
+                refused[ro.entries[x - 1][0]] = o[-1].split(" ")[-1] if o else "-"
+                return None
+        return outs
+    rl = fmt_round(r, ro.fp, lw, lay)
+    advl = [feed(x, [rl])[0] for x in sorted(souls)]
+    u1 = sorted(souls)
+    shares = []
+    for x in u1:
+        o = feed(x, advl + [fmt_set(r, 1, bitmap(u1))])
+        shares += [l for l in o if l.startswith("SA4_SHARE ")]
+    u2 = list(u1)
+    ys, u3 = {}, []
+    for x in u2:
+        me = ro.entries[x - 1][0]
+        o = feed(x, [l for l in shares if parse(l)[3] == me] + [fmt_set(r, 2, bitmap(u2))])
+        if o is None:
+            continue
+        ys[me] = [w for l in o if l.startswith("SA4_Y ") for w in parse(l)[5]]
+        if x not in drop_after:
+            u3.append(x)
+    sigs = []
+    for x in u3:
+        sigs += feed(x, [fmt_set(r, 3, bitmap(u3))])
+    reveals = {}
+    for x in u3:
+        o = feed(x, sigs + [fmt_set(r, 4, bitmap(u3))])
+        reveals[ro.entries[x - 1][0]] = [parse(l) for l in o if l.startswith("SA4_REVEAL ")]
+    return {"advs": {p[2]: p for p in map(parse, advl)}, "ys": ys, "reveals": reveals, "u2": u2, "u3": u3,
+            "inputs": {ro.entries[x - 1][0]: h_input(x - 1, lw) for x in u1}, "refused": refused}
+
+
+def o_rebuild(ro, r, lw, rd, reveals=None):
+    return coord_rebuild(ro, r, lw, rd["advs"], rd["ys"], rd["reveals"] if reveals is None else reveals,
+                         rd["u2"], rd["u3"])
+
+
+def o_expected(ro, rd, lw):
+    out = [0] * lw
+    for x in rd["u3"]:
+        out = [(a + b) & M32 for a, b in zip(out, rd["inputs"][ro.entries[x - 1][0]])]
+    return out
+
+
+def o_lie(ro, rd, revealer_x, dealer_x, kind, xor=1, pos=0):
+    """Copy of rd["reveals"] with one reveal's share byte altered (proof kept)."""
+    w, u = ro.entries[revealer_x - 1][0], ro.entries[dealer_x - 1][0]
+    out = {}
+    for k, recs in rd["reveals"].items():
+        new = []
+        for p in recs:
+            if k == w and p[3] == u and p[4] == kind:
+                sh = bytearray(p[5]); sh[pos] ^= xor
+                p = p[:5] + (bytes(sh),) + p[6:]
+            new.append(p)
+        out[k] = new
+    return out
+
+
+def oracle_selftest():
+    """Coordinator-oracle scenarios; returns the number of checks."""
+    k = 0
+    # N = 4 harness souls, t = 3, |R| = 4 (one spare revealer).
+    ro4 = h_roster(4)
+    seeds4 = [bytes.fromhex(h) for h in H_SEEDS[:4]]
+    lw = 6
+    rd = o_round(ro4, seeds4, 5, lw, harness=True)
+    exp = o_expected(ro4, rd, lw)
+    assert not rd["refused"] and rd["u3"] == [1, 2, 3, 4]
+    assert o_rebuild(ro4, 5, lw, rd) == (exp, [], None, ""); k += 1
+    I4 = lambda x: ro4.entries[x - 1][0]
+    # one bad b reveal (x1 about x2): correct sum, x1 excluded
+    assert o_rebuild(ro4, 5, lw, rd, o_lie(ro4, rd, 1, 2, 0)) == (exp, [I4(1)], None, ""); k += 1
+    # one liar about two dealers: excluded once, correct sum
+    two = o_lie(ro4, {"reveals": o_lie(ro4, rd, 1, 2, 0)}, 1, 3, 0)
+    assert o_rebuild(ro4, 5, lw, rd, two) == (exp, [I4(1)], None, ""); k += 1
+    # a liar outside the first t (x4) is not looked at: correct sum, no exclusion
+    assert o_rebuild(ro4, 5, lw, rd, o_lie(ro4, rd, 4, 2, 0)) == (exp, [], None, ""); k += 1
+    # |R| - t + 1 = 2 liars about x3: refused
+    # (xor 2 for the second: with xs 1,2,3 both Lagrange weights are 1, so two
+    # equal errors would cancel and give the right b -- harmless, but no test)
+    lie2 = o_lie(ro4, {"reveals": o_lie(ro4, rd, 1, 3, 0)}, 2, 3, 0, xor=2)
+    got = o_rebuild(ro4, 5, lw, rd, lie2)
+    assert got[0] is None and got[1] == [I4(1), I4(2)] and got[2] is None and "fewer than t" in got[3], got; k += 1
+    # a truncated proof (x4): left out structurally, correct sum
+    cut = dict(rd["reveals"])
+    cut[I4(4)] = [p[:6] + (p[6][:-32],) for p in cut[I4(4)]]
+    assert o_rebuild(ro4, 5, lw, rd, cut) == (exp, [], None, ""); k += 1
+    # inconsistent dealer x1: no receiver refuses, rebuild blames x1
+    rdi = o_round(ro4, seeds4, 5, lw, faults={1: "inconsistent-deal"}, harness=True)
+    assert not rdi["refused"] and rdi["u3"] == [1, 2, 3, 4]
+    got = o_rebuild(ro4, 5, lw, rdi)
+    assert got[0] is None and got[1] == [] and got[2] == I4(1) and "dealt shares" in got[3], got; k += 1
+    # bad-commit-share from x1: its lowest other receiver (x2) refuses bad_commit
+    rdc = o_round(ro4, seeds4, 5, lw, faults={1: "bad-commit-share"}, harness=True)
+    assert rdc["refused"] == {I4(2): "bad_commit"}, rdc["refused"]; k += 1
+    # N = 7 (t = 5), x4 drops after its Y: |U3| = 6, s of x4 rebuilt.
+    ro7, seeds7 = o_roster(7)
+    rd7 = o_round(ro7, seeds7, 3, lw, drop_after=(4,))
+    I7 = lambda x: ro7.entries[x - 1][0]
+    exp7 = o_expected(ro7, rd7, lw)
+    assert rd7["u3"] == [1, 2, 3, 5, 6, 7] and not rd7["refused"]
+    assert o_rebuild(ro7, 3, lw, rd7) == (exp7, [], None, ""); k += 1
+    # bad s reveal (x1 about x4) with the dropout: correct sum, x1 excluded
+    assert o_rebuild(ro7, 3, lw, rd7, o_lie(ro7, rd7, 1, 4, 1)) == (exp7, [I7(1)], None, ""); k += 1
+    # clamped-bit s error: the rebuilt s differs only in bit 0 of byte 0
+    lam = lagrange0([1, 2, 3, 5, 6])
+    clamp = o_lie(ro7, rd7, 1, 4, 1, xor=gf_inv(lam[0]))
+    cs = [(x, next(p[5] for p in clamp[I7(x)] if p[3] == I7(4) and p[4] == 1)) for x in (1, 2, 3, 5, 6)]
+    s_alt = shamir_combine(cs, 32)
+    assert s_alt != shamir_combine([(x, next(p[5] for p in rd7["reveals"][I7(x)] if p[3] == I7(4)))
+                                    for x in (1, 2, 3, 5, 6)], 32)
+    assert o_rebuild(ro7, 3, lw, rd7, clamp) == (exp7, [], None, ""); k += 1
+    # one liar about an s-secret (x4) and a b-secret (x5): excluded once
+    both = o_lie(ro7, {"reveals": o_lie(ro7, rd7, 1, 4, 1)}, 1, 5, 0)
+    assert o_rebuild(ro7, 3, lw, rd7, both) == (exp7, [I7(1)], None, ""); k += 1
+    # two liars about different dealers: the global exclusion leaves |R| - 2 < t
+    # candidates for the second dealer -> refused
+    two7 = o_lie(ro7, {"reveals": o_lie(ro7, rd7, 1, 4, 1)}, 2, 5, 0)
+    got = o_rebuild(ro7, 3, lw, rd7, two7)
+    assert got[0] is None and got[1] == [I7(1), I7(2)] and got[2] is None, got; k += 1
+    return k
 
 
 # ============================================================ harness replay
@@ -1007,7 +1361,7 @@ SCEN = {"A": (3, 5, 4, -1, -1, -1), "B": (5, 9, 0, -1, 2, -1), "C": (4, 11, 0, 0
 
 
 def refusal_lines():
-    """The 11 refusal cases of sa4_dump.nova E, as 'CASE k ok=.. last=..' lines."""
+    """The 15 refusal cases of sa4_dump.nova E, as 'CASE k ok=.. last=..' lines."""
     ro = h_roster(3)
     lay = h_layout()
     rl = fmt_round(5, ro.fp, H_L, lay)
@@ -1025,9 +1379,17 @@ def refusal_lines():
     cases = [[fmt_round(5, fpx, H_L, lay)], [fmt_round(4, ro.fp, H_L, lay)], [fmt_round(5, ro.fp, H_L + 1, lay)],
              [fmt_round(5, ro.fp, H_L, fpx)], ["SA4_ROUND 05 x"], [rl, fmt_set(5, 2, bm([1, 2, 3]))],
              [rl, fmt_set(6, 1, bm([1, 2, 3]))],
-             [rl, advs[0], fmt_adv(5, a1[2], a1[3], a1[4], bytes(g)), advs[2], fmt_set(5, 1, bm([1, 2, 3]))],
+             [rl, advs[0], fmt_adv(5, a1[2], a1[3], a1[4], bytes(g), a1[6], a1[7]), advs[2], fmt_set(5, 1, bm([1, 2, 3]))],
              [rl] + advs + [fmt_set(5, 1, bm([1, 2, 3, 4]))], [rl, advs[0], advs[1], fmt_set(5, 1, bm([1, 2, 3]))],
              [rl] + advs + [advs[2], fmt_set(5, 1, bm([1, 2, 3]))]]
+    # v4-sa2: own ADV relayed back with B (then M) altered, a peer ADV with M
+    # altered under its original signature, and a v1 (6-token) ADV.
+    a0 = parse(advs[0])
+    flip = lambda b, i, m: b[:i] + bytes([b[i] ^ m]) + b[i + 1:]
+    cases.append([rl, fmt_adv(5, a0[2], a0[3], a0[4], a0[5], flip(a0[6], 0, 1), a0[7]), advs[1], advs[2], fmt_set(5, 1, bm([1, 2, 3]))])
+    cases.append([rl, fmt_adv(5, a0[2], a0[3], a0[4], a0[5], a0[6], flip(a0[7], 31, 128)), advs[1], advs[2], fmt_set(5, 1, bm([1, 2, 3]))])
+    cases.append([rl, advs[0], fmt_adv(5, a1[2], a1[3], a1[4], a1[5], a1[6], flip(a1[7], 0, 1)), advs[2], fmt_set(5, 1, bm([1, 2, 3]))])
+    cases.append([rl, advs[0], "SA4_ADV 5 %d %s %s %s" % (a1[2], a1[3].hex(), a1[4].hex(), a1[5].hex()), advs[2], fmt_set(5, 1, bm([1, 2, 3]))])
     got = []
     for k, c in enumerate(cases):
         s = fresh(0)
@@ -1066,6 +1428,114 @@ def harness_compare(which, dump):
             print("FIRST DIFF\n  py  : %s\n  nova: %s" % (a[:160], b[:160]))
             break
     return 0 if got == want else 1
+
+
+# ============================================================ v4-sa2 pins
+KAT_FP = bytes(range(32))
+KAT_R = 7
+KAT_U = 300
+
+
+def kat_shares(n):
+    """KAT vector: s-share of x = [x]*32, b-share of x = [255 - x]*32."""
+    return [(x, bytes([x]) * 32) for x in range(1, n + 1)], [(x, bytes([255 - x]) * 32) for x in range(1, n + 1)]
+
+
+def pin_lines():
+    """The v4-sa2 known answers (tree KATs, transcripts) as 'PIN name hex' lines."""
+    out = ["# vector: fp = 00 01 .. 1f, r = 7, u = 300; s-share(x) = [x]*32, b-share(x) = [255-x]*32,"
+           " b = [0x42]*32; tree pins: D, root, path of x = N and of x = 1 (path[0] first, concatenated)"]
+    fp, r, u = KAT_FP, KAT_R, KAT_U
+    out.append("PIN hs_1 " + h_sshare(fp, r, u, 1, bytes([1]) * 32).hex())
+    out.append("PIN hb_1 " + h_bshare(fp, r, u, 1, bytes([254]) * 32).hex())
+    out.append("PIN leaf_1 " + share_leaf(fp, r, u, 1, bytes([1]) * 32, bytes([254]) * 32).hex())
+    out.append("PIN bcommit " + b_commit(fp, r, u, bytes([0x42]) * 32).hex())
+    for n in (2, 3, 5, 255):
+        d = depth(n)
+        ssh, bsh = kat_shares(n)
+        lv = deal_tree(fp, r, u, ssh, bsh, d)
+        out.append("PIN tree_n%d_d %d" % (n, d))
+        out.append("PIN tree_n%d_root %s" % (n, lv[-1][0].hex()))
+        out.append("PIN tree_n%d_path_x%d %s" % (n, n, b"".join(tree_path(lv, n - 1)).hex()))
+        out.append("PIN tree_n%d_path_x1 %s" % (n, b"".join(tree_path(lv, 0)).hex()))
+    # transcripts: id = 300, L = 150, layout = h_layout(), c/s/B/M = [1]/[2]/[3]/[4]*32
+    k1 = tuple(bytes([v]) * 32 for v in (1, 2, 3, 4))
+    k2 = tuple(bytes([v]) * 32 for v in (5, 6, 7, 8))
+    tr = adv_transcript(fp, r, 300, H_L, h_layout(), *k1)
+    out.append("PIN adv_transcript_len %d" % len(tr))
+    out.append("PIN adv_transcript " + tr.hex())
+    out.append("PIN adv_transcript_sha256 " + sha256(tr).hex())
+    h1 = advset_hash(bitmap([1, 2]), [k1, k2])
+    out.append("PIN h1_u1_12 " + h1.hex())
+    out.append("PIN t3_sha256 " + sha256(t3_transcript(fp, r, h1, bitmap([1, 2]), bitmap([1, 2]))).hex())
+    spt = share_pt(300, 7, r, 2, bytes([0x11]) * 32, bytes([0x22]) * 32, [bytes([0x33]) * 32, bytes([0x44]) * 32])
+    out.append("PIN share_pt_n3 " + spt.hex())
+    # reveal proofs of the N = 3 tree for x = 2: kind b and kind s
+    ssh, bsh = kat_shares(3)
+    lv = deal_tree(fp, r, u, ssh, bsh, 2)
+    pth = tree_path(lv, 1)
+    out.append("PIN reveal_n3_x2_b " + reveal_proof(fp, r, u, 2, 0, ssh[1][1], bsh[1][1], pth).hex())
+    out.append("PIN reveal_n3_x2_s " + reveal_proof(fp, r, u, 2, 1, ssh[1][1], bsh[1][1], pth).hex())
+    return out
+
+
+def pins_selftest():
+    """Tree properties and the pinned values; returns the pin lines."""
+    fp, r, u = KAT_FP, KAT_R, KAT_U
+    assert [depth(n) for n in (2, 3, 4, 5, 8, 9, 10, 16, 17, 255)] == [1, 2, 2, 3, 3, 4, 4, 4, 5, 8]
+    for n in (2, 3, 5, 8, 255):
+        d = depth(n)
+        ssh, bsh = kat_shares(n)
+        lv = deal_tree(fp, r, u, ssh, bsh, d)
+        root = lv[-1][0]
+        assert len(lv[0]) == 1 << d and all(lf == bytes(32) for lf in lv[0][n:])
+        for i in range(1 << d):              # every position, padding included
+            assert path_fold(lv[0][i], i, tree_path(lv, i)) == root
+            if n <= 8 and i < n:             # the index bit matters (real leaves)
+                for b in range(d):
+                    assert path_fold(lv[0][i], i ^ (1 << b), tree_path(lv, i)) != root
+        for x in ([1, 2, n] if n > 8 else range(1, n + 1)):
+            sh_s, sh_b, pth = ssh[x - 1][1], bsh[x - 1][1], tree_path(lv, x - 1)
+            pb = reveal_proof(fp, r, u, x, 0, sh_s, sh_b, pth)
+            ps = reveal_proof(fp, r, u, x, 1, sh_s, sh_b, pth)
+            assert reveal_proof_ok(fp, r, u, x, 0, sh_b, pb, root, d)
+            assert reveal_proof_ok(fp, r, u, x, 1, sh_s, ps, root, d)
+            assert not reveal_proof_ok(fp, r, u, x, 1, sh_b, pb, root, d)   # b proof used as s proof
+            assert not reveal_proof_ok(fp, r, u, x, 0, sh_s, ps, root, d)   # and the reverse
+            assert not reveal_proof_ok(fp, r, u, x, 0, sh_b, pb[:-32], root, d)
+            assert not reveal_proof_ok(fp, r, u, x, 0, sh_b, pb + bytes(32), root, d)
+            assert not reveal_proof_ok(fp, r, u, x, 0, bytes([sh_b[0] ^ 1]) + sh_b[1:], pb, root, d)
+            if x < n:
+                assert not reveal_proof_ok(fp, r, u, x + 1, 0, sh_b, pb, root, d)  # another x
+            hs, hb = h_sshare(fp, r, u, x, sh_s), h_bshare(fp, r, u, x, sh_b)
+            assert path_fold(node_hash(hs, hb), x - 1, pth) != root      # leaf hashed as a node
+            assert path_fold(sha256(hs + hb), x - 1, pth) != root        # no prefix
+            assert path_fold(leaf_hash(hb, hs), x - 1, pth) != root      # order hs, hb
+        if d >= 2:                           # an inner node presented as a leaf at depth d-1
+            assert path_fold(lv[1][0], 0, tree_path(lv, 0)[1:]) == root
+    pl = pin_lines()
+    vals = dict(l.split(" ")[1:3] for l in pl if l.startswith("PIN "))
+    for k, v in PINS.items():
+        assert vals[k] == v, "pin " + k
+    assert sha256("\n".join(pl).encode("ascii")).hex() == PINS_ALL, "pin file digest"
+    return pl
+
+
+PINS = {
+    "hs_1": "dedb8985274c2034269288c11171cf2af47351a1ad96910667a1cf40ddc98e54",
+    "hb_1": "5b5dec45f421070478331ddf151614a7d0d72669ec3c412bc32a88d683410c8f",
+    "leaf_1": "32499f0776218cb385e0bc12889a2a756688e1171876503f505f773865b8b4cd",
+    "bcommit": "b2943cc0a9bb4d9292f868a29a56b8006ae2b337a7e4e8880a1a0bc8726d5c0d",
+    "tree_n2_root": "0b88dab2d65003c3d8c2eaa1444b067900408cd414ce2ea4a020e429bc88d198",
+    "tree_n3_root": "0527c3401851a7b47fccb649a4b5828daad1d7971b6e195d509a4e76846ee7d7",
+    "tree_n5_root": "ed9dfe68f8ea4897ca1501c80600c347c52183cc3cf8596c47ff389b46365077",
+    "tree_n255_root": "a5265bbbc439d2192f473172c1eb8eb8e77822f634cfe2f1fcd43f2b26ad573e",
+    "adv_transcript_sha256": "c163dd9e4122c932706424043c579b455af83d8ccf0403b89e3bdb3292142be0",
+    "h1_u1_12": "5301bba390762bc4105514164ce503fe8a6b01c58a234f67c587bae1bc20612c",
+    "t3_sha256": "c86f5e81552a9b83e513b7c4c05c338523001b7ae3765778115027f07949c662",
+    "share_pt_n3": "020000012c000000070000000000000007021111111111111111111111111111111111111111111111111111111111111111222222222222222222222222222222222222222222222222222222222222222233333333333333333333333333333333333333333333333333333333333333334444444444444444444444444444444444444444444444444444444444444444",
+}
+PINS_ALL = "e1ed810f3e389660ced48de3cf326bccff85c7814f00daa39594c8d8ddb74d18"
 
 
 # ============================================================ selftest
@@ -1220,7 +1690,44 @@ def selftest():
         assert parse(bad) is None, bad
     assert parse("SA4_END 4611686018427387903 1 7 2") is not None
     assert bitmap([1, 9, 255]) [0] == 1 and bitmap_xs(bitmap([1, 9]), 8) is None
+    # v4-sa2 wire: 8-token ADV, ct of 98 + 32k bytes (k = 1..8), 7-token REVEAL
+    # with a proof of 32k bytes (k = 2..9); v1 shapes refused.
+    g32, g64 = bytes(range(32)), bytes(range(64))
+    adv = fmt_adv(5, 7, g32, g32[::-1], g64, b"\x03" * 32, b"\x04" * 32)
+    assert parse(adv) == (EV_ADV, 5, 7, g32, g32[::-1], g64, b"\x03" * 32, b"\x04" * 32)
+    assert parse(" ".join(adv.split(" ")[:5] + adv.split(" ")[7:])) is None          # v1 ADV
+    for k in range(0, 10):
+        ln = fmt_share(5, 7, 300, bytes(98 + 32 * k))
+        assert (parse(ln) is not None) == (1 <= k <= 8), k
+        rv = fmt_reveal(5, 7, 300, 0, g32, bytes(32 * k))
+        assert (parse(rv) is not None) == (2 <= k <= 9), k
+    assert parse(fmt_share(5, 7, 300, bytes(98 + 32 * 2))[:-1]) is None
+    assert parse(fmt_share(5, 7, 300, bytes(98 + 32)).replace("0000", "000A", 1)) is None
+    rv = fmt_reveal(5, 7, 300, 1, g32, g64 + g32)
+    assert parse(rv) == (EV_REVEAL, 5, 7, 300, 1, g32, g64 + g32)
+    assert parse(" ".join(rv.split(" ")[:6])) is None                                  # v1 REVEAL
+    assert max(len(fmt_adv(2 ** 62 - 1, M32, g32, g32, g64, g32, g32)),
+               len(fmt_share(2 ** 62 - 1, M32, M32, bytes(98 + 32 * 8))),
+               len(fmt_reveal(2 ** 62 - 1, M32, M32, 0, g32, bytes(32 * 9)))) <= 1000
+    pt2 = share_pt(300, 7, 5, 2, g32, g32[::-1], [g32, g32])
+    assert share_pt_parse(pt2, 2) == (300, 7, 5, 2, g32, g32[::-1], [g32, g32])
+    assert share_pt_parse(pt2, 1) is None and share_pt_parse(b"\x01" + pt2[1:], 2) is None
+    pins = pins_selftest()
+    for line in pins:
+        if not line.startswith(("PIN adv_transcript ", "PIN tree_n255_path")):
+            print(line)
+    k = oracle_selftest()
+    print("sa4_ref selftest: v4-sa2 pins %d, coordinator oracle scenarios %d" % (len(pins) - 1, k))
     print("sa4_ref selftest: OK")
+    return 0
+
+
+def pins_main(path=None):
+    text = "\n".join(pins_selftest()) + "\n"
+    if path:
+        with open(path, "w") as fh:
+            fh.write(text)
+    sys.stdout.write(text)
     return 0
 
 
@@ -1241,8 +1748,8 @@ def dump(which):
 
 
 # ============================================================ live soul (A2.3c)
-FED_HELLO = "SECAGG_HELLO ce-fed v4-sa"
-FED_OK = "OK ce-fed v4-sa protocol accepted"
+FED_HELLO = "SECAGG_HELLO ce-fed v4-sa2"
+FED_OK = "OK ce-fed v4-sa2 protocol accepted"
 LAYOUT_HEADER = "crossengin-fed-layout v1"
 TAG_CHARS = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_:-")
 
@@ -1358,6 +1865,8 @@ def connect_main(argv):
     if opt["--state"] and os.path.exists(opt["--state"]):
         last = int(open(opt["--state"]).read().strip())
     soul = Soul(ro, seed, OsRng(), last)
+    if opt["--fault"] in ("bad-commit-share", "inconsistent-deal"):
+        soul.fault = opt["--fault"]
     if not soul.set_input(fed_words(tags, x), fed_layout(tags)):
         print("sa4_ref: input refused")
         return 2
@@ -1489,7 +1998,7 @@ def _connect_loop(soul, tags, opt, fault, sock, send, recv):
                 u3n = len(xs)
         ok, err, outs = soul.handle(line)
         if fault == "bad-adv-sig":
-            outs = [_corrupt_hex_token(o, 5) if o.startswith("SA4_ADV ") else o for o in outs]
+            outs = [_corrupt_hex_token(o, 7) if o.startswith("SA4_ADV ") else o for o in outs]
         if fault == "bad-sig3":
             outs = [_corrupt_hex_token(o, 3) if o.startswith("SA4_SIG3 ") else o for o in outs]
         if fault == "bad-share":
@@ -1498,6 +2007,14 @@ def _connect_loop(soul, tags, opt, fault, sock, send, recv):
             for o in outs:
                 if o.startswith("SA4_SHARE ") and not done1:
                     o = _corrupt_hex_token(o, 4, 10)
+                    done1 = True
+                new.append(o)
+            outs = new
+        if fault in ("bad-b-reveal", "bad-s-reveal"):   # alter the share, keep the proof
+            want, done1, new = fault[4], False, []
+            for o in outs:
+                if o.startswith("SA4_REVEAL ") and o.split(" ")[4] == want and not done1:
+                    o = _corrupt_hex_token(o, 5)
                     done1 = True
                 new.append(o)
             outs = new
@@ -1535,6 +2052,8 @@ if __name__ == "__main__":
         sys.exit(connect_main(sys.argv[1:]))
     if len(sys.argv) == 2 and sys.argv[1] == "--selftest":
         sys.exit(selftest())
+    if len(sys.argv) in (2, 3) and sys.argv[1] == "--pins":
+        sys.exit(pins_main(sys.argv[2] if len(sys.argv) == 3 else None))
     if len(sys.argv) == 3 and sys.argv[1] == "--dump" and sys.argv[2] in "ABCDE":
         sys.exit(dump(sys.argv[2]))
     if len(sys.argv) == 4 and sys.argv[1] == "--harness" and sys.argv[2] in "ABCDE":
