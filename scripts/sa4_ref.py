@@ -1373,7 +1373,6 @@ def connect_main(argv):
     if sock is None:
         print("sa4_ref: cannot connect to %s:%s" % (host, port))
         return 3
-    rf = sock.makefile("rb")
     deadline = time.monotonic() + float(opt["--deadline"])   # bounds the whole session
 
     def send(line):
@@ -1385,17 +1384,29 @@ def connect_main(argv):
             return
         sock.sendall(data)
 
+    pending = bytearray()
+
     def recv():
-        left = deadline - time.monotonic()
-        if left <= 0:
-            raise TimeoutError("session deadline (--deadline) passed")
-        sock.settimeout(min(left, float(opt["--timeout"])))
-        b = rf.readline(1002)
-        if not b:
-            return None
-        if not b.endswith(b"\n") or len(b) > 1001:
-            raise ValueError("line too long or not terminated")
-        return b[:-1].decode("latin-1")
+        # The deadline is checked before every socket read, so a peer that
+        # trickles bytes cannot stretch the session past --deadline.
+        while True:
+            nl = pending.find(b"\n")
+            if nl >= 0:
+                if nl > 1000:
+                    raise ValueError("line over 1000 bytes")
+                line = bytes(pending[:nl])
+                del pending[:nl + 1]
+                return line.decode("latin-1")
+            if len(pending) > 1000:
+                raise ValueError("line over 1000 bytes")
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("session deadline (--deadline) passed")
+            sock.settimeout(min(left, float(opt["--timeout"])))
+            chunk = sock.recv(1024)
+            if not chunk:
+                return None
+            pending.extend(chunk)
 
     sock.sendall((FED_HELLO + "\n").encode("latin-1"))
     if recv() != FED_OK:
@@ -1442,6 +1453,9 @@ def _connect_loop(soul, tags, opt, fault, sock, send, recv):
                 print("sa4_ref: BYE after %d aggregate(s)" % sums)
                 return 0
             after_done += 1
+            if after_done > len(tags):           # an honest coordinator sends at most one per tag
+                print("sa4_ref: too many lines after the round; closing")
+                return 0
             rec = fed_parse_result(line)
             why = fed_result_why(rec, soul.done_round, tags, u3n, applied)
             if why == "":
@@ -1450,9 +1464,6 @@ def _connect_loop(soul, tags, opt, fault, sock, send, recv):
                 sums += 1
             else:
                 print("sa4_ref: ignored a result line (%s)" % why, flush=True)
-            if after_done > len(tags):
-                print("sa4_ref: too many lines after the round; closing")
-                return 0
             continue
         rec = parse(line)
         if soul.state == ST_IDLE and opt["--state"] and rec is not None and rec[0] == EV_ROUND:
