@@ -1348,10 +1348,12 @@ def connect_main(argv):
     sock.sendall(("FED_JOIN %d 1000\n" % soul.me).encode("latin-1"))
     print("sa4_ref: joined as id=%d x=%d" % (soul.me, soul.mx), flush=True)
     if fault == "silent":                     # joins, then never answers
-        sock.settimeout(None)
-        while recv() is not None:
-            pass
-        print("sa4_ref: fault silent: coordinator closed")
+        try:
+            while recv() is not None:
+                pass
+            print("sa4_ref: fault silent: coordinator closed")
+        except (socket.timeout, OSError):
+            print("sa4_ref: fault silent: timed out")
         return 0
     sums = 0
     while True:
