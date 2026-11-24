@@ -1275,6 +1275,56 @@ def fed_words(tags, x):
     return w
 
 
+def fed_parse_result(line):
+    """sa4f_parse_result: strict FED_AGGREGATE_SUM -> (r, tag, sp, sa, n) or None."""
+    t = _tokens(line)
+    if t is None or len(t) != 6 or t[0] != "FED_AGGREGATE_SUM":
+        return None
+    r = _round(t[1])
+    if r < 0 or not (1 <= len(t[2]) <= 64) or any(c not in TAG_CHARS for c in t[2]):
+        return None
+    sp, sa, n = _u32(t[3]), _u32(t[4]), _u32(t[5])
+    if sp < 0 or sa < 0 or n < 0:
+        return None
+    return (r, t[2], sp, sa, n)
+
+
+def fed_result_why(rec, r, tags, u3n, applied):
+    """sa4f_result_why."""
+    if rec is None:
+        return "not a FED_AGGREGATE_SUM line"
+    if rec[0] != r:
+        return "for another round"
+    if rec[1] not in tags:
+        return "tag not in CE_SECAGG_V4_TAGS"
+    if rec[1] in applied:
+        return "second result for this tag"
+    if rec[4] < 1:
+        return "n_part below 1"
+    if rec[4] > u3n:
+        return "n_part above |U3|"
+    return ""
+
+
+def round_ok(soul, rec):
+    """sa4s_round_ok: '' when the soul would accept this SA4_ROUND record."""
+    if rec is None:
+        return "bad_line"
+    if rec[0] != EV_ROUND:
+        return "unexpected"
+    if soul.x is None:
+        return "no_input"
+    if rec[2] != soul.ro.fp:
+        return "bad_fp"
+    if rec[1] <= soul.last:
+        return "stale_round"
+    if rec[3] != len(soul.x):
+        return "bad_len"
+    if rec[4] != soul.layout:
+        return "bad_layout"
+    return ""
+
+
 def _corrupt_hex_token(line, idx, pos=0):
     t = line.split(" ")
     h = list(t[idx])
@@ -1285,7 +1335,8 @@ def _corrupt_hex_token(line, idx, pos=0):
 
 def connect_main(argv):
     import socket
-    opt = {"--x": "", "--state": None, "--fault": None, "--timeout": "60", "--tags": None, "--connect": None}
+    opt = {"--x": "", "--state": None, "--fault": None, "--timeout": "60", "--tags": None, "--connect": None,
+           "--deadline": "300"}
     i = 0
     while i < len(argv):
         if argv[i] not in opt or i + 1 >= len(argv):
@@ -1323,6 +1374,7 @@ def connect_main(argv):
         print("sa4_ref: cannot connect to %s:%s" % (host, port))
         return 3
     rf = sock.makefile("rb")
+    deadline = time.monotonic() + float(opt["--deadline"])   # bounds the whole session
 
     def send(line):
         data = (line + "\n").encode("latin-1")
@@ -1334,6 +1386,10 @@ def connect_main(argv):
         sock.sendall(data)
 
     def recv():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("session deadline (--deadline) passed")
+        sock.settimeout(min(left, float(opt["--timeout"])))
         b = rf.readline(1002)
         if not b:
             return None
@@ -1355,7 +1411,27 @@ def connect_main(argv):
         except (socket.timeout, OSError):
             print("sa4_ref: fault silent: timed out")
         return 0
+    try:
+        return _connect_loop(soul, tags, opt, fault, sock, send, recv)
+    except (ValueError, OSError) as e:          # socket.timeout is an OSError
+        if soul.state not in (ST_DONE, ST_ABORTED):
+            soul._wipe()
+            soul.state = ST_ABORTED
+            try:
+                sock.sendall((fmt_abort(max(soul.r, 0), soul.me, "transport") + "\n").encode("latin-1"))
+            except OSError:
+                pass
+            print("sa4_ref: refused: transport: %s (abort code transport)" % e)
+            return 3
+        print("sa4_ref: transport after the round: %s" % e)
+        return 0
+
+
+def _connect_loop(soul, tags, opt, fault, sock, send, recv):
     sums = 0
+    applied = []
+    after_done = 0
+    u3n = 0
     while True:
         line = recv()
         if line is None:
@@ -1365,20 +1441,31 @@ def connect_main(argv):
             if line == "BYE":
                 print("sa4_ref: BYE after %d aggregate(s)" % sums)
                 return 0
-            f = line.split(" ")
-            if len(f) == 6 and f[0] == "FED_AGGREGATE_SUM" and int(f[1]) == soul.done_round:
-                print("sa4_ref: AGGREGATE_SUM round=%s tag=%s sum_promo=%s sum_atr=%s n_part=%s" % tuple(f[1:]),
-                      flush=True)
+            after_done += 1
+            rec = fed_parse_result(line)
+            why = fed_result_why(rec, soul.done_round, tags, u3n, applied)
+            if why == "":
+                applied.append(rec[1])
+                print("sa4_ref: AGGREGATE_SUM round=%d tag=%s sum_promo=%d sum_atr=%d n_part=%d" % rec, flush=True)
                 sums += 1
+            else:
+                print("sa4_ref: ignored a result line (%s)" % why, flush=True)
+            if after_done > len(tags):
+                print("sa4_ref: too many lines after the round; closing")
+                return 0
             continue
-        if line.startswith("SA4_ROUND ") and opt["--state"]:
-            rec = parse(line)
-            if rec is not None and rec[1] > soul.last:
-                with open(opt["--state"] + ".tmp", "w") as fh:          # write-ahead
+        rec = parse(line)
+        if soul.state == ST_IDLE and opt["--state"] and rec is not None and rec[0] == EV_ROUND:
+            if round_ok(soul, rec) == "":              # write-ahead, only for a round we accept
+                with open(opt["--state"] + ".tmp", "w") as fh:
                     fh.write("%d\n" % rec[1])
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(opt["--state"] + ".tmp", opt["--state"])
+        if rec is not None and rec[0] == EV_SET and rec[2] == 3:
+            xs = bitmap_xs(rec[3], soul.ro.n)
+            if xs is not None:
+                u3n = len(xs)
         ok, err, outs = soul.handle(line)
         if fault == "bad-adv-sig":
             outs = [_corrupt_hex_token(o, 5) if o.startswith("SA4_ADV ") else o for o in outs]
@@ -1405,7 +1492,8 @@ def connect_main(argv):
         for o in outs:
             send(o)
         if not ok:
-            print("sa4_ref: " + err)
+            code = outs[-1].split(" ")[-1] if outs else "-"
+            print("sa4_ref: %s (abort code %s)" % (err, code))
             return 3
         stop = {"stop-after-adv": ST_ADV, "stop-after-shares": ST_SHARED, "stop-after-y": ST_MASKED,
                 "stop-after-sig3": ST_SIGNED}.get(fault)

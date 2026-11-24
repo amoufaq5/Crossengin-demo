@@ -1240,6 +1240,26 @@ coordinator.**
     so a coordinator that disconnects cannot kill the chat process.
   - One round per coordinator process.
 
+**Collusion bound.** To learn one honest soul v's input, the coordinator
+needs t shares of both b_v and s_v^SK. An honest soul reveals one kind
+about v, and only after t valid SIG3 signatures over the U3 it signed,
+so the b- and s-reveals about v come from disjoint groups of honest
+souls. With C souls colluding with the coordinator, a leak needs
+2(t − C) ≤ N − C, that is C ≥ 2t − N. There is also a trivial limit: if
+U3 is v plus t − 1 colluders, the sum alone gives x_v. v4 is therefore
+private against the coordinator plus C colluding souls only when
+C ≤ 2t − N − 1 (and C < t − 1):
+
+| N | t | Largest tolerated C |
+|---|---|---|
+| 3 | 3 | 1 |
+| 4 | 3 | 1 |
+| 5 | 4 | 2 |
+| 10 | 7 | 3 |
+| 255 | 171 | 86 |
+
+`scenario_u4_evil.sh` checks both sides of this bound at N = 10 (A2.4a).
+
 **What this does and does not protect.**
 - **What the coordinator sees.** It sees the sum per word over U3 (masks
   cancel only there), the sets, and who joined. With the minimum-present
@@ -1272,11 +1292,35 @@ coordinator.**
   reach the port can do that (and squat ids); expose the coordinator only
   to the souls (bind address, firewall).
 
+**Hardening after the malicious-coordinator mapping (A2.4a).**
+- **No round-id burn.** A soul saves a round id only for a round it would
+  accept (`sa4s_round_ok`: input set, fingerprint, r after the last round,
+  L, layout). Before, one `SA4_ROUND` with a wrong fingerprint and
+  r = 2^62 − 1 made the soul refuse every later round of that roster.
+  A coordinator with the right fingerprint can still advance the soul's
+  last round to any value (a denial of service it can cause anyway by
+  not running rounds).
+- **Strict results.** The soul parses `FED_AGGREGATE_SUM` itself
+  (`sa4f_parse_result`): canonical decimals, the sums and n as u32. The
+  shared v3n-sa parser accepted `-5000` and wrapped long numbers.
+- **Transport failures wipe secrets.** When the connection fails before
+  the round is done (closed, timeout, a line over 1000 bytes, a NUL
+  byte), the chat calls `sa4s_abort` (round secrets wiped, `SA4_ABORT
+  ... transport` sent if possible) and says which of these it was. Every
+  refusal message names the abort code it sent.
+- **Python reference soul.** The same round check before saving its
+  state, the same result checks, a clean refusal on transport errors,
+  an overall `--deadline` (default 300 s) and at most one line per tag
+  after the round.
+
 **Tests.**
-- `tests/unit/test_sa4_fed.nova` (80 checks): tag parsing, the layout text
+- `tests/unit/test_sa4_soul_api.nova` (20 checks): `sa4s_round_ok` codes
+  and `sa4s_abort`.
+- `tests/unit/test_sa4_fed.nova` (101 checks): tag parsing, the layout text
   and hash (checked against Python hashlib), input words and sums, the
-  `FED_JOIN` parser, the soul's result checks, and the last-round file
-  (missing, durable save, exact content, 0600, the refusals).
+  `FED_JOIN` parser, the strict result parser and the soul's result
+  checks, and the last-round file (missing, durable save, exact content,
+  0600, the refusals).
 - `tests/integration/scenario_u4_secagg.sh` (in CI):
   - a mixed round: two chat souls and one Python soul, all printing the same
     sums, which equal the inputs each soul printed locally; the Python soul's
