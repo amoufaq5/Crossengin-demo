@@ -27,7 +27,9 @@
 //   acceptance tests assert the round-trip flow. The audit docs
 //   (FEDERATED_AUDIT.md, SECAGG_AUDIT.md) walk the production gaps.
 //
-//   SecAgg mode (CE_SECAGG_ENABLED=1) speaks protocol v3n-sa:
+//   SecAgg mode (CE_SECAGG_ENABLED=1) speaks protocol v3n-sa unless
+//   CE_SECAGG_MODE=v4 (double masking, A2.3c; see the "SecAgg v4" block
+//   above main). v3n-sa:
 //     soul -> coord : SECAGG_HELLO ce-fed v3n-sa      (exact)
 //     coord -> soul : OK ce-fed v3n-sa protocol accepted
 //     soul -> coord : FED_JOIN <id> <eps>
@@ -54,9 +56,18 @@
 //     CE_FED_BIND              -- bind address (default 127.0.0.1)
 //     CE_FED_ROUND_INTERVAL_NS -- ns between rounds (default 30000000000)
 //     CE_FED_TOKEN             -- shared auth token (default: anonymous)
-//     CE_FED_SOULS             -- expected initial soul count (default 1)
+//     CE_FED_SOULS             -- expected initial soul count (default 1;
+//                                 in v4: the roster size, at least t)
 //     CE_FED_MAX_ROUNDS        -- bound rounds (test mode; default 0 = forever)
 //     CE_SECAGG_ENABLED        -- 1 = SecAgg (v3n-sa) mode
+//     CE_SECAGG_MODE           -- v4 = SecAgg v4 double masking (A2.3c; see
+//                                 the "SecAgg v4" block above main and
+//                                 SECAGG_AUDIT.md); unset / v3n-sa = v3n-sa;
+//                                 v4 without CE_SECAGG_ENABLED=1 is refused
+//     CE_SECAGG_ROSTER, CE_SECAGG_V4_TAGS, CE_SECAGG_V4_JOIN_MS,
+//     CE_SECAGG_V4_PHASE_MS, CE_SECAGG_V4_MIN_PRESENT -- v4 settings (v4
+//     runs one round per process; CE_FED_MAX_ROUNDS, CE_FED_TOKEN and the
+//     v3n-sa round deadline are not used)
 //     CE_SECAGG_ALLOW_RECON    -- "1" = on a dropout, run FED_DROPOUT /
 //                                 FED_RECON_MASKED reconciliation; default:
 //                                 ABORT the round (no sum, BYE, session ends)
@@ -66,7 +77,10 @@
 //                                 ("C>S ..." / "S>C ...", mode 0600)
 //     CE_RUN_DIR               -- run dir holding the SecAgg round counter
 //                                 file crossengin_fed_secagg_round (0600,
-//                                 written durably before each FED_ROUND)
+//                                 written durably before each FED_ROUND);
+//                                 v4: crossengin_fed_sa4_round_<fp16>. Use
+//                                 persistent storage: the default
+//                                 $XDG_RUNTIME_DIR is cleared at reboot
 //
 // ADRs exercised: ADR-0054 (federated multi-soul framework). NOVA
 //   dependencies: socket builtins, getenv, nanotime, read_line.
@@ -77,6 +91,8 @@
 import "../src/io/transducers/kg_sync.nova"
 import "../src/learning/federated_aggregator.nova"
 import "../src/learning/secure_aggregation.nova"
+import "../src/learning/sa4_coord.nova"
+import "../src/learning/sa4_fed.nova"
 import "../src/util/str_safe.nova"
 import "../src/util/run_dir.nova"
 import "../src/util/sys_tagged.nova"
@@ -266,7 +282,11 @@ fn _fed_errno(raw_neg) {
 }
 
 fn _fed_round_load() {
-    let path = _fed_round_path()
+    return _fed_round_load_at(_fed_round_path())
+}
+
+// The same for any counter path (v4 keeps one per roster fingerprint).
+fn _fed_round_load_at(path) {
     let fd = sys_open(path, O_RDONLY + 131072, 0)          // O_NOFOLLOW
     if fd < 0 {
         let e = _fed_errno(fd)
@@ -333,7 +353,11 @@ fn _fed_flock_ex_nb(fd) {
 }
 
 fn _fed_round_lock() {
-    let path = _fed_round_path() + ".lock"
+    return _fed_round_lock_at(_fed_round_path())
+}
+
+fn _fed_round_lock_at(counter_path) {
+    let path = counter_path + ".lock"
     let fd = sys_open(path, 2 + 64 + 131072, 384)           // O_RDWR|O_CREAT|O_NOFOLLOW, 0600
     if fd < 0 {
         println("fed-coord: FATAL cannot open SecAgg lock " + path
@@ -352,7 +376,10 @@ fn _fed_round_lock() {
 // Durable write: temp file (O_EXCL|O_NOFOLLOW, 0600) + fsync + rename +
 // fsync of the run dir. Returns 1 on success, 0 on any failure.
 fn _fed_round_save(round_id) {
-    let path = _fed_round_path()
+    return _fed_round_save_at(_fed_round_path(), round_id)
+}
+
+fn _fed_round_save_at(path, round_id) {
     let tmp = path + ".tmp." + int_to_str(getpid())
     sys_unlink(tmp)
     let flags = O_WRONLY + O_CREAT + 131200                 // + O_EXCL|O_NOFOLLOW
@@ -1237,6 +1264,411 @@ fn _fed_souls_env() {
     return 1
 }
 
+// ---- SecAgg v4 (A2.3c) ----------------------------------------------------------
+// CE_SECAGG_ENABLED=1 + CE_SECAGG_MODE=v4: one double-masking round
+// (src/learning/sa4_coord.nova) over the network, then exit.
+//   Config  CE_SECAGG_ROSTER (pinned roster), CE_SECAGG_V4_TAGS (pinned tag
+//           set; the layout is derived from it), CE_FED_SOULS (souls to wait
+//           for; default the roster size, at least the threshold t).
+//           Refused in v4: CE_SECAGG_ALLOW_RECON, CE_SECAGG_DH*.
+//   Join    up to CE_SECAGG_V4_JOIN_MS (default 60000): "SECAGG_HELLO
+//           ce-fed v4-sa" -> "OK ce-fed v4-sa protocol accepted", then
+//           "FED_JOIN <roster id> 1000" (an id in the roster, once).
+//   Round   the round id continues from crossengin_fed_sa4_round_<fp16> in
+//           the run dir (saved before SA4_ROUND is sent). Each phase reads
+//           every live soul's lines up to its terminator within
+//           CE_SECAGG_V4_PHASE_MS (default 30000), then feeds them to
+//           sa4c_recv, closes the phase and routes the messages. A soul
+//           that times out, closes, sends a line over 1000 bytes or too many
+//           lines is disconnected; souls outside the next set are
+//           disconnected too.
+//   Result  FED_AGGREGATE_SUM <r> <tag> <sum promo> <sum atr> <present> per
+//           tag, only when present (souls in U3 with that tag) is at least
+//           max(2, CE_SECAGG_V4_MIN_PRESENT, default t): a smaller count
+//           would let anyone who knows the other souls' values learn one
+//           soul's value. Then BYE.
+
+fn _fed_v4_now_ms() { return nanotime() / 1000000 }
+
+fn _fed_v4_env_ms(name, dflt) {
+    let e = getenv(name)
+    if e == 0 { return dflt }
+    if len(e) == 0 { return dflt }
+    if len(e) > 9 { return dflt }
+    if _is_digits(e) == 0 { return dflt }
+    let v = _fed_str_to_int(e)
+    if v < 1 { return dflt }
+    return v
+}
+
+fn _fed_v4_env_set(name) {
+    let e = getenv(name)
+    if e == 0 { return 0 }
+    if len(e) == 0 { return 0 }
+    if str_eq_bytes(e, "0") == 1 { return 0 }
+    return 1
+}
+
+// [ok, err, roster, tags, n_want]
+fn _fed_v4_config() {
+    if _fed_v4_env_set("CE_SECAGG_ALLOW_RECON") == 1 { return [0, "CE_SECAGG_ALLOW_RECON is not used in v4 (dropouts are part of the protocol); unset it", 0, 0, 0] }
+    if _fed_v4_env_set("CE_SECAGG_DH") == 1 { return [0, "CE_SECAGG_DH is a v3n-sa option; unset it in v4", 0, 0, 0] }
+    if _fed_v4_env_set("CE_SECAGG_DH_2048") == 1 { return [0, "CE_SECAGG_DH_2048 is a v3n-sa option; unset it in v4", 0, 0, 0] }
+    let ro = sroster_load_from_env()
+    if sroster_ok(ro) != 1 { return [0, sroster_err(ro), 0, 0, 0] }
+    let tg = sa4f_tags_from_env()
+    if tg[0] != 1 { return [0, tg[1], 0, 0, 0] }
+    let n_want = sroster_n(ro)
+    let env = getenv("CE_FED_SOULS")
+    if env != 0 {
+        if len(env) > 0 {
+            if _is_digits(env) == 0 { return [0, "CE_FED_SOULS is not a number", 0, 0, 0] }
+            if len(env) > 3 { return [0, "CE_FED_SOULS is larger than the roster", 0, 0, 0] }
+            n_want = _fed_str_to_int(env)
+        }
+    }
+    if n_want > sroster_n(ro) { return [0, "CE_FED_SOULS " + int_to_str(n_want) + " is larger than the roster (" + int_to_str(sroster_n(ro)) + ")", 0, 0, 0] }
+    if n_want < sroster_t(ro) {
+        return [0, "CE_FED_SOULS " + int_to_str(n_want) + " is below the roster threshold t = " + int_to_str(sroster_t(ro)), 0, 0, 0]
+    }
+    return [1, "", ro, tg[2], n_want]
+}
+
+fn _fed_v4_status(st) {
+    if st == SA4F_RL_EOF { return "<EOF>" }
+    if st == SA4F_RL_TIMEOUT { return "<TIMEOUT>" }
+    if st == SA4F_RL_LONG { return "<TOO LONG>" }
+    if st == SA4F_RL_BAD { return "<NUL BYTE>" }
+    return "<?>"
+}
+
+fn _fed_v4_recv(fd, deadline_ms) {
+    let rl = sa4f_recv_line_by(fd, deadline_ms)
+    if rl[0] == SA4F_RL_LINE { _cw_log("C>S", fd, rl[1]) }
+    else { _cw_log("C>S", fd, _fed_v4_status(rl[0])) }
+    return rl
+}
+
+fn _fed_v4_reject(fd, why) {
+    _cw_send(fd, KGSYNC_ERR_PREFIX + why + "\n")
+    close_fd(fd)
+    println("fed-coord: [SA4] REJECT handshake: " + why)
+    return 0
+}
+
+// One handshake. Connection record: [fd, id, open].
+fn _fed_v4_handshake(fd, ro, conns, deadline_ms) {
+    let h = _fed_v4_recv(fd, deadline_ms)
+    if h[0] != SA4F_RL_LINE {
+        close_fd(fd)
+        println("fed-coord: [SA4] REJECT handshake: no hello (" + _fed_v4_status(h[0]) + ")")
+        return 0
+    }
+    if str_eq_bytes(h[1], SA4F_HELLO) == 0 { return _fed_v4_reject(fd, "expected " + SA4F_HELLO) }
+    if _cw_send(fd, SA4F_OK + "\n") == 0 {
+        close_fd(fd)
+        return 0
+    }
+    let j = _fed_v4_recv(fd, deadline_ms)
+    if j[0] != SA4F_RL_LINE {
+        close_fd(fd)
+        println("fed-coord: [SA4] REJECT handshake: no FED_JOIN (" + _fed_v4_status(j[0]) + ")")
+        return 0
+    }
+    let id = sa4f_parse_join(j[1])
+    if id < 0 { return _fed_v4_reject(fd, "expected FED_JOIN <roster id> 1000") }
+    if sroster_entry_by_id(ro, id) == 0 { return _fed_v4_reject(fd, "id " + int_to_str(id) + " is not in the roster") }
+    let i = 0
+    while i < len(conns) {
+        if conns[i][1] == id { return _fed_v4_reject(fd, "id " + int_to_str(id) + " has already joined") }
+        i = i + 1
+    }
+    return [fd, id, 1]
+}
+
+fn _fed_v4_accept(server_fd, ro, n_want, join_ms) {
+    let conns = list_new()
+    let t0 = _fed_v4_now_ms()
+    let go = 1
+    while go == 1 {
+        let left = join_ms - (_fed_v4_now_ms() - t0)
+        if left <= 0 { go = 0 }
+        if len(conns) >= n_want { go = 0 }
+        if go == 1 {
+            sa4f_set_recv_timeout(server_fd, left)
+            let fd = accept_conn(server_fd, 0, 0)
+            if fd >= 0 {
+                // A fixed, short hello deadline: idle connections cannot use
+                // up the join window (each costs at most 3 s; see the audit
+                // on sequential accepts).
+                let hs_ms = left
+                if hs_ms > 3000 { hs_ms = 3000 }
+                sa4f_set_timeouts(fd, hs_ms)
+                let cn = _fed_v4_handshake(fd, ro, conns, _fed_v4_now_ms() + hs_ms)
+                if cn != 0 {
+                    push(conns, cn)
+                    println("fed-coord: [SA4] JOIN id=" + int_to_str(cn[1]) + " ("
+                        + int_to_str(len(conns)) + " of " + int_to_str(n_want) + ")")
+                }
+            }
+        }
+    }
+    return conns
+}
+
+fn _fed_v4_drop(cn, k, why) {
+    if cn[2] == 1 {
+        close_fd(cn[0])
+        list_set(cn, 2, 0)
+        println("fed-coord: [SA4] disconnected id=" + int_to_str(cn[1]) + " in phase "
+            + int_to_str(k) + ": " + why)
+    }
+    return 0
+}
+
+fn _fed_v4_starts(s, p) {
+    if len(s) < len(p) { return 0 }
+    return str_eq_bytes(substr(s, 0, len(p)), p)
+}
+
+// Read each live soul's lines for phase k: one line in phases 0 and 3
+// (ADV, SIG3); otherwise up to SA4_END (or SA4_ABORT), at most cap lines.
+// Souls are read one after another against one phase deadline; a soul
+// read after the deadline still gets a short grace window, so the lines it
+// already sent (sitting in the socket buffer) are not lost because an
+// earlier soul was slow. Returns [[id, lines], ...].
+let _FED_V4_GRACE_MS = 250
+
+fn _fed_v4_collect(conns, k, phase_ms, cap) {
+    let out = list_new()
+    let phase_end = _fed_v4_now_ms() + phase_ms
+    let i = 0
+    while i < len(conns) {
+        let cn = conns[i]
+        if cn[2] == 1 {
+            let lines = list_new()
+            let fin = 0
+            let soul_end = phase_end
+            let grace_end = _fed_v4_now_ms() + _FED_V4_GRACE_MS
+            if grace_end > soul_end { soul_end = grace_end }
+            sa4f_set_timeouts(cn[0], _FED_V4_GRACE_MS)
+            while fin == 0 {
+                let rl = _fed_v4_recv(cn[0], soul_end)
+                if rl[0] != SA4F_RL_LINE {
+                    let why = _fed_v4_status(rl[0])
+                    if rl[0] == SA4F_RL_TIMEOUT { why = "phase deadline passed" }
+                    _fed_v4_drop(cn, k, why)
+                    fin = 1
+                } else {
+                    push(lines, rl[1])
+                    if k == 0 { fin = 1 }
+                    if k == 3 { fin = 1 }
+                    if _fed_v4_starts(rl[1], "SA4_END ") == 1 { fin = 1 }
+                    if _fed_v4_starts(rl[1], "SA4_ABORT ") == 1 { fin = 1 }
+                    if fin == 0 {
+                        if len(lines) >= cap {
+                            _fed_v4_drop(cn, k, "more than " + int_to_str(cap) + " lines")
+                            fin = 1
+                        }
+                    }
+                }
+            }
+            push(out, [cn[1], lines])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _fed_v4_conn(conns, id) {
+    let i = 0
+    while i < len(conns) {
+        if conns[i][1] == id { return conns[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _fed_v4_has(ids, id) {
+    let i = 0
+    while i < len(ids) {
+        if ids[i] == id { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _fed_v4_bye_all(conns) {
+    let i = 0
+    while i < len(conns) {
+        let cn = conns[i]
+        if cn[2] == 1 {
+            _cw_send(cn[0], KGSYNC_BYE_LINE + "\n")
+            close_fd(cn[0])
+            list_set(cn, 2, 0)
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _fed_v4_report(c, conns) {
+    let i = 0
+    while i < len(conns) {
+        let why = sa4c_why(c, conns[i][1])
+        if len(why) > 0 {
+            // sa4c_why already says "possibly a victim" for a soul that aborted.
+            println("fed-coord: [SA4] left out id=" + int_to_str(conns[i][1]) + ": " + why)
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn _fed_v4_min_present(ro) {
+    let m = _fed_v4_env_ms("CE_SECAGG_V4_MIN_PRESENT", sroster_t(ro))
+    if m < 2 { m = 2 }
+    return m
+}
+
+// Run one round. Returns 1 when it published, 0 otherwise.
+fn _fed_main_v4(server_fd, cfg) {
+    let ro = cfg[2]
+    let tags = cfg[3]
+    let n_want = cfg[4]
+    let fp = sroster_fingerprint(ro)
+    let lw = sa4f_lw(tags)
+    let layout = sa4f_layout(tags)
+    let join_ms = _fed_v4_env_ms("CE_SECAGG_V4_JOIN_MS", 60000)
+    let phase_ms = _fed_v4_env_ms("CE_SECAGG_V4_PHASE_MS", 30000)
+    let min_present = _fed_v4_min_present(ro)
+    let cpath = ce_run_path("crossengin_fed_sa4_round_" + substr(fp, 0, 16))
+    _fed_round_lock_at(cpath)
+    let r = _fed_round_load_at(cpath) + 1
+    println("fed-coord: [SA4] roster fp=" + fp + " N=" + int_to_str(sroster_n(ro)) + " t=" + int_to_str(sroster_t(ro))
+        + " tags=" + int_to_str(len(tags)) + " L=" + int_to_str(lw) + " layout=" + sa4w_hex(layout))
+    println("fed-coord: [SA4] waiting for " + int_to_str(n_want) + " soul(s), join-ms=" + int_to_str(join_ms)
+        + " phase-ms=" + int_to_str(phase_ms) + " min-present=" + int_to_str(min_present)
+        + " round-counter=" + cpath)
+    let conns = _fed_v4_accept(server_fd, ro, n_want, join_ms)
+    if len(conns) < sroster_t(ro) {
+        println("fed-coord: [SA4] REFUSE round: only " + int_to_str(len(conns)) + " soul(s) joined, below t = "
+            + int_to_str(sroster_t(ro)))
+        _fed_v4_bye_all(conns)
+        return 0
+    }
+    // Durable write BEFORE SA4_ROUND: a round id is never used twice.
+    if _fed_round_save_at(cpath, r) == 0 {
+        println("fed-coord: [SA4] REFUSE round " + int_to_str(r) + ": cannot persist the round counter " + cpath)
+        _fed_v4_bye_all(conns)
+        return 0
+    }
+    println("fed-coord: [SA4] round-counter=" + int_to_str(r) + " persisted")
+    let c = sa4c_new(ro, r, lw, layout, 0)
+    let rline = sa4c_round_line(c) + "\n"
+    println("fed-coord: [SA4] opening round " + int_to_str(r) + " with " + int_to_str(len(conns)) + " soul(s)")
+    let i = 0
+    while i < len(conns) {
+        if _cw_send(conns[i][0], rline) == 0 { _fed_v4_drop(conns[i], 0, "send failed") }
+        i = i + 1
+    }
+    let caps = [1, sroster_n(ro) + 1, (lw + SA4W_CHUNK - 1) / SA4W_CHUNK + 1, 1, sroster_n(ro) + 1]
+    let k = 0
+    let cancelled = 0
+    while k < 5 {
+        if cancelled == 0 {
+            let got = _fed_v4_collect(conns, k, phase_ms, caps[k])
+            let g = 0
+            while g < len(got) {
+                let id = got[g][0]
+                let lines = got[g][1]
+                let told = 0
+                let q = 0
+                while q < len(lines) {
+                    let rv = sa4c_recv(c, id, lines[q])
+                    if rv[0] == 0 {
+                        if told == 0 {
+                            println("fed-coord: [SA4] refused a line from id=" + int_to_str(id) + ": " + rv[1])
+                            told = 1
+                        }
+                    }
+                    q = q + 1
+                }
+                g = g + 1
+            }
+            let cr = sa4c_close(c)
+            if cr[0] == 0 {
+                println("fed-coord: [SA4] round " + int_to_str(r) + " " + cr[1] + "; nothing published")
+                cancelled = 1
+            } else {
+                let msgs = cr[2]
+                let m = 0
+                while m < len(msgs) {
+                    let cn = _fed_v4_conn(conns, msgs[m][0])
+                    if cn != 0 {
+                        if cn[2] == 1 {
+                            if _cw_send(cn[0], msgs[m][1] + "\n") == 0 { _fed_v4_drop(cn, k, "send failed") }
+                        }
+                    }
+                    m = m + 1
+                }
+                let keep = sa4c_set(c, k + 1)
+                let nk = len(keep)
+                if k < 4 {
+                    let z = 0
+                    while z < len(conns) {
+                        if conns[z][2] == 1 {
+                            if _fed_v4_has(keep, conns[z][1]) == 0 { _fed_v4_drop(conns[z], k, "not in U" + int_to_str(k + 1)) }
+                        }
+                        z = z + 1
+                    }
+                    println("fed-coord: [SA4] phase " + int_to_str(k) + " closed: |U" + int_to_str(k + 1) + "|=" + int_to_str(nk))
+                } else {
+                    println("fed-coord: [SA4] phase 4 closed: " + int_to_str(nk) + " complete reveal batch(es)")
+                }
+            }
+        }
+        k = k + 1
+    }
+    _fed_v4_report(c, conns)
+    if cancelled == 1 {
+        _fed_v4_bye_all(conns)
+        return 0
+    }
+    let um = sa4c_unmask(c)
+    if um[0] == 0 {
+        println("fed-coord: [SA4] round " + int_to_str(r) + " not unmasked: " + um[1] + "; nothing published")
+        _fed_v4_bye_all(conns)
+        return 0
+    }
+    println("fed-coord: [SA4] round " + int_to_str(r) + " unmasked over |U3|=" + int_to_str(len(sa4c_set(c, 3))))
+    let sums = sa4f_sums(tags, um[2])
+    let published = 0
+    let s = 0
+    while s < len(sums) {
+        let row = sums[s]
+        if row[3] >= min_present {
+            let line = sa_format_aggregate_sum_line(r, row[0], row[1], row[2], row[3])
+            let z2 = 0
+            while z2 < len(conns) {
+                if conns[z2][2] == 1 { _cw_send(conns[z2][0], line) }
+                z2 = z2 + 1
+            }
+            println("fed-coord: [SA4] AGGREGATE_SUM round=" + int_to_str(r) + " tag=" + row[0]
+                + " sum_promo=" + int_to_str(row[1]) + " sum_atr=" + int_to_str(row[2])
+                + " n_part=" + int_to_str(row[3]))
+            published = published + 1
+        } else {
+            println("fed-coord: [SA4] withheld tag " + row[0] + ": present in " + int_to_str(row[3])
+                + " soul(s), below min-present " + int_to_str(min_present))
+        }
+        s = s + 1
+    }
+    _fed_v4_bye_all(conns)
+    println("fed-coord: [SA4] round " + int_to_str(r) + " done (" + int_to_str(published) + " tag(s) published)")
+    return 1
+}
+
 fn main() {
     let port = fed_port_from_env()
     let bind_ip = fed_bind_from_env()
@@ -1247,6 +1679,30 @@ fn main() {
     let secagg = sa_enabled_from_env()
     let allow_recon = sa_recon_allowed_from_env()
     let allow_weak_dh = sa_weak_dh_allowed_from_env()
+    // SecAgg v4 (A2.3c): CE_SECAGG_MODE=v4 selects double masking; unset or
+    // v3n-sa keeps the v3n-sa path below unchanged; anything else refuses.
+    let sa4mode = 0
+    let v4cfg = 0
+    if secagg == 1 { sa4mode = sa4f_mode() }
+    if secagg == 0 {
+        // CE_SECAGG_MODE without CE_SECAGG_ENABLED=1 would otherwise run
+        // plain v1 (per-soul stats in the clear): refuse instead.
+        if sa4f_mode() != 0 {
+            println("fed-coord: [SA4] REFUSE: CE_SECAGG_MODE is set but CE_SECAGG_ENABLED is not 1")
+            exit(1)
+        }
+    }
+    if sa4mode < 0 {
+        println("fed-coord: [SA4] REFUSE: CE_SECAGG_MODE must be v3n-sa or v4")
+        exit(1)
+    }
+    if sa4mode == 1 {
+        v4cfg = _fed_v4_config()
+        if v4cfg[0] != 1 {
+            println("fed-coord: [SA4] REFUSE: " + v4cfg[1])
+            exit(1)
+        }
+    }
 
     // A soul that closes its socket must not kill the coordinator.
     _cw_ignore_sigpipe()
@@ -1256,10 +1712,17 @@ fn main() {
     if secagg == 1 {
         mode_str = "v3n-sa (SecAgg; recon=off)"
         if allow_recon == 1 { mode_str = "v3n-sa (SecAgg; recon=on)" }
+        if sa4mode == 1 { mode_str = "v4-sa (SecAgg double masking)" }
     }
 
     let deadline_ms = sa_round_deadline_ms_from_env()
 
+    if sa4mode == 1 {
+        println("fed-coord: starting on port " + int_to_str(port)
+            + " (bind " + bind_ip + ") expected-souls=" + int_to_str(v4cfg[4]) + " mode=" + mode_str)
+        let rdw = sa4f_run_dir_warning()
+        if len(rdw) > 0 { sa_stderr("fed-coord: [SA4] WARNING " + rdw) }
+    } else {
     println("fed-coord: starting on port " + int_to_str(port)
         + " (bind " + bind_ip + ")"
         + " expected-souls=" + int_to_str(n_souls)
@@ -1267,7 +1730,8 @@ fn main() {
         + " mode=" + mode_str
         + " round-interval-ns=" + int_to_str(round_interval)
         + " round-deadline-ms=" + int_to_str(deadline_ms))
-    if secagg == 1 {
+    }
+    if sa4mode == 0 { if secagg == 1 {
         let wd = "off"
         if allow_weak_dh == 1 { wd = "on" }
         println("fed-coord: [SECAGG] reconciliation=" + _fed_on_off(allow_recon)
@@ -1277,13 +1741,21 @@ fn main() {
                 + "public keys are relayed UNAUTHENTICATED by this coordinator (a malicious "
                 + "coordinator can MITM them); the 256-bit group is breakable")
         }
-    }
+    } }
 
     let server_fd = sync_pub_listen(port)
     if server_fd < 0 {
         println("fed-coord: ERROR cannot bind / listen on port "
             + int_to_str(port))
         exit(1)
+    }
+    if sa4mode == 1 {
+        println("fed-coord: listening (v4-sa) ...")
+        let okv4 = _fed_main_v4(server_fd, v4cfg)
+        sync_close(server_fd)
+        println("fed-coord: closed (v4-sa)")
+        if okv4 == 0 { exit(1) }
+        return 0
     }
     println("fed-coord: listening, awaiting "
         + int_to_str(n_souls) + " soul HELLO(s) ...")

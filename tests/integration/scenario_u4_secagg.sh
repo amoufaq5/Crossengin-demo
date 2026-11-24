@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+# Scenario U4 -- SecAgg v4 (double masking) over the network (A2.3c).
+#
+# A v4 fed coordinator (CE_SECAGG_MODE=v4) runs one round with NOVA chat
+# souls (/fed_join) and independent Python souls (scripts/sa4_ref.py
+# --connect). Every soul is pinned by a roster of Ed25519 keys made with
+# scripts/secagg_keygen.sh; the tag set is pinned with CE_SECAGG_V4_TAGS.
+#
+# Stages (each with its own run dirs under one mktemp dir):
+#   U4.mixed    2 chat souls + 1 Python soul, N = 3: every party prints the
+#               same sums, equal to the inputs each soul printed locally;
+#               wire log: v4 hello / OK / FED_JOIN / SA4_ROUND, the Python
+#               soul's plain input words never cross the wire; the round
+#               counter and a chat soul's last-round file are 0600. (A
+#               fresh chat session's promo/atr rates are 0, so for chat
+#               souls the sums check the present words; the Python soul's
+#               non-zero values check the rest.)
+#   U4.replay   chat soul1 and the Python soul (with their recorded last
+#               round) plus a fresh soul against a fresh coordinator that
+#               reopens round 1: the two refuse it (stale_round), nothing
+#               is published.
+#   U4.dropout  N = 4 Python souls, one leaves after its shares: the sum
+#               covers the other three (|U3| = 3).
+#   U4.silent   one soul joins and never answers: disconnected at the phase
+#               deadline, the round completes over the other three (the
+#               souls read after it still get their buffered lines read).
+#   U4.drip     a soul sends its ADV one byte every 0.2 s: cut off at the
+#               phase deadline (the timeout is re-armed per byte).
+#   U4.faults   a corrupted share (its receiver aborts and is left out as
+#               "possibly a victim"); a swapped reveal kind (that soul's
+#               reveals are refused, the sum still covers all four).
+#   U4.faults2  stop after ADV / Y / SIG3, a bad ADV signature, a bad SIG3:
+#               the expected sets and sums.
+#   U4.minpresent  a tag only two souls have is withheld (min-present t).
+#   U4.writeahead  a chat soul records the round id when the round opens,
+#               even when the round is then cancelled.
+#   U4.layout   a soul with another tag set refuses the round (bad_len /
+#               bad_layout) and is not in U1.
+#   U4.join     an id not in the roster and a second connection with an
+#               already-joined id are rejected; too few souls -> no round.
+#   U4.refuse   configuration refusals: CE_SECAGG_MODE without
+#               CE_SECAGG_ENABLED and an unknown CE_SECAGG_MODE (both
+#               sides), CE_SECAGG_ALLOW_RECON in v4, no tags, CE_FED_SOULS
+#               below t, CE_FED_SOUL_ID not the roster name, a corrupt
+#               last-round file; v3n-sa and v4 refuse each other's hello.
+#
+# Env: CE_IT_STRICT=1 (CI) turns an environment SKIP (socket bind denied,
+# python3 or openssl missing) into a FAIL.
+
+. "$(dirname "$0")/_lib.sh"
+
+PASS=0; FAIL=0
+STRICT="${CE_IT_STRICT:-0}"
+it_section "scenario U4: SecAgg v4 double masking over the network (A2.3c)"
+
+COORD_BIN="$REPO_ROOT/bin/crossengin-fed-coordinator"
+CHAT_BIN="$REPO_ROOT/bin/crossengin-chat"
+REF="$REPO_ROOT/scripts/sa4_ref.py"
+KG="$REPO_ROOT/scripts/secagg_keygen.sh"
+
+skip() {
+    if [ "$STRICT" = "1" ]; then
+        FAIL=$((FAIL+1))
+        printf "  ${C_RED}FAIL${C_RST}  (strict) SKIP not allowed: %s\n" "$1"
+    else
+        printf "  ${C_YEL}SKIP${C_RST}  %s\n" "$1"
+    fi
+}
+finish() { summary "scenario_u4_secagg"; exit $?; }
+
+if [ ! -x "$COORD_BIN" ] || [ ! -x "$CHAT_BIN" ]; then
+    printf "  ${C_RED}ERROR${C_RST}: %s or %s missing. Run: make install\n" "$COORD_BIN" "$CHAT_BIN" >&2
+    FAIL=$((FAIL+1)); finish
+fi
+command -v python3 >/dev/null 2>&1 || { skip "python3 not on PATH"; finish; }
+command -v openssl >/dev/null 2>&1 || { skip "openssl not on PATH"; finish; }
+
+T="$(mktemp -d)"
+chmod 700 "$T"
+PIDS=()
+cleanup() {
+    local p
+    for p in "${PIDS[@]}"; do pkill -9 -P "$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; done
+    rm -rf "$T"
+}
+trap cleanup EXIT
+
+# wait_all <deadline_s> <pid>... ; force-kills on deadline (counts a FAIL).
+wait_all() {
+    local deadline="$1"; shift
+    local elapsed=0 alive p
+    while [ "$elapsed" -lt "$deadline" ]; do
+        alive=0
+        for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done
+        [ "$alive" -eq 0 ] && break
+        sleep 1; elapsed=$((elapsed + 1))
+    done
+    if [ "$elapsed" -ge "$deadline" ]; then
+        FAIL=$((FAIL+1))
+        printf "  ${C_RED}FAIL${C_RST}  process(es) hung past %ss, force-killed\n" "$deadline"
+        # The coordinator and chats run inside a subshell: kill its
+        # children (the binaries) as well as the subshell itself.
+        for p in "$@"; do pkill -9 -P "$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; done
+    fi
+    for p in "$@"; do wait "$p" 2>/dev/null; done
+}
+
+# Every process a stage starts goes into SP; stage_wait waits for all of
+# them with a hang guard (never a bare `wait`).
+SP=()
+stage_wait() { wait_all "$1" "${SP[@]}"; SP=(); }
+
+# Keys and rosters: souls 1..5 with ids 10..50; R3 = souls 1-3, R4 = 1-4.
+for i in 1 2 3 4 5; do
+    bash "$KG" "$T/k$i" $((i * 10)) "soul$i" | sed -n 's/^roster line: //p' > "$T/line$i"
+done
+mkroster() {   # mkroster <file> <soul numbers...>
+    local f="$1"; shift
+    { echo "crossengin-secagg-roster v1"; for i in "$@"; do cat "$T/line$i"; done; } > "$f"
+    chmod 644 "$f"
+}
+mkroster "$T/R3" 1 2 3
+mkroster "$T/R4" 1 2 3 4
+mkroster "$T/R3b" 1 2 5
+assert_match "$(cat "$T/R4")" '^crossengin-secagg-roster v1' "rosters written"
+
+TAGS="seed,user-teach"
+PORT=$(( 33000 + (RANDOM % 900) * 4 ))
+next_port() { PORT=$((PORT + 1)); }
+
+# start_coord <dir> <roster> [ENV=VAL ...] -> COORD_PID; output <dir>/coord.out
+start_coord() {
+    local d="$1" ro="$2"; shift 2
+    mkdir -p "$d/run"; chmod 700 "$d" "$d/run"
+    (
+        export CE_RUN_DIR="${RUN_DIR:-$d/run}" CE_FED_PORT="$PORT" CE_FED_BIND=127.0.0.1
+        export CE_SECAGG_ENABLED=1 CE_SECAGG_MODE=v4 CE_SECAGG_ROSTER="$ro" CE_SECAGG_V4_TAGS="$TAGS"
+        export CE_FED_WIRE_LOG="$d/wire.log" CE_SECAGG_V4_JOIN_MS=20000 CE_SECAGG_V4_PHASE_MS=20000
+        for kv in "$@"; do export "$kv"; done
+        "$COORD_BIN" >>"$d/coord.out" 2>&1
+        echo "coord-exit=$?" >>"$d/coord.out"
+    ) &
+    COORD_PID=$!; PIDS+=("$COORD_PID"); SP+=("$COORD_PID")
+    local n=0
+    while [ $n -lt 40 ]; do
+        grep -q "listening\|REFUSE\|cannot bind" "$d/coord.out" 2>/dev/null && break
+        sleep 0.25; n=$((n + 1))
+    done
+}
+
+# wait_log <file> <regex> <seconds>: until the pattern appears.
+wait_log() {
+    local n=0
+    while [ $n -lt $(( $3 * 4 )) ]; do
+        grep -qE "$2" "$1" 2>/dev/null && return 0
+        sleep 0.25; n=$((n + 1))
+    done
+    return 1
+}
+now_ms() { date +%s%3N; }
+
+bind_ok() {
+    if grep -q "ERROR cannot bind / listen" "$1/coord.out" 2>/dev/null; then
+        skip "socket bind denied -- $2 skipped"
+        return 1
+    fi
+    return 0
+}
+
+# py_soul <dir> <name> <roster> <soul#> <x> [extra args] -> PY_PID
+py_soul() {
+    local d="$1" name="$2" ro="$3" k="$4" x="$5"; shift 5
+    CE_SECAGG_ROSTER="$ro" CE_SECAGG_ID_KEY="$T/k$k.priv" \
+        python3 -I "$REF" --connect "127.0.0.1:$PORT" --tags "${PYTAGS:-$TAGS}" --x "$x" --state "${PYSTATE:-$d/state_$name}" \
+        --timeout 30 "$@" > "$d/$name.out" 2>&1 &
+    PY_PID=$!; PIDS+=("$PY_PID"); SP+=("$PY_PID")
+}
+
+# chat_soul <dir> <name> <roster> <soul#> [ENV=VAL ...] -> CHAT_PID
+chat_soul() {
+    local d="$1" name="$2" ro="$3" k="$4"; shift 4
+    (
+        export CE_RUN_DIR="$T/chatrun_$name"
+        mkdir -p "$CE_RUN_DIR"; chmod 700 "$CE_RUN_DIR"
+        export CE_SECAGG_ENABLED=1 CE_SECAGG_MODE=v4 CE_SECAGG_ROSTER="$ro" CE_SECAGG_ID_KEY="$T/k$k.priv"
+        export CE_SECAGG_V4_TAGS="$TAGS" CE_SESSION_ID="$name"
+        export CE_SNAP_PATH="$d/$name.snap" CE_DLOG_PATH="$d/$name.dlog"
+        for kv in "$@"; do export "$kv"; done
+        printf '/teach widget\n/teach gadget%s\n/cap grant network_send\n/fed_join 127.0.0.1:%s\n/fed_leave\n/quit\n' "$k" "$PORT" \
+            | "$CHAT_BIN" > "$d/$name.out" 2>&1
+    ) &
+    CHAT_PID=$!; PIDS+=("$CHAT_PID"); SP+=("$CHAT_PID")
+}
+
+# sum_of <file...>: total of "input (stays local)" values for <tag> <field>
+local_input() {   # local_input <file> <tag> <field>
+    sed -n "s/.*input (stays local) tag=$2 promo=\([0-9]*\) atr=\([0-9]*\) present=\([0-9]*\).*/\1 \2 \3/p" "$1" \
+        | awk -v f="$3" '{ if (f == "promo") print $1; else if (f == "atr") print $2; else print $3 }'
+}
+
+# ===========================================================================
+# U4.mixed: 2 chat souls + 1 Python soul.
+# ===========================================================================
+D="$T/mixed"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R3"
+CP=$COORD_PID
+if bind_ok "$D" "U4.mixed"; then
+    chat_soul "$D" soul1 "$T/R3" 1; C1=$CHAT_PID
+    chat_soul "$D" soul2 "$T/R3" 2; C2=$CHAT_PID
+    py_soul "$D" py3 "$T/R3" 3 "seed=11:22,user-teach=33:44"; P3=$PY_PID
+    stage_wait 120
+    CO=$(cat "$D/coord.out"); O1=$(cat "$D/soul1.out"); O2=$(cat "$D/soul2.out"); O3=$(cat "$D/py3.out")
+    W=$(cat "$D/wire.log" 2>/dev/null)
+    assert_match "$CO" "mode=v4-sa \\(SecAgg double masking\\)" "coordinator in v4 mode"
+    assert_match "$CO" "\\[SA4\\] JOIN id=10 " "soul 10 joined"
+    assert_match "$CO" "\\[SA4\\] JOIN id=20 " "soul 20 joined"
+    assert_match "$CO" "\\[SA4\\] JOIN id=30 " "soul 30 joined"
+    assert_match "$CO" "round-counter=1 persisted" "round counter persisted before the round"
+    assert_match "$CO" "phase 3 closed: \\|U4\\|=3" "all three souls signed U3"
+    assert_match "$CO" "coord-exit=0" "coordinator exited 0"
+    for tag in seed user-teach; do
+        EP=$(( $(local_input "$D/soul1.out" $tag promo) + $(local_input "$D/soul2.out" $tag promo) + $( [ $tag = seed ] && echo 11 || echo 33) ))
+        EA=$(( $(local_input "$D/soul1.out" $tag atr) + $(local_input "$D/soul2.out" $tag atr) + $( [ $tag = seed ] && echo 22 || echo 44) ))
+        EN=$(( $(local_input "$D/soul1.out" $tag present) + $(local_input "$D/soul2.out" $tag present) + 1 ))
+        L="AGGREGATE_SUM round=1 tag=$tag sum_promo=$EP sum_atr=$EA n_part=$EN"
+        assert_match "$CO" "\\[SA4\\] $L" "coordinator: $tag sum = the souls' local inputs ($EP/$EA/$EN)"
+        assert_match "$O1" "fed: \\[SA4\\] $L" "chat soul1 received the $tag sum"
+        assert_match "$O2" "fed: \\[SA4\\] $L" "chat soul2 received the $tag sum"
+        assert_match "$O3" "sa4_ref: $L" "Python soul received the $tag sum"
+    done
+    assert_match "$O1" "fed: \\[SA4\\] round 1 complete \\(2 sum aggregate" "chat soul1 completed the round"
+    assert_match "$O2" "fed: \\[SA4\\] round 1 complete \\(2 sum aggregate" "chat soul2 completed the round"
+    assert_match "$O3" "BYE after 2 aggregate" "Python soul completed the round"
+    assert_match "$W" "C>S SECAGG_HELLO ce-fed v4-sa$" "wire: v4 hello"
+    assert_match "$W" "S>C OK ce-fed v4-sa protocol accepted$" "wire: exact v4 OK"
+    assert_match "$W" "C>S FED_JOIN 10 1000$" "wire: FED_JOIN with the roster id"
+    assert_match "$W" "S>C SA4_ROUND 1 [0-9a-f]{64} 6 [0-9a-f]{64}$" "wire: SA4_ROUND with L = 6 and the layout hash"
+    assert_match "$W" "C>S SA4_Y 1 30 0 1 [0-9a-f]{48}$" "wire: the Python soul's masked vector (6 words)"
+    assert_nomatch "$W" "0000000b0000001600000001000000210000002c00000001" "wire: the Python soul's plain input words never appear"
+    assert_nomatch "$W" "SECAGG_NONCE|SECAGG_PEER|FED_STAT_MASKED" "wire: no v3n-sa lines"
+    CF="$D/run/$(ls "$D/run" | grep '^crossengin_fed_sa4_round_[0-9a-f]*$' | head -1)"
+    assert_eq "$(cat "$CF" 2>/dev/null)" "1" "coordinator round counter holds 1"
+    assert_eq "$(stat -c %a "$CF" 2>/dev/null)" "600" "coordinator round counter is 0600"
+    LR=$(ls "$T/chatrun_soul1" | grep '^crossengin_sa4_last_round_[0-9a-f]*_10$' | head -1)
+    assert_match "$(cat "$T/chatrun_soul1/$LR" 2>/dev/null)" "^crossengin-sa4-last-round v1 [0-9a-f]{64} 10 1$" "chat soul1 last-round file records round 1"
+    assert_eq "$(stat -c %a "$T/chatrun_soul1/$LR" 2>/dev/null)" "600" "chat last-round file is 0600"
+fi
+
+# ===========================================================================
+# U4.replay: a fresh coordinator reopens round 1; the souls refuse it.
+# ===========================================================================
+D="$T/replay"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R3" CE_SECAGG_V4_PHASE_MS=5000
+CP=$COORD_PID
+if bind_ok "$D" "U4.replay"; then
+    chat_soul "$D" soul1 "$T/R3" 1; C1=$CHAT_PID
+    PYSTATE="$T/mixed/state_py3" py_soul "$D" py3 "$T/R3" 3 "seed=11:22"; P3=$PY_PID
+    py_soul "$D" py2 "$T/R3" 2 "seed=1:2"; P2=$PY_PID
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "opening round 1 " "fresh coordinator reopened round 1"
+    assert_match "$(cat "$D/soul1.out")" "last-round=1" "chat soul1 loaded its last round (1)"
+    assert_match "$(cat "$D/soul1.out")" "round 1 is not after the last round" "chat soul1 refused the replayed round 1"
+    assert_match "$(cat "$D/py3.out")" "not after the last round" "Python soul refused the replayed round 1"
+    assert_match "$CO" "left out id=10: aborted the round \\(stale_round\\)" "coordinator saw the chat soul's stale_round abort"
+    assert_match "$CO" "left out id=30: aborted the round \\(stale_round\\)" "coordinator saw the Python soul's stale_round abort"
+    assert_nomatch "$CO" "AGGREGATE_SUM" "replay: nothing published"
+fi
+
+# ===========================================================================
+# U4.dropout: N = 4, one Python soul leaves after its shares.
+# ===========================================================================
+D="$T/dropout"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4"
+CP=$COORD_PID
+if bind_ok "$D" "U4.dropout"; then
+    for k in 1 2 3; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    P1=$PY_PID
+    py_soul "$D" p4 "$T/R4" 4 "seed=4000:4000" --fault stop-after-shares
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "phase 1 closed: \\|U2\\|=4" "dropout: the leaving soul sent its shares (in U2)"
+    assert_match "$CO" "phase 2 closed: \\|U3\\|=3" "dropout: it is not in U3"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=seed sum_promo=600 sum_atr=42 n_part=3" "dropout: sum over the other three (s-shares revealed)"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=user-teach sum_promo=6 sum_atr=6 n_part=3" "dropout: second tag summed too"
+fi
+
+# ===========================================================================
+# U4.silent: a soul joins and never answers.
+# ===========================================================================
+D="$T/silent"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4" CE_SECAGG_V4_PHASE_MS=3000
+CP=$COORD_PID
+if bind_ok "$D" "U4.silent"; then
+    # The silent soul joins first, so it is read first in every phase: the
+    # others are read after the deadline and must still be read (grace).
+    py_soul "$D" p4 "$T/R4" 4 "seed=9:9" --fault silent
+    wait_log "$D/coord.out" "JOIN id=40 " 10
+    for k in 1 2 3; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    wait_log "$D/coord.out" "opening round 1" 20
+    T0=$(now_ms)
+    wait_log "$D/coord.out" "disconnected id=40" 20
+    CUT=$(( $(now_ms) - T0 ))
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "disconnected id=40 in phase 0: phase deadline passed" "silent soul disconnected at the phase deadline"
+    assert_eq "$([ "$CUT" -ge 2500 ] && echo yes || echo "no (${CUT} ms)")" "yes" "silent: cut no earlier than the 3 s deadline (${CUT} ms after the round opened)"
+    assert_match "$CO" "phase 0 closed: \\|U1\\|=3" "silent: the souls read after the deadline still got their ADV read"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=seed sum_promo=600 sum_atr=42 n_part=3" "silent: round completed over the other three"
+fi
+
+# ===========================================================================
+# U4.drip: a soul trickles its ADV one byte every 0.2 s; the phase deadline
+# still holds (the receive timeout is re-armed per byte).
+# ===========================================================================
+D="$T/drip"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4" CE_SECAGG_V4_PHASE_MS=3000
+CP=$COORD_PID
+if bind_ok "$D" "U4.drip"; then
+    py_soul "$D" p4 "$T/R4" 4 "seed=9:9" --fault drip
+    wait_log "$D/coord.out" "JOIN id=40 " 10
+    for k in 1 2 3; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    SECONDS=0
+    stage_wait 90
+    ELAPSED=$SECONDS
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "disconnected id=40 in phase 0: phase deadline passed" "a dripping soul is cut off at the phase deadline"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=seed sum_promo=600 sum_atr=42 n_part=3" "drip: round completed over the other three"
+    assert_match "$ELAPSED" '^([3-9]|1[0-9])$' "drip: the round took ${ELAPSED}s (at least the 3 s deadline, bounded by it, not by the drip)"
+fi
+
+# ===========================================================================
+# U4.faults: corrupted share; swapped reveal kind.
+# ===========================================================================
+D="$T/badshare"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4"
+CP=$COORD_PID
+if bind_ok "$D" "U4.faults (bad share)"; then
+    py_soul "$D" p1 "$T/R4" 1 "seed=100:7,user-teach=1:1" --fault bad-share
+    for k in 2 3 4; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$(cat "$D/p2.out")" "refused: share does not open" "the receiver of the corrupted share refused the round"
+    assert_match "$CO" "left out id=20: aborted the round \\(bad_share\\); possibly a victim" "coordinator records the receiver as an abort, possibly a victim"
+    assert_nomatch "$CO" "left out id=10" "the sender is not blamed (no complaint round yet)"
+    assert_match "$CO" "disconnected id=20 in phase 2: not in U3" "a soul outside the next set is disconnected"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=seed sum_promo=800 sum_atr=56 n_part=3" "bad share: sum over the other three"
+fi
+D="$T/swap"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4"
+CP=$COORD_PID
+if bind_ok "$D" "U4.faults (swap reveal)"; then
+    py_soul "$D" p2 "$T/R4" 2 "seed=200:14,user-teach=2:2" --fault swap-reveal
+    for k in 1 3 4; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "left out id=20: wrong share kind for that soul" "a swapped reveal kind is refused"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=seed sum_promo=1000 sum_atr=70 n_part=4" "swap reveal: sum still covers all four (t reveals remain)"
+fi
+
+# ===========================================================================
+# U4.faults2: the other fault modes, one round each (N = 4, t = 3).
+# ===========================================================================
+for spec in "1 stop-after-adv 900 63 3" "2 bad-adv-sig 800 56 3" "3 bad-sig3 1000 70 4" "4 stop-after-y 1000 70 4" "4 stop-after-sig3 1000 70 4"; do
+    set -- $spec
+    FK=$1; FM=$2; SP_=$3; SA_=$4; SN_=$5
+    D="$T/f_$FM"; mkdir -p "$D"
+    next_port
+    start_coord "$D" "$T/R4"
+    CP=$COORD_PID
+    if bind_ok "$D" "U4.faults2 $FM"; then
+        for k in 1 2 3 4; do
+            if [ "$k" = "$FK" ]; then
+                py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k" --fault "$FM"
+            else
+                py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"
+            fi
+        done
+        stage_wait 90
+        assert_match "$(cat "$D/coord.out")" "AGGREGATE_SUM round=1 tag=seed sum_promo=$SP_ sum_atr=$SA_ n_part=$SN_" \
+            "$FM (soul $FK): seed sum $SP_/$SA_ over $SN_"
+    fi
+done
+assert_match "$(cat "$T/f_bad-adv-sig/coord.out" 2>/dev/null)" "left out id=20: ADV signature does not verify" "bad ADV signature: that soul is left out of U1"
+assert_match "$(cat "$T/f_bad-sig3/coord.out" 2>/dev/null)" "left out id=30: SIG3 does not verify" "bad SIG3: that soul is left out of U4 (its input still counts: it is in U3)"
+
+# ===========================================================================
+# U4.minpresent: a tag only two souls have is withheld (min-present = t = 3).
+# ===========================================================================
+D="$T/minpresent"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4"
+CP=$COORD_PID
+if bind_ok "$D" "U4.minpresent"; then
+    py_soul "$D" p1 "$T/R4" 1 "seed=100:7,user-teach=1:1"
+    py_soul "$D" p2 "$T/R4" 2 "seed=200:14,user-teach=2:2"
+    py_soul "$D" p3 "$T/R4" 3 "seed=300:21"
+    py_soul "$D" p4 "$T/R4" 4 "seed=400:28"
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=seed sum_promo=1000 sum_atr=70 n_part=4" "minpresent: a tag all four have is published"
+    assert_match "$CO" "withheld tag user-teach: present in 2 soul\\(s\\), below min-present 3" "minpresent: a tag only two have is withheld"
+    assert_nomatch "$(cat "$D/p3.out")" "tag=user-teach" "minpresent: no soul receives the withheld tag"
+fi
+
+# ===========================================================================
+# U4.writeahead: a soul records the round id when the round opens, even if
+# the round then fails (|U2| < t cancels it).
+# ===========================================================================
+D="$T/writeahead"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R3"
+CP=$COORD_PID
+if bind_ok "$D" "U4.writeahead"; then
+    chat_soul "$D" wa1 "$T/R3" 1
+    py_soul "$D" p2 "$T/R3" 2 "seed=1:1"
+    py_soul "$D" p3 "$T/R3" 3 "seed=1:1" --fault stop-after-adv
+    stage_wait 120
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "cancelled: \\|U2\\| 2 below t; nothing published" "writeahead: the round is cancelled at U2"
+    LR=$(ls "$T/chatrun_wa1" 2>/dev/null | grep '^crossengin_sa4_last_round_[0-9a-f]*_10$' | head -1)
+    assert_match "$(cat "$T/chatrun_wa1/$LR" 2>/dev/null)" " 10 1$" "writeahead: the chat soul saved round 1 although the round failed"
+    assert_match "$(cat "$D/wa1.out")" "round not completed" "writeahead: the chat soul reports the failed round"
+fi
+
+# ===========================================================================
+# U4.layout: a soul with another tag set.
+# ===========================================================================
+D="$T/layout"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4"
+CP=$COORD_PID
+if bind_ok "$D" "U4.layout"; then
+    for k in 1 2 3; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    PYTAGS="seed,topic:other" py_soul "$D" p4 "$T/R4" 4 "seed=9:9"
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$(cat "$D/p4.out")" "refused: vector layout differs" "a soul with another tag set refuses the round"
+    assert_match "$CO" "phase 0 closed: \\|U1\\|=3" "it is not in U1"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=seed sum_promo=600 sum_atr=42 n_part=3" "layout: round over the other three"
+fi
+
+# ===========================================================================
+# U4.join: unknown id, duplicate id, too few souls.
+# ===========================================================================
+D="$T/join"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R3" CE_SECAGG_V4_JOIN_MS=6000
+CP=$COORD_PID
+if bind_ok "$D" "U4.join"; then
+    python3 -I - "$PORT" > "$D/raw.out" 2>&1 <<'PYEOF'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+f = s.makefile("rb")
+s.sendall(b"SECAGG_HELLO ce-fed v4-sa\n"); print(f.readline().decode().strip())
+s.sendall(b"FED_JOIN 999 1000\n"); print(f.readline().decode().strip())
+PYEOF
+    py_soul "$D" p1 "$T/R3" 1 "seed=1:1"
+    sleep 1
+    py_soul "$D" p1b "$T/R3" 1 "seed=1:1"
+    stage_wait 60
+    CO=$(cat "$D/coord.out")
+    assert_match "$(cat "$D/raw.out")" "ERR id 999 is not in the roster" "an id not in the roster is rejected"
+    assert_match "$CO" "REJECT handshake: id 10 has already joined" "a second connection with a joined id is rejected"
+    assert_match "$CO" "REFUSE round: only 1 soul\\(s\\) joined, below t = 3" "too few souls: no round"
+    assert_match "$CO" "coord-exit=1" "coordinator exits 1 without a round"
+fi
+
+# ===========================================================================
+# U4.refuse: configuration refusals and cross-version hellos.
+# ===========================================================================
+D="$T/refuse"; mkdir -p "$D/run"; chmod 700 "$D" "$D/run"
+coord_once() {   # coord_once <ENV=VAL...> -> output
+    ( export CE_RUN_DIR="$D/run" CE_FED_PORT="$PORT" CE_FED_BIND=127.0.0.1 CE_SECAGG_ENABLED=1
+      export CE_SECAGG_MODE=v4 CE_SECAGG_ROSTER="$T/R3" CE_SECAGG_V4_TAGS="$TAGS"
+      for kv in "$@"; do export "$kv"; done
+      timeout 20 "$COORD_BIN" 2>&1; echo "exit=$?" )
+}
+OUT=$(coord_once CE_SECAGG_ENABLED=0)
+assert_match "$OUT" "REFUSE: CE_SECAGG_MODE is set but CE_SECAGG_ENABLED is not 1" "coordinator: v4 without CE_SECAGG_ENABLED refused (no plain v1 fallback)"
+OUT=$(coord_once CE_SECAGG_MODE=v5)
+assert_match "$OUT" "REFUSE: CE_SECAGG_MODE must be v3n-sa or v4" "coordinator: unknown mode refused"
+assert_match "$OUT" "exit=1" "coordinator: unknown mode exits 1"
+OUT=$(coord_once CE_SECAGG_ALLOW_RECON=1)
+assert_match "$OUT" "REFUSE: CE_SECAGG_ALLOW_RECON is not used in v4" "coordinator: reconciliation flag refused in v4"
+OUT=$(coord_once CE_SECAGG_V4_TAGS=)
+assert_match "$OUT" "REFUSE: CE_SECAGG_V4_TAGS is empty" "coordinator: tags required"
+OUT=$(coord_once CE_FED_SOULS=2)
+assert_match "$OUT" "below the roster threshold t = 3" "coordinator: CE_FED_SOULS below t refused"
+OUT=$(coord_once CE_SECAGG_ROSTER="$T/missing")
+assert_match "$OUT" "REFUSE: roster: .*not found" "coordinator: missing roster refused"
+
+chat_once() {   # chat_once <name> <ENV=VAL...> -> output (no coordinator)
+    local name="$1"; shift
+    ( export CE_RUN_DIR="$T/chatrun_$name"; mkdir -p "$CE_RUN_DIR"; chmod 700 "$CE_RUN_DIR"
+      export CE_SECAGG_ENABLED=1 CE_SECAGG_MODE=v4 CE_SECAGG_ROSTER="$T/R3" CE_SECAGG_ID_KEY="$T/k1.priv"
+      export CE_SECAGG_V4_TAGS="$TAGS" CE_SESSION_ID="$name" CE_SNAP_PATH="$D/$name.snap" CE_DLOG_PATH="$D/$name.dlog"
+      for kv in "$@"; do export "$kv"; done
+      printf '/cap grant network_send\n/fed_join 127.0.0.1:%s\n/quit\n' "$PORT" | timeout 60 "$CHAT_BIN" 2>&1 )
+}
+OUT=$(chat_once r0 CE_SECAGG_ENABLED=0)
+assert_match "$OUT" "refusing: CE_SECAGG_MODE is set but CE_SECAGG_ENABLED is not 1" "chat: v4 without CE_SECAGG_ENABLED refused (no plain v1 fallback)"
+OUT=$(chat_once r1 CE_SECAGG_MODE=v5)
+assert_match "$OUT" "fed_join: \\[SA4\\] refusing: CE_SECAGG_MODE must be v3n-sa or v4" "chat: unknown mode refused"
+OUT=$(chat_once r2 CE_FED_SOUL_ID=someone)
+assert_match "$OUT" "refusing: CE_FED_SOUL_ID someone is not this identity's roster name soul1" "chat: CE_FED_SOUL_ID must be the roster name"
+OUT=$(chat_once r3 CE_SECAGG_ALLOW_RECON=1)
+assert_match "$OUT" "refusing: CE_SECAGG_ALLOW_RECON is not used in v4" "chat: reconciliation flag refused in v4"
+OUT=$(chat_once r4 CE_SECAGG_ID_KEY="$T/k5.priv")
+assert_match "$OUT" "refusing: identity: this key .* is not in the roster" "chat: an identity not in the roster is refused"
+mkdir -p "$T/chatrun_r5"; chmod 700 "$T/chatrun_r5"
+FP=$(sed -n 's/.*roster fp=\([0-9a-f]*\) .*/\1/p' "$T/mixed/soul1.out" | head -1)
+if [ -n "$FP" ]; then
+    printf 'crossengin-sa4-last-round v1 %s 10 x\n' "$FP" > "$T/chatrun_r5/crossengin_sa4_last_round_${FP:0:16}_10"
+    chmod 600 "$T/chatrun_r5/crossengin_sa4_last_round_${FP:0:16}_10"
+    OUT=$(chat_once r5)
+    assert_match "$OUT" "refusing: last round: .*corrupt" "chat: a corrupt last-round file is refused (never reset)"
+fi
+
+# v3n-sa chat -> v4 coordinator, v4 Python soul -> v3n-sa coordinator.
+D="$T/cross"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R3" CE_SECAGG_V4_JOIN_MS=8000
+CP=$COORD_PID
+if bind_ok "$D" "U4.cross"; then
+    OUT=$( export CE_RUN_DIR="$T/chatrun_v3"; mkdir -p "$CE_RUN_DIR"; chmod 700 "$CE_RUN_DIR"
+           export CE_SECAGG_ENABLED=1 CE_SECAGG_PEERS=bob CE_FED_TOKEN_bob=tok CE_FED_SOUL_ID=alice CE_SESSION_ID=alice
+           export CE_SNAP_PATH="$D/a.snap" CE_DLOG_PATH="$D/a.dlog"
+           printf '/cap grant network_send\n/fed_join 127.0.0.1:%s\n/quit\n' "$PORT" | timeout 60 "$CHAT_BIN" 2>&1 )
+    assert_match "$OUT" "ERROR cannot connect / SecAgg handshake" "v3n-sa chat refuses a v4 coordinator"
+    stage_wait 40
+    assert_match "$(cat "$D/coord.out")" "REJECT handshake: expected SECAGG_HELLO ce-fed v4-sa" "v4 coordinator rejects the v3n-sa hello"
+fi
+D="$T/cross2"; mkdir -p "$D/run"; chmod 700 "$D" "$D/run"
+next_port
+( export CE_RUN_DIR="$D/run" CE_FED_PORT="$PORT" CE_FED_BIND=127.0.0.1 CE_FED_SOULS=2 CE_FED_MAX_ROUNDS=1 CE_SECAGG_ENABLED=1
+  timeout 20 "$COORD_BIN" > "$D/coord.out" 2>&1 ) &
+CP=$!; PIDS+=("$CP")
+sleep 1
+py_soul "$D" p1 "$T/R3" 1 "seed=1:1"
+wait "$PY_PID" 2>/dev/null
+assert_match "$(cat "$D/p1.out")" "handshake refused" "v4 soul refuses a v3n-sa coordinator"
+kill -9 "$CP" 2>/dev/null; wait "$CP" 2>/dev/null
+
+finish
