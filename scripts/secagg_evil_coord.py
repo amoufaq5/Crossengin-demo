@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Malicious SecAgg v4 coordinator for tests (A2.4a; wire v4-sa2 since A2.4b). Stdlib only.
+"""Malicious SecAgg v4 coordinator for tests (A2.4a; wire v4-sa2 since A2.4b, v4-sa3 since A2.4c). Stdlib only.
 
-It speaks the real v4-sa2 wire (src/learning/sa4_wire.nova: 8-token ADV with
-B_u and M_u, share plaintext v2 with the Merkle path, 7-token REVEAL with a
-proof) to real souls: NOVA chat souls (/fed_join with CE_SECAGG_MODE=v4)
-and Python souls (scripts/sa4_ref.py --connect). It accepts the v4-sa2 hello and FED_JOIN, then
+It speaks the real v4-sa3 wire (src/learning/sa4_wire.nova: 8-token ADV with
+B_u and M_u, 6-token SHARE with the one-time e_pk, SHSIG, the CHECK phase
+SET 5 with signed COMPLAINT lines, ACCUSE / OPEN, the final SET 2, 7-token
+REVEAL with a proof) to real souls: NOVA chat souls (/fed_join with
+CE_SECAGG_MODE=v4) and Python souls (scripts/sa4_ref.py --connect). It
+accepts the v4-sa3 hello and FED_JOIN, then
 drives one round in which it lies in a chosen way (--attack), and logs every
 line both ways. A second mode (--check) judges, from that log alone, what
 the honest souls revealed: it does not trust the attack code.
@@ -12,8 +14,18 @@ the honest souls revealed: it does not trust the attack code.
     secagg_evil_coord.py --listen HOST:PORT --round R --attack NAME --log FILE
         [--souls K] [--victim ID[,ID..]] [--hide ID] [--groups A1,A2/B1,B2]
         [--r0 ID=KIND,..] [--collude SEEDFILE,..] [--prev-log FILE]
+        [--forge KIND] [--evidence-dir DIR]
         [--join-s S] [--phase-s S] [--hang-s S] [--trickle-s S]
     secagg_evil_coord.py --check LOG [--x ID=TAG=P:A,TAG=P:A]... [--x ID=W,W,..]...
+
+Unless the attack says otherwise it acts as an honest v4-sa3 coordinator:
+structural receipt checks (a sender with a bad e_pk / ct length / no SHSIG
+is left out of U2', log "#LEFTOUT ID why"), every complaint forwarded to its
+accused with SA4_ACCUSE, verdicts by the Python oracle over the lines it
+received (sa4_ref.coord_verdicts: log "#VERDICTS counters=..", "#BLAME ID
+CODE why", "#EVIDENCE ID CODE BYTES SHA256 PATH"; evidence files written
+to --evidence-dir as sa4_evidence_r<R>_<ID>.txt), final U2 = U2' without
+the removed souls.
 
 Roster and tags come from CE_SECAGG_ROSTER and CE_SECAGG_V4_TAGS (or
 --roster / --tags). Colluding souls (--collude, their identity seeds) are
@@ -41,9 +53,41 @@ Attacks (stage names of tests/integration/scenario_u4_evil.sh):
   u1-small     U1 of t-1 souls.        not-in-u1   U1 without the receiver.
   equiv-u1     --victim is shown U1 without --hide, the others the full U1;
                every U2 leaves --hide out, so only U1 / H1 differ.
-  tamper-ct    one share ciphertext to every soul has a flipped byte.
-  u2-small     U2 of t-1 souls.        not-in-u2   U2 without the receiver.
-  u2-notsub    U1 without --hide for everyone, then U2 with it.
+  tamper-ct    one routed share ciphertext to every soul has a flipped
+               byte: the receivers complain, every complaint is forwarded,
+               no honest accused opens (its leaf differs), the complainers
+               get code 5 (the coordinator holds the true line).
+  tamper-epk   the same with a flipped digit of the line's e_pk.
+  tamper-share one routed share replaced by the coordinator's own (fresh e,
+               opens, fails the commit check): as tamper-ct.
+  low-epk      one routed share to every soul gets a low-order e_pk:
+               bad_share, no complaint.
+  drop-share   one share to every soul left out: bad_share.
+  forge-complaint  every honest soul is sent one forged COMPLAINT about its
+               own share and an ACCUSE (--forge zero-sig | wrong-signer |
+               wrong-leaf | old-round | other-h1; wrong-leaf / other-h1 sign
+               with the first --collude key, old-round takes a COMPLAINT of
+               --prev-log or a colluder's signature over round r - 1): no
+               OPEN, no refusal, the round completes.
+  accuse-empty an ACCUSE naming one other soul without complaint lines:
+               bad_complaint.       accuse-self  an ACCUSE naming the
+               receiver: bad_set.
+  u2-with-accused  as tamper-ct, but the final U2 keeps the accused: the
+               complainers refuse it (bad_set).
+  u2-not-sub-u2p  U2' without --hide, then the final U2 with it: bad_set.
+  double-adv-recv  the colluder (first --collude) signs a second ADV with
+               another c key, shown to --victim only: the victim's share to
+               it does not open, the colluder complains (re-signed over the
+               victim's H1): the victim opens, the verdict is code 4 (not
+               proven), no evidence.
+  double-adv-send  the colluder signs a second ADV with another M, shown to
+               --victim only: the victim complains, code 5, no evidence.
+  open-harvest the colluders complain about every honest soul's valid share:
+               the honest souls open their one-time keys to colluders only
+               (--check: every opened share is at a colluder x), the
+               colluders are proven (code 2).
+  u2-small     U2' of t-1 souls.       not-in-u2   U2' without the receiver.
+  u2-notsub    U1 without --hide for everyone, then U2' with it.
   false-dropout  --victim is shown U3 with itself, everyone else U3 without
                it: they reveal its s-share; it must refuse (bad_sig3).
   split-u3     --groups A/B: A is shown U3 without B's last soul, B without
@@ -75,7 +119,12 @@ reveals follow the U3 it signed, B / S (holders of its b- / s-shares: honest
 reveals plus colluder-held shares, opened here), leak = B >= t and S >= t,
 its input rebuilt on a leak, its y with pairwise masks stripped when s is
 rebuilt (words equal to the input), and the control aggregate over the
-souls whose b was revealed.
+souls whose b was revealed. v4-sa3 keys: per soul complaints /
+complained_about / opens / opened_for / accused_by / blame (code from the
+log); top level open_lines, opened (every OPEN opened against the SHARE
+line it names: from, about, at_colluder, opens_share; an opened share
+counts as held at the receiver's x in B / S), honest_opens (souls that
+opened a share to a non-colluder), blame, evidence (sha256).
 """
 import json
 import os
@@ -257,7 +306,11 @@ class Evil:
         self.cols = {}
         self.col_seed = {}
         self.adv, self.shares, self.ys, self.sig3, self.rev = {}, {}, {}, {}, {}
-        self.end = {1: set(), 2: set(), 3: set()}
+        self.shsig, self.compl, self.opens = {}, {}, {}      # v4-sa3: id -> line / {about: line} / {about: e}
+        self.leftout = {}                                     # id -> why (receipt, honest coordinator rules)
+        self.blame, self.evidence = {}, {}                    # verdicts of the oracle (R.coord_verdicts)
+        self.accused_xs = []
+        self.end = {1: set(), 2: set(), 3: set(), 4: set(), 5: set()}
         self.abort = {}
         self.quiet = set()         # timed out in a phase
         self.view = {}
@@ -269,6 +322,7 @@ class Evil:
         if o["groups"]:
             ga, _, gb = o["groups"].partition("/")
             self.groups = ([int(v) for v in ga.split(",")], [int(v) for v in gb.split(",")])
+        self.forge = o.get("forge") or "zero-sig"
         self.r0 = {}
         for item in (o["r0"] or "").split(","):
             if item:
@@ -425,6 +479,23 @@ class Evil:
         if a == "alter-m" and nxt:
             k = u1.index(nxt[0])
             lines[k] = flip_hex(lines[k], 6, 10)
+        if a in ("double-adv-recv", "double-adv-send") and i == self.victim and self.cols:
+            # a second ADV of the colluder, validly signed with its key, shown to
+            # the victim only: another c key (it is the receiver) or another M
+            # (it is the sender)
+            c = sorted(self.cols)[0]
+            if self.X(c) in u1:
+                k = u1.index(self.X(c))
+                q = R.parse(lines[k])
+                cpk, mr = q[3], q[7]
+                if a == "double-adv-recv":
+                    cpk = R.x25519_base(R.sha256(b"second c key of %d" % c))
+                else:
+                    mr = R.sha256(b"other M of %d" % c)
+                seed = self.col_seed[c]
+                g = R.ed25519_sign(R.adv_transcript(self.fp, self.r, c, self.lw, self.lay, cpk, q[4], q[6], mr),
+                                   seed, R.ed25519_pk_from_seed(seed))
+                lines[k] = R.fmt_adv(self.r, c, cpk, q[4], g, q[6], mr)
         if a == "adv-old" and nxt:
             k = u1.index(nxt[0])
             old = self.old_adv.get(self.I(nxt[0]))
@@ -436,7 +507,8 @@ class Evil:
                 lines[k] = old
         return lines
 
-    def u2_for(self, i, base):
+    def u2p_for(self, i, base):
+        """U2' (SET 5, starts CHECK) shown to soul i."""
         a, mx = self.a, self.X(i)
         d = [x for x in base if x in self.view[i][1]]
         if a == "u2-small":
@@ -445,18 +517,53 @@ class Evil:
             return [x for x in d if x != mx]
         if a == "u2-notsub":
             return sorted(set(d) | {self.X(self.hide)})
-        if a == "equiv-u1":
-            # Every soul (the hidden one too) gets the same U2 without
+        if a in ("equiv-u1", "u2-not-sub-u2p"):
+            # Every soul (the hidden one too) gets the same U2' without
             # --hide, so the transcripts differ only in U1 / H1.
             return [x for x in d if x != self.X(self.hide)]
         return d
 
-    def shares_for(self, i, u2):
+    def u2_for(self, i, base):
+        """The final U2 (SET 2) shown to soul i."""
+        a = self.a
+        d = [x for x in base if x in self.view[i][5]]
+        if a == "u2-not-sub-u2p":
+            return sorted(set(d) | {self.X(self.hide)})
+        if a == "u2-with-accused":
+            return sorted(set(d) | set(self.accused_xs))
+        return d
+
+    def shares_for(self, i, u2p):
         got = self.shares.get(i, {})
-        lines = [got[self.I(x)] for x in u2 if x != self.X(i) and self.I(x) in got]
-        if self.a == "tamper-ct" and lines and i not in self.cols:
+        lines = [got[self.I(x)] for x in u2p if x != self.X(i) and self.I(x) in got]
+        if i in self.cols or not lines:
+            return lines
+        a = self.a
+        if a in ("tamper-ct", "u2-with-accused"):
+            lines[0] = flip_hex(lines[0], 5, 20)
+        elif a == "tamper-epk":
             lines[0] = flip_hex(lines[0], 4, 20)
+        elif a == "low-epk":
+            t = lines[0].split(" ")
+            t[4] = R.LOW_ORDER[2].hex()
+            lines[0] = " ".join(t)
+        elif a == "drop-share":
+            lines = lines[1:]
+        elif a == "tamper-share":                # a valid-looking share re-sealed under a fresh e
+            lines[0] = self.reseal(lines[0])
         return lines
+
+    def reseal(self, line):
+        """The coordinator's own share for the same (u, v): fresh e, a plaintext
+        of zero shares and path, sealed to v's c_pk (it opens, fails the commit
+        check): the receiver complains, the honest sender does not open."""
+        p = R.parse(line)
+        e = R.sha256(b"evil coordinator e" + line.encode())
+        cpk = R.parse(self.adv[p[3]])[3]
+        d = R.depth(self.n)
+        pt = R.share_pt(p[2], p[3], self.r, self.X(p[3]), bytes(32), bytes(32), [bytes(32)] * d)
+        ct = R.share_seal(R.enc_key(e, cpk, self.r, p[2], p[3]), self.r, p[2], p[3], pt)
+        return R.fmt_share(self.r, p[2], p[3], ct, R.x25519_base(e))
 
     def u3_for(self, i, base):
         a = self.a
@@ -543,8 +650,9 @@ class Evil:
             for i in self.alive():
                 self.recv(i, (), 2)
             return
-        # phase 1
+        # phase 1: ADVs + SET 1 -> SHARE lines, SHSIG, END 1
         base = self.xs(self.adv)
+        self.u1_base = list(base)
         for i in self.alive():
             self.view[i] = {1: self.u1_for(i, base)}
             self.sent_adv[i] = self.advs_for(i, self.view[i][1])
@@ -558,37 +666,80 @@ class Evil:
                 p = R.parse(ln)
                 if p and p[0] == R.EV_SHARE:
                     self.shares.setdefault(p[3], {})[c] = ln
+                if p and p[0] == R.EV_SHSIG:
+                    self.shsig[c] = ln
         for i in [j for j in self.real if j in self.view and j in self.alive()]:
-            for ln in self.recv(i, ("SA4_END",), self.n + 2):
+            for ln in self.recv(i, ("SA4_END",), self.n + 3):
                 p = R.parse(ln)
                 if p and p[0] == R.EV_SHARE and p[2] == i:
                     self.shares.setdefault(p[3], {})[i] = ln
+                if p and p[0] == R.EV_SHSIG and p[2] == i:
+                    self.shsig[i] = ln
                 if p and p[0] == R.EV_END and p[2] == 1:
                     self.end[1].add(i)
         if a in ("hang", "trickle"):
             return
-        # phase 2
-        base = self.xs([i for i in self.end[1] if i in self.alive()] + list(self.cols))
-        for i in [j for j in self.alive() if j in self.view]:
-            self.view[i][2] = self.u2_for(i, base)
-            for ln in self.shares_for(i, self.view[i][2]):
+        self.receipt()
+        # CHECK (v4-sa3): shares + SET 5 (U2') -> COMPLAINT lines, END 4
+        base = self.xs([i for i in self.end[1] if i in self.alive() and i not in self.leftout] +
+                       [c for c in self.cols if c not in self.leftout])
+        self.u2p_base = list(base)
+        if len(base) < self.t:
+            self.log.w("#CANCEL |U2'| %d below t" % len(base))
+            return
+        for i in [j for j in self.alive() if j in self.view and self.X(j) in base]:
+            self.view[i][5] = self.u2p_for(i, base)
+            for ln in self.shares_for(i, self.view[i][5]):
                 self.send(i, ln)
-            self.send(i, R.fmt_set(self.r, 2, R.bitmap(self.view[i][2])))
+            self.send(i, R.fmt_set(self.r, 5, R.bitmap(self.view[i][5])))
         for c in self.cols:
-            self.view[c][2] = [x for x in base if x in self.view[c][1]]
-            outs = self.feed(c, self.shares_for(c, self.view[c][2]) + [R.fmt_set(self.r, 2, R.bitmap(self.view[c][2]))])
-            self.ys[c] = [ln for ln in outs if ln.startswith("SA4_Y ")]
-        for i in [j for j in self.alive() if 2 in self.view.get(j, {})]:
+            self.view[c][5] = [x for x in base if x in self.view[c][1]]
+            outs = self.feed(c, self.shares_for(c, self.view[c][5]) + [R.fmt_set(self.r, 5, R.bitmap(self.view[c][5]))])
+            for ln in outs:
+                p = R.parse(ln)
+                if p and p[0] == R.EV_COMPLAINT:
+                    self.compl.setdefault(c, {})[p[3]] = ln
+            self.end[4].add(c)
+        for i in [j for j in self.alive() if 5 in self.view.get(j, {})]:
+            for ln in self.recv(i, ("SA4_END",), self.n + 2):
+                p = R.parse(ln)
+                if p and p[0] == R.EV_COMPLAINT and p[2] == i:
+                    self.compl.setdefault(i, {})[p[3]] = ln
+                if p and p[0] == R.EV_END and p[2] == 4:
+                    self.end[4].add(i)
+        # OPEN (only when a complaint, a forged complaint or a bare ACCUSE is routed)
+        routed = self.open_phase()
+        # final SET 2 (U2): U2' souls not left out (verdicts) that finished
+        out = set(self.blame)
+        ids = [self.I(x) for x in self.u2p_base]
+        keep = [i for i in ids if i not in out and (i in self.cols or (i in self.alive() and i in self.end[4]))
+                and not (i in routed and i not in self.end[5] and i not in self.cols)]
+        base = self.xs(keep)
+        if len(base) < self.t:
+            self.log.w("#CANCEL |U2| %d below t" % len(base))
+            return
+        sent2 = []
+        for i in [j for j in self.alive() if 5 in self.view.get(j, {})]:
+            self.view[i][2] = self.u2_for(i, base)
+            if self.X(i) in self.view[i][2] or (self.a == "u2-with-accused" and self.X(i) in self.accused_xs):
+                self.send(i, R.fmt_set(self.r, 2, R.bitmap(self.view[i][2])))
+                sent2.append(i)
+        for c in self.cols:
+            self.view[c][2] = [x for x in base if x in self.view[c][5]]
+            if self.X(c) in self.view[c][2]:
+                outs = self.feed(c, [R.fmt_set(self.r, 2, R.bitmap(self.view[c][2]))])
+                self.ys[c] = [ln for ln in outs if ln.startswith("SA4_Y ")]
+        for i in [j for j in sent2 if j in self.alive()]:
             got = self.recv(i, ("SA4_END",), self.lw // 100 + 3)
             self.ys[i] = [ln for ln in got if ln.startswith("SA4_Y ")]
             if any(ln.startswith("SA4_END %d 2 " % self.r) for ln in got):
                 self.end[2].add(i)
         # phase 3
-        base = self.xs([i for i in self.end[2] if i in self.alive()] + list(self.cols))
+        base = self.xs([i for i in self.end[2] if i in self.alive()] + [c for c in self.cols if c in self.ys])
         for i in [j for j in self.alive() if j in self.end[2]]:
             self.view[i][3] = self.u3_for(i, base)
             self.send(i, R.fmt_set(self.r, 3, R.bitmap(self.view[i][3])))
-        for c in self.cols:
+        for c in [c for c in self.cols if c in self.ys]:
             self.view[c][3] = [x for x in base if x in self.view[c][2]]
             self.sig3[c] = self.feed(c, [R.fmt_set(self.r, 3, R.bitmap(self.view[c][3]))])[0]
         for i in [j for j in self.alive() if 3 in self.view.get(j, {})]:
@@ -597,7 +748,7 @@ class Evil:
                 if p and p[0] == R.EV_SIG3 and p[2] == i:
                     self.sig3[i] = ln
         # phase 4
-        base = self.xs([i for i in self.sig3 if i in self.alive()] + list(self.cols))
+        base = self.xs([i for i in self.sig3 if i in self.alive()] + [c for c in self.cols if c in self.sig3])
         for i in [j for j in self.alive() if j in self.sig3]:
             self.view[i][4] = self.u4_for(i, base)
             for ln in self.sig3_for(i, self.view[i][4]):
@@ -609,6 +760,196 @@ class Evil:
             if any(ln.startswith("SA4_END %d 3 " % self.r) for ln in got):
                 self.end[3].add(i)
         self.results()
+
+    # ---- v4-sa3 coordinator duties: receipt, routing of complaints, verdicts
+    def receipt(self):
+        """Structural receipt checks of an honest coordinator (8.4, state 1):
+        a sender with a bad SHARE line or no SHSIG is left out (code 0)."""
+        d = R.depth(self.n)
+        for i in sorted(self.end[1] | set(self.cols)):
+            mine = [(to, ln) for to, by in self.shares.items() for frm, ln in by.items() if frm == i]
+            why = ""
+            for to, ln in mine:
+                p = R.parse(ln)
+                if len(p[4]) != 98 + 32 * d:
+                    why = "share ciphertext length does not match the roster's tree depth"
+                elif not R.epk_ok(p[5]):
+                    why = "share one-time key is not a valid X25519 key"
+                if why:
+                    break
+            if not why and i not in self.shsig:
+                why = "no share signature"
+            if not why and len(mine) != len(self.view[i][1]) - 1:     # the U1 this soul was shown
+                why = "not one share per soul in U1"
+            if why:
+                self.leftout[i] = why
+                self.log.w("#LEFTOUT %d %s" % (i, why))
+
+    def h1_of(self, i):
+        """The H1 soul i computes from the ADVs it was sent."""
+        keys = {}
+        for ln in self.sent_adv[i]:
+            p = R.parse(ln)
+            if p and p[0] == R.EV_ADV:
+                keys[self.X(p[2])] = (p[3], p[4], p[6], p[7])
+        return R.advset_hash(R.bitmap(self.view[i][1]), [keys.get(x, (b"",) * 4) for x in self.view[i][1]])
+
+    def held_leaf(self, u, v):
+        """sleaf of the line u -> v as the coordinator received it."""
+        p = R.parse(self.shares[v][u])
+        return R.sleaf(self.fp, self.r, u, self.X(v), v, p[5], p[4])
+
+    def signer(self, i):
+        """Identity seed of a colluder (None for an honest soul)."""
+        return self.col_seed.get(i)
+
+    def forged_complaint(self, u):
+        """--attack forge-complaint --forge KIND: (complaint line, complainer id) to honest u."""
+        r, fp, k = self.r, self.fp, self.forge
+        col = sorted(self.cols)[0] if self.cols else None
+        others = [self.I(x) for x in self.view[u][5] if self.I(x) != u and self.I(x) not in self.cols]
+
+        def sign(v, rr, h1, lh, seed):
+            return R.ed25519_sign(R.complaint_transcript(fp, rr, v, u, h1, lh), seed, R.ed25519_pk_from_seed(seed))
+        h1u = self.h1_of(u)
+        if k == "zero-sig" and others:
+            v = others[0]
+            return R.fmt_complaint(r, v, u, self.held_leaf(u, v), bytes(64)), v
+        if k == "wrong-signer" and others:
+            v = others[0]
+            seed = self.signer(col) if col else R.sha256(b"evil coordinator signer")
+            return R.fmt_complaint(r, v, u, self.held_leaf(u, v), sign(v, r, h1u, self.held_leaf(u, v), seed)), v
+        if k == "wrong-leaf" and col and others:
+            return R.fmt_complaint(r, col, u, self.held_leaf(u, others[0]),
+                                   sign(col, r, h1u, self.held_leaf(u, others[0]), self.signer(col))), col
+        if k == "other-h1" and col:
+            lh = self.held_leaf(u, col)
+            return R.fmt_complaint(r, col, u, lh, sign(col, r, R.sha256(b"other H1"), lh, self.signer(col))), col
+        if k == "old-round":
+            for ln in self.old_complaints:
+                p = R.parse(ln)
+                if p and p[3] == u and self.X(p[2]) in self.view[u][5]:
+                    t = ln.split(" ")
+                    t[1] = str(r)
+                    return " ".join(t), p[2]
+            if col:
+                lh = self.held_leaf(u, col)
+                return R.fmt_complaint(r, col, u, lh, sign(col, r - 1, h1u, lh, self.signer(col))), col
+        self.log.w("#NOFORGE %d %s" % (u, k))
+        return None, None
+
+    def open_phase(self):
+        """Route every complaint (and the attack's forged ones) to its accused
+        with SA4_ACCUSE; collect OPEN / END 5; run the verdicts. -> routed ids."""
+        a, r = self.a, self.r
+        u2p = set(self.u2p_base)
+        acc = {}
+        for v in sorted(self.compl):
+            if v not in self.end[4] or (v not in self.cols and v not in self.alive()):
+                continue
+            for u in self.compl[v]:
+                if self.X(u) in u2p and (u in self.cols or u in self.alive()):
+                    acc.setdefault(u, []).append(v)
+        self.accused_xs = self.xs(acc)
+        routed = {}
+        for u, vs in acc.items():
+            vs = sorted(vs, key=self.X)
+            lines = []
+            for v in vs:
+                ln = self.compl[v][u]
+                if a == "double-adv-recv" and u == self.victim and v in self.cols:
+                    # the corrupt receiver re-signs over the victim's H1 (it knows both ADV views)
+                    p = R.parse(ln)
+                    seed = self.signer(v)
+                    g = R.ed25519_sign(R.complaint_transcript(self.fp, r, v, u, self.h1_of(u), p[4]), seed,
+                                       R.ed25519_pk_from_seed(seed))
+                    ln = R.fmt_complaint(r, v, u, p[4], g)
+                lines.append(ln)
+            routed[u] = (lines, [self.X(v) for v in vs])
+        for u in [j for j in self.alive() if 5 in self.view.get(j, {}) and j not in self.cols]:
+            if a == "forge-complaint" and u not in routed:
+                ln, v = self.forged_complaint(u)
+                if ln is not None:
+                    routed[u] = ([ln], [self.X(v)])
+            elif a == "accuse-empty":
+                other = next(x for x in self.view[u][5] if x != self.X(u))
+                routed[u] = ([], [other])
+            elif a == "accuse-self":
+                routed[u] = (routed.get(u, ([], []))[0], [self.X(u)])
+        for u in sorted(routed, key=self.X):
+            lines, xs = routed[u]
+            if u in self.cols:
+                for ln in self.feed(u, lines + [R.fmt_accuse(r, R.bitmap(xs))]):
+                    p = R.parse(ln)
+                    if p and p[0] == R.EV_OPEN:
+                        self.opens.setdefault(u, {})[p[3]] = p[4]
+                self.end[5].add(u)
+                continue
+            for ln in lines:
+                self.send(u, ln)
+            self.send(u, R.fmt_accuse(r, R.bitmap(xs)))
+        for u in [j for j in sorted(routed) if j not in self.cols and j in self.alive()]:
+            for ln in self.recv(u, ("SA4_END",), self.n + 2):
+                p = R.parse(ln)
+                if p and p[0] == R.EV_OPEN and p[2] == u:
+                    self.opens.setdefault(u, {})[p[3]] = p[4]
+                if p and p[0] == R.EV_END and p[2] == 5:
+                    self.end[5].add(u)
+        if acc:
+            self.verdicts(acc)
+        return routed
+
+    def verdicts(self, acc):
+        """The honest verdicts (sa4_ref.coord_verdicts) over the coordinator's
+        own view: the ADVs and lines it received (not what it routed)."""
+        c = R.Coord(self.ro, self.r, self.lw, self.lay)
+        c.u1 = list(self.u1_base)
+        for x in c.u1:
+            c.P[x]["adv"] = R.parse(self.adv[self.I(x)])
+        c.h1 = R.advset_hash(R.bitmap(c.u1), [tuple(c.P[x]["adv"][k] for k in (3, 4, 6, 7)) for x in c.u1])
+        c.u2p = list(self.u2p_base)
+        for x in c.u1:
+            i = self.I(x)
+            p = c.P[x]
+            for to, by in self.shares.items():
+                if i in by:
+                    p["sh"][self.X(to)], p["shl"][self.X(to)] = R.parse(by[i]), by[i]
+            if i in self.shsig:
+                p["shsig"] = R.parse(self.shsig[i])[3]
+            for about, ln in self.compl.get(i, {}).items():
+                p["comp"][self.X(about)], p["compl"][self.X(about)] = R.parse(ln), ln
+            p["opens"] = {self.X(v): e for v, e in self.opens.get(i, {}).items()}
+            p["end5"] = len(p["opens"]) if i in self.end[5] else -1
+            if x in c.u2p and (i in self.abort or (i not in self.cols and i not in self.end[4])):
+                c.bad(x, "did not finish the check phase")
+        c.accused = {self.X(u): sorted(self.X(v) for v in vs) for u, vs in acc.items()}
+        c.st = R.C_OPEN
+        R.coord_verdicts(c)
+        for ux in sorted(c.accused):
+            if not c.P[ux]["bad"] and c.P[ux]["end5"] < 0:
+                c.bad(ux, "did not finish the open phase")
+        self.counters = c.counters()
+        self.log.w("#VERDICTS counters=%s" % ",".join(str(k) for k in self.counters))
+        for x in sorted(c.P):
+            if c.P[x]["bad"] and x in c.u2p:
+                i = self.I(x)
+                self.blame[i] = (c.P[x]["code"], c.P[x]["why"])
+                self.log.w("#BLAME %d %d %s" % (i, c.P[x]["code"], c.P[x]["why"]))
+                print("evil: blame %d code %d: %s" % (i, c.P[x]["code"], c.P[x]["why"]), flush=True)
+        for i, text in sorted(c.evidence.items()):
+            self.evidence[i] = text
+            path = ""
+            if self.o.get("evidence_dir"):
+                path = os.path.join(self.o["evidence_dir"], "sa4_evidence_r%d_%d.txt" % (self.r, i))
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                    with os.fdopen(fd, "w") as fh:
+                        fh.write(text)
+                except OSError as e:
+                    self.log.w("#EVIDENCE-NOT-WRITTEN %d %s" % (i, e))
+                    path = ""
+            self.log.w("#EVIDENCE %d %d %d %s %s" % (i, self.blame[i][0], len(text),
+                                                      R.sha256(text.encode()).hex(), path or "-"))
 
     # ---- results
     def aggregate(self, i):
@@ -745,14 +1086,22 @@ def coord_main(o):
             raise ValueError("colluder input refused")
         ev.cols[s.me] = s
         ev.col_seed[s.me] = seed
+    for c, s in ev.cols.items():
+        if ev.a == "open-harvest":             # complain about every honest soul's (valid) share
+            s.f3 = {"false": set(x for x in range(1, ro.n + 1) if ro.entries[x - 1][0] not in ev.cols)}
+        if ev.a in ("double-adv-send", "open-harvest"):
+            s.f3["open_any"] = 1                 # a corrupt accused opens whatever is forwarded
     if o["souls"] is None:
         o["souls"] = ro.n - len(ev.cols)
     ev.old_adv = {}
+    ev.old_complaints = []
     if o["prev_log"]:
         for raw in open(o["prev_log"], encoding="latin-1"):
             i, _, rest = raw.rstrip("\n").partition(">S ")
             if rest.startswith("SA4_ADV ") and i.isdigit():
                 ev.old_adv.setdefault(int(i), rest)
+            if rest.startswith("SA4_COMPLAINT ") and i.isdigit():
+                ev.old_complaints.append(rest)
     log.w("#EVIL attack=%s round=%d n=%d t=%d colluders=%s" % (ev.a, ev.r, ro.n, ro.t, sorted(ev.cols)))
     host, _, port = o["listen"].rpartition(":")
     srv = socket.socket()
@@ -773,8 +1122,9 @@ def coord_main(o):
     finally:
         ev.finish()
         log.f.close()
-    print("evil: done aborts=%s revealers=%s" % (json.dumps(ev.abort, sort_keys=True), sorted(i for i in ev.rev if ev.rev[i])),
-          flush=True)
+    print("evil: done aborts=%s revealers=%s blamed=%s" % (
+        json.dumps(ev.abort, sort_keys=True), sorted(i for i in ev.rev if ev.rev[i]),
+        ",".join("%d:%d" % (i, ev.blame[i][0]) for i in sorted(ev.blame) if ev.blame[i][0]) or "-"), flush=True)
     return 0
 
 
@@ -797,7 +1147,7 @@ def check_main(o):
     n, t = ro.n, ro.t
     xin = dict(parse_x(s, tags) for s in o["x"])
     to, frm = {}, {}                      # id -> [(seq, line)]
-    cols_csk, joins, eofs = {}, {}, {}
+    cols_csk, joins, eofs, blame, evid = {}, {}, {}, {}, {}
     seq = 0
     for raw in open(o["check"], encoding="latin-1"):
         raw = raw.rstrip("\n")
@@ -810,6 +1160,10 @@ def check_main(o):
                 joins[int(f[1])] = int(f[2])
             elif f[0] == "EOF" and len(f) == 3:
                 eofs.setdefault(int(f[1]), int(f[2]))
+            elif f[0] == "BLAME" and len(f) >= 3:
+                blame[int(f[1])] = int(f[2])
+            elif f[0] == "EVIDENCE" and len(f) >= 5:
+                evid[int(f[1])] = f[4]
             continue
         if raw.startswith("S>"):
             i, _, ln = raw[2:].partition(" ")
@@ -864,15 +1218,45 @@ def check_main(o):
             if not (p and p[0] == R.EV_SHARE and p[2] == u and p[3] in cols_csk and col_ok.get(p[3]) and u in cpk):
                 continue
             c = p[3]
-            ek = R.enc_key(cols_csk[c], cpk[u], p[1], u, c)
+            ek = R.enc_key(cols_csk[c], p[5], p[1], u, c)       # v4-sa3: the line's one-time e_pk
             pt = R.share_open(ek, p[1], u, c, p[4]) if ek else None
             q = R.share_pt_parse(pt, R.depth(n)) if pt else None
             if q and q[:4] == (u, c, r, X(c)):
                 ssh.setdefault(u, {})[X(c)] = q[4]
                 bsh.setdefault(u, {})[X(c)] = q[5]
                 col_held[u] = col_held.get(u, 0) + 1
+    # v4-sa3: every logged OPEN opened against the logged SHARE line it names
+    # (with the c_pk its sender was shown for the receiver): a share revealed
+    # this way is held at the receiver's x.
+    opened = []
+    for u in souls:
+        r = rounds[u][1] if u in rounds else -1
+        cpk_seen = {}
+        for _, ln in to.get(u, []):
+            p = P(ln)
+            if p and p[0] == R.EV_ADV and p[1] == r:
+                cpk_seen.setdefault(p[2], p[3])
+        lines = {P(ln)[3]: P(ln) for _, ln in frm.get(u, []) if P(ln) and P(ln)[0] == R.EV_SHARE and P(ln)[2] == u}
+        for _, ln in frm.get(u, []):
+            p = P(ln)
+            if not (p and p[0] == R.EV_OPEN and p[2] == u):
+                continue
+            v, e = p[3], p[4]
+            sh = lines.get(v)
+            ok = False
+            if sh is not None and R.x25519_base(e) == sh[5] and v in cpk_seen:
+                ek = R.enc_key(e, cpk_seen[v], sh[1], u, v)
+                pt = R.share_open(ek, sh[1], u, v, sh[4]) if ek else None
+                q = R.share_pt_parse(pt, R.depth(n)) if pt else None
+                if q and q[:4] == (u, v, r, X(v)):
+                    ok = True
+                    ssh.setdefault(u, {})[X(v)] = q[4]
+                    bsh.setdefault(u, {})[X(v)] = q[5]
+            opened.append({"from": u, "about": v, "at_colluder": v in cols_csk, "opens_share": ok})
     res = {"n": n, "t": t, "colluders": sorted(cols_csk), "colluder_keys_ok": all(col_ok.values()),
-           "souls": {}, "reveal_lines": 0}
+           "souls": {}, "reveal_lines": 0, "open_lines": len(opened), "opened": opened,
+           "honest_opens": sorted(set(o["from"] for o in opened if not o["at_colluder"] and o["from"] not in cols_csk)),
+           "blame": {str(k): v for k, v in sorted(blame.items())}, "evidence": {str(k): v for k, v in sorted(evid.items())}}
     ysv = {}
     for v in souls:
         fl, tl = frm.get(v, []), to.get(v, [])
@@ -881,6 +1265,19 @@ def check_main(o):
         d["abort"] = pa[3] if pa else None
         d["lines_after_abort"] = sum(1 for s, _ in fl if sa is not None and s > sa)
         d["lines_from"] = len(fl)
+        cps = [p for _, ln in fl for p in [P(ln)] if p and p[0] == R.EV_COMPLAINT and p[2] == v]
+        d["complaints"] = len(cps)
+        d["complained_about"] = sorted(p[3] for p in cps)
+        ops = [p for _, ln in fl for p in [P(ln)] if p and p[0] == R.EV_OPEN and p[2] == v]
+        d["opens"] = len(ops)
+        d["opened_for"] = sorted(p[3] for p in ops)
+        acc = set()
+        for _, ln in tl:
+            p = P(ln)
+            if p and p[0] == R.EV_ACCUSE:
+                acc |= set(ro.entries[x - 1][0] for x in (R.bitmap_xs(p[2], n) or []))
+        d["accused_by"] = sorted(acc)
+        d["blame"] = blame.get(v, 0)
         revs = [(s, p) for s, ln in fl for p in [P(ln)] if p and p[0] == R.EV_REVEAL]
         res["reveal_lines"] += len(revs)
         d["revealed"] = bool(revs)
@@ -989,6 +1386,7 @@ def check_main(o):
 
 def main(argv):
     o = {"listen": None, "round": "1", "attack": "honest", "log": None, "souls": None, "victim": "", "hide": "",
+         "forge": "zero-sig", "evidence_dir": "",
          "groups": "", "r0": "", "collude": "", "prev_log": "", "join_s": "20", "phase_s": "20", "hang_s": "15",
          "trickle_s": "0.5", "check": None, "x": [], "roster": os.environ.get("CE_SECAGG_ROSTER", ""),
          "tags": os.environ.get("CE_SECAGG_V4_TAGS", "")}
