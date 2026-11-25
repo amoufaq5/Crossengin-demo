@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Scenario U4 evil -- SecAgg v4 against a malicious coordinator (A2.4a).
+# Scenario U4 evil -- SecAgg v4 against a malicious coordinator (A2.4a;
+# protocol v4-sa2 with verifiable shares since A2.4b).
 #
 # scripts/secagg_evil_coord.py speaks the real v4 wire to real souls (NOVA
 # chat souls via /fed_join, Python souls via scripts/sa4_ref.py --connect)
@@ -21,6 +22,8 @@
 #   E.afterburn  a normal round 6 then completes.
 #   E.r0a/r0b    bad_fp / bad_len / bad_layout (chat and Python each).
 #   E.ownadv E.advsig E.advold   bad_adv / bad_sig / bad_round + bad_sig.
+#   E.alterm     another soul's ADV with its Merkle root altered (v4-sa2;
+#                the signature covers B and M): bad_sig.
 #   E.u1small E.notinu1          u1_small / not_in_u1.
 #   E.equivu1a/b U1 equivocation (chat and Python victim): no REVEAL at all.
 #   E.tamper     a share ciphertext altered in transit: bad_share.
@@ -265,6 +268,13 @@ if stage ownadv "$T/R5" "1 2" "3 4 5" --round 7 --attack own-adv; then
 fi
 if stage advsig "$T/R5" "1 2" "3 4 5" --round 7 --attack adv-sig; then
     refusal adv-sig "$(all5 bad_sig)" "refused: ADV signature of soul 20 does not verify \\(abort code bad_sig\\)" \
+        "refused: ADV signature does not verify \\(abort code bad_sig\\)"
+fi
+# v4-sa2: the Merkle root M (token 6) is covered by the ADV signature, so a
+# coordinator that alters it (to make a dealer's shares look bad) is caught
+# at R1 by every soul.
+if stage alterm "$T/R5" "1 2" "3 4 5" --round 7 --attack alter-m; then
+    refusal alter-m "$(all5 bad_sig)" "refused: ADV signature of soul 20 does not verify \\(abort code bad_sig\\)" \
         "refused: ADV signature does not verify \\(abort code bad_sig\\)"
 fi
 if stage advold "$T/R5" "1 2" "3 4 5" --round 7 --attack adv-old --prev-log "$T/afterburn/wire.log" --victim 10,30; then

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Scenario U4 -- SecAgg v4 (double masking) over the network (A2.3c).
+# Scenario U4 -- SecAgg v4 (double masking) over the network (A2.3c),
+# protocol v4-sa2 (verifiable shares, A2.4b).
 #
 # A v4 fed coordinator (CE_SECAGG_MODE=v4) runs one round with NOVA chat
 # souls (/fed_join) and independent Python souls (scripts/sa4_ref.py
@@ -9,7 +10,7 @@
 # Stages (each with its own run dirs under one mktemp dir):
 #   U4.mixed    2 chat souls + 1 Python soul, N = 3: every party prints the
 #               same sums, equal to the inputs each soul printed locally;
-#               wire log: v4 hello / OK / FED_JOIN / SA4_ROUND, the Python
+#               wire log: v4-sa2 hello / OK / FED_JOIN / SA4_ROUND, the Python
 #               soul's plain input words never cross the wire; the round
 #               counter and a chat soul's last-round file are 0600. (A
 #               fresh chat session's promo/atr rates are 0, so for chat
@@ -31,6 +32,15 @@
 #               reveals are refused, the sum still covers all four).
 #   U4.faults2  stop after ADV / Y / SIG3, a bad ADV signature, a bad SIG3:
 #               the expected sets and sums.
+#   U4.vshares  verifiable shares (v4-sa2): a revealer alters one b-share
+#               (N = 4: the sums still equal the inputs, the coordinator
+#               logs the excluded revealer); a revealer alters one s-share
+#               of a soul that dropped out (N = 7: sums correct, excluded);
+#               a dealer seals a receiver a b-share that does not match its
+#               commitment (the receiver aborts bad_commit, recorded as
+#               possibly a victim); a dealer commits to an off-polynomial
+#               b-share (every proof verifies, the rebuild fails: the round
+#               is refused and that dealer is blamed).
 #   U4.minpresent  a tag only two souls have is withheld (min-present t).
 #   U4.writeahead  a chat soul records the round id when the round opens,
 #               even when the round is then cancelled.
@@ -42,7 +52,8 @@
 #               CE_SECAGG_ENABLED and an unknown CE_SECAGG_MODE (both
 #               sides), CE_SECAGG_ALLOW_RECON in v4, no tags, CE_FED_SOULS
 #               below t, CE_FED_SOUL_ID not the roster name, a corrupt
-#               last-round file; v3n-sa and v4 refuse each other's hello.
+#               last-round file; v3n-sa and v4 refuse each other's hello;
+#               a v4-sa2 coordinator refuses the v4-sa (v1) hello.
 #
 # Env: CE_IT_STRICT=1 (CI) turns an environment SKIP (socket bind denied,
 # python3 or openssl missing) into a FAIL.
@@ -114,8 +125,9 @@ wait_all() {
 SP=()
 stage_wait() { wait_all "$1" "${SP[@]}"; SP=(); }
 
-# Keys and rosters: souls 1..5 with ids 10..50; R3 = souls 1-3, R4 = 1-4.
-for i in 1 2 3 4 5; do
+# Keys and rosters: souls 1..7 with ids 10..70; R3 = souls 1-3, R4 = 1-4,
+# R7 = 1-7.
+for i in 1 2 3 4 5 6 7; do
     bash "$KG" "$T/k$i" $((i * 10)) "soul$i" | sed -n 's/^roster line: //p' > "$T/line$i"
 done
 mkroster() {   # mkroster <file> <soul numbers...>
@@ -126,6 +138,7 @@ mkroster() {   # mkroster <file> <soul numbers...>
 mkroster "$T/R3" 1 2 3
 mkroster "$T/R4" 1 2 3 4
 mkroster "$T/R3b" 1 2 5
+mkroster "$T/R7" 1 2 3 4 5 6 7
 assert_match "$(cat "$T/R4")" '^crossengin-secagg-roster v1' "rosters written"
 
 TAGS="seed,user-teach"
@@ -217,7 +230,7 @@ if bind_ok "$D" "U4.mixed"; then
     stage_wait 120
     CO=$(cat "$D/coord.out"); O1=$(cat "$D/soul1.out"); O2=$(cat "$D/soul2.out"); O3=$(cat "$D/py3.out")
     W=$(cat "$D/wire.log" 2>/dev/null)
-    assert_match "$CO" "mode=v4-sa \\(SecAgg double masking\\)" "coordinator in v4 mode"
+    assert_match "$CO" "mode=v4-sa2 \\(SecAgg double masking, verifiable shares\\)" "coordinator in v4 mode (protocol v4-sa2)"
     assert_match "$CO" "\\[SA4\\] JOIN id=10 " "soul 10 joined"
     assert_match "$CO" "\\[SA4\\] JOIN id=20 " "soul 20 joined"
     assert_match "$CO" "\\[SA4\\] JOIN id=30 " "soul 30 joined"
@@ -237,8 +250,11 @@ if bind_ok "$D" "U4.mixed"; then
     assert_match "$O1" "fed: \\[SA4\\] round 1 complete \\(2 sum aggregate" "chat soul1 completed the round"
     assert_match "$O2" "fed: \\[SA4\\] round 1 complete \\(2 sum aggregate" "chat soul2 completed the round"
     assert_match "$O3" "BYE after 2 aggregate" "Python soul completed the round"
-    assert_match "$W" "C>S SECAGG_HELLO ce-fed v4-sa$" "wire: v4 hello"
-    assert_match "$W" "S>C OK ce-fed v4-sa protocol accepted$" "wire: exact v4 OK"
+    assert_match "$W" "C>S SECAGG_HELLO ce-fed v4-sa2$" "wire: v4-sa2 hello"
+    assert_match "$W" "S>C OK ce-fed v4-sa2 protocol accepted$" "wire: exact v4-sa2 OK"
+    assert_match "$W" "C>S SA4_ADV 1 30 [0-9a-f]{64} [0-9a-f]{64} [0-9a-f]{64} [0-9a-f]{64} [0-9a-f]{128}$" "wire: v4-sa2 ADV (c_pk, s_pk, B, M, sig)"
+    assert_match "$W" "C>S SA4_SHARE 1 30 10 [0-9a-f]{324}$" "wire: v4-sa2 share ciphertext (N = 3: 98 + 32 * 2 bytes)"
+    assert_match "$W" "C>S SA4_REVEAL 1 30 10 b [0-9a-f]{64} [0-9a-f]{192}$" "wire: v4-sa2 reveal with its proof (other hash + 2 path nodes)"
     assert_match "$W" "C>S FED_JOIN 10 1000$" "wire: FED_JOIN with the roster id"
     assert_match "$W" "S>C SA4_ROUND 1 [0-9a-f]{64} 6 [0-9a-f]{64}$" "wire: SA4_ROUND with L = 6 and the layout hash"
     assert_match "$W" "C>S SA4_Y 1 30 0 1 [0-9a-f]{48}$" "wire: the Python soul's masked vector (6 words)"
@@ -397,6 +413,108 @@ assert_match "$(cat "$T/f_bad-adv-sig/coord.out" 2>/dev/null)" "left out id=20: 
 assert_match "$(cat "$T/f_bad-sig3/coord.out" 2>/dev/null)" "left out id=30: SIG3 does not verify" "bad SIG3: that soul is left out of U4 (its input still counts: it is in U3)"
 
 # ===========================================================================
+# U4.vshares: verifiable shares (v4-sa2, A2.4b). Every share is committed in
+# the dealer's signed ADV (B_u, Merkle root M_u); a receiver checks its share
+# and path in R2; the coordinator rebuilds b_u / s_u robustly.
+# ===========================================================================
+# bad-b-reveal, N = 4 (t = 3, |R| = 4): soul 2 alters one b-share it reveals
+# (proof kept). The rebuild excludes it and the sums are still the inputs.
+D="$T/badbrev"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4"
+CP=$COORD_PID
+if bind_ok "$D" "U4.vshares (bad b reveal)"; then
+    py_soul "$D" p2 "$T/R4" 2 "seed=200:14,user-teach=2:2" --fault bad-b-reveal
+    for k in 1 3 4; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "phase 3 closed: \\|U4\\|=4" "bad b reveal: all four signed U3"
+    assert_match "$CO" "unmasked over \\|U3\\|=4" "bad b reveal: the round is unmasked (was a silently wrong sum in v4-sa)"
+    assert_match "$CO" "\\[SA4\\] excluded revealer\\(s\\): 20$" "bad b reveal: the coordinator logs the excluded revealer (id 20)"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=seed sum_promo=1000 sum_atr=70 n_part=4" "bad b reveal: seed sum equals the inputs"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=user-teach sum_promo=10 sum_atr=10 n_part=4" "bad b reveal: user-teach sum equals the inputs"
+    assert_match "$(cat "$D/p1.out")" "sa4_ref: AGGREGATE_SUM round=1 tag=seed sum_promo=1000 sum_atr=70 n_part=4" "bad b reveal: a soul received the correct sum"
+    assert_match "$(cat "$D/p2.out")" "sa4_ref: round 1 done" "bad b reveal: the lying soul itself finished its round"
+fi
+
+# two bad-b-reveal souls, N = 4 (t = 3, |R| = 4): |R| - t + 1 liars leave
+# fewer than t good shares, so the round is refused; the coordinator still
+# names both connections that lied.
+D="$T/badbrev2"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4"
+CP=$COORD_PID
+if bind_ok "$D" "U4.vshares (two bad b reveals)"; then
+    py_soul "$D" p2 "$T/R4" 2 "seed=200:14,user-teach=2:2" --fault bad-b-reveal
+    py_soul "$D" p3 "$T/R4" 3 "seed=300:21,user-teach=3:3" --fault bad-b-reveal
+    for k in 1 4; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "\\[SA4\\] excluded revealer\\(s\\): 20,30$" "two bad b reveals: both liars logged although the round is refused"
+    assert_match "$CO" "round 1 not unmasked: refused: fewer than t good shares about soul [0-9]+; nothing published" "two bad b reveals: round refused"
+    assert_nomatch "$CO" "AGGREGATE_SUM" "two bad b reveals: nothing published"
+fi
+
+# bad-s-reveal with a dropout, N = 7 (t = 5): soul 7 leaves after its shares
+# (in U2, not U3), so its s_u is rebuilt from the six others' s reveals
+# (|R| = t + 1); soul 1 alters its s reveal. v4-sa refused the whole round.
+D="$T/badsrev"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R7"
+CP=$COORD_PID
+if bind_ok "$D" "U4.vshares (bad s reveal)"; then
+    py_soul "$D" p1 "$T/R7" 1 "seed=100:7,user-teach=1:1" --fault bad-s-reveal
+    for k in 2 3 4 5 6; do py_soul "$D" p$k "$T/R7" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    py_soul "$D" p7 "$T/R7" 7 "seed=7000:7000" --fault stop-after-shares
+    stage_wait 120
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "phase 1 closed: \\|U2\\|=7" "bad s reveal: the leaving soul sent its shares (in U2)"
+    assert_match "$CO" "phase 2 closed: \\|U3\\|=6" "bad s reveal: it is not in U3"
+    assert_match "$CO" "\\[SA4\\] excluded revealer\\(s\\): 10$" "bad s reveal: the coordinator logs the excluded revealer (id 10)"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=seed sum_promo=2100 sum_atr=147 n_part=6" "bad s reveal: seed sum over the six (the dropout's mask removed)"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=user-teach sum_promo=21 sum_atr=21 n_part=6" "bad s reveal: user-teach sum over the six"
+    assert_nomatch "$CO" "not unmasked" "bad s reveal: the round is not refused"
+fi
+
+# bad-commit-share, N = 4: soul 1 seals soul 2 (the lowest other x) a b-share
+# that does not match its commitment. Soul 2 refuses in R2 (bad_commit) and
+# is recorded as possibly a victim; the dealer is not blamed (no complaint
+# round yet, A2.4c); the round completes over the other three.
+D="$T/badcommit"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4"
+CP=$COORD_PID
+if bind_ok "$D" "U4.vshares (bad commit share)"; then
+    py_soul "$D" p1 "$T/R4" 1 "seed=100:7,user-teach=1:1" --fault bad-commit-share
+    for k in 2 3 4; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$(cat "$D/p2.out")" "refused: share does not match its commitment \\(abort code bad_commit\\)" "bad commit share: the receiver refuses the round (bad_commit)"
+    assert_match "$CO" "left out id=20: aborted the round \\(bad_commit\\); possibly a victim" "bad commit share: the receiver is recorded as possibly a victim"
+    assert_nomatch "$CO" "left out id=10" "bad commit share: the dealer is not blamed (complaint round is A2.4c)"
+    assert_match "$CO" "AGGREGATE_SUM round=1 tag=seed sum_promo=800 sum_atr=56 n_part=3" "bad commit share: sum over the other three"
+fi
+
+# inconsistent-deal, N = 4: soul 1 commits to an off-polynomial b-share for
+# soul 2. Soul 2's check passes (the share matches the commitment), every
+# reveal proof verifies, but the t verified shares do not rebuild B_1: the
+# round is refused and dealer 10 is blamed.
+D="$T/inconsistent"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4"
+CP=$COORD_PID
+if bind_ok "$D" "U4.vshares (inconsistent deal)"; then
+    py_soul "$D" p1 "$T/R4" 1 "seed=100:7,user-teach=1:1" --fault inconsistent-deal
+    for k in 2 3 4; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "phase 3 closed: \\|U4\\|=4" "inconsistent deal: every soul accepted its shares and signed U3"
+    assert_match "$CO" "round 1 not unmasked: refused: soul 10 dealt shares that do not match its commitment; nothing published" "inconsistent deal: round refused, the Python dealer (id 10) blamed"
+    assert_nomatch "$CO" "AGGREGATE_SUM" "inconsistent deal: nothing published"
+    assert_nomatch "$CO" "excluded revealer" "inconsistent deal: no honest revealer is excluded (the list is logged on refusal too)"
+fi
+
+# ===========================================================================
 # U4.minpresent: a tag only two souls have is withheld (min-present = t = 3).
 # ===========================================================================
 D="$T/minpresent"; mkdir -p "$D"
@@ -464,7 +582,7 @@ if bind_ok "$D" "U4.join"; then
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
 f = s.makefile("rb")
-s.sendall(b"SECAGG_HELLO ce-fed v4-sa\n"); print(f.readline().decode().strip())
+s.sendall(b"SECAGG_HELLO ce-fed v4-sa2\n"); print(f.readline().decode().strip())
 s.sendall(b"FED_JOIN 999 1000\n"); print(f.readline().decode().strip())
 PYEOF
     py_soul "$D" p1 "$T/R3" 1 "seed=1:1"
@@ -541,8 +659,61 @@ if bind_ok "$D" "U4.cross"; then
            printf '/cap grant network_send\n/fed_join 127.0.0.1:%s\n/quit\n' "$PORT" | timeout 60 "$CHAT_BIN" 2>&1 )
     assert_match "$OUT" "ERROR cannot connect / SecAgg handshake" "v3n-sa chat refuses a v4 coordinator"
     stage_wait 40
-    assert_match "$(cat "$D/coord.out")" "REJECT handshake: expected SECAGG_HELLO ce-fed v4-sa" "v4 coordinator rejects the v3n-sa hello"
+    assert_match "$(cat "$D/coord.out")" "REJECT handshake: expected SECAGG_HELLO ce-fed v4-sa2" "v4 coordinator rejects the v3n-sa hello"
 fi
+# A v4-sa (v1) soul -> a v4-sa2 coordinator: refused at the hello (no
+# fallback, never a mid-round bad_sig).
+D="$T/crossv1"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R3" CE_SECAGG_V4_JOIN_MS=5000
+CP=$COORD_PID
+if bind_ok "$D" "U4.cross (v1 hello)"; then
+    python3 -I - "$PORT" > "$D/raw.out" 2>&1 <<'PYEOF'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+f = s.makefile("rb")
+s.sendall(b"SECAGG_HELLO ce-fed v4-sa\n")
+print("reply=" + f.readline().decode().strip())
+PYEOF
+    stage_wait 40
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "REJECT handshake: expected SECAGG_HELLO ce-fed v4-sa2" "v4-sa2 coordinator rejects the v4-sa (v1) hello"
+    assert_match "$(cat "$D/raw.out")" "reply=ERR expected SECAGG_HELLO ce-fed v4-sa2" "the v1 soul gets an ERR naming the v4-sa2 hello, no OK"
+    assert_nomatch "$CO" "JOIN id=" "the v1 soul never joins"
+fi
+# A v4-sa2 soul -> a v4-sa (v1) coordinator (a stand-in that answers every
+# hello with the v1 OK): the Python soul and the chat soul both refuse.
+D="$T/crossv1b"; mkdir -p "$D"
+next_port
+python3 -I - "$PORT" > "$D/fake.out" 2>&1 <<'PYEOF' &
+import socket, sys
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", int(sys.argv[1]))); srv.listen(4); srv.settimeout(40)
+for _ in range(2):
+    c, _a = srv.accept(); c.settimeout(20)
+    f = c.makefile("rb")
+    hello = f.readline().decode().strip()
+    print("hello=" + hello, flush=True)
+    c.sendall(b"OK ce-fed v4-sa protocol accepted\n")
+    try:
+        print("next=" + f.readline().decode().strip(), flush=True)
+    except OSError:
+        print("next=(none)", flush=True)
+    c.close()
+PYEOF
+FK=$!; PIDS+=("$FK")
+sleep 0.5
+py_soul "$D" p1 "$T/R3" 1 "seed=1:1"
+wait "$PY_PID" 2>/dev/null
+assert_match "$(cat "$D/p1.out")" "handshake refused" "v4-sa2 Python soul refuses a v4-sa (v1) coordinator"
+OUT=$( export CE_RUN_DIR="$T/chatrun_v1b"; mkdir -p "$CE_RUN_DIR"; chmod 700 "$CE_RUN_DIR"
+       export CE_SECAGG_ENABLED=1 CE_SECAGG_MODE=v4 CE_SECAGG_ROSTER="$T/R3" CE_SECAGG_ID_KEY="$T/k2.priv"
+       export CE_SECAGG_V4_TAGS="$TAGS" CE_SESSION_ID=v1b CE_SNAP_PATH="$D/v1b.snap" CE_DLOG_PATH="$D/v1b.dlog"
+       printf '/cap grant network_send\n/fed_join 127.0.0.1:%s\n/quit\n' "$PORT" | timeout 60 "$CHAT_BIN" 2>&1 )
+assert_match "$OUT" "fed_join: ERROR cannot connect / v4 handshake" "v4-sa2 chat soul refuses a v4-sa (v1) coordinator"
+wait_all 30 "$FK"
+assert_eq "$(grep -c '^hello=SECAGG_HELLO ce-fed v4-sa2$' "$D/fake.out")" "2" "both souls sent the v4-sa2 hello"
+assert_nomatch "$(cat "$D/fake.out")" "next=FED_JOIN" "neither soul sent FED_JOIN after the v1 OK"
 D="$T/cross2"; mkdir -p "$D/run"; chmod 700 "$D" "$D/run"
 next_port
 ( export CE_RUN_DIR="$D/run" CE_FED_PORT="$PORT" CE_FED_BIND=127.0.0.1 CE_FED_SOULS=2 CE_FED_MAX_ROUNDS=1 CE_SECAGG_ENABLED=1
