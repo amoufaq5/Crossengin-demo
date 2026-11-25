@@ -437,6 +437,24 @@ if bind_ok "$D" "U4.vshares (bad b reveal)"; then
     assert_match "$(cat "$D/p2.out")" "sa4_ref: round 1 done" "bad b reveal: the lying soul itself finished its round"
 fi
 
+# two bad-b-reveal souls, N = 4 (t = 3, |R| = 4): |R| - t + 1 liars leave
+# fewer than t good shares, so the round is refused; the coordinator still
+# names both connections that lied.
+D="$T/badbrev2"; mkdir -p "$D"
+next_port
+start_coord "$D" "$T/R4"
+CP=$COORD_PID
+if bind_ok "$D" "U4.vshares (two bad b reveals)"; then
+    py_soul "$D" p2 "$T/R4" 2 "seed=200:14,user-teach=2:2" --fault bad-b-reveal
+    py_soul "$D" p3 "$T/R4" 3 "seed=300:21,user-teach=3:3" --fault bad-b-reveal
+    for k in 1 4; do py_soul "$D" p$k "$T/R4" $k "seed=$((k * 100)):$((k * 7)),user-teach=$k:$k"; done
+    stage_wait 90
+    CO=$(cat "$D/coord.out")
+    assert_match "$CO" "\\[SA4\\] excluded revealer\\(s\\): 20,30$" "two bad b reveals: both liars logged although the round is refused"
+    assert_match "$CO" "round 1 not unmasked: refused: fewer than t good shares about soul [0-9]+; nothing published" "two bad b reveals: round refused"
+    assert_nomatch "$CO" "AGGREGATE_SUM" "two bad b reveals: nothing published"
+fi
+
 # bad-s-reveal with a dropout, N = 7 (t = 5): soul 7 leaves after its shares
 # (in U2, not U3), so its s_u is rebuilt from the six others' s reveals
 # (|R| = t + 1); soul 1 alters its s reveal. v4-sa refused the whole round.
@@ -493,7 +511,7 @@ if bind_ok "$D" "U4.vshares (inconsistent deal)"; then
     assert_match "$CO" "phase 3 closed: \\|U4\\|=4" "inconsistent deal: every soul accepted its shares and signed U3"
     assert_match "$CO" "round 1 not unmasked: refused: soul 10 dealt shares that do not match its commitment; nothing published" "inconsistent deal: round refused, the Python dealer (id 10) blamed"
     assert_nomatch "$CO" "AGGREGATE_SUM" "inconsistent deal: nothing published"
-    assert_nomatch "$CO" "excluded revealer" "inconsistent deal: no honest revealer is excluded"
+    assert_nomatch "$CO" "excluded revealer" "inconsistent deal: no honest revealer is excluded (the list is logged on refusal too)"
 fi
 
 # ===========================================================================

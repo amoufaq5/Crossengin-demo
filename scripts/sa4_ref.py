@@ -1267,6 +1267,14 @@ def oracle_selftest():
     two7 = o_lie(ro7, {"reveals": o_lie(ro7, rd7, 1, 4, 1)}, 2, 5, 0)
     got = o_rebuild(ro7, 3, lw, rd7, two7)
     assert got[0] is None and got[1] == [I7(1), I7(2)] and got[2] is None, got; k += 1
+    # lazy verification, N = 7 with no dropout (|R| = 7): liars x1 (inside
+    # the first t) and x7 (after the t-th verified share) about x3. Proofs
+    # are checked only until t verify, so only x1 is excluded.
+    rd7f = o_round(ro7, seeds7, 4, lw)
+    exp7f = o_expected(ro7, rd7f, lw)
+    assert rd7f["u3"] == [1, 2, 3, 4, 5, 6, 7] and not rd7f["refused"]
+    lazy = o_lie(ro7, {"reveals": o_lie(ro7, rd7f, 1, 3, 0)}, 7, 3, 0)
+    assert o_rebuild(ro7, 4, lw, rd7f, lazy) == (exp7f, [I7(1)], None, ""); k += 1
     return k
 
 

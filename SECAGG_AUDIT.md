@@ -1497,9 +1497,14 @@ unmask the fed coordinator logs `fed-coord: [SA4] excluded revealer(s):
 - **Privacy is unchanged.** Every revealer is in U3 and could already
   garble the sum. B_u leaks nothing, and a proof carries only a hash of the
   other share. The collusion bound above still holds.
-- **Robustness to |R| − t bad revealers.** While t revealers per secret
-  are honest, the published sum is exactly Σ_{U3} x_u, a well-defined
-  result: b_u is the secret behind u's signed B_u. A wrong s-share in a
+- **Robustness to |R| − t bad revealers in total.** Exclusion is global:
+  a revealer caught with one bad share is left out for every secret, even
+  ones it revealed honestly. So while at least t revealers have sent no
+  share that fails its proof (that is, at most |R| − t liars in the whole
+  round, not per secret), the published sum is exactly Σ_{U3} x_u, a
+  well-defined result: b_u is the secret behind u's signed B_u. Proofs are
+  checked lazily, only until t verify, so a liar after the t-th verified
+  share is not looked at and not excluded (harmless: its share is unused). A wrong s-share in a
   round with a dropout no longer kills the round.
 - **Honest revealers cannot be framed.** Their proofs always verify,
   because their soul checked the share in R2. Blame for an inconsistent
@@ -1532,11 +1537,21 @@ unmask the fed coordinator logs `fed-coord: [SA4] excluded revealer(s):
   7.3 MB.
 - For comparison, the Ed25519 work is about 3.5 s and 13 MB per soul.
 - **Coordinator, honest path:** |U3| B hashes, about 12 ms.
-- **Coordinator, one dispute:** up to |R| proofs of D + 3 hashes each,
-  about 130 ms.
-- **Coordinator, worst case:** at N = 255 with 84 coordinated liars, about
-  21.7k proofs, about 11 s and about 600 MB. Checking every proof eagerly
-  would take about 33 s and 1.9 GB, so the rebuild is lazy.
+- **Coordinator, one dispute:** up to |R| proofs of D + 2 hashes each
+  (the share hash, the leaf, D nodes), about 120 ms at N = 255.
+- **Coordinator, worst case:** with global exclusion each liar can force at
+  most one disputed secret, so at N = 255 with |R| − t = 84 liars at most
+  about 84 · (t + 1) ≈ 14.4k proofs: about 7 s and about 400 MB, estimated
+  from the per-hash figure. Checking every proof of every secret eagerly
+  would be about |U2| · |R| ≈ 65k proofs, so the rebuild is lazy.
+- **Memory hygiene:** the hashes over secret bytes (hs, hb, B_u) use
+  `sha256_oneshot_wipe`, which zeroes its padded block and message
+  schedule, and the hash input is zeroed after use, so no raw copy of a
+  share or of b_u is left on the never-freed heap
+  (tests/unit/test_sa4_wipe_hash.nova scans the heap for it). This is best
+  effort, as for the other primitives: ChaCha20 and HKDF state are not
+  wiped. Hex encoding is linear (one allocation per string), so the longer
+  v2 SHARE and REVEAL lines cost about 1 KB of heap each, not about 260 KB.
 - **Bandwidth at N = 255:**
   - share phase: about 49 MB (from about 16 MB);
   - reveal phase: about 45 MB (from about 7 MB).
@@ -1561,7 +1576,11 @@ unmask the fed coordinator logs `fed-coord: [SA4] excluded revealer(s):
   - a peer's B or M altered in transit (`bad_sig`);
   - two ADVs differing only in B (H1 differs, `bad_sig3`);
   - the dealt shares zeroed on a refusal.
-- `test_sa4_coord6` (43 checks), new:
+- `test_sa4_wipe_hash` (25 checks), new: `sha256_oneshot_wipe` matches
+  `sha256_oneshot` across padding boundaries; hs, hb and B_u leave no raw
+  copy of their secret on the heap (with a positive control);
+  `sa4w_hex` stays under 4 KB for a 354-byte ciphertext.
+- `test_sa4_coord6` (47 checks), new:
   - a wrong b-share with |R| = t + 1: correct sum, liar listed;
   - a wrong s-share with a dropout at N = 7: correct sum;
   - |R| − t + 1 liars: refused;
@@ -1569,7 +1588,9 @@ unmask the fed coordinator logs `fed-coord: [SA4] excluded revealer(s):
   - an inconsistent dealer: refused, that dealer blamed;
   - a clamped-bit s error: correct sum, no exclusion;
   - a proof of the wrong length: left out on receipt;
-  - one liar about every dealer: excluded once.
+  - one liar about every dealer: excluded once;
+  - lazy verification at N = 7: a liar after the t-th verified share is
+    not looked at (only the liar inside the first t is excluded).
 - Updated tests:
   - `test_sa4_coord` (15): an altered s-share at |R| = t is still refused,
     now as "fewer than t good shares", with the liar excluded;
@@ -1593,6 +1614,8 @@ unmask the fed coordinator logs `fed-coord: [SA4] excluded revealer(s):
   - `sa4_cases.py check`, 62 named outcomes.
 - `scenario_u4_secagg.sh`, with new `sa4_ref.py --fault` modes:
   - `bad-b-reveal` at N = 4;
+  - two `bad-b-reveal` souls at N = 4: refused, and the coordinator still
+    logs both excluded revealers;
   - `bad-s-reveal` with a dropout at N = 7;
   - `bad-commit-share`;
   - `inconsistent-deal`;
