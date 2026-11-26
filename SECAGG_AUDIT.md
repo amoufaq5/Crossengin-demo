@@ -1030,21 +1030,22 @@ The coordinator also leaves out both souls of any pair that advertised the
 same key. Without these exclusions, one bad ADV would make every honest
 soul refuse the round.
 
-**What the coordinator cannot check: share contents.** Only a share's
-receiver can open it. A malicious soul can send an honest receiver a share
-that does not open, or that holds the wrong fields. The receiver then
-refuses the round and sends `SA4_ABORT`, and the coordinator leaves the
-receiver out, not the sender.
-- With enough such shares, |U3| falls below t and the round is cancelled.
-  `test_sa4_coord5` pins both outcomes.
-- The coordinator records these souls separately (`sa4c_aborted`), and
-  their reason says "possibly a victim". An abort is not evidence of
-  misbehaviour and must not be used to penalise a soul.
-- Since A2.4b a share that opens but does not match the sender's signed
-  commitment is refused the same way (`bad_commit`), with the same
+**Share contents.** Only a share's receiver can open it.
+- Up to A2.4b, a receiver of a share that did not open, held the wrong
+  fields or (A2.4b) missed the sender's signed commitment refused the
+  round, and the coordinator left the receiver out, not the sender, with a
   "possibly a victim" record.
-- Verifiable blame needs a complaint round. That is an open design item
-  (A2.4c).
+- Since protocol v4-sa3 (A2.4c) such a receiver no longer aborts. It sends
+  a signed `SA4_COMPLAINT`, the accused sender reveals the one-time key of
+  that one share, and the coordinator judges: the sender is removed (code
+  1, with evidence a third party can check; or 3 / 4 unproven) and the
+  receiver stays in the round. `test_sa4_coord5` now expects the sender
+  blamed with code 1 and the round completed. See "SecAgg v4-sa3:
+  complaint round (A2.4c)".
+- `sa4c_aborted` still marks souls that sent `SA4_ABORT` (structural,
+  coordinator or transport faults, or refusals); their reason still says
+  "possibly a victim". An abort is not evidence of misbehaviour and must
+  not be used to penalise a soul.
 
 **Unmasking** (`sa4c_unmask`, at most once):
 - Start from the sum of y over U3.
@@ -1207,14 +1208,14 @@ coordinator.**
   has and read that soul's value from the sum.
 
 **Flow.**
-- **Join.** `SECAGG_HELLO ce-fed v4-sa2`, answered exactly by
-  `OK ce-fed v4-sa2 protocol accepted`, then `FED_JOIN <roster id> 1000`
-  (the hello was `v4-sa` before A2.4b).
-  - v3n-sa and v4 refuse each other's hello. A v4-sa2 soul or coordinator
-    also refuses the v4-sa (v1) hello: no fallback, so the versions part
-    at the hello instead of at a mid-round `bad_sig`.
+- **Join.** `SECAGG_HELLO ce-fed v4-sa3`, answered exactly by
+  `OK ce-fed v4-sa3 protocol accepted`, then `FED_JOIN <roster id> 1000`
+  (the hello was `v4-sa` before A2.4b and `v4-sa2` before A2.4c).
+  - v3n-sa and v4 refuse each other's hello. A v4-sa3 soul or coordinator
+    also refuses the v4-sa (v1) and v4-sa2 hellos: no fallback, so the
+    versions part at the hello instead of at a mid-round `bad_sig`.
     `CE_SECAGG_MODE=v4` (or `v4-sa`) selects the v4 path, which speaks
-    v4-sa2.
+    v4-sa3.
   - Unknown ids and duplicate connections are rejected.
   - The coordinator waits for `CE_FED_SOULS` souls (default: the roster
     size; at least t) for up to `CE_SECAGG_V4_JOIN_MS` (default 60 s).
@@ -1237,10 +1238,14 @@ coordinator.**
     seeds, so a reused round id does not repeat any mask; the guard is
     defence in depth.)
 - **Phases.**
-  - The coordinator reads each live soul's lines for the phase up to its
-    terminator: one ADV or SIG3 line, or up to `SA4_END` or `SA4_ABORT`
-    with at most N + 1 (or ⌈L/100⌉ + 1) lines. All reads share one deadline,
-    `CE_SECAGG_V4_PHASE_MS` (default 30 s).
+  - Since v4-sa3 the phases follow the coordinator state
+    (`sa4c_phase_order`: ADV, shares, check, open only when a complaint was
+    forwarded, Y, SIG3, reveals). The coordinator reads the lines of the
+    souls the state expects (`sa4c_expect`; in the open phase only the
+    accused) up to their terminator: one ADV or SIG3 line, or up to
+    `SA4_END` or `SA4_ABORT` with at most N + 2 (shares), N + 1 (check,
+    open, reveals) or ⌈L/100⌉ + 1 (Y) lines. All reads share one
+    deadline, `CE_SECAGG_V4_PHASE_MS` (default 30 s).
   - The receive timeout is re-armed before every byte, so a soul that
     trickles bytes cannot stretch the phase.
   - A soul read after the deadline still gets a 250 ms grace window for
@@ -1262,7 +1267,8 @@ coordinator.**
     a v3n-sa sum (the source-tier nudge). After the round it reads at
     most one line per tag plus `BYE`.
   - The whole `/fed_join` (dial, join wait, round, results) is bounded by
-    `CE_SECAGG_V4_SOUL_MS` (default 300 s), read with the same per-byte
+    `CE_SECAGG_V4_SOUL_MS` (default 360 s since v4-sa3, which added two
+    collecting phases; 300 s before), read with the same per-byte
     deadline, so a coordinator cannot hold the chat. SIGPIPE is ignored,
     so a coordinator that disconnects cannot kill the chat process.
   - One round per coordinator process.
@@ -1313,9 +1319,11 @@ C ≤ 2t − N − 1 (and C < t − 1):
     correct sum while t good shares remain (see "SecAgg v4-sa2: verifiable
     shares (A2.4b)").
   - A soul that sends an unopenable share, or one that does not match its
-    signed commitment, makes its receiver abort (`bad_share` /
-    `bad_commit`). The receiver is recorded as "possibly a victim".
-    Verifiable blame needs the complaint round (A2.4c).
+    signed commitment, is blamed since v4-sa3: its receiver complains
+    instead of aborting, the sender is removed (code 1 with evidence, or
+    3 / 4 unproven) and the receiver stays (see "SecAgg v4-sa3: complaint
+    round (A2.4c)"). Up to v4-sa2 the receiver aborted (`bad_share` /
+    `bad_commit`) and was recorded as "possibly a victim".
 - **Scaling and denial of service.** The coordinator reads souls one
   after another (no `poll`), so a phase takes about as long as its
   slowest soul or the deadline. Joins are handled one at a time too: a
@@ -1522,12 +1530,13 @@ unmask the fed coordinator logs `fed-coord: [SA4] excluded revealer(s):
   in the design and is not shipped.
 - **`FED_AGGREGATE_SUM` is still unsigned.** A malicious coordinator can
   still publish a wrong sum to the souls.
-- **The complaint round is still open (A2.4c).** A dealer that seals a
-  receiver a share that does not match its commitment makes that receiver
-  abort with `bad_commit`. The receiver is recorded as "possibly a victim",
-  and the dealer is not blamed. Making that claim checkable needs the
-  receiver to reveal its c key: ChaCha20-Poly1305 is not key-committing,
-  so a revealed directional key proves nothing on its own.
+- **No complaint round in v4-sa2.** A dealer that sealed a receiver a
+  share that did not match its commitment made that receiver abort with
+  `bad_commit`; the receiver was recorded as "possibly a victim" and the
+  dealer was not blamed (a revealed directional c key proves nothing on
+  its own: ChaCha20-Poly1305 is not key-committing). Protocol v4-sa3
+  (A2.4c) closes this with one-time share keys and a signed share root:
+  see "SecAgg v4-sa3: complaint round (A2.4c)".
 
 **Costs.** These are the design report's measurements: a SHA-256 of about
 100 bytes in NOVA takes about 46 µs and about 2.6 KB of heap.
@@ -1623,6 +1632,299 @@ unmask the fed coordinator logs `fed-coord: [SA4] excluded revealer(s):
 - `scenario_u4_evil.sh`: `alter-m`, another soul's M altered by the
   coordinator, gives `bad_sig` at every soul.
 
+## SecAgg v4-sa3: complaint round (A2.4c)
+
+Protocol v4-sa3 gives verifiable blame for bad shares. Up to v4-sa2 the
+receiver of a share that did not open, held the wrong fields or missed the
+dealer's commitment refused the round and was left out as "possibly a
+victim"; the dealer was not blamed. Now that receiver sends a signed
+complaint and stays in the round; the accused dealer reveals the one-time
+key of that one share, and the coordinator decides who is removed. For a
+bad share (code 1) and a false complaint (code 2) it writes an evidence
+file that anyone with the roster can check. This section summarises the
+A2.4c design spec; the byte-exact vectors are pinned in
+`scripts/sa4_ref.py --selftest` and the NOVA unit tests.
+
+**Design.**
+- **One-time share keys.** In R0 each soul draws a 32-byte `eseed` as the
+  last rng draw (after the s-coefficients), so every v4-sa2 byte (keys,
+  shares, SA4_Y, REVEAL) is unchanged for the same rng. For each receiver
+  v the sender derives e_uv = HKDF(eseed, kdf_info("eph", r, u, v)) and
+  seals the share (plaintext v2, same AAD) under
+  `sac_enc_key(e_uv, c_v^PK)`. The SHARE line carries e_pk = X25519_base(e_uv).
+  The receiver opens with `sac_enc_key(c_v^SK, e_pk)`. Revealing e_uv opens
+  exactly one message, and the key is bound to (r, u, v).
+- **Signed share root.** Each sender builds a share tree S_u over sleaf =
+  H(0x00 ‖ `crossengin/v4-sa/v3/sleaf` ‖ fp ‖ r ‖ u ‖ x ‖ v ‖ e_pk ‖ ct) at
+  each receiver's x (zero at its own x and outside U1; the v4-sa2 tree
+  shape) and signs T_sh = SIGPFX("shares") ‖ u ‖ H1 ‖ S_u (138 bytes) in one
+  `SA4_SHSIG` line. Binding (e_pk, ct) stops a receiver, who knows k_uv,
+  from forging a ciphertext that frames the dealer; binding H1 stops an
+  equivocated ADV from framing it (attack A1 of the design).
+- **Signed complaint.** T_c = SIGPFX("complaint") ‖ v ‖ u ‖ H1 ‖ lh (145
+  bytes), lh = sleaf of the line v received. Binding H1 stops an
+  equivocated ADV from framing the complainer (attack A2).
+- **One content check.** `sa4w_share_check` (open, length, version,
+  fields, commitment against M_u) is used by the receiver (open key) and
+  by the coordinator and judge (key from the revealed e and c_v^PK). Since
+  e_pk = X25519_base(e), both get the same key, so the judge reaches the
+  receiver's result exactly.
+- **Privacy gate.** The accused reveals e_uv only when the complaint's lh
+  equals its own leaf for that receiver (compared first) and v's signature
+  over the accused's own H1 verifies. An honest dealer's genuine line
+  passes an honest receiver's check, and a tampered line has another lh,
+  so an honest dealer's key is revealed only to a corrupt receiver, which
+  already holds that share. The coalition's share count of any honest
+  secret stays at most n_C.
+- `SIG_DOMAIN` is `crossengin/v4-sa/v3/sig`, so no v4-sa2 signature
+  verifies; the ADVSET, commitment and share domains are unchanged.
+
+**Wire** (every line at most 1000 bytes; at N = 255 the SHARE line is
+825 bytes, every other new line at most 249).
+
+| Line | Direction | Grammar |
+|---|---|---|
+| SHARE (changed) | soul → coordinator → soul | `SA4_SHARE r from to epk ct` (6 tokens; a 5-token v4-sa2 SHARE is refused) |
+| SHSIG (new) | soul → coordinator | `SA4_SHSIG r from sig` |
+| SET 5 (new k) | coordinator → soul | `SA4_SET r 5 bm(U2')`: starts the check |
+| COMPLAINT (new) | soul → coordinator → accused | `SA4_COMPLAINT r from about lh sig` |
+| ACCUSE (new) | coordinator → accused | `SA4_ACCUSE r bm(complainers)` |
+| OPEN (new) | accused → coordinator | `SA4_OPEN r from about e` |
+| END 4 / END 5 | soul → coordinator | complaints / openings sent |
+| Hello | both | `SECAGG_HELLO ce-fed v4-sa3`, `OK ce-fed v4-sa3 protocol accepted`; the v4-sa2 hello is refused by both sides |
+
+**Phases** (coordinator states in run order 0, 1, 8, 9, 2, 3, 4;
+`sa4c_phase_order`):
+1. ADV (unchanged; the coordinator also caches H1).
+2. Shares: SHARE lines, SHSIG, END 1. Receipt is structural only (no
+   crypto): wrong ct length, an e_pk that is not canonical or is one of the
+   five low-order points, a missing, duplicate or misaddressed SHARE, or no
+   SHSIG leaves the sender out of U2' (code 0).
+3. Check (SET 5 with U2'): each soul checks every routed share (pass 1
+   structural, refusing `bad_share`; pass 2 content) and sends one signed
+   COMPLAINT per failing share, then END 4. A content failure never makes
+   it refuse. Its c key is wiped after this phase.
+4. Open (only when a complaint was forwarded): each accused gets its
+   complaints and `SA4_ACCUSE`; it answers OPEN for each valid complaint,
+   then END 5. Non-accused souls send nothing.
+5. Verdicts, then the final `SA4_SET 2` (U2 = U2' without removed souls);
+   Y, SIG3 and REVEAL as before (T3 binds the final U2). A soul refuses a
+   final U2 that contains a soul it complained about.
+
+An honest round costs one extra round trip (the check); a complaint adds
+one more. Honest rounds run no extra signature, X25519 or hash at the
+coordinator.
+
+**Blame codes** (`sa4c_blamed`; why texts via `sa4c_why`).
+
+| Code | Meaning | Removed | Proof |
+|---|---|---|---|
+| 0 | not blamed: dropout, structural leave-out, abort | – | – |
+| 1 | sent a share that fails its receiver's check (open, fields, commit ...), shown with its revealed key | sender | yes (evidence) |
+| 2 | false complaint: the share opens and matches | complainer | yes (evidence) |
+| 3 | no opening matching its e_pk for a complaint the coordinator found valid: a silent accused, a lost END 5, or a complaint it could not verify (its H1 differs, e.g. ADV equivocation) | accused | no |
+| 4 | its share signature does not verify over the lines the coordinator received | sender | no (sender or its uplink) |
+| 5 | complaint names a share it was not routed, or does not verify | complainer | no (complainer or its downlink) |
+
+The verdict loop judges pairs complainer first, checks lh and the
+complaint signature before it looks at the opening, proves a false
+complaint without the sender's root, and computes a root only for a
+code-1/4 decision. Each judged pair removes one soul; judging stops once
+|U2'| − t + 1 souls are gone (the round is lost). Codes 3–5 mean "out for
+this round", like an abort; operators must not treat them as evidence.
+Code 3 in particular does not mean the accused chose to stay silent: its
+why text ("did not open its share to soul <v> with its one-time key (not
+proven)", identical in NOVA and Python) is also what an honest accused
+gets when it could not verify the complaint because its view of H1
+differs from the coordinator's (ADV equivocation by the complainer, shown
+to it by a network attacker or the coordinator: "not covered" item 5), or
+when its OPEN arrived without END 5 (openings count only once END 5
+arrived).
+
+**Evidence and judge.**
+- For codes 1 and 2 the coordinator holds an evidence text
+  (`sa4c_evidence`): header `crossengin-sa4-evidence v1`, fp, round, code,
+  sender, complainer, the U1 bitmap, one key line per U1 soul, the routed
+  SHARE line, its path in S_u and the SHSIG (code 1; `-` for code 2), the
+  COMPLAINT line and the revealed e. About 275 bytes per U1 soul plus about
+  1.6 KB (2682 bytes for the 5-soul vector round F).
+- The fed coordinator logs `blamed: <id>:<code>,...` and one
+  `soul <id>: <why>` line per blamed soul after the round (cancelled or
+  not), and writes evidence to
+  `CE_SECAGG_EVIDENCE_DIR/sa4_evidence_r<r>_<id>.txt` (O_CREAT|O_EXCL, mode
+  0644, never overwritten); unset, it logs that the evidence was not kept.
+- `scripts/sa4_ref.py --judge FILE [--roster R]` checks a file against the
+  roster alone: the exact lines and keys of the format (canonical hex and
+  decimal, no CR, no trailing space, nothing after `open`; code 2 carries
+  exactly `path -` and `shsig -`), the fingerprint, the key lines against
+  the roster, H1, X25519_base(e) = e_pk, the content check, then the
+  sender's root signature (code 1); for both codes the `complaint` line
+  must be the canonical SA4_COMPLAINT of the complainer about the sender
+  for that round, naming the recomputed leaf, with a complainer signature
+  over H1 that verifies (for code 1 the coordinator checked the same line
+  before judging, so it is authenticated too, not free text). It prints
+  `verdict: sender <u>` / `verdict: complainer <v>` (exit 0) or
+  `invalid: <why>` (exit 2). ADV signatures are not needed: H1 is bound by
+  the signer whose guilt is shown.
+- Evidence files are not unique. X25519 clamps its scalar, so bits 0–2 of
+  byte 0 and bits 6–7 of byte 31 of the `open` key do not change
+  X25519_base(e) or the sealing key: 32 encodings of one opening judge
+  alike, and anyone relaying a file can change those bits. The judge cannot
+  bind them without the sender's eseed. The verdict is unique; a file's
+  bytes or hash are not an identifier of the case.
+- Evidence holds one opened share: the corrupt sender's (code 1), or an
+  honest dealer's share at the corrupt complainer's x, which the
+  complainer already holds (code 2). Give it to roster members and
+  auditors only.
+
+**What it does and does not cover.**
+- Covered: a sender of a share that does not open, has wrong fields or
+  misses its commitment is removed (code 1, 3 or 4) and its honest
+  receiver stays; a false complainer is removed (code 2 or 5) at its first
+  judged complaint that the accused answers with an opening; if the
+  accused does not open (silent, its END 5 lost, or colluding with the
+  liar), the accused is removed instead (code 3) and the complainer stays
+  for that pair (each judged pair still removes one soul); the round
+  completes while |U2| ≥ t; no transferable evidence can be made against
+  an honest soul; a malicious
+  coordinator cannot open an honest share at an honest x (forged
+  complaints get no OPEN).
+- Not covered (SPEC A2.4c section 2):
+  1. Off-polynomial but on-commitment shares (an inconsistent dealer) are
+     still caught only at unmask by the v4-sa2 rebuild, which refuses the
+     round and names the dealer; no continuation (needs a post-y removal,
+     A2.4d).
+  2. Structural faults (wrong ct length, bad / low-order / non-canonical
+     e_pk, missing / duplicate / misaddressed SHARE, no SHSIG) are removed
+     at receipt (code 0), not proven.
+  3. Codes 3, 4 and 5 are not transferable: a cheater can always choose an
+     unproven removal (stay silent, send a bad SHSIG). Removal is
+     guaranteed, proof is not.
+  4. A network MITM or a malicious coordinator can still remove honest
+     souls (codes 3/4/5 or as dropouts) and cancel rounds. It cannot make
+     transferable evidence against an honest soul or open an honest share
+     at an honest x. The coordinator has no signing key and is not
+     accountable; `FED_AGGREGATE_SUM` stays unsigned.
+  5. ADV equivocation is not blamed: two valid ADVs of one soul are proof,
+     but they are not collected; the affected honest souls are removed
+     unproven. A1 (a corrupt receiver's second ADV shown to an honest
+     sender): with an honest coordinator and a network attacker that swaps
+     only the ADV, the sender cannot verify the complaint (signed over the
+     coordinator's H1, not its own), sends no OPEN and gets code 3; if the
+     complaint it is shown is also re-signed over its own H1 (a colluding
+     coordinator, or an attacker on its downlink with the complainer's
+     help) it opens and gets code 4. A2 (a corrupt sender's second ADV
+     shown to an honest receiver): the receiver gets code 5.
+  6. Faults after the final SET 2 are as in v4-sa2: wrong REVEAL shares
+     (robust rebuild), a wrong y (indistinguishable from a wrong input),
+     SIG3 problems (U4 shrinks).
+  7. Liveness: |U2'| − t + 1 souls can still cancel a round, as they can
+     by dropping out. Rounds are never published with a wrong sum.
+  8. What operators do with codes 1 / 2 across rounds (roster eviction) is
+     out of scope, as are input validity and poisoning.
+  9. Transport corruption of a routed line gives an honest complainer code
+     5; of an uplink line, an honest sender code 3 or 4 (only if someone
+     complains).
+
+**Costs (estimates from the NOVA primitive figures, not measurements).**
+- Sender R1 at N = 255: +254 X25519_base (about 0.76 s), +254 HKDF and
+  sleaf (about 0.1 s), +255 node hashes, +1 signature: about +0.9 s per
+  soul; about +40 ms at N = 10. The DH count is unchanged.
+- Receiver: as v4-sa2 for good shares; +1 sleaf and +1 signature per
+  complaint.
+- Accused: per forwarded complaint a 32-byte compare, and one verify
+  (about 8 ms) only on a match: at most 254 complaints, about 2 s.
+- Coordinator: +0 crypto in an honest round; about 25 ms per judged pair;
+  one root per code-1/4 sender, about 60–110 ms + 8 ms. Worst case at
+  N = 255: 85 judged pairs, at most about 11 s; one bad sender about
+  0.14 s. Complaint storage at most |U2'| (|U2'| − 1) raw lines of at most
+  249 bytes (about 16 MB at N = 255).
+- Traffic: SHARE +65 bytes (routed shares per soul at N = 255 about
+  210 KB, from 193 KB); SHSIG 169 bytes and SET 5 94 bytes per soul.
+- Time: seven collecting phases × `CE_SECAGG_V4_PHASE_MS` (30 s) plus the
+  60 s join is 270 s, so the chat default `CE_SECAGG_V4_SOUL_MS` is now
+  360 s (was 300 s).
+
+**Tests.**
+- Unit (NOVA; checks per test): `test_sa4_wire` (249), `test_sa_crypto`
+  (80: `sac_eph_key` K1/K2/K9), `test_sa4_commit` (157), new
+  `test_sa4_blame_kat` (145: the five low-order points, canonical
+  encodings, share root K4), new `test_sa4_soul_check` (334: one complaint
+  per content kind, structural refusals, OPEN gate against forged
+  complaints, ACCUSE / final SET 2 refusals incl. a validly signed
+  complaint from a soul in U1 \ U2', wipes), new
+  `test_sa4_coord_blame` (176, N = 5 and 10: codes 1–5 with exact whys, a
+  valid OPEN without END 5 → code 3 with no evidence, early stop,
+  counters, evidence; rounds K / L with U1 ≠ U2' whose evidence must equal
+  the F / G vectors), `test_sa4_coord5` (19: one bad share now gives the
+  sender code 1 and the round completes), `test_sa4_attack` (80: forged
+  complaints, privacy, A1 → 4 with the complaint re-signed and → 3 with
+  only the ADV swapped by a network attacker, A2 → 5, A3 → liar code 2),
+  `test_sa4_wipe_hash` (39: no raw copy of eseed or any e_uv), and the
+  updated soul / coordinator refusal tests (`test_sa4_coord_refuse`, now
+  206: the 8.4 receipt rules, the check close forwarding nothing from a
+  complainer or about an accused left out before it, sa4c_keep /
+  sa4c_expect in state 9 with left-out souls).
+- Mutation checks: 28 weakened checks in NOVA and 28 in the Python
+  reference (accused lh and signature checks, H1 in both transcripts,
+  (e_pk, ct) in sleaf, the judge's X25519_base(e) = e_pk, the
+  coordinator's lh and signature checks, the verdict order, early stop,
+  epk_ok, U2 ∩ CMPL, U2 ⊆ U2', eseed as the last draw, the wipes, each
+  low-order entry, ...) each made a test fail. An adversarial review then
+  found mutants no test killed; tests were added for each and each now
+  fails a test (NOVA: an OPEN counted without END 5, the check close
+  forwarding complaints of a left-out complainer or about a left-out
+  accused, sa4c_keep in state 9 returning all of U2', evidence built over
+  U2' instead of U1, ACCUSE accepted from a soul in U1 \ U2'; Python: the
+  same evidence and ACCUSE mutants, the oracle's "complaint about a soul
+  outside U2'" receipt rule removed, its forwarding of complaints about a
+  left-out soul, and the judge without the `-` checks of code 2, without
+  the code-1 complaint line or its signature, without the "nothing after
+  `open`" check, or without the round check of the share or complaint
+  line).
+- Coordinator parity, NOVA vs the Python oracle (`Coord` /
+  `coord_verdicts` in `scripts/sa4_ref.py`): compared only on whole rounds,
+  F–J, P, K and L in `scenario_sa4_pyref.sh` (every soul line, blame codes,
+  why texts, evidence bytes, final U2, verdict counters). That covers the
+  shares close (including a soul in U1 \ U2'), the check close's
+  forwarding, verdicts 1–5 and the evidence builder. The individual
+  receipt rules of the shares, check and open states are written text for
+  text on both sides but are tested on each side separately, not
+  differentially: NOVA in `test_sa4_coord_refuse` / `_refuse2`, the oracle
+  only for the rules its `--selftest` exercises (a complaint about a soul
+  outside U2', complaints of or about a soul left out in the check phase
+  not forwarded). There is no line-by-line coordinator differential like
+  `sa4_cases.py` for souls. The oracle's ADV-state receipt is not mirrored
+  at all: it checks only "bad ADV" (wrong phase, id or a second ADV) and
+  the ADV signature; NOVA's "expected SA4_ADV", "second ADV",
+  c_pk = s_pk and low-order key checks have no oracle counterpart, so the
+  oracle is not a reference for ADV receipt.
+- `scenario_sa4_pyref.sh` (150 checks): NOVA and Python byte-identical on
+  rounds A–D, 21 refusal cases (6 new), and the v4-sa3 rounds F, G, H, I,
+  J and P with the coordinator (every soul line, blame codes, why texts,
+  evidence hashes, sums), plus K and L (F / G with a soul in U1 \ U2':
+  the evidence covers U1 and equals F's / G's); the NOVA evidence of F,
+  G, K and L is judged by `sa4_ref.py --judge`, tampered copies are
+  refused (claimed code, one-time key, `path` / `shsig` of code 2 not
+  exactly `-`, a trailing space on or an unsigned code-1 complaint line,
+  an appended line); a 1112-case soul differential (56 complaints, 82
+  openings; `bad_commit` no longer emitted).
+- `scenario_u4_secagg.sh` (`--fault`): bad-share-open, bad-share-fields
+  and bad-commit-share give the sender code 1 with the receiver kept and
+  the sum published (evidence file 0644, judged); false-complaint gives
+  the complainer code 2 (judged); bad-share-open with no-open, and
+  foreign-e, give code 3; bad-shsig with a bad share gives code 4, alone it
+  is harmless; low-epk leaves the sender out at receipt; silent-check and
+  stop-after-shares are removed at the check; v4-sa (v1) and v4-sa2 hellos
+  refused both ways.
+- `scenario_u4_evil.sh` (`secagg_evil_coord.py`): tamper-ct / tamper-epk /
+  tamper-share (receivers complain, every complaint forwarded, no OPEN
+  from an honest soul, the first complainer judged code 5), low-epk and
+  drop-share (`bad_share`, no complaint), forged complaints of five kinds
+  (no OPEN), accuse-empty, accuse-self, u2-with-accused, u2-not-sub-u2p,
+  ADV equivocation by a colluder (honest victim code 4 / 5, no evidence),
+  open-harvest (every OPEN at the colluder's x, colluder code 2, no leak).
+
 ## Full SecAgg upgrade path
 
 The reference Google SecAgg (~4-6 weeks per the published prototype)
@@ -1644,9 +1946,11 @@ adds:
    peer's mask from its own submission") works without Shamir.
 4. **Authenticated channel** — **souls are authenticated in v4**: a
    pinned Ed25519 roster, signed ADV and SIG3 transcripts, and shares
-   encrypted per pair with ChaCha20-Poly1305. Still open: signed
-   results (`FED_AGGREGATE_SUM` is unsigned), the complaint round for
-   verifiable blame (A2.4c), and TLS on the coordinator connection.
+   encrypted per pair with ChaCha20-Poly1305; since v4-sa3 (A2.4c) a
+   complaint round gives verifiable blame for bad shares (codes 1 / 2
+   with evidence). Still open: signed results (`FED_AGGREGATE_SUM` is
+   unsigned), blame for ADV equivocation and for faults after the final
+   U2 (A2.4d), and TLS on the coordinator connection.
 
 The MVP's pairwise-additive-masking module is the foundation; each
 of the four layers above sits on top of it without invalidating the

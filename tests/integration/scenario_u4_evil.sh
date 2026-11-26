@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Scenario U4 evil -- SecAgg v4 against a malicious coordinator (A2.4a;
-# protocol v4-sa2 with verifiable shares since A2.4b).
+# verifiable shares since A2.4b; protocol v4-sa3 with the complaint round
+# and blame since A2.4c).
 #
 # scripts/secagg_evil_coord.py speaks the real v4 wire to real souls (NOVA
 # chat souls via /fed_join, Python souls via scripts/sa4_ref.py --connect)
@@ -26,8 +27,33 @@
 #                the signature covers B and M): bad_sig.
 #   E.u1small E.notinu1          u1_small / not_in_u1.
 #   E.equivu1a/b U1 equivocation (chat and Python victim): no REVEAL at all.
-#   E.tamper     a share ciphertext altered in transit: bad_share.
-#   E.u2small E.notinu2 E.u2notsub   u2_small / not_in_u2 / bad_set.
+#   E.tamper E.tamperepk E.tampershare  a routed share altered in transit
+#                (ciphertext, one-time key, or replaced by the coordinator's
+#                own): the receivers complain (signed COMPLAINT, no abort),
+#                every complaint is forwarded, no honest accused opens (its
+#                leaf differs), the first complainer judged is removed with
+#                code 5 (not proof), the round completes over the others.
+#   E.lowepk E.dropshare  a low-order one-time key / a missing share in a
+#                routed batch: bad_share, no complaint.
+#   E.forge*     forged complaints (zero signature, wrong signer, another
+#                soul's leaf, an older round from --prev-log, another H1):
+#                no SA4_OPEN from an honest soul, no refusal.
+#   E.accuseempty E.accuseself  an ACCUSE without complaints / naming the
+#                receiver: bad_complaint / bad_set.
+#   E.u2acc E.u2p   a final U2 with a complained-about soul / not a subset of
+#                U2': bad_set.
+#   E.dadvrecv E.dadvsend  ADV equivocation by a colluder (simulated): the
+#                honest victim is removed unproven (code 4 / 5), no
+#                evidence. (dadvrecv re-signs the complaint over the
+#                victim's H1, so the victim opens: code 4. With only the ADV
+#                swapped, as by a network attacker, the victim cannot verify
+#                the complaint and gets code 3: sa4_ref.py --selftest and
+#                test_sa4_attack.)
+#   E.harvest    a colluder complains about every honest share: every OPEN
+#                is at the colluder's x (no honest share opened at an honest
+#                x), the colluder is proven (code 2, evidence judged), no
+#                leak.
+#   E.u2small E.notinu2 E.u2notsub   u2_small / not_in_u2 / bad_set (U2').
 #   E.fd50 E.fd10  false dropout of a Python / chat soul: the victim refuses
 #                (bad_sig3), no b-reveal about it, its s key is rebuilt but
 #                its y without pairwise masks equals its input in no word;
@@ -302,7 +328,7 @@ if stage equivu1a "$T/R5" "1 2" "3 4 5" --round 7 --attack equiv-u1 --victim 10 
 fi
 if stage equivu1b "$T/R5" "1 2" "3 4 5" --round 7 --attack equiv-u1 --victim 50 --hide 20; then
     assert_eq "$(codes "$CK")" "10=bad_sig3 20=not_in_u2 30=bad_sig3 40=bad_sig3 50=bad_sig3" "equiv-u1/py: abort codes on the wire"
-    assert_match "$(cat "$D/soul2.out")" "refused: this soul is not in U2 \\(abort code not_in_u2\\)" "equiv-u1/py: chat soul 20 (hidden from 50, left out of every U2) refused"
+    assert_match "$(cat "$D/soul2.out")" "refused: this soul is not in U2' \\(abort code not_in_u2\\)" "equiv-u1/py: chat soul 20 (hidden from 50, left out of every U2') refused"
     assert_match "$(cat "$D/py5.out")" "refused: consistency signature does not verify \\(abort code bad_sig3\\)" "equiv-u1/py: Python victim 50 refused"
     nothing_learned equiv-u1/py
 fi
@@ -310,21 +336,123 @@ fi
 # ===========================================================================
 # R2
 # ===========================================================================
+# v4-sa3: a routed line altered in transit is a complaint, not an abort.
+# tamper_checks <label>: soul 10's line from 20 and every other soul's line
+# from 10 are altered; pairs are judged complainer first, so 10 (whose
+# complaint names a line it was not routed) is removed with code 5 and the
+# complaints about 10 are then skipped.
+tamper_checks() {
+    assert_eq "$(codes "$CK")" "10=transport 20=- 30=- 40=- 50=-" "$1: no soul refuses; only the removed complainer 10 sees the connection close"
+    assert_match "$(cat "$D/soul1.out")" "fed: \\[SA4\\] complained about soul\\(s\\) 20 " "$1: chat soul 10 complains about 20"
+    assert_match "$(cat "$D/soul2.out")" "fed: \\[SA4\\] complained about soul\\(s\\) 10 " "$1: chat soul 20 complains about 10"
+    assert_match "$(cat "$D/py3.out")" "sa4_ref: complained about 10$" "$1: Python soul 30 complains about 10"
+    assert_eq "$(grep -c '^[0-9]*>S SA4_COMPLAINT ' "$D/wire.log")" "5" "$1: five complaints sent"
+    assert_eq "$(grep -c '^S>[0-9]* SA4_COMPLAINT ' "$D/wire.log")" "5" "$1: every complaint forwarded to its accused"
+    assert_eq "$(jget "$CK" open_lines)" "0" "$1: no SA4_OPEN from any soul (the leaf is not the accused's)"
+    assert_eq "$(jget "$CK" honest_opens)" "[]" "$1: no honest share opened"
+    assert_eq "$(jget "$CK" blame)" '{"10": 5}' "$1: the first complainer judged gets code 5 (not proof)"
+    assert_eq "$(jget "$CK" evidence)" "{}" "$1: no evidence"
+    assert_eq "$(jget "$CK" revealers)" "[20, 30, 40, 50]" "$1: the round completes over the other four"
+    assert_eq "$(jget "$CK" leaks)" "[]" "$1: no leak"
+    assert_eq "$(jget "$CK" control.exact)" "true" "$1: exact aggregate over the other four"
+}
 if stage tamper "$T/R5" "1 2" "3 4 5" --round 7 --attack tamper-ct; then
-    refusal tamper-ct "$(all5 bad_share)" "refused: share from soul [0-9]+ does not open \\(abort code bad_share\\)" \
-        "refused: share does not open \\(abort code bad_share\\)"
+    tamper_checks tamper-ct
+fi
+if stage tamperepk "$T/R5" "1 2" "3 4 5" --round 7 --attack tamper-epk; then
+    tamper_checks tamper-epk
+fi
+if stage tampershare "$T/R5" "1 2" "3 4 5" --round 7 --attack tamper-share; then
+    tamper_checks tamper-share
+fi
+if stage lowepk "$T/R5" "1 2" "3 4 5" --round 7 --attack low-epk; then
+    refusal low-epk "$(all5 bad_share)" "refused: share one-time key is not a valid X25519 key \\(abort code bad_share\\)" \
+        "refused: share one-time key is not a valid X25519 key \\(abort code bad_share\\)"
+    assert_eq "$(grep -c 'SA4_COMPLAINT' "$D/wire.log")" "0" "low-epk: structural, no complaint"
+fi
+if stage dropshare "$T/R5" "1 2" "3 4 5" --round 7 --attack drop-share; then
+    refusal drop-share "$(all5 bad_share)" "refused: share lines do not match U2' \\(abort code bad_share\\)" \
+        "refused: share lines do not match U2' \\(abort code bad_share\\)"
+fi
+# Forged complaints: the accused checks the leaf and the complainer's
+# signature over its own H1 before it reveals anything.
+for FG in zero-sig wrong-signer wrong-leaf old-round other-h1; do
+    # Soul 50 is a simulated colluder (signer for wrong-leaf / other-h1, and
+    # for old-round where --prev-log (round 7 of E.tamper) has no complaint
+    # about a soul).
+    FARGS=(--collude "$T/k5.priv")
+    if [ "$FG" = "old-round" ]; then FARGS+=(--prev-log "$T/tamper/wire.log"); fi
+    if stage "forge_$FG" "$T/R5" "1 2" "3 4" --round 8 --attack forge-complaint --forge "$FG" "${FARGS[@]}"; then
+        NA=$(grep -c '^S>[0-9]* SA4_ACCUSE ' "$D/wire.log")
+        assert_eq "$NA" "4" "forge $FG: a forged complaint was forwarded with ACCUSE to each honest soul"
+        assert_eq "$(grep -c '^#NOFORGE ' "$D/wire.log")" "0" "forge $FG: every forgery was built"
+        assert_eq "$(jget "$CK" open_lines)" "0" "forge $FG: no SA4_OPEN from an honest soul"
+        assert_eq "$(jget "$CK" honest_opens)" "[]" "forge $FG: no honest share opened"
+        assert_match "$(grep -c '^[0-9]*>S SA4_END 8 5 [0-9]* 0$' "$D/wire.log")" "^$NA$" "forge $FG: every accused answers END 5 0"
+        assert_match "$(codes "$CK")" '^(10=(-|transport) 20=(-|transport) 30=(-|transport) 40=(-|transport)( 50=(-|transport))?)$' "forge $FG: no soul refuses the round"
+        assert_eq "$(jget "$CK" leaks)" "[]" "forge $FG: no leak"
+        assert_match "$(jget "$CK" revealers)" '^\[[0-9]' "forge $FG: the round completes"
+    fi
+done
+if stage accuseempty "$T/R5" "1 2" "3 4 5" --round 7 --attack accuse-empty; then
+    refusal accuse-empty "$(all5 bad_complaint)" "refused: complaint lines do not match the ACCUSE set \\(abort code bad_complaint\\)" \
+        "refused: complaint lines do not match the ACCUSE set \\(abort code bad_complaint\\)"
+    assert_eq "$(jget "$CK" open_lines)" "0" "accuse-empty: no SA4_OPEN"
+fi
+if stage accuseself "$T/R5" "1 2" "3 4 5" --round 7 --attack accuse-self; then
+    refusal accuse-self "$(all5 bad_set)" "refused: ACCUSE set is not a subset of U2' without this soul \\(abort code bad_set\\)" \
+        "refused: ACCUSE set is not a subset of U2' without this soul \\(abort code bad_set\\)"
+    assert_eq "$(jget "$CK" open_lines)" "0" "accuse-self: no SA4_OPEN"
+fi
+if stage u2acc "$T/R5" "1 2" "3 4 5" --round 7 --attack u2-with-accused; then
+    assert_match "$(codes "$CK")" "^10=bad_set 20=bad_set 30=bad_set 40=bad_set 50=bad_set$" "u2-with-accused: every complainer refuses the final U2 (bad_set)"
+    assert_match "$(cat "$D/soul2.out")" "refused: U2 contains a soul whose share this soul complained about \\(abort code bad_set\\)" "u2-with-accused: chat soul 20 says why"
+    assert_match "$(cat "$D/py3.out")" "refused: U2 contains a soul whose share this soul complained about \\(abort code bad_set\\)" "u2-with-accused: Python soul 30 says why"
+    nothing_learned u2-with-accused
+    assert_eq "$(jget "$CK" open_lines)" "0" "u2-with-accused: no SA4_OPEN"
+fi
+if stage u2p "$T/R5" "1 2" "3 4 5" --round 7 --attack u2-not-sub-u2p --hide 50; then
+    refusal u2-not-sub-u2p "10=bad_set 20=bad_set 30=bad_set 40=bad_set 50=not_in_u2" \
+        "refused: U2 is not a subset of U2' \\(abort code bad_set\\)" "refused: U2 is not a subset of U2' \\(abort code bad_set\\)"
+fi
+# ADV equivocation by a colluder (soul 50 simulated by the coordinator):
+# the honest victim is removed without proof (A2.4c does not blame
+# equivocation itself), never with evidence.
+if stage dadvrecv "$T/R5" "1 2" "3 4" --round 7 --attack double-adv-recv --victim 10 --collude "$T/k5.priv"; then
+    assert_eq "$(jget "$CK" blame)" '{"10": 4}' "double-adv-recv: the honest victim 10 gets code 4 (not proof)"
+    assert_eq "$(jget "$CK" evidence)" "{}" "double-adv-recv: no evidence against the victim"
+    assert_eq "$(jget "$CK" honest_opens)" "[]" "double-adv-recv: the victim opened only to the colluder"
+    assert_eq "$(jget "$CK" leaks)" "[]" "double-adv-recv: no leak"
+fi
+if stage dadvsend "$T/R5" "1 2" "3 4" --round 7 --attack double-adv-send --victim 30 --collude "$T/k5.priv"; then
+    assert_eq "$(jget "$CK" blame)" '{"30": 5}' "double-adv-send: the honest victim 30 gets code 5 (not proof)"
+    assert_eq "$(jget "$CK" evidence)" "{}" "double-adv-send: no evidence against the victim"
+    assert_match "$(cat "$D/py3.out")" "sa4_ref: complained about 50$" "double-adv-send: the victim complained about the colluder"
+    assert_eq "$(jget "$CK" leaks)" "[]" "double-adv-send: no leak"
+fi
+# Open harvest: a colluder complains about every honest soul's valid share.
+if stage harvest "$T/R5" "1 2" "3 4" --round 7 --attack open-harvest --collude "$T/k5.priv" --evidence-dir "$T/harvest"; then
+    NO=$(jget "$CK" open_lines)
+    assert_eq "$NO" "4" "open-harvest: each honest soul opened its one-time key for the colluder"
+    assert_eq "$(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(all(o["at_colluder"] for o in d["opened"]), len(d["opened"]))' "$CK" 2>&1)" "True 4" "open-harvest: every opened share is at the colluder's x"
+    assert_eq "$(jget "$CK" honest_opens)" "[]" "open-harvest: no honest share opened at an honest x"
+    assert_eq "$(jget "$CK" blame)" '{"50": 2}' "open-harvest: the colluder is proven (code 2)"
+    assert_eq "$(jget "$CK" leaks)" "[]" "open-harvest: no leak (B, S within n_C)"
+    assert_eq "$(codes "$CK")" "10=- 20=- 30=- 40=-" "open-harvest: the honest souls complete"
+    EVF=$(ls "$T/harvest"/sa4_evidence_r7_50.txt 2>/dev/null)
+    assert_eq "$(CE_SECAGG_ROSTER="$T/R5" python3 -I "$REPO_ROOT/scripts/sa4_ref.py" --judge "$EVF" 2>&1)" "verdict: complainer 50" "open-harvest: the evidence convicts the colluder"
 fi
 if stage u2small "$T/R5" "1 2" "3 4 5" --round 7 --attack u2-small; then
-    refusal u2-small "$(all5 u2_small)" "refused: \\|U2\\| below the threshold \\(abort code u2_small\\)" \
-        "refused: \\|U2\\| below the threshold \\(abort code u2_small\\)"
+    refusal u2-small "$(all5 u2_small)" "refused: \\|U2'\\| below the threshold \\(abort code u2_small\\)" \
+        "refused: \\|U2'\\| below the threshold \\(abort code u2_small\\)"
 fi
 if stage notinu2 "$T/R5" "1 2" "3 4 5" --round 7 --attack not-in-u2; then
-    refusal not-in-u2 "$(all5 not_in_u2)" "refused: this soul is not in U2 \\(abort code not_in_u2\\)" \
-        "refused: this soul is not in U2 \\(abort code not_in_u2\\)"
+    refusal not-in-u2 "$(all5 not_in_u2)" "refused: this soul is not in U2' \\(abort code not_in_u2\\)" \
+        "refused: this soul is not in U2' \\(abort code not_in_u2\\)"
 fi
 if stage u2notsub "$T/R5" "1 2" "3 4 5" --round 7 --attack u2-notsub --hide 50; then
     refusal u2-notsub "10=bad_set 20=bad_set 30=bad_set 40=bad_set 50=not_in_u1" \
-        "refused: U2 is not a subset of U1 \\(abort code bad_set\\)" "refused: U2 is not a subset of U1 \\(abort code bad_set\\)"
+        "refused: U2' is not a subset of U1 \\(abort code bad_set\\)" "refused: U2' is not a subset of U1 \\(abort code bad_set\\)"
 fi
 
 # ===========================================================================
@@ -424,7 +552,7 @@ fi
 # Transport: out of phase, early result, long line, NUL, hang, trickle.
 # ===========================================================================
 if stage oop "$T/R5" "1 2" "3 4 5" --round 7 --attack out-of-phase; then
-    refusal out-of-phase "$(all5 unexpected)" "refused: unexpected line while collecting ADV \\(abort code unexpected\\)" \
+    refusal out-of-phase "$(all5 unexpected)" "refused: unexpected line in state 1 \\(abort code unexpected\\)" \
         "refused: unexpected line in state 1 \\(abort code unexpected\\)"
 fi
 if stage early "$T/R5" "1 2" "3 4 5" --round 7 --attack early-result; then
