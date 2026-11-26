@@ -1722,7 +1722,7 @@ coordinator.
 | 0 | not blamed: dropout, structural leave-out, abort | – | – |
 | 1 | sent a share that fails its receiver's check (open, fields, commit ...), shown with its revealed key | sender | yes (evidence) |
 | 2 | false complaint: the share opens and matches | complainer | yes (evidence) |
-| 3 | did not answer a valid complaint with a key matching its e_pk | accused | no |
+| 3 | no opening matching its e_pk for a complaint the coordinator found valid: a silent accused, a lost END 5, or a complaint it could not verify (its H1 differs, e.g. ADV equivocation) | accused | no |
 | 4 | its share signature does not verify over the lines the coordinator received | sender | no (sender or its uplink) |
 | 5 | complaint names a share it was not routed, or does not verify | complainer | no (complainer or its downlink) |
 
@@ -1732,6 +1732,14 @@ complaint without the sender's root, and computes a root only for a
 code-1/4 decision. Each judged pair removes one soul; judging stops once
 |U2'| − t + 1 souls are gone (the round is lost). Codes 3–5 mean "out for
 this round", like an abort; operators must not treat them as evidence.
+Code 3 in particular does not mean the accused chose to stay silent: its
+why text ("did not open its share to soul <v> with its one-time key (not
+proven)", identical in NOVA and Python) is also what an honest accused
+gets when it could not verify the complaint because its view of H1
+differs from the coordinator's (ADV equivocation by the complainer, shown
+to it by a network attacker or the coordinator: "not covered" item 5), or
+when its OPEN arrived without END 5 (openings count only once END 5
+arrived).
 
 **Evidence and judge.**
 - For codes 1 and 2 the coordinator holds an evidence text
@@ -1746,12 +1754,24 @@ this round", like an abort; operators must not treat them as evidence.
   `CE_SECAGG_EVIDENCE_DIR/sa4_evidence_r<r>_<id>.txt` (O_CREAT|O_EXCL, mode
   0644, never overwritten); unset, it logs that the evidence was not kept.
 - `scripts/sa4_ref.py --judge FILE [--roster R]` checks a file against the
-  roster alone: format, fingerprint, the key lines against the roster, H1,
-  X25519_base(e) = e_pk, the content check, then the sender's root
-  signature (code 1) or the complainer's signature (code 2). It prints
+  roster alone: the exact lines and keys of the format (canonical hex and
+  decimal, no CR, no trailing space, nothing after `open`; code 2 carries
+  exactly `path -` and `shsig -`), the fingerprint, the key lines against
+  the roster, H1, X25519_base(e) = e_pk, the content check, then the
+  sender's root signature (code 1); for both codes the `complaint` line
+  must be the canonical SA4_COMPLAINT of the complainer about the sender
+  for that round, naming the recomputed leaf, with a complainer signature
+  over H1 that verifies (for code 1 the coordinator checked the same line
+  before judging, so it is authenticated too, not free text). It prints
   `verdict: sender <u>` / `verdict: complainer <v>` (exit 0) or
   `invalid: <why>` (exit 2). ADV signatures are not needed: H1 is bound by
   the signer whose guilt is shown.
+- Evidence files are not unique. X25519 clamps its scalar, so bits 0–2 of
+  byte 0 and bits 6–7 of byte 31 of the `open` key do not change
+  X25519_base(e) or the sealing key: 32 encodings of one opening judge
+  alike, and anyone relaying a file can change those bits. The judge cannot
+  bind them without the sender's eseed. The verdict is unique; a file's
+  bytes or hash are not an identifier of the case.
 - Evidence holds one opened share: the corrupt sender's (code 1), or an
   honest dealer's share at the corrupt complainer's x, which the
   complainer already holds (code 2). Give it to roster members and
@@ -1760,9 +1780,13 @@ this round", like an abort; operators must not treat them as evidence.
 **What it does and does not cover.**
 - Covered: a sender of a share that does not open, has wrong fields or
   misses its commitment is removed (code 1, 3 or 4) and its honest
-  receiver stays; a false complainer is removed at its first judged
-  complaint (code 2 or 5); the round completes while |U2| ≥ t; no
-  transferable evidence can be made against an honest soul; a malicious
+  receiver stays; a false complainer is removed (code 2 or 5) at its first
+  judged complaint that the accused answers with an opening; if the
+  accused does not open (silent, its END 5 lost, or colluding with the
+  liar), the accused is removed instead (code 3) and the complainer stays
+  for that pair (each judged pair still removes one soul); the round
+  completes while |U2| ≥ t; no transferable evidence can be made against
+  an honest soul; a malicious
   coordinator cannot open an honest share at an honest x (forged
   complaints get no OPEN).
 - Not covered (SPEC A2.4c section 2):
@@ -1783,7 +1807,14 @@ this round", like an abort; operators must not treat them as evidence.
      accountable; `FED_AGGREGATE_SUM` stays unsigned.
   5. ADV equivocation is not blamed: two valid ADVs of one soul are proof,
      but they are not collected; the affected honest souls are removed
-     unproven (codes 4 / 5).
+     unproven. A1 (a corrupt receiver's second ADV shown to an honest
+     sender): with an honest coordinator and a network attacker that swaps
+     only the ADV, the sender cannot verify the complaint (signed over the
+     coordinator's H1, not its own), sends no OPEN and gets code 3; if the
+     complaint it is shown is also re-signed over its own H1 (a colluding
+     coordinator, or an attacker on its downlink with the complainer's
+     help) it opens and gets code 4. A2 (a corrupt sender's second ADV
+     shown to an honest receiver): the receiver gets code 5.
   6. Faults after the final SET 2 are as in v4-sa2: wrong REVEAL shares
      (robust rebuild), a wrong y (indistinguishable from a wrong input),
      SIG3 problems (U4 shrinks).
@@ -1818,28 +1849,66 @@ this round", like an abort; operators must not treat them as evidence.
 - Unit (NOVA; checks per test): `test_sa4_wire` (249), `test_sa_crypto`
   (80: `sac_eph_key` K1/K2/K9), `test_sa4_commit` (157), new
   `test_sa4_blame_kat` (145: the five low-order points, canonical
-  encodings, share root K4), new `test_sa4_soul_check` (326: one complaint
+  encodings, share root K4), new `test_sa4_soul_check` (334: one complaint
   per content kind, structural refusals, OPEN gate against forged
-  complaints, ACCUSE / final SET 2 refusals, wipes), new
-  `test_sa4_coord_blame` (149, N = 5 and 10: codes 1–5 with exact whys,
-  early stop, counters, evidence), `test_sa4_coord5` (19: one bad share
-  now gives the sender code 1 and the round completes),
-  `test_sa4_attack` (74: forged complaints, privacy, A1 → 4, A2 → 5,
-  A3 → liar code 2), `test_sa4_wipe_hash` (39: no raw copy of eseed or
-  any e_uv), and the updated soul / coordinator refusal tests.
+  complaints, ACCUSE / final SET 2 refusals incl. a validly signed
+  complaint from a soul in U1 \ U2', wipes), new
+  `test_sa4_coord_blame` (176, N = 5 and 10: codes 1–5 with exact whys, a
+  valid OPEN without END 5 → code 3 with no evidence, early stop,
+  counters, evidence; rounds K / L with U1 ≠ U2' whose evidence must equal
+  the F / G vectors), `test_sa4_coord5` (19: one bad share now gives the
+  sender code 1 and the round completes), `test_sa4_attack` (80: forged
+  complaints, privacy, A1 → 4 with the complaint re-signed and → 3 with
+  only the ADV swapped by a network attacker, A2 → 5, A3 → liar code 2),
+  `test_sa4_wipe_hash` (39: no raw copy of eseed or any e_uv), and the
+  updated soul / coordinator refusal tests (`test_sa4_coord_refuse`, now
+  206: the 8.4 receipt rules, the check close forwarding nothing from a
+  complainer or about an accused left out before it, sa4c_keep /
+  sa4c_expect in state 9 with left-out souls).
 - Mutation checks: 28 weakened checks in NOVA and 28 in the Python
   reference (accused lh and signature checks, H1 in both transcripts,
   (e_pk, ct) in sleaf, the judge's X25519_base(e) = e_pk, the
   coordinator's lh and signature checks, the verdict order, early stop,
   epk_ok, U2 ∩ CMPL, U2 ⊆ U2', eseed as the last draw, the wipes, each
-  low-order entry, ...) each made a test fail.
-- `scenario_sa4_pyref.sh` (123 checks): NOVA and Python byte-identical on
+  low-order entry, ...) each made a test fail. An adversarial review then
+  found mutants no test killed; tests were added for each and each now
+  fails a test (NOVA: an OPEN counted without END 5, the check close
+  forwarding complaints of a left-out complainer or about a left-out
+  accused, sa4c_keep in state 9 returning all of U2', evidence built over
+  U2' instead of U1, ACCUSE accepted from a soul in U1 \ U2'; Python: the
+  same evidence and ACCUSE mutants, the oracle's "complaint about a soul
+  outside U2'" receipt rule removed, its forwarding of complaints about a
+  left-out soul, and the judge without the `-` checks of code 2, without
+  the code-1 complaint line or its signature, without the "nothing after
+  `open`" check, or without the round check of the share or complaint
+  line).
+- Coordinator parity, NOVA vs the Python oracle (`Coord` /
+  `coord_verdicts` in `scripts/sa4_ref.py`): compared only on whole rounds,
+  F–J, P, K and L in `scenario_sa4_pyref.sh` (every soul line, blame codes,
+  why texts, evidence bytes, final U2, verdict counters). That covers the
+  shares close (including a soul in U1 \ U2'), the check close's
+  forwarding, verdicts 1–5 and the evidence builder. The individual
+  receipt rules of the shares, check and open states are written text for
+  text on both sides but are tested on each side separately, not
+  differentially: NOVA in `test_sa4_coord_refuse` / `_refuse2`, the oracle
+  only for the rules its `--selftest` exercises (a complaint about a soul
+  outside U2', complaints of or about a soul left out in the check phase
+  not forwarded). There is no line-by-line coordinator differential like
+  `sa4_cases.py` for souls. The oracle's ADV-state receipt is not mirrored
+  at all: it checks only "bad ADV" (wrong phase, id or a second ADV) and
+  the ADV signature; NOVA's "expected SA4_ADV", "second ADV",
+  c_pk = s_pk and low-order key checks have no oracle counterpart, so the
+  oracle is not a reference for ADV receipt.
+- `scenario_sa4_pyref.sh` (150 checks): NOVA and Python byte-identical on
   rounds A–D, 21 refusal cases (6 new), and the v4-sa3 rounds F, G, H, I,
   J and P with the coordinator (every soul line, blame codes, why texts,
-  evidence hashes, sums); the NOVA evidence of F and G is judged by
-  `sa4_ref.py --judge`, tampered copies are refused; a 1111-case soul
-  differential (56 complaints, 82 openings; `bad_commit` no longer
-  emitted).
+  evidence hashes, sums), plus K and L (F / G with a soul in U1 \ U2':
+  the evidence covers U1 and equals F's / G's); the NOVA evidence of F,
+  G, K and L is judged by `sa4_ref.py --judge`, tampered copies are
+  refused (claimed code, one-time key, `path` / `shsig` of code 2 not
+  exactly `-`, a trailing space on or an unsigned code-1 complaint line,
+  an appended line); a 1112-case soul differential (56 complaints, 82
+  openings; `bad_commit` no longer emitted).
 - `scenario_u4_secagg.sh` (`--fault`): bad-share-open, bad-share-fields
   and bad-commit-share give the sender code 1 with the receiver kept and
   the sum published (evidence file 0644, judged); false-complaint gives

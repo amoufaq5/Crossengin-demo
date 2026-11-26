@@ -44,7 +44,11 @@
 #                U2': bad_set.
 #   E.dadvrecv E.dadvsend  ADV equivocation by a colluder (simulated): the
 #                honest victim is removed unproven (code 4 / 5), no
-#                evidence.
+#                evidence. (dadvrecv re-signs the complaint over the
+#                victim's H1, so the victim opens: code 4. With only the ADV
+#                swapped, as by a network attacker, the victim cannot verify
+#                the complaint and gets code 3: sa4_ref.py --selftest and
+#                test_sa4_attack.)
 #   E.harvest    a colluder complains about every honest share: every OPEN
 #                is at the colluder's x (no honest share opened at an honest
 #                x), the colluder is proven (code 2, evidence judged), no

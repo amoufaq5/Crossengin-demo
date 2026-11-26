@@ -19,7 +19,7 @@ bytes, and its PRG is slow for long vectors.
     sa4_ref.py --dump X                print this implementation's transcript
                                        of a tests/sa4_harness.nova scenario:
                                        A..D (souls only), E (refusals),
-                                       F G H I J P (souls + coordinator:
+                                       F G H I J P K L (souls + coordinator:
                                        ADV / OUT lines, BLAME and EVIDENCE)
     sa4_ref.py --harness X DUMPFILE    compare it with the NOVA transcript
                                        (tests/tools/sa4_dump.nova output)
@@ -83,7 +83,8 @@ evidence text for codes 1 / 2 (judge_evidence).
 Scenarios: A N=3 honest; B N=5, one soul in U2 but not U3; C N=4, one soul
 drops after its ADV; D N=5, one soul in U3 but not U4; E 21 refusals;
 F..J, P blame rounds (N=5, r=13): F code 1, G code 2, H code 3, I code 5,
-J code 4, P plain.
+J code 4, P plain; K, L as F, G with 70000 in U1 but not in U2' (the
+evidence covers U1; the round then cancels).
 """
 import hashlib
 import hmac
@@ -1666,7 +1667,16 @@ def coord_verdicts(c):
 
 def judge_evidence(ro, text):
     """Standalone judge (section 9): roster + evidence text ->
-    ("sender", u) | ("complainer", v) | ("invalid", why)."""
+    ("sender", u) | ("complainer", v) | ("invalid", why).
+
+    Strict: the exact 8.8 lines and keys, canonical hex / decimal, no extra
+    line; code 2 must carry exactly `path -` and `shsig -`; the complaint
+    line (both codes) must be the canonical SA4_COMPLAINT of v about u for
+    round r whose leaf is the recomputed one and whose signature verifies.
+    One malleability remains and cannot be removed: X25519 clamps the
+    scalar, so bits 0-2 of byte 0 and bits 6-7 of byte 31 of the `open` key
+    are not bound by X25519_base(e) == e_pk (32 encodings of one opening
+    judge alike). Evidence files are therefore not unique; the verdict is."""
     if not text.endswith("\n"):
         return ("invalid", "format")
     L = text[:-1].split("\n")
@@ -1709,7 +1719,7 @@ def judge_evidence(ro, text):
     h1 = advset_hash(bm, keys)
     kt = {ro.entries[x - 1][0]: k for x, k in zip(u1, keys)}
     sh, e = parse(shl), _unhex(e_s, 32)
-    if sh is None or sh[0] != EV_SHARE or e is None:
+    if sh is None or sh[0] != EV_SHARE or fmt_share(*sh[1:]) != shl or e is None:
         return ("invalid", "format")
     u, v, d = sh[2], sh[3], depth(ro.n)
     ux, vx = ro.x(u), ro.x(v)
@@ -1731,12 +1741,19 @@ def judge_evidence(ro, text):
             return ("invalid", "the sender did not sign this share")
         verdict = ("sender", u)
     else:
-        cp = parse(cpl)
-        if cp is None or cp[0] != EV_COMPLAINT or cp[1] != r or (cp[2], cp[3]) != (v, u) or cp[4] != lh:
-            return ("invalid", "complaint does not name this share")
-        if not ed25519_verify(complaint_transcript(fp, r, v, u, h1, lh), cp[5], ro.entries[vx - 1][2]):
-            return ("invalid", "the complainer did not sign this complaint")
+        if path_s != "-" or sig_s != "-":           # 8.8: code 2 carries exactly "path -" / "shsig -"
+            return ("invalid", "format")
         verdict = ("complainer", v)
+    # The complaint line, for both verdicts: the canonical SA4_COMPLAINT of
+    # v about u in round r naming this share, signed by v over H1 (for
+    # code 1 the coordinator verified the same line before judging, so no
+    # evidence file it writes carries anything else).
+    cp = parse(cpl)
+    if cp is None or cp[0] != EV_COMPLAINT or fmt_complaint(*cp[1:]) != cpl or cp[1] != r or \
+            (cp[2], cp[3]) != (v, u) or cp[4] != lh:
+        return ("invalid", "complaint does not name this share")
+    if not ed25519_verify(complaint_transcript(fp, r, v, u, h1, lh), cp[5], ro.entries[vx - 1][2]):
+        return ("invalid", "the complainer did not sign this complaint")
     if (code == 1) != (verdict[0] == "sender"):
         return ("invalid", "claimed code differs from the verdict")
     return verdict
@@ -2192,6 +2209,12 @@ def _round_i_tamper(ph, msgs):
              else l) for to, l in msgs]
 
 
+def _round_kl_tamper(ph, msgs):
+    """Rounds K, L: nothing reaches 70000 after its ADV (in U1, left out of
+    U2' at the shares close: "share batch incomplete")."""
+    return [(to, l) for to, l in msgs if to != 70000]
+
+
 H_ROUNDS = {
     "F": ({5: {1: "garbage"}}, None),                       # 4294967295 sends 7 garbage: code 1
     "G": ({3: {"false": {1}}}, None),                       # 65536 complains falsely about 7: code 2
@@ -2199,6 +2222,9 @@ H_ROUNDS = {
     "I": ({}, _round_i_tamper),                             # downlink tamper: 7 code 5
     "J": ({5: {1: "garbage", "badsig": 1}}, None),          # as F plus bad SHSIG: code 4
     "P": ({}, None),                                        # plain
+    # U1 != U2' (70000 silent after its ADV): the evidence covers U1
+    "K": ({5: {1: "garbage"}}, _round_kl_tamper),           # as F: code 1, then |U2| 3 < t
+    "L": ({3: {"false": {1}}}, _round_kl_tamper),           # as G: code 2, then |U2| 3 < t
 }
 
 
@@ -2842,8 +2868,10 @@ def blame_selftest():
     """Rounds F-J / P (section 15, verbatim), the judge, and the prototype's
     oracle scenarios incl. the mutants the spec lists (each must be seen)."""
     k = 0
+    evid = {}
     for name, (lines, whys) in SA3_ROUNDS.items():
         net = h_round(name)
+        evid[name] = dict(net.C.evidence)
         got = [l for _, l in net.all_lines]
         k += _chk(all(l in got for l in lines), "round %s lines" % name)
         k += _chk({i: net.C.why(i) for i in whys} == whys and set(net.C.codes()) == set(whys), "round %s whys" % name)
@@ -2852,17 +2880,50 @@ def blame_selftest():
         for who, text in net.C.evidence.items():
             want = ("sender", who) if net.C.codes()[who] == 1 else ("complainer", who)
             k += _chk(judge_evidence(net.ro, text) == want, "round %s judge" % name)
-            # negative: every tampered evidence is invalid
+            # negative: every tampered evidence is invalid -- every line
+            # (header, round, sender, complainer, u1, the '-' fields of
+            # code 2, the complaint of code 1 ...), each with its last
+            # character changed and with a trailing space
             L = text.split("\n")
             for i, ln in enumerate(L[:-1]):
-                # (code 1 needs no complaint: the sender's own signature is the proof)
-                if ln.startswith(("code ", "fp ", "share ", "open ", "path ", "shsig ", "complaint ", "key ")) \
-                        and not ln.endswith(" -") and not (want[0] == "sender" and ln.startswith("complaint ")):
-                    t2 = "\n".join(L[:i] + [_flip_last_hex(ln) if not ln.startswith("code ")
-                                            else "code %d" % (3 - int(ln[5:]))] + L[i + 1:])
-                    k += _chk(judge_evidence(net.ro, t2)[0] == "invalid", "round %s tampered %s" % (name, ln[:8]))
+                for t1 in ((_flip_last_hex(ln) if not ln.startswith("code ") else "code %d" % (3 - int(ln[5:]))),
+                           ln + " "):
+                    t2 = "\n".join(L[:i] + [t1] + L[i + 1:])
+                    k += _chk(judge_evidence(net.ro, t2)[0] == "invalid", "round %s tampered %r" % (name, t1[:12]))
+            # the share and complaint lines must carry the evidence's round
+            # (no signature covers their round token)
+            for pfx in ("share SA4_SHARE ", "complaint SA4_COMPLAINT "):
+                t2 = "\n".join(l.replace(pfx + "%d " % net.C.r, pfx + "%d " % (net.C.r + 1), 1) for l in L)
+                k += _chk(t2 != text and judge_evidence(net.ro, t2)[0] == "invalid",
+                          "round %s: %s line of another round" % (name, pfx.split(" ")[0]))
+            for extra in ("x\n", "\n", "open " + "00" * 32 + "\n"):
+                k += _chk(judge_evidence(net.ro, text + extra)[0] == "invalid", "round %s: appended line" % name)
+            if want[0] == "sender":
+                for key in ("path ", "shsig "):
+                    t2 = "\n".join(("%s-" % key) if l.startswith(key) else l for l in L)
+                    k += _chk(judge_evidence(net.ro, t2)[0] == "invalid", "round %s: code 1 with %s-" % (name, key))
+            # the one known malleability: the X25519 clamp bits of `open`
+            # are not bound (SECAGG_AUDIT A2.4c, "Evidence and judge")
+            for bi, bit in ((0, 1), (0, 4), (31, 0x40), (31, 0x80)):
+                t2 = "\n".join(l if not l.startswith("open ") else "open " + bytes(
+                    b ^ (bit if j == bi else 0) for j, b in enumerate(bytes.fromhex(l[5:]))).hex() for l in L)
+                k += _chk(judge_evidence(net.ro, t2) == want, "round %s: open clamp bit %d/%#x not bound" % (name, bi, bit))
             k += _chk(judge_evidence(net.ro, text[:-1])[0] == "invalid", "no final newline")
             k += _chk(judge_evidence(h_roster(4), text)[0] == "invalid", "other roster")
+    # U1 != U2' (rounds K, L: 70000 sent its ADV, then nothing; left out of
+    # U2' at the shares close). The evidence covers U1 -- the key lines and
+    # H1 the signer used -- so it is byte-identical to rounds F / G (an
+    # evidence builder over U2' would write another H1: invalid).
+    for name, twin, want in (("K", "F", {4294967295: 1}), ("L", "G", {65536: 2})):
+        net = h_round(name)
+        C = net.C
+        k += _chk(C.u1 == [1, 2, 3, 4, 5] and C.u2p == [1, 2, 3, 5] and C.why(70000) == "share batch incomplete" and
+                  net.codes() == want and C.st == C_CANCELLED and C.cancel == "|U2| 3 below t" and not net.refused,
+                  "round %s: U1 != U2', codes %s" % (name, net.codes()))
+        k += _chk(C.evidence == evid[twin], "round %s: evidence identical to round %s" % (name, twin))
+        for who, text in C.evidence.items():
+            k += _chk(judge_evidence(net.ro, text) == (("sender", who) if want[who] == 1 else ("complainer", who)),
+                      "round %s judge" % name)
     ro, seeds = o_roster(5)
 
     def case(faults=None, mut=None, n=5, names=None):
@@ -2885,6 +2946,72 @@ def blame_selftest():
     k += _chk(net.codes() == {40: 2} and net.C.counters()[:2] == [1, 3], "complain-all: judged once")
     k += _chk(case({1: {3: "garbage", "silent": 1}}).codes() == {10: 3}, "silent accused: code 3")
     k += _chk(case({1: {3: "garbage", "badsig": 1}}).codes() == {10: 4}, "bad SHSIG: code 4")
+    # the false-complainer guarantee needs an answer: if the accused does
+    # not open, the accused is removed (code 3) and the liar stays
+    net = case({4: {"false": {1}}, 1: {"silent": 1}})
+    k += _chk(net.codes() == {10: 3} and net.C.u3 == [2, 3, 4, 5] and net.result() == net.expected(),
+              "false complaint, silent accused: accused code 3, liar stays")
+    # U1 != U2' at N = 10 (x10's END 1 lost on the uplink) with a code-1 and
+    # a code-2 verdict: both evidence files cover U1 and are judged
+    net = Net(*o_roster(10), 5, 6, {1: {4: "garbage"}, 6: {"false": {3}}})
+    net.up = lambda fid, l: "SA4_END 5 1 100 x" if fid == 100 and l.startswith("SA4_END 5 1 ") else l
+    net.run()
+    C = net.C
+    k += _chk(C.u1 == list(range(1, 11)) and C.u2p == list(range(1, 10)) and net.codes() == {10: 1, 60: 2} and
+              C.st == C_READY and net.result() == net.expected(), "U1 != U2' (N = 10): codes %s" % net.codes())
+    k += _chk(judge_evidence(net.ro, C.evidence[10]) == ("sender", 10) and
+              judge_evidence(net.ro, C.evidence[60]) == ("complainer", 60) and
+              all(("u1 " + bitmap(C.u1).hex() + "\n") in t and t.count("\nkey ") == 10 for t in C.evidence.values()),
+              "U1 != U2' (N = 10): evidence over U1, judged")
+    # A1 with an honest coordinator: corrupt receiver 30 signs a second ADV
+    # (other c key) and a network attacker shows it to honest sender 10
+    # only. 30's complaint verifies over the coordinator's H1, not 10's, so
+    # 10 cannot verify it, sends no OPEN, and is removed with code 3.
+    net = Net(ro, seeds, 5, 6)
+    adv_b = {}
+
+    def a1_tamper(ph, msgs):
+        out = []
+        for to, l in msgs:
+            if ph == C_ADV and l.startswith("SA4_ADV 5 30 "):
+                if "line" not in adv_b:
+                    q = parse(l)
+                    cb = x25519_base(sha256(b"second c key"))
+                    g = ed25519_sign(adv_transcript(ro.fp, 5, 30, 6, h_layout(), cb, q[4], q[6], q[7]), seeds[2],
+                                     ro.entries[2][2])
+                    adv_b["line"] = fmt_adv(5, 30, cb, q[4], g, q[6], q[7])
+                if to == 10:
+                    l = adv_b["line"]
+            out.append((to, l))
+        return out
+    net.tamper = a1_tamper
+    net.run()
+    k += _chk(net.codes() == {10: 3} and net.C.why(10) == "did not open its share to soul 30 with its one-time key "
+              "(not proven)" and not net.opens() and not net.C.evidence and not net.refused and net.C.st == C_READY,
+              "A1, honest coordinator + network attacker: honest sender code 3, no OPEN, no evidence")
+    # coordinator receipt and check close (8.4 / 8.5), oracle side:
+    # a complaint about a soul outside U2' is refused with the 8.4 why
+    net = Net(ro, seeds, 5, 6)
+    cpl50 = fmt_complaint(5, 10, 50, bytes(32), bytes(64))
+    net.up = lambda fid, l: ("SA4_END 5 1 50 x" if fid == 50 and l.startswith("SA4_END 5 1 ") else
+                             cpl50 if fid == 10 and l.startswith("SA4_END 5 4 ") else l)
+    net.run(stop_after=C_SHARES)
+    k += _chk(net.C.u2p == [1, 2, 3, 4] and net.C.why(10) == "complaint about a soul outside U2'" and
+              net.C.P[1]["bad"] and not net.C.P[1]["comp"], "oracle: complaint about a soul outside U2' refused")
+    # complaints about a soul left out in the check phase are not
+    # forwarded; neither are those of a complainer left out after it
+    # complained: no ACCUSE, no open phase, no verdict crypto
+    for nm, bad_id in (("accused", 10), ("complainer", 30)):
+        net = Net(ro, seeds, 5, 6, {1: {3: "garbage"}})
+        seen = []
+        net.tamper = lambda ph, msgs: (seen.extend((ph, to, l) for to, l in msgs), msgs)[1]
+        net.up = lambda fid, l, b=bad_id: "SA4_END 5 4 %d x" % b if fid == b and l.startswith("SA4_END 5 4 ") else l
+        net.run()
+        k += _chk(net.C.why(bad_id) == "malformed line" and net.C.accused == {} and net.codes() == {} and
+                  not any(l.startswith(("SA4_ACCUSE ", "SA4_COMPLAINT ")) for _, _, l in seen) and
+                  net.C.counters() == [0, 0, 0, 0] and bad_id not in [net.C.I(x) for x in net.C.u2] and
+                  net.C.st == C_READY and net.result() == net.expected(),
+                  "oracle: left-out %s -> complaint not forwarded" % nm)
     net = case({1: {"badsig": 1}})
     k += _chk(net.codes() == {} and net.C.u3 == [1, 2, 3, 4, 5], "bad SHSIG alone harmless")
     net = case({1: {3: "lowepk"}})

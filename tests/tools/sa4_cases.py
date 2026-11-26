@@ -505,6 +505,11 @@ def gen_accuse():
     case("acc_about_other", 4, 0, 5, 4, pre + [Q.complaint(4, 2), acc4])
     case("acc_from_outside", 4, 0, 5, 4, pre + [Q.complaint(3, 1), acc4])
     case("acc_from_unknown", 4, 0, 5, 4, pre + [c4.replace("SA4_COMPLAINT 5 70000 ", "SA4_COMPLAINT 5 70001 "), acc4])
+    # a validly signed complaint from a soul in U1 but not in U2' (x4 sent
+    # its shares, then was left out at the shares close): ACCUSE naming it
+    # is refused (cx must be a subset of U2' without this soul), no OPEN
+    Qo = H(4, 5, 4, [1, 2, 3, 4], [1, 2, 3], [1, 2, 3], [1, 2, 3], U2p=[1, 2, 3])
+    case("acc_from_u1_not_u2p", 4, 0, 5, 4, Qo.upto(1, 2) + [Qo.complaint(4, 1), acc4])
     case("acc_two_from_one", 4, 0, 5, 4, pre + [c4, c4, R.fmt_accuse(5, R.bitmap([3, 4]))])
     case("acc_beyond_n", 4, 0, 5, 4, pre + [c4] * 5)
     case("acc_twice", 4, 0, 5, 4, pre + [c4, acc4, acc4])
@@ -735,7 +740,8 @@ EXPECT = {
     "acc_forged_v2_domain": "open:0>done", "acc_forged_signed_about_other": "open:0>done",
     "acc_bits_above_n": "bad_set", "acc_empty": "bad_set", "acc_self": "bad_set", "acc_self_and_other": "bad_set",
     "acc_no_lines": "bad_complaint", "acc_too_many_lines": "bad_complaint", "acc_about_other": "bad_complaint",
-    "acc_from_outside": "bad_complaint", "acc_from_unknown": "bad_complaint", "acc_two_from_one": "bad_complaint",
+    "acc_from_outside": "bad_complaint", "acc_from_unknown": "bad_complaint",
+    "acc_from_u1_not_u2p": "bad_set", "acc_two_from_one": "bad_complaint",
     "acc_beyond_n": "bad_complaint", "acc_twice": "open:1>unexpected", "acc_complaints_then_set2": "bad_complaint",
     "acc_wrong_round": "bad_round", "acc_complaint_wrong_round": "bad_round", "acc_complaint_upper": "bad_line",
     "acc_complaint_5tok": "bad_line", "acc_complaint_7tok": "bad_line", "acc_complaint_lh63": "bad_line",

@@ -24,15 +24,20 @@
 #        COMPLAINT, OPEN, END 4/5, Y, SIG3, REVEAL), the blame codes and why
 #        texts, the evidence texts (length and SHA-256) and the sum must be
 #        identical; the NOVA evidence files of F and G are judged by
-#        sa4_ref.py --judge (sender / complainer), a tampered copy is
-#        refused.
+#        sa4_ref.py --judge (sender / complainer), tampered copies are
+#        refused (claimed code, one-time key, `path -` / `shsig -` of code
+#        2, the code-1 complaint line, an appended line).
+#     K L  F / G with 70000 silent after its ADV (in U1, not in U2'; the
+#        round then cancels, |U2| 3 < t): the evidence covers U1, so it is
+#        byte-identical to F / G, NOVA and Python agree, and the judge
+#        accepts the NOVA files.
 #   Every ADV/SHARE/Y/SIG3/REVEAL line carries a signature, ciphertext,
 #   masked words or a share, so a match pins the KDFs, AEAD framing, Shamir
 #   layout, PRG, mask signs, transcripts, share commitments (B_u, Merkle
 #   root, authentication paths, reveal proofs), one-time keys, share roots
 #   and reveal policy; E compares abort lines. A tampered transcript must be
 #   reported as a difference (negative control).
-#   Then a differential run: tests/tools/sa4_cases.py builds 1111 cases
+#   Then a differential run: tests/tools/sa4_cases.py builds 1112 cases
 #   (honest rounds perturbed in every phase: every abort code, forged shares
 #   and signatures, shares or paths that do not match the dealer's
 #   commitment (v4-sa3: a signed COMPLAINT, not an abort), one-time keys
@@ -71,7 +76,7 @@ assert_match "$OUT" 'selftest: OK' "self-test reports OK"
 "$NOVA" build "$REPO_ROOT/tests/tools/sa4_dump.nova" -o "$WORK/dump" >"$WORK/build.log" 2>&1
 assert_eq "$?" "0" "transcript dumper builds"
 
-for X in A B C D E F G H I J P; do
+for X in A B C D E F G H I J P K L; do
     SA4DUMP=$X SA4EVDIR="$WORK" "$WORK/dump" > "$WORK/nova_$X.txt" 2>&1
     assert_eq "$?" "0" "NOVA scenario $X runs"
     case $X in
@@ -82,6 +87,7 @@ for X in A B C D E F G H I J P; do
     case $X in
         A|B|C|D) assert_match "$(head -3 "$WORK/nova_$X.txt")" "#$X ok=1 sum_ok=1" "NOVA scenario $X: round completes, sum correct" ;;
         F|G|H|I|J|P) assert_match "$(head -1 "$WORK/nova_$X.txt")" "^#$X ok=1 sum_ok=1 " "NOVA scenario $X: round completes with the coordinator, sum correct" ;;
+        K|L) assert_match "$(head -1 "$WORK/nova_$X.txt")" "^#$X ok=0 sum_ok=0 state=7 .* err=cancelled: [|]U2[|] 3 below t$" "NOVA scenario $X: U1 != U2', one removal, then |U2| 3 < t cancels" ;;
     esac
     RES=$(python3 -I "$REF" --harness $X "$WORK/nova_$X.txt" 2>&1)
     assert_eq "$?" "0" "scenario $X: Python and NOVA lines identical"
@@ -105,7 +111,7 @@ for X in A B C D E F G H I J P; do
         *) assert_eq "$(grep -c -E '^(ADV|OUT) ' "$WORK/py_$X.txt")" "$N" "scenario $X: same number of lines" ;;
     esac
     case $X in
-        F|G|H|I|J|P)
+        F|G|H|I|J|P|K|L)
             assert_eq "$(grep -E '^(BLAME|EVIDENCE|#SUM) ' "$WORK/nova_$X.txt")" "$(grep -E '^(BLAME|EVIDENCE|#SUM) ' "$WORK/py_$X.txt")" "scenario $X: blame codes, why texts, evidence hashes and sum identical"
             assert_eq "$(grep -o ' state=[0-9]* u2=[0-9,]* counters=[0-9,]*' "$WORK/nova_$X.txt" | sed 's/ state=[0-9]*//')" "$(grep -o ' state=[0-9]* u2=[0-9,]* counters=[0-9,]*' "$WORK/py_$X.txt" | sed 's/ state=[0-9]*//')" "scenario $X: final U2 and verdict counters identical" ;;
     esac
@@ -139,6 +145,34 @@ awk '/^open /{ c = substr($2, 1, 1); r = (c == "0") ? "1" : "0"; print "open " r
 J=$(python3 -I "$REF" --judge "$WORK/ev_bad2.txt" --roster "$WORK/roster.txt" 2>&1)
 assert_eq "$?" "2" "judge: evidence with another one-time key is refused"
 assert_match "$J" 'opening does not match e_pk' "judge: names the key mismatch"
+# Strict format (SPEC 8.8 / 9 step 1): code 2 carries exactly `path -` and
+# `shsig -`; the complaint line of code 1 is the signed complaint; nothing
+# after `open`.
+for T in 's/^path -$/path  -/' 's/^shsig -$/shsig 00/'; do
+    sed "$T" "$WORK/evidence_G_65536.txt" > "$WORK/ev_bad3.txt"
+    J=$(python3 -I "$REF" --judge "$WORK/ev_bad3.txt" --roster "$WORK/roster.txt" 2>&1)
+    assert_eq "$?" "2" "judge: code-2 evidence with '$T' is refused"
+done
+sed 's/^\(complaint .*\)$/\1 /' "$WORK/evidence_F_4294967295.txt" > "$WORK/ev_bad4.txt"
+J=$(python3 -I "$REF" --judge "$WORK/ev_bad4.txt" --roster "$WORK/roster.txt" 2>&1)
+assert_eq "$?" "2" "judge: code-1 evidence with a trailing space on the complaint line is refused"
+awk '/^complaint /{ c = substr($0, length($0), 1); r = (c == "0") ? "1" : "0"; print substr($0, 1, length($0) - 1) r; next } { print }' "$WORK/evidence_F_4294967295.txt" > "$WORK/ev_bad5.txt"
+J=$(python3 -I "$REF" --judge "$WORK/ev_bad5.txt" --roster "$WORK/roster.txt" 2>&1)
+assert_eq "$?" "2" "judge: code-1 evidence with an unsigned complaint line is refused"
+assert_match "$J" 'the complainer did not sign this complaint' "judge: names the complaint signature"
+{ cat "$WORK/evidence_G_65536.txt"; echo "note x"; } > "$WORK/ev_bad6.txt"
+J=$(python3 -I "$REF" --judge "$WORK/ev_bad6.txt" --roster "$WORK/roster.txt" 2>&1)
+assert_eq "$?" "2" "judge: evidence with an appended line is refused"
+# U1 != U2' (rounds K, L): the NOVA evidence covers U1 and is judged.
+J=$(python3 -I "$REF" --judge "$WORK/evidence_K_4294967295.txt" --roster "$WORK/roster.txt" 2>&1)
+assert_eq "$?" "0" "judge: round K evidence (U1 != U2') is valid"
+assert_eq "$J" "verdict: sender 4294967295" "judge: round K blames the sender"
+J=$(python3 -I "$REF" --judge "$WORK/evidence_L_65536.txt" --roster "$WORK/roster.txt" 2>&1)
+assert_eq "$?" "0" "judge: round L evidence (U1 != U2') is valid"
+assert_eq "$J" "verdict: complainer 65536" "judge: round L blames the complainer"
+assert_eq "$(cmp -s "$WORK/evidence_K_4294967295.txt" "$WORK/evidence_F_4294967295.txt"; echo $?)" "0" "round K: evidence identical to round F (built over U1, not U2')"
+assert_eq "$(cmp -s "$WORK/evidence_L_65536.txt" "$WORK/evidence_G_65536.txt"; echo $?)" "0" "round L: evidence identical to round G (built over U1, not U2')"
+assert_match "$(grep '^#K ' "$WORK/nova_K.txt")" ' u2=7,300,65536 ' "round K: 70000 (outside U2') and the sender are out"
 
 # Differential run over perturbed rounds (only the reason text may differ).
 python3 -I "$REPO_ROOT/tests/tools/sa4_cases.py" gen > "$WORK/cases.txt" 2>&1
